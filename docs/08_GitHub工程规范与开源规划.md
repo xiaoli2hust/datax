@@ -14,7 +14,7 @@
 
 - 权威产品和工程文档。
 - 前端、API、Worker 与部署代码。
-- 机器可校验的 API/JobSpec/Plugin/Audit 契约。
+- 机器可校验的 API、JobSpec、Plugin、Audit、Verification Oracle 和 Acceptance Manifest 契约。
 - 自动测试、迁移、构建、SBOM 和发布证据。
 
 不承载：
@@ -51,7 +51,8 @@
 │   └── e2e/
 ├── docs/
 │   ├── adr/
-│   └── contracts/
+│   ├── contracts/
+│   └── security/
 ├── AGENTS.md
 ├── CONTRIBUTING.md
 ├── SECURITY.md
@@ -90,6 +91,8 @@ DataX Runtime 由构建脚本获取或从受控制品库下载，按 manifest �
 - 真实外部链路是否验证。
 - 未验证项、风险和回滚方式。
 - 文档、契约和追踪矩阵是否同步。
+- PRD、ADR、数据模型与机器契约在各自关注点上是否一致；任何冲突必须列为阻塞项。
+- 需求优先级、唯一测试 ID、oracle、证据路径和结果是否进入 `acceptance-manifest.v1`。
 
 禁止把无关格式化、依赖升级和功能改动塞入同一 PR。
 
@@ -114,7 +117,8 @@ DataX Runtime 由构建脚本获取或从受控制品库下载，按 manifest �
 - Markdown 格式和内部链接。
 - OpenAPI 语法与示例校验。
 - JSON Schema 解析、Meta Schema 和示例校验。
-- ADR 状态与追踪矩阵引用检查。
+- ADR 状态、威胁模型、逐条需求追踪和无错位引用检查。
+- JobSpec、OpenAPI、数据枚举和验收 manifest 的跨契约一致性检查。
 - Secret/高熵字符串扫描。
 
 ### 工程阶段
@@ -123,7 +127,12 @@ DataX Runtime 由构建脚本获取或从受控制品库下载，按 manifest �
 - 后端格式化、lint、类型检查、单元和 API 集成测试。
 - Alembic 从空库升级、前后版本兼容与恢复测试。
 - Docker 镜像构建、健康检查、非 root 和制品摘要检查。
-- 真实 DataX E2E 由隔离测试环境执行；没有真实凭据时明确为未运行，不能替换成 Mock 绿灯。
+- 真实 DataX E2E 由隔离测试环境执行；必须包含源静默确认、空目标复检、目标外部独占
+  `statement_version='1.0'`/`valid_until`/`ACTIVE|REVOKED|EXPIRED` 生命周期、已知窗口破坏的
+  Operator/DBA 撤回或报告与 `TARGET_EXCLUSIVITY_REVOKED` 审计、独立 oracle、部分写入、
+  并发同目标、Worker fencing 和恢复后再次执行。Oracle `PASSED` 必须要求声明未撤回、
+  未过期且目标快照结束不晚于 `valid_until`；测试不得声称平台能自动发现任意瞬时、未报告
+  或已回滚的平台外 DML/DDL。没有真实凭据时明确为未运行，不能替换成 Mock 绿灯。
 - SAST、依赖漏洞、SBOM、许可证和容器扫描。
 
 高风险 CI 所需密钥只使用受保护环境和最小权限短期凭据，不向 Fork PR 暴露。
@@ -137,7 +146,7 @@ DataX Runtime 由构建脚本获取或从受控制品库下载，按 manifest �
 - 输入、输出和非目标。
 - 正常/失败/权限/并发路径。
 - 数据、API、UI、迁移和安全影响。
-- 可执行验收标准。
+- 可执行验收标准，包括唯一测试 ID、oracle、证据等级和证据路径。
 
 Bug Issue 应包含版本、环境、复现步骤、预期/实际、脱敏日志和影响；不得粘贴密码、连接串或业务数据。
 
@@ -155,6 +164,7 @@ Bug Issue 应包含版本、环境、复现步骤、预期/实际、脱敏日志
 - 数据库迁移 head。
 - DataX 版本、Runtime 包 SHA-256、每个插件 JAR SHA-256。
 - OpenAPI/JobSpec/Plugin Manifest 版本。
+- Verification Oracle、Acceptance Manifest 和外部审计锚点格式版本。
 - SBOM、许可证清单和已知漏洞豁免。
 - 升级、回滚和数据备份说明。
 
