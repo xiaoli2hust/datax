@@ -1,0 +1,36 @@
+name: 文档问题
+description: 报告缺失、冲突、过期或不可执行的文档
+title: "[Docs] "
+labels:
+  - documentation
+body:
+  - type: input
+    id: location
+    attributes:
+      label: 文档位置
+      placeholder: docs/05_API接口与前后端契约.md
+    validations:
+      required: true
+  - type: dropdown
+    id: kind
+    attributes:
+      label: 问题类型
+      options:
+        - 与机器契约冲突
+        - 与其他文档冲突
+        - 内容缺失
+        - 内容过期
+        - 步骤不可执行
+        - 链接或格式问题
+    validations:
+      required: true
+  - type: textarea
+    id: current
+    attributes:
+      label: 当前问题
+    validations:
+      required: true
+  - type: textarea
+    id: proposed
+    attributes:
+      label: 建议修正

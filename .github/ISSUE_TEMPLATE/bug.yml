@@ -1,0 +1,49 @@
+name: 缺陷报告
+description: 报告可复现且已脱敏的问题
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: input
+    id: version
+    attributes:
+      label: 版本或 commit
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: 环境
+      description: 系统、浏览器、镜像摘要、数据库与 DataX 版本；不要包含密钥
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 预期行为
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: 实际行为
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: 脱敏证据
+      description: request_id、execution_id、截图或日志片段；禁止连接串、密码、Token 和业务数据
+  - type: checkboxes
+    id: sensitive
+    attributes:
+      label: 安全确认
+      options:
+        - label: 我已移除密钥、连接串、个人信息和业务数据
+          required: true

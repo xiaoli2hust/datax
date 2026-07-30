@@ -1,0 +1,2932 @@
+openapi: 3.1.0
+jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
+info:
+  title: DataX Enterprise Studio API
+  version: 1.0.0
+  description: |
+    V1 单组织、多项目离线批同步控制 API。
+    仅支持 MySQL 8/PostgreSQL 15、人工触发、预存在目标表和 insert-only。
+    不提供调度、DAG、告警、AI、CDC、自由 SQL、Transformer 或插件安装接口。
+servers:
+  - url: /api/v1
+tags:
+  - name: Auth
+    description: 本地账号会话与本人密码
+  - name: Users
+    description: Admin 用户生命周期管理
+  - name: Projects
+    description: 项目、成员、角色与首页统计
+  - name: Plugins
+    description: 只读认证插件清单
+  - name: Datasources
+    description: 数据源、凭证测试和 Schema 探测
+  - name: Jobs
+    description: 任务草稿、校验、预览与不可变版本
+  - name: Executions
+    description: 人工运行、取消、重跑和脱敏日志
+  - name: Audit
+    description: 项目级与组织级追加式审计
+  - name: Health
+    description: 无敏感信息的存活与就绪检查
+security:
+  - bearerAuth: []
+
+paths:
+  /auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: 本地账号登录
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+            example:
+              email: operator@example.com
+              password: <write-only-password>
+      responses:
+        '200':
+          description: 登录成功；同时设置 HttpOnly refresh cookie
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+              description: des_refresh cookie
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refreshAccessToken
+      summary: 旋转 refresh token 并签发 access token
+      security:
+        - refreshCookie: []
+      responses:
+        '200':
+          description: 刷新成功
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: 撤销当前 refresh session
+      responses:
+        '204':
+          description: 已撤销；重复退出同样返回 204
+          headers:
+            Set-Cookie:
+              schema:
+                type: string
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: 获取当前用户及作用域角色
+      responses:
+        '200':
+          description: 当前用户
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MeResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/change-password:
+    post:
+      tags: [Auth]
+      operationId: changeOwnPassword
+      summary: 修改本人密码并撤销其他 session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ChangePasswordRequest'
+      responses:
+        '204':
+          description: 密码已修改；当前 session 保留，其他 session 已撤销
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /users:
+    get:
+      tags: [Users]
+      operationId: listUsers
+      summary: 分页列出组织用户
+      description: 需要组织级 Admin。
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [ACTIVE, LOCKED, DISABLED]
+      responses:
+        '200':
+          description: 用户页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [Users]
+      operationId: createUser
+      summary: 创建本地用户
+      description: 需要 Admin；temporary_password 是 write-only，响应不回显。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreate'
+      responses:
+        '201':
+          description: 已创建，用户首次登录必须改密
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /users/{user_id}:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    get:
+      tags: [Users]
+      operationId: getUser
+      summary: 获取用户状态与角色摘要
+      description: 需要组织级 Admin。
+      responses:
+        '200':
+          description: 用户
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Users]
+      operationId: updateUser
+      summary: 修改显示名或启用/停用用户
+      description: 停用用户会撤销其全部 session。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserPatch'
+      responses:
+        '200':
+          description: 已更新
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /users/{user_id}/unlock:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags: [Users]
+      operationId: unlockUser
+      summary: 解除登录锁定
+      description: 需要 Admin；清零失败计数并清空 locked_until。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '200':
+          description: 已解锁
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /users/{user_id}/organization-roles:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    put:
+      tags: [Users]
+      operationId: replaceOrganizationRoles
+      summary: 原子替换组织级 Admin 角色
+      description: 需要 Admin；允许空数组撤销，但系统必须至少保留一名有效 Admin。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrganizationRoleReplaceRequest'
+      responses:
+        '200':
+          description: 已更新
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /users/{user_id}/reset-password:
+    parameters:
+      - $ref: '#/components/parameters/UserId'
+    post:
+      tags: [Users]
+      operationId: resetUserPassword
+      summary: 设置临时密码并撤销全部 session
+      description: 需要 Admin；响应不返回临时密码，用户下次登录必须改密。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResetPasswordRequest'
+      responses:
+        '204':
+          description: 已重置
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /projects:
+    get:
+      tags: [Projects]
+      operationId: listProjects
+      summary: 分页列出当前用户可见项目
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 项目页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectPage'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Projects]
+      operationId: createProject
+      summary: 创建项目
+      description: 需要组织级 Admin。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectCreate'
+            example:
+              name: 订单数据集成
+              slug: order-integration
+              description: 订单离线同步任务
+      responses:
+        '201':
+          description: 已创建
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /projects/{project_id}:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [Projects]
+      operationId: getProject
+      summary: 获取项目
+      responses:
+        '200':
+          description: 项目
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Projects]
+      operationId: updateProject
+      summary: 更新或归档项目
+      description: 需要组织级 Admin。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectPatch'
+      responses:
+        '200':
+          description: 已更新
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /projects/{project_id}/members:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [Projects]
+      operationId: listProjectMembers
+      summary: 列出项目成员及角色
+      description: 需要 Admin。
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 成员页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MemberPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /projects/{project_id}/members/{user_id}/roles:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+      - $ref: '#/components/parameters/UserId'
+    put:
+      tags: [Projects]
+      operationId: replaceProjectMemberRoles
+      summary: 原子替换用户的项目角色
+      description: 需要 Admin；角色可多选，权限取并集。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RoleReplaceRequest'
+            example:
+              roles: [DEVELOPER, VIEWER]
+      responses:
+        '200':
+          description: 已更新
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Member'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /projects/{project_id}/dashboard:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [Projects]
+      operationId: getProjectDashboard
+      summary: 获取固定时间窗的项目运行概览
+      description: |
+        所有项目成员可读。Execution 以 queued_at 落入半开区间 [from,to) 统计；
+        时间窗最长 31 天。成功率为 SUCCEEDED /
+        (SUCCEEDED + FAILED + TIMED_OUT + LOST)，分母为 0 时 ratio 为 null。
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: 项目概览
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DashboardResponse'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /plugins:
+    get:
+      tags: [Plugins]
+      operationId: listCertifiedPlugins
+      summary: 获取四个只读认证插件 manifest
+      responses:
+        '200':
+          description: 插件 manifest 列表
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    minItems: 4
+                    maxItems: 4
+                    items:
+                      $ref: './plugin-manifest.v1.schema.json'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /projects/{project_id}/datasources:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [Datasources]
+      operationId: listDatasources
+      summary: 分页列出项目数据源
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: engine
+          in: query
+          schema:
+            $ref: '#/components/schemas/Engine'
+      responses:
+        '200':
+          description: 数据源页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasourcePage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Datasources]
+      operationId: createDatasource
+      summary: 创建数据源并加密凭证
+      description: 需要 Admin 或 Developer。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasourceCreate'
+            example:
+              name: 订单库
+              description: 只读订单源
+              engine: MYSQL_8
+              host: mysql.internal.example
+              port: 3306
+              database_name: sales
+              default_schema: sales
+              username: datax_reader
+              password: <write-only-password>
+              ssl_mode: VERIFY_FULL
+      responses:
+        '201':
+          description: 已创建；响应不包含 password
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Datasource'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /datasources/{datasource_id}:
+    parameters:
+      - $ref: '#/components/parameters/DatasourceId'
+    get:
+      tags: [Datasources]
+      operationId: getDatasource
+      summary: 获取脱敏数据源
+      responses:
+        '200':
+          description: 数据源
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Datasource'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Datasources]
+      operationId: updateDatasource
+      summary: 更新数据源或轮换密码
+      description: password 缺失表示不轮换；null 或空字符串无效。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasourcePatch'
+      responses:
+        '200':
+          description: 已更新
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Datasource'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+    delete:
+      tags: [Datasources]
+      operationId: deleteDatasource
+      summary: 软删除数据源
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '204':
+          description: 已软删除
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /datasources/{datasource_id}/test:
+    parameters:
+      - $ref: '#/components/parameters/DatasourceId'
+    post:
+      tags: [Datasources]
+      operationId: testDatasource
+      summary: 使用已保存凭证执行受限连接测试
+      responses:
+        '200':
+          description: 测试已完成；连接失败通过 status=FAILED 表达
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasourceTestResult'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /datasources/{datasource_id}/schema/tables:
+    parameters:
+      - $ref: '#/components/parameters/DatasourceId'
+    get:
+      tags: [Datasources]
+      operationId: listDatasourceTables
+      summary: 读取表和列元数据
+      parameters:
+        - name: schema_name
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+        - name: table_name
+          in: query
+          required: false
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 表元数据页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableSchemaPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '502':
+          $ref: '#/components/responses/DatasourceConnectionFailed'
+
+  /projects/{project_id}/jobs:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [Jobs]
+      operationId: listJobs
+      summary: 分页列出项目任务
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: status
+          in: query
+          schema:
+            $ref: '#/components/schemas/JobStatus'
+        - name: exclude_status
+          in: query
+          schema:
+            $ref: '#/components/schemas/JobStatus'
+        - name: has_published_version
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: 任务页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobPage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Jobs]
+      operationId: createJob
+      summary: 创建任务及首个草稿
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobCreate'
+      responses:
+        '201':
+          description: 已创建，状态 DRAFT
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncJob'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /jobs/{job_id}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      operationId: getJob
+      summary: 获取任务、当前草稿与发布信息
+      responses:
+        '200':
+          description: 任务
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncJob'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Jobs]
+      operationId: updateJobDraft
+      summary: 更新任务元数据或草稿
+      description: 草稿变化后状态回到 DRAFT。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobPatch'
+      responses:
+        '200':
+          description: 已更新
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncJob'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /jobs/{job_id}/validate:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [Jobs]
+      operationId: validateJobDraft
+      summary: 校验当前已保存草稿
+      description: 包括结构、权限、同表自同步阻断、Schema 漂移和类型兼容。
+      responses:
+        '200':
+          description: 校验已完成；valid=false 是正常业务结果
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidationReport'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /jobs/{job_id}/preview:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [Jobs]
+      operationId: previewJobDraft
+      summary: 生成不可执行、已脱敏的 DataX JSON 预览
+      responses:
+        '200':
+          description: 脱敏预览
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobPreview'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /jobs/{job_id}/versions:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    get:
+      tags: [Jobs]
+      operationId: listJobVersions
+      summary: 分页列出不可变版本
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 版本页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobVersionPage'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Jobs]
+      operationId: publishJobVersion
+      summary: 发布当前 VALID 草稿为不可变版本
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PublishRequest'
+      responses:
+        '201':
+          description: 已发布
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobVersion'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /jobs/{job_id}/versions/{version_id}:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+      - $ref: '#/components/parameters/VersionId'
+    get:
+      tags: [Jobs]
+      operationId: getJobVersion
+      summary: 获取不可变 JobVersion
+      responses:
+        '200':
+          description: 版本
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/JobVersion'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /projects/{project_id}/executions:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [Executions]
+      operationId: listExecutions
+      summary: 分页列出项目执行
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: state
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            maxItems: 9
+            uniqueItems: true
+            items:
+              $ref: '#/components/schemas/ExecutionState'
+        - name: job_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          description: queued_at 半开区间起点
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          description: queued_at 半开区间终点
+          schema:
+            type: string
+            format: date-time
+        - name: unresolved_failure
+          in: query
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: 执行页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ExecutionPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /jobs/{job_id}/executions:
+    parameters:
+      - $ref: '#/components/parameters/JobId'
+    post:
+      tags: [Executions]
+      operationId: createExecution
+      summary: 对明确的已发布 JobVersion 人工执行
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecutionCreate'
+            example:
+              job_version_id: b64006fc-5a22-4e48-a0bd-f9cb1440031f
+      responses:
+        '202':
+          description: 已持久化为 QUEUED
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Execution'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /executions/{execution_id}:
+    parameters:
+      - $ref: '#/components/parameters/ExecutionId'
+    get:
+      tags: [Executions]
+      operationId: getExecution
+      summary: 获取执行状态与摘要
+      responses:
+        '200':
+          description: 执行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Execution'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /executions/{execution_id}/cancel:
+    parameters:
+      - $ref: '#/components/parameters/ExecutionId'
+    post:
+      tags: [Executions]
+      operationId: cancelExecution
+      summary: 创建取消请求
+      description: API 不直接推进 Execution 状态；由 Worker 确认并写 CANCEL_REQUESTED。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CancelExecutionRequest'
+      responses:
+        '202':
+          description: 取消请求已持久化
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /executions/{execution_id}/rerun:
+    parameters:
+      - $ref: '#/components/parameters/ExecutionId'
+    post:
+      tags: [Executions]
+      operationId: rerunExecution
+      summary: 使用原 JobVersion 创建新 Execution
+      description: insert-only 可能产生重复记录；不会自动选择最新 JobVersion。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      responses:
+        '202':
+          description: 新 Execution
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Execution'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /executions/{execution_id}/logs:
+    parameters:
+      - $ref: '#/components/parameters/ExecutionId'
+    get:
+      tags: [Executions]
+      operationId: getExecutionLogs
+      summary: 用不透明游标读取脱敏日志
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/LogLimit'
+        - name: stream
+          in: query
+          schema:
+            type: string
+            enum: [STDOUT, STDERR, SYSTEM]
+      responses:
+        '200':
+          description: 日志页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+
+  /executions/{execution_id}/logs/download:
+    parameters:
+      - $ref: '#/components/parameters/ExecutionId'
+    get:
+      tags: [Executions]
+      operationId: downloadExecutionLogs
+      summary: 下载服务端生成的完整脱敏日志
+      description: |
+        所有项目成员可读。响应由服务端从脱敏 LogChunk 组装并产生
+        EXECUTION_LOG_EXPORTED 审计。V1 脱敏后未压缩大小上限为 100 MiB；
+        超限返回 413，不静默截断。
+      responses:
+        '200':
+          description: UTF-8 脱敏日志
+          headers:
+            Content-Disposition:
+              description: attachment 文件名
+              schema:
+                type: string
+            X-Log-Redaction-Version:
+              description: 脱敏规则版本
+              schema:
+                type: string
+                maxLength: 32
+            X-Content-SHA256:
+              description: 响应正文 SHA-256
+              schema:
+                $ref: '#/components/schemas/Sha256'
+          content:
+            text/plain:
+              schema:
+                type: string
+                format: binary
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '410':
+          $ref: '#/components/responses/Gone'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+
+  /projects/{project_id}/audit-events:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [Audit]
+      operationId: listAuditEvents
+      summary: 分页列出追加式审计事件
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: action
+          in: query
+          schema:
+            type: string
+            maxLength: 64
+        - name: outcome
+          in: query
+          schema:
+            type: string
+            enum: [SUCCEEDED, DENIED, FAILED]
+        - name: actor_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: 审计页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /audit-events:
+    get:
+      tags: [Audit]
+      operationId: listOrganizationAuditEvents
+      summary: 跨项目分页列出组织审计
+      description: 仅组织级 Admin。
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+        - name: project_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: action
+          in: query
+          schema:
+            type: string
+            maxLength: 64
+        - name: outcome
+          in: query
+          schema:
+            type: string
+            enum: [SUCCEEDED, DENIED, FAILED]
+        - name: actor_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: from
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: to
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: 审计页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuditPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /health/live:
+    get:
+      tags: [Health]
+      operationId: liveness
+      summary: 进程存活检查
+      security: []
+      responses:
+        '200':
+          description: 进程可响应
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /health/ready:
+    get:
+      tags: [Health]
+      operationId: readiness
+      summary: PostgreSQL、Redis、日志卷、dispatcher、Worker/Runtime 就绪检查
+      security: []
+      responses:
+        '200':
+          description: 可接收请求和新执行
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+        '503':
+          description: 一个或多个关键组件未就绪
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: des_refresh
+
+  headers:
+    RequestId:
+      description: 服务端请求关联 UUID
+      schema:
+        type: string
+        format: uuid
+    ETag:
+      description: 弱 ETag，值为 W/"row_version"
+      schema:
+        type: string
+        pattern: '^W/"[1-9][0-9]*"$'
+    IdempotencyReplayed:
+      description: true 表示返回 24 小时内首次请求结果
+      schema:
+        type: boolean
+
+  parameters:
+    ProjectId:
+      name: project_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    UserId:
+      name: user_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DatasourceId:
+      name: datasource_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    JobId:
+      name: job_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    VersionId:
+      name: version_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    ExecutionId:
+      name: execution_id
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    Cursor:
+      name: cursor
+      in: query
+      required: false
+      description: 服务端生成的不透明游标
+      schema:
+        type: string
+        minLength: 1
+        maxLength: 2048
+    Limit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 200
+        default: 50
+    LogLimit:
+      name: limit
+      in: query
+      required: false
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 1000
+        default: 200
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema:
+        type: string
+        minLength: 8
+        maxLength: 128
+        pattern: '^[A-Za-z0-9._:-]+$'
+    IfMatch:
+      name: If-Match
+      in: header
+      required: true
+      schema:
+        type: string
+        pattern: '^W/"[1-9][0-9]*"$'
+
+  responses:
+    BadRequest:
+      description: 请求或 cursor 无效
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Unauthorized:
+      description: 未认证、凭证无效或 token 到期
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Forbidden:
+      description: 无权限
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    NotFound:
+      description: 资源不存在或对当前主体不可见
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Conflict:
+      description: 版本、幂等、状态或唯一约束冲突
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    Gone:
+      description: 日志已按保留策略删除
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    PayloadTooLarge:
+      description: 脱敏日志超过 V1 单次导出上限
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ValidationError:
+      description: 请求或业务语义校验失败
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    DatasourceConnectionFailed:
+      description: 数据源连接、认证或元数据读取失败
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+    ServiceUnavailable:
+      description: Worker、Runtime 或关键依赖未就绪
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/Problem'
+
+  schemas:
+    Uuid:
+      type: string
+      format: uuid
+    Timestamp:
+      type: string
+      format: date-time
+    NullableTimestamp:
+      oneOf:
+        - $ref: '#/components/schemas/Timestamp'
+        - type: 'null'
+    NullableUuid:
+      oneOf:
+        - $ref: '#/components/schemas/Uuid'
+        - type: 'null'
+    Sha256:
+      type: string
+      pattern: '^[a-f0-9]{64}$'
+    Role:
+      type: string
+      enum: [ADMIN, DEVELOPER, OPERATOR, VIEWER]
+    ProjectRole:
+      type: string
+      enum: [DEVELOPER, OPERATOR, VIEWER]
+    Engine:
+      type: string
+      enum: [MYSQL_8, POSTGRESQL_15]
+    ProjectStatus:
+      type: string
+      enum: [ACTIVE, ARCHIVED]
+    DatasourceStatus:
+      type: string
+      enum: [ACTIVE, DISABLED, DELETED]
+    JobStatus:
+      type: string
+      enum: [DRAFT, VALID, PUBLISHED, ARCHIVED]
+    ExecutionState:
+      type: string
+      enum:
+        - QUEUED
+        - STARTING
+        - RUNNING
+        - CANCEL_REQUESTED
+        - SUCCEEDED
+        - FAILED
+        - TIMED_OUT
+        - CANCELED
+        - LOST
+    FieldError:
+      type: object
+      additionalProperties: false
+      required: [path, code, message]
+      properties:
+        path:
+          type: string
+          maxLength: 500
+        code:
+          type: string
+          pattern: '^[A-Z0-9_]+$'
+        message:
+          type: string
+          maxLength: 1000
+    Problem:
+      type: object
+      additionalProperties: false
+      required:
+        - type
+        - title
+        - status
+        - code
+        - detail
+        - instance
+        - request_id
+        - retryable
+        - field_errors
+      properties:
+        type:
+          type: string
+          format: uri
+        title:
+          type: string
+          maxLength: 200
+        status:
+          type: integer
+          minimum: 400
+          maximum: 599
+        code:
+          type: string
+          pattern: '^[A-Z0-9_]+$'
+        detail:
+          type: [string, 'null']
+          maxLength: 2000
+        instance:
+          type: string
+          maxLength: 500
+        request_id:
+          $ref: '#/components/schemas/Uuid'
+        retryable:
+          type: boolean
+        field_errors:
+          type: array
+          maxItems: 100
+          items:
+            $ref: '#/components/schemas/FieldError'
+
+    UserSummary:
+      type: object
+      additionalProperties: false
+      required: [id, email, display_name]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+    User:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - email
+        - display_name
+        - status
+        - must_change_password
+        - role_assignments
+        - row_version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        status:
+          type: string
+          enum: [ACTIVE, LOCKED, DISABLED]
+        must_change_password:
+          type: boolean
+        role_assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScopedRoles'
+        row_version:
+          type: integer
+          minimum: 1
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+    UserCreate:
+      type: object
+      additionalProperties: false
+      required: [email, display_name, temporary_password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        temporary_password:
+          type: string
+          format: password
+          minLength: 12
+          maxLength: 256
+          writeOnly: true
+    UserPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        status:
+          type: string
+          enum: [ACTIVE, DISABLED]
+    UserPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/User'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+    ChangePasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [current_password, new_password]
+      properties:
+        current_password:
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 256
+          writeOnly: true
+        new_password:
+          type: string
+          format: password
+          minLength: 12
+          maxLength: 256
+          writeOnly: true
+    ResetPasswordRequest:
+      type: object
+      additionalProperties: false
+      required: [temporary_password]
+      properties:
+        temporary_password:
+          type: string
+          format: password
+          minLength: 12
+          maxLength: 256
+          writeOnly: true
+    LoginRequest:
+      type: object
+      additionalProperties: false
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+        password:
+          type: string
+          format: password
+          minLength: 12
+          maxLength: 256
+          writeOnly: true
+    AuthResponse:
+      type: object
+      additionalProperties: false
+      required: [access_token, token_type, expires_in, user]
+      properties:
+        access_token:
+          type: string
+          readOnly: true
+        token_type:
+          const: Bearer
+        expires_in:
+          type: integer
+          minimum: 60
+          example: 900
+        user:
+          $ref: '#/components/schemas/UserSummary'
+    ScopedRoles:
+      type: object
+      additionalProperties: false
+      required: [scope_type, scope_id, roles]
+      properties:
+        scope_type:
+          type: string
+          enum: [ORGANIZATION, PROJECT]
+        scope_id:
+          $ref: '#/components/schemas/Uuid'
+        roles:
+          type: array
+          minItems: 1
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Role'
+    MeResponse:
+      type: object
+      additionalProperties: false
+      required: [user, role_assignments]
+      properties:
+        user:
+          $ref: '#/components/schemas/UserSummary'
+        role_assignments:
+          type: array
+          items:
+            $ref: '#/components/schemas/ScopedRoles'
+
+    Project:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - organization_id
+        - name
+        - slug
+        - description
+        - status
+        - row_version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        organization_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        slug:
+          type: string
+          pattern: '^[a-z][a-z0-9-]{2,63}$'
+        description:
+          type: [string, 'null']
+          maxLength: 1000
+        status:
+          $ref: '#/components/schemas/ProjectStatus'
+        row_version:
+          type: integer
+          minimum: 1
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+    ProjectCreate:
+      type: object
+      additionalProperties: false
+      required: [name, slug]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        slug:
+          type: string
+          pattern: '^[a-z][a-z0-9-]{2,63}$'
+        description:
+          type: [string, 'null']
+          maxLength: 1000
+    ProjectPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description:
+          type: [string, 'null']
+          maxLength: 1000
+        status:
+          type: string
+          enum: [ARCHIVED]
+    ProjectPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Project'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+    Member:
+      type: object
+      additionalProperties: false
+      required: [user, roles]
+      properties:
+        user:
+          $ref: '#/components/schemas/UserSummary'
+        roles:
+          type: array
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/Role'
+    MemberPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Member'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+    RoleReplaceRequest:
+      type: object
+      additionalProperties: false
+      required: [roles]
+      properties:
+        roles:
+          type: array
+          minItems: 0
+          maxItems: 3
+          uniqueItems: true
+          items:
+            $ref: '#/components/schemas/ProjectRole'
+    OrganizationRoleReplaceRequest:
+      type: object
+      additionalProperties: false
+      required: [roles]
+      properties:
+        roles:
+          type: array
+          maxItems: 1
+          uniqueItems: true
+          items:
+            const: ADMIN
+
+    DashboardWindow:
+      type: object
+      additionalProperties: false
+      required: [from, to]
+      properties:
+        from:
+          $ref: '#/components/schemas/Timestamp'
+        to:
+          $ref: '#/components/schemas/Timestamp'
+    DashboardJobCounts:
+      type: object
+      additionalProperties: false
+      required: [total, draft, valid, published, archived, executable]
+      properties:
+        total:
+          type: integer
+          minimum: 0
+        draft:
+          type: integer
+          minimum: 0
+        valid:
+          type: integer
+          minimum: 0
+        published:
+          type: integer
+          minimum: 0
+        archived:
+          type: integer
+          minimum: 0
+        executable:
+          type: integer
+          minimum: 0
+          description: 未归档且至少存在一个 JobVersion
+    DashboardExecutionCounts:
+      type: object
+      additionalProperties: false
+      required:
+        - QUEUED
+        - STARTING
+        - RUNNING
+        - CANCEL_REQUESTED
+        - SUCCEEDED
+        - FAILED
+        - TIMED_OUT
+        - CANCELED
+        - LOST
+      properties:
+        QUEUED:
+          type: integer
+          minimum: 0
+        STARTING:
+          type: integer
+          minimum: 0
+        RUNNING:
+          type: integer
+          minimum: 0
+        CANCEL_REQUESTED:
+          type: integer
+          minimum: 0
+        SUCCEEDED:
+          type: integer
+          minimum: 0
+        FAILED:
+          type: integer
+          minimum: 0
+        TIMED_OUT:
+          type: integer
+          minimum: 0
+        CANCELED:
+          type: integer
+          minimum: 0
+        LOST:
+          type: integer
+          minimum: 0
+    DashboardSuccessRate:
+      type: object
+      additionalProperties: false
+      required: [numerator, denominator, ratio]
+      properties:
+        numerator:
+          type: integer
+          minimum: 0
+          description: SUCCEEDED
+        denominator:
+          type: integer
+          minimum: 0
+          description: SUCCEEDED + FAILED + TIMED_OUT + LOST
+        ratio:
+          type: [number, 'null']
+          minimum: 0
+          maximum: 1
+    DashboardRecordsWritten:
+      type: object
+      additionalProperties: false
+      required: [value, complete, missing_summary_count]
+      properties:
+        value:
+          type: integer
+          minimum: 0
+        complete:
+          type: boolean
+        missing_summary_count:
+          type: integer
+          minimum: 0
+    DashboardExecutionItem:
+      type: object
+      additionalProperties: false
+      required:
+        - execution_id
+        - job_id
+        - job_version_id
+        - job_name
+        - state
+        - queued_at
+        - started_at
+        - finished_at
+        - failure_code
+      properties:
+        execution_id:
+          $ref: '#/components/schemas/Uuid'
+        job_id:
+          $ref: '#/components/schemas/Uuid'
+        job_version_id:
+          $ref: '#/components/schemas/Uuid'
+        job_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        state:
+          $ref: '#/components/schemas/ExecutionState'
+        queued_at:
+          $ref: '#/components/schemas/Timestamp'
+        started_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        finished_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        failure_code:
+          type: [string, 'null']
+          maxLength: 64
+    DashboardTrendBucket:
+      type: object
+      additionalProperties: false
+      required: [bucket_start, bucket_end, counts]
+      properties:
+        bucket_start:
+          $ref: '#/components/schemas/Timestamp'
+        bucket_end:
+          $ref: '#/components/schemas/Timestamp'
+        counts:
+          $ref: '#/components/schemas/DashboardExecutionCounts'
+    DashboardRuntime:
+      type: object
+      additionalProperties: false
+      required: [worker_online, runtime_ready, datax_release, version_match]
+      properties:
+        worker_online:
+          type: boolean
+        runtime_ready:
+          type: boolean
+        datax_release:
+          type: [string, 'null']
+          enum: [datax_v202309, null]
+        version_match:
+          type: boolean
+    DashboardDrilldown:
+      type: object
+      additionalProperties: false
+      required: [metric_key, resource, path, filters]
+      properties:
+        metric_key:
+          type: string
+          enum:
+            - executable_jobs
+            - all_executions
+            - queued
+            - running
+            - succeeded
+            - failed
+            - timed_out
+            - lost
+            - canceled
+            - unresolved_failures
+        resource:
+          type: string
+          enum: [JOBS, EXECUTIONS]
+        path:
+          type: string
+          pattern: '^/api/v1/projects/[0-9a-fA-F-]+/(jobs|executions)$'
+        filters:
+          type: object
+          additionalProperties: false
+          required:
+            - from
+            - to
+            - states
+            - exclude_job_status
+            - has_published_version
+            - unresolved_failure
+          properties:
+            from:
+              oneOf:
+                - $ref: '#/components/schemas/Timestamp'
+                - type: 'null'
+            to:
+              oneOf:
+                - $ref: '#/components/schemas/Timestamp'
+                - type: 'null'
+            states:
+              type: array
+              maxItems: 9
+              uniqueItems: true
+              items:
+                $ref: '#/components/schemas/ExecutionState'
+            exclude_job_status:
+              oneOf:
+                - $ref: '#/components/schemas/JobStatus'
+                - type: 'null'
+            has_published_version:
+              type: [boolean, 'null']
+            unresolved_failure:
+              type: [boolean, 'null']
+    DashboardResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - project_id
+        - window
+        - job_counts
+        - execution_total
+        - execution_state_counts
+        - success_rate
+        - unresolved_failure_count
+        - records_written
+        - recent_executions
+        - recent_failures
+        - trend
+        - runtime
+        - drilldowns
+        - generated_at
+      properties:
+        project_id:
+          $ref: '#/components/schemas/Uuid'
+        window:
+          $ref: '#/components/schemas/DashboardWindow'
+        job_counts:
+          $ref: '#/components/schemas/DashboardJobCounts'
+        execution_total:
+          type: integer
+          minimum: 0
+        execution_state_counts:
+          $ref: '#/components/schemas/DashboardExecutionCounts'
+        success_rate:
+          $ref: '#/components/schemas/DashboardSuccessRate'
+        unresolved_failure_count:
+          type: integer
+          minimum: 0
+        records_written:
+          $ref: '#/components/schemas/DashboardRecordsWritten'
+        recent_executions:
+          type: array
+          maxItems: 10
+          items:
+            $ref: '#/components/schemas/DashboardExecutionItem'
+        recent_failures:
+          type: array
+          maxItems: 10
+          items:
+            allOf:
+              - $ref: '#/components/schemas/DashboardExecutionItem'
+              - type: object
+                properties:
+                  state:
+                    type: string
+                    enum: [FAILED, TIMED_OUT, LOST]
+        trend:
+          type: array
+          maxItems: 31
+          items:
+            $ref: '#/components/schemas/DashboardTrendBucket'
+        runtime:
+          $ref: '#/components/schemas/DashboardRuntime'
+        drilldowns:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/DashboardDrilldown'
+        generated_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    SslMode:
+      type: string
+      enum: [DISABLE, REQUIRE, VERIFY_CA, VERIFY_FULL]
+    Datasource:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - project_id
+        - name
+        - description
+        - engine
+        - host
+        - port
+        - database_name
+        - default_schema
+        - username
+        - ssl_mode
+        - credential_configured
+        - status
+        - row_version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        project_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description:
+          type: [string, 'null']
+          maxLength: 1000
+        engine:
+          $ref: '#/components/schemas/Engine'
+        host:
+          type: string
+          minLength: 1
+          maxLength: 253
+          pattern: '^[^:/\\\s]+$'
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        database_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        default_schema:
+          type: string
+          minLength: 1
+          maxLength: 128
+        username:
+          type: string
+          minLength: 1
+          maxLength: 128
+        ssl_mode:
+          $ref: '#/components/schemas/SslMode'
+        credential_configured:
+          type: boolean
+          const: true
+        status:
+          $ref: '#/components/schemas/DatasourceStatus'
+        row_version:
+          type: integer
+          minimum: 1
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+    DatasourceCreate:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - engine
+        - host
+        - port
+        - database_name
+        - default_schema
+        - username
+        - password
+        - ssl_mode
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description:
+          type: [string, 'null']
+          maxLength: 1000
+        engine:
+          $ref: '#/components/schemas/Engine'
+        host:
+          type: string
+          minLength: 1
+          maxLength: 253
+          pattern: '^[^:/\\\s]+$'
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        database_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        default_schema:
+          type: string
+          minLength: 1
+          maxLength: 128
+        username:
+          type: string
+          minLength: 1
+          maxLength: 128
+        password:
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 512
+          writeOnly: true
+        ssl_mode:
+          $ref: '#/components/schemas/SslMode'
+    DatasourcePatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description:
+          type: [string, 'null']
+          maxLength: 1000
+        host:
+          type: string
+          minLength: 1
+          maxLength: 253
+          pattern: '^[^:/\\\s]+$'
+        port:
+          type: integer
+          minimum: 1
+          maximum: 65535
+        database_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        default_schema:
+          type: string
+          minLength: 1
+          maxLength: 128
+        username:
+          type: string
+          minLength: 1
+          maxLength: 128
+        password:
+          type: string
+          format: password
+          minLength: 1
+          maxLength: 512
+          writeOnly: true
+        ssl_mode:
+          $ref: '#/components/schemas/SslMode'
+        status:
+          type: string
+          enum: [ACTIVE, DISABLED]
+    DatasourcePage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Datasource'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+    DatasourceTestResult:
+      type: object
+      additionalProperties: false
+      required:
+        - status
+        - tested_at
+        - latency_ms
+        - server_version
+        - error_code
+        - message
+        - request_id
+      properties:
+        status:
+          type: string
+          enum: [SUCCEEDED, FAILED]
+        tested_at:
+          $ref: '#/components/schemas/Timestamp'
+        latency_ms:
+          type: integer
+          minimum: 0
+        server_version:
+          type: [string, 'null']
+          maxLength: 128
+        error_code:
+          type: [string, 'null']
+          maxLength: 64
+        message:
+          type: string
+          maxLength: 500
+        request_id:
+          $ref: '#/components/schemas/Uuid'
+    ColumnSchema:
+      type: object
+      additionalProperties: false
+      required: [name, ordinal, native_type, nullable, primary_key]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        ordinal:
+          type: integer
+          minimum: 1
+        native_type:
+          type: string
+          minLength: 1
+          maxLength: 128
+        nullable:
+          type: boolean
+        primary_key:
+          type: boolean
+    TableSchema:
+      type: object
+      additionalProperties: false
+      required: [schema_name, table_name, columns, schema_hash, captured_at]
+      properties:
+        schema_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        table_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        columns:
+          type: array
+          minItems: 1
+          items:
+            $ref: '#/components/schemas/ColumnSchema'
+        schema_hash:
+          $ref: '#/components/schemas/Sha256'
+        captured_at:
+          $ref: '#/components/schemas/Timestamp'
+    TableSchemaPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TableSchema'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+
+    SyncJob:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - project_id
+        - name
+        - description
+        - status
+        - draft_spec
+        - draft_spec_hash
+        - validated_spec_hash
+        - latest_published_version_id
+        - row_version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        project_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description:
+          type: [string, 'null']
+          maxLength: 1000
+        status:
+          $ref: '#/components/schemas/JobStatus'
+        draft_spec:
+          $ref: './job-spec.v1.schema.json'
+        draft_spec_hash:
+          $ref: '#/components/schemas/Sha256'
+        validated_spec_hash:
+          oneOf:
+            - $ref: '#/components/schemas/Sha256'
+            - type: 'null'
+        latest_published_version_id:
+          $ref: '#/components/schemas/NullableUuid'
+        row_version:
+          type: integer
+          minimum: 1
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+    JobCreate:
+      type: object
+      additionalProperties: false
+      required: [name, draft_spec]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description:
+          type: [string, 'null']
+          maxLength: 1000
+        draft_spec:
+          $ref: './job-spec.v1.schema.json'
+    JobPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description:
+          type: [string, 'null']
+          maxLength: 1000
+        draft_spec:
+          $ref: './job-spec.v1.schema.json'
+        status:
+          type: string
+          enum: [ARCHIVED]
+    JobPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SyncJob'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+    ValidationIssue:
+      type: object
+      additionalProperties: false
+      required: [code, path, message]
+      properties:
+        code:
+          type: string
+          enum:
+            - JOB_SPEC_INVALID
+            - SOURCE_TARGET_SAME_TABLE
+            - DATASOURCE_DISABLED
+            - TARGET_TABLE_NOT_FOUND
+            - COLUMN_NOT_FOUND
+            - TYPE_MAPPING_UNSUPPORTED
+            - NULLABILITY_UNSAFE
+            - SCHEMA_DRIFT_DETECTED
+        path:
+          type: string
+          maxLength: 500
+        message:
+          type: string
+          maxLength: 1000
+    ValidationReport:
+      type: object
+      additionalProperties: false
+      required:
+        - valid
+        - draft_spec_hash
+        - source_schema_hash
+        - target_schema_hash
+        - errors
+        - warnings
+      properties:
+        valid:
+          type: boolean
+        draft_spec_hash:
+          $ref: '#/components/schemas/Sha256'
+        source_schema_hash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        target_schema_hash:
+          type: [string, 'null']
+          pattern: '^[a-f0-9]{64}$'
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationIssue'
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationIssue'
+    JobPreview:
+      type: object
+      additionalProperties: false
+      required: [draft_spec_hash, redacted_datax_json, executable, warnings]
+      properties:
+        draft_spec_hash:
+          $ref: '#/components/schemas/Sha256'
+        redacted_datax_json:
+          type: object
+          description: 已脱敏、不可执行的预览；password 固定为 ${SECRET}
+          additionalProperties: true
+        executable:
+          const: false
+        warnings:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidationIssue'
+    PublishRequest:
+      type: object
+      additionalProperties: false
+      required: [expected_draft_spec_hash]
+      properties:
+        expected_draft_spec_hash:
+          $ref: '#/components/schemas/Sha256'
+    JobVersion:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - job_id
+        - version_no
+        - spec
+        - spec_hash
+        - source_schema_hash
+        - target_schema_hash
+        - datax_release
+        - reader_plugin
+        - writer_plugin
+        - published_by
+        - published_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        job_id:
+          $ref: '#/components/schemas/Uuid'
+        version_no:
+          type: integer
+          minimum: 1
+        spec:
+          $ref: './job-spec.v1.schema.json'
+        spec_hash:
+          $ref: '#/components/schemas/Sha256'
+        source_schema_hash:
+          $ref: '#/components/schemas/Sha256'
+        target_schema_hash:
+          $ref: '#/components/schemas/Sha256'
+        datax_release:
+          const: datax_v202309
+        reader_plugin:
+          type: string
+          enum: [mysqlreader, postgresqlreader]
+        writer_plugin:
+          type: string
+          enum: [mysqlwriter, postgresqlwriter]
+        published_by:
+          $ref: '#/components/schemas/Uuid'
+        published_at:
+          $ref: '#/components/schemas/Timestamp'
+    JobVersionPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/JobVersion'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+
+    Execution:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - project_id
+        - job_id
+        - job_version_id
+        - rerun_of_execution_id
+        - trigger_type
+        - state
+        - queued_at
+        - started_at
+        - finished_at
+        - exit_code
+        - failure_code
+        - failure_message
+        - summary_parse_status
+        - run_summary
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        project_id:
+          $ref: '#/components/schemas/Uuid'
+        job_id:
+          $ref: '#/components/schemas/Uuid'
+        job_version_id:
+          $ref: '#/components/schemas/Uuid'
+        rerun_of_execution_id:
+          $ref: '#/components/schemas/NullableUuid'
+        trigger_type:
+          const: MANUAL
+        state:
+          $ref: '#/components/schemas/ExecutionState'
+        queued_at:
+          $ref: '#/components/schemas/Timestamp'
+        started_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        finished_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        exit_code:
+          type: [integer, 'null']
+        failure_code:
+          type: [string, 'null']
+          maxLength: 64
+        failure_message:
+          type: [string, 'null']
+          maxLength: 2000
+        summary_parse_status:
+          type: string
+          enum: [PENDING, SUCCEEDED, FAILED]
+        run_summary:
+          oneOf:
+            - $ref: '#/components/schemas/RunSummary'
+            - type: 'null'
+    RunSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - records_read
+        - records_written
+        - records_failed
+        - bytes_read
+        - average_bytes_per_second
+        - average_records_per_second
+      properties:
+        records_read:
+          type: integer
+          minimum: 0
+        records_written:
+          type: integer
+          minimum: 0
+        records_failed:
+          type: integer
+          minimum: 0
+        bytes_read:
+          type: integer
+          minimum: 0
+        average_bytes_per_second:
+          type: number
+          minimum: 0
+        average_records_per_second:
+          type: number
+          minimum: 0
+    ExecutionCreate:
+      type: object
+      additionalProperties: false
+      required: [job_version_id]
+      properties:
+        job_version_id:
+          $ref: '#/components/schemas/Uuid'
+    ExecutionPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Execution'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+    CancelExecutionRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 500
+    CancelRequest:
+      type: object
+      additionalProperties: false
+      required: [id, execution_id, status, requested_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        execution_id:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [PENDING, ACKNOWLEDGED, COMPLETED, REJECTED]
+        requested_at:
+          $ref: '#/components/schemas/Timestamp'
+    LogLine:
+      type: object
+      additionalProperties: false
+      required: [sequence, timestamp, stream, level, message]
+      properties:
+        sequence:
+          type: integer
+          minimum: 1
+        timestamp:
+          $ref: '#/components/schemas/Timestamp'
+        stream:
+          type: string
+          enum: [STDOUT, STDERR, SYSTEM]
+        level:
+          type: string
+          enum: [TRACE, DEBUG, INFO, WARN, ERROR, UNKNOWN]
+        message:
+          type: string
+          maxLength: 16384
+    LogPage:
+      type: object
+      additionalProperties: false
+      required:
+        - items
+        - next_cursor
+        - eof
+        - redaction_rules_version
+        - expires_at
+      properties:
+        items:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/LogLine'
+        next_cursor:
+          type: string
+          minLength: 1
+        eof:
+          type: boolean
+        redaction_rules_version:
+          type: string
+          maxLength: 32
+        expires_at:
+          $ref: '#/components/schemas/Timestamp'
+
+    AuditPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: './audit-event.v1.schema.json'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+
+    ComponentHealth:
+      type: object
+      additionalProperties: false
+      required: [status, code]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        code:
+          type: string
+          pattern: '^[A-Z0-9_]+$'
+    HealthResponse:
+      type: object
+      additionalProperties: false
+      required: [status, version, checked_at, components]
+      properties:
+        status:
+          type: string
+          enum: [UP, DOWN, DEGRADED]
+        version:
+          type: string
+          maxLength: 64
+        checked_at:
+          $ref: '#/components/schemas/Timestamp'
+        components:
+          type: object
+          additionalProperties:
+            $ref: '#/components/schemas/ComponentHealth'

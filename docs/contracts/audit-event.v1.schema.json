@@ -1,0 +1,352 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/audit-event.v1.schema.json",
+  "title": "DataX Enterprise Studio Audit Event V1",
+  "description": "追加式安全审计事件。只记录稳定标识、哈希和脱敏元数据，不允许记录密码、Token、连接串或完整 DataX 配置。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "event_id",
+    "organization_id",
+    "sequence",
+    "project_id",
+    "occurred_at",
+    "action",
+    "actor",
+    "target",
+    "request",
+    "outcome",
+    "reason_code",
+    "changes",
+    "metadata",
+    "integrity"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "event_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "organization_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "project_id": {
+      "$ref": "#/$defs/nullableUuid"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "SYSTEM_BOOTSTRAP_ADMIN",
+        "AUTH_LOGIN_SUCCEEDED",
+        "AUTH_LOGIN_FAILED",
+        "AUTH_TOKEN_REFRESHED",
+        "AUTH_LOGOUT",
+        "USER_CREATED",
+        "USER_STATUS_CHANGED",
+        "USER_PASSWORD_CHANGED",
+        "USER_PASSWORD_RESET",
+        "USER_UNLOCKED",
+        "ROLE_GRANTED",
+        "ROLE_REVOKED",
+        "PROJECT_CREATED",
+        "PROJECT_UPDATED",
+        "PROJECT_ARCHIVED",
+        "DATASOURCE_CREATED",
+        "DATASOURCE_UPDATED",
+        "DATASOURCE_TESTED",
+        "DATASOURCE_CREDENTIAL_ROTATED",
+        "DATASOURCE_DISABLED",
+        "DATASOURCE_DELETED",
+        "JOB_CREATED",
+        "JOB_DRAFT_UPDATED",
+        "JOB_VALIDATED",
+        "JOB_PREVIEWED",
+        "JOB_VERSION_PUBLISHED",
+        "JOB_ARCHIVED",
+        "EXECUTION_CREATED",
+        "EXECUTION_CANCEL_REQUESTED",
+        "EXECUTION_RERUN_CREATED",
+        "EXECUTION_LOG_EXPORTED",
+        "AUDIT_EXPORTED"
+      ]
+    },
+    "actor": {
+      "$ref": "#/$defs/actor"
+    },
+    "target": {
+      "$ref": "#/$defs/target"
+    },
+    "request": {
+      "$ref": "#/$defs/request"
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "SUCCEEDED",
+        "DENIED",
+        "FAILED"
+      ]
+    },
+    "reason_code": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "maxLength": 64,
+      "pattern": "^[A-Z0-9_]*$"
+    },
+    "changes": {
+      "$ref": "#/$defs/changes"
+    },
+    "metadata": {
+      "$ref": "#/$defs/metadata"
+    },
+    "integrity": {
+      "$ref": "#/$defs/integrity"
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "nullableUuid": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/uuid"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullableHash": {
+      "oneOf": [
+        {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "actor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "user_id",
+        "display_name"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "USER",
+            "SYSTEM"
+          ]
+        },
+        "user_id": {
+          "$ref": "#/$defs/nullableUuid"
+        },
+        "display_name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {
+                "const": "USER"
+              }
+            },
+            "required": [
+              "kind"
+            ]
+          },
+          "then": {
+            "properties": {
+              "user_id": {
+                "$ref": "#/$defs/uuid"
+              },
+              "display_name": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 128
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "user_id": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "target": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "id",
+        "name"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "AUTH_SESSION",
+            "USER",
+            "ROLE_ASSIGNMENT",
+            "PROJECT",
+            "DATASOURCE",
+            "SYNC_JOB",
+            "JOB_VERSION",
+            "EXECUTION",
+            "AUDIT_EXPORT"
+          ]
+        },
+        "id": {
+          "$ref": "#/$defs/nullableUuid"
+        },
+        "name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 256
+        }
+      }
+    },
+    "request": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "request_id",
+        "source_ip",
+        "user_agent"
+      ],
+      "properties": {
+        "request_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "source_ip": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 45
+        },
+        "user_agent": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 512
+        }
+      }
+    },
+    "changes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "before_hash",
+        "after_hash",
+        "changed_fields"
+      ],
+      "properties": {
+        "before_hash": {
+          "$ref": "#/$defs/nullableHash"
+        },
+        "after_hash": {
+          "$ref": "#/$defs/nullableHash"
+        },
+        "changed_fields": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.]{0,127}$"
+          }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "maxProperties": 32,
+      "propertyNames": {
+        "pattern": "^[a-z][a-z0-9_]{0,63}$"
+      },
+      "additionalProperties": {
+        "oneOf": [
+          {
+            "type": "string",
+            "maxLength": 500
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "null"
+          },
+          {
+            "type": "array",
+            "maxItems": 32,
+            "items": {
+              "type": "string",
+              "maxLength": 128
+            }
+          }
+        ]
+      }
+    },
+    "integrity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "algorithm",
+        "previous_hash",
+        "event_hash"
+      ],
+      "properties": {
+        "algorithm": {
+          "const": "SHA-256"
+        },
+        "previous_hash": {
+          "$ref": "#/$defs/nullableHash"
+        },
+        "event_hash": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    }
+  }
+}

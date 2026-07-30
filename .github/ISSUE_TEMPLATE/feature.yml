@@ -1,0 +1,49 @@
+name: 功能需求
+description: 提交可实现、可验收的产品或工程能力
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: input
+    id: requirement
+    attributes:
+      label: 需求 ID
+      description: 关联 PRD-FR、NFR、SEC 或 AI 编号
+      placeholder: PRD-FR-001
+    validations:
+      required: true
+  - type: textarea
+    id: value
+    attributes:
+      label: 背景与用户价值
+      description: 谁在什么场景遇到什么问题，完成后得到什么结果
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: 范围与非目标
+      description: 明确本 Issue 做什么、不做什么
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: 行为与异常
+      description: 正常、失败、权限、重复提交和并发行为
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: 验收标准
+      description: 使用 Given/When/Then 或其他可执行条件
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: V1 边界确认
+      options:
+        - label: 不引入调度、DAG、CDC、插件市场、任意 SQL 或 AI 自动执行
+          required: true

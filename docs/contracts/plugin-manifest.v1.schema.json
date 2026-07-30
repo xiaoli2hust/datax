@@ -1,0 +1,410 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/plugin-manifest.v1.schema.json",
+  "title": "DataX Enterprise Studio Plugin Manifest V1",
+  "description": "V1 内置、已认证 DataX Reader/Writer 插件的能力和表单字段清单。该契约不提供上传、下载或安装入口。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "name",
+    "display_name",
+    "engine",
+    "direction",
+    "datax_plugin_name",
+    "datax_release",
+    "artifact",
+    "runtime",
+    "connection_fields",
+    "capabilities",
+    "status"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{2,63}$"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "engine": {
+      "type": "string",
+      "enum": [
+        "MYSQL_8",
+        "POSTGRESQL_15"
+      ]
+    },
+    "direction": {
+      "type": "string",
+      "enum": [
+        "READER",
+        "WRITER"
+      ]
+    },
+    "datax_plugin_name": {
+      "type": "string",
+      "enum": [
+        "mysqlreader",
+        "mysqlwriter",
+        "postgresqlreader",
+        "postgresqlwriter"
+      ]
+    },
+    "datax_release": {
+      "const": "datax_v202309"
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "relative_path",
+        "sha256"
+      ],
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+\\.jar$"
+        },
+        "sha256": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{64}$"
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "jdk_major",
+        "python_major"
+      ],
+      "properties": {
+        "jdk_major": {
+          "const": 8
+        },
+        "python_major": {
+          "const": 3
+        }
+      }
+    },
+    "connection_fields": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 8,
+      "items": {
+        "$ref": "#/$defs/connectionField"
+      }
+    },
+    "capabilities": {
+      "$ref": "#/$defs/capabilities"
+    },
+    "status": {
+      "const": "CERTIFIED"
+    }
+  },
+  "$defs": {
+    "connectionField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "label",
+        "value_type",
+        "required",
+        "sensitive"
+      ],
+      "properties": {
+        "key": {
+          "type": "string",
+          "enum": [
+            "host",
+            "port",
+            "database_name",
+            "default_schema",
+            "username",
+            "password",
+            "ssl_mode"
+          ]
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "value_type": {
+          "type": "string",
+          "enum": [
+            "STRING",
+            "INTEGER",
+            "SECRET",
+            "ENUM"
+          ]
+        },
+        "required": {
+          "type": "boolean"
+        },
+        "sensitive": {
+          "type": "boolean"
+        },
+        "default": {
+          "type": [
+            "string",
+            "integer",
+            "boolean",
+            "null"
+          ]
+        },
+        "enum_values": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "maxLength": 64
+          }
+        },
+        "constraints": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "minimum": {
+              "type": "integer"
+            },
+            "maximum": {
+              "type": "integer"
+            },
+            "min_length": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "max_length": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "pattern": {
+              "type": "string",
+              "maxLength": 256
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "key": {
+                "const": "password"
+              }
+            },
+            "required": [
+              "key"
+            ]
+          },
+          "then": {
+            "properties": {
+              "value_type": {
+                "const": "SECRET"
+              },
+              "sensitive": {
+                "const": true
+              }
+            }
+          }
+        }
+      ]
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_introspection",
+        "full_table_selection",
+        "column_selection",
+        "direct_mapping_only",
+        "target_table_must_exist",
+        "write_modes",
+        "supports_free_sql",
+        "supports_pre_sql",
+        "supports_post_sql",
+        "supports_transformer",
+        "supports_custom_parameters"
+      ],
+      "properties": {
+        "schema_introspection": {
+          "const": true
+        },
+        "full_table_selection": {
+          "const": true
+        },
+        "column_selection": {
+          "const": true
+        },
+        "direct_mapping_only": {
+          "const": true
+        },
+        "target_table_must_exist": {
+          "const": true
+        },
+        "write_modes": {
+          "type": "array",
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "const": "INSERT"
+          }
+        },
+        "supports_free_sql": {
+          "const": false
+        },
+        "supports_pre_sql": {
+          "const": false
+        },
+        "supports_post_sql": {
+          "const": false
+        },
+        "supports_transformer": {
+          "const": false
+        },
+        "supports_custom_parameters": {
+          "const": false
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "direction": {
+            "const": "READER"
+          }
+        },
+        "required": [
+          "direction"
+        ]
+      },
+      "then": {
+        "properties": {
+          "capabilities": {
+            "properties": {
+              "write_modes": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "capabilities": {
+            "properties": {
+              "write_modes": {
+                "minItems": 1,
+                "maxItems": 1
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "engine": {
+            "const": "MYSQL_8"
+          },
+          "direction": {
+            "const": "READER"
+          }
+        },
+        "required": [
+          "engine",
+          "direction"
+        ]
+      },
+      "then": {
+        "properties": {
+          "datax_plugin_name": {
+            "const": "mysqlreader"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "engine": {
+            "const": "MYSQL_8"
+          },
+          "direction": {
+            "const": "WRITER"
+          }
+        },
+        "required": [
+          "engine",
+          "direction"
+        ]
+      },
+      "then": {
+        "properties": {
+          "datax_plugin_name": {
+            "const": "mysqlwriter"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "engine": {
+            "const": "POSTGRESQL_15"
+          },
+          "direction": {
+            "const": "READER"
+          }
+        },
+        "required": [
+          "engine",
+          "direction"
+        ]
+      },
+      "then": {
+        "properties": {
+          "datax_plugin_name": {
+            "const": "postgresqlreader"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "engine": {
+            "const": "POSTGRESQL_15"
+          },
+          "direction": {
+            "const": "WRITER"
+          }
+        },
+        "required": [
+          "engine",
+          "direction"
+        ]
+      },
+      "then": {
+        "properties": {
+          "datax_plugin_name": {
+            "const": "postgresqlwriter"
+          }
+        }
+      }
+    }
+  ]
+}

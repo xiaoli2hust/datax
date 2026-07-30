@@ -1,0 +1,42 @@
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+
+# Node
+node_modules/
+dist/
+.vite/
+coverage/
+
+# IDE and OS
+.DS_Store
+.idea/
+.vscode/
+
+# Runtime and data artifacts
+datax-runtime/
+runtime/
+work/
+logs/
+backups/
+*.log
+*.db
+*.sqlite*
+
+# Generated reports
+reports/
+test-results/
+playwright-report/
