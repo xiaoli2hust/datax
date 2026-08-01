@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import http.client
 import ipaddress
 import json
@@ -10,13 +11,15 @@ from unittest.mock import patch
 
 from guard import (
     POLICY_ENGINE_VERSION,
+    PSQL_BINARY,
     RESOLVER_POLICY_VERSION,
     AttestationServer,
     AttestationState,
     EgressRule,
     GuardController,
     GuardError,
-    _without_expiry_counters,
+    PostgresPolicySource,
+    _without_nft_runtime_metadata,
     lease_is_allowed,
     nft_batch,
     normalize_lease_request,
@@ -152,6 +155,12 @@ class NftContractTests(unittest.TestCase):
         self.assertTrue(batch.startswith("delete table inet des_egress\n"))
         self.assertIn("policy drop", batch)
         self.assertIn("ip daddr 127.0.0.11 udp dport 53 accept", batch)
+        # Loopback must be bidirectional.  A response from the attestation
+        # server/API targets the caller's ephemeral port, so destination-port
+        # allow rules alone would make the health probe time out.
+        self.assertIn('oifname "lo" accept', batch)
+        self.assertNotIn("ip daddr 127.0.0.1 tcp dport 8000 accept", batch)
+        self.assertNotIn("ip daddr 127.0.0.1 tcp dport 17990 accept", batch)
         self.assertIn("ip daddr 172.29.0.0/16 accept", batch)
         self.assertIn("flags timeout", batch)
         self.assertNotIn("flags interval", batch)
@@ -163,6 +172,13 @@ class NftContractTests(unittest.TestCase):
             batch,
         )
         self.assertNotIn("policy accept", batch)
+
+    def test_pinned_postgres_image_client_path_is_absolute_and_in_sanitized_path(self) -> None:
+        # postgres:15.18-alpine3.24 supplies psql in /usr/local/bin. The
+        # guard must not silently fall back to a PATH lookup because a missing
+        # policy reader leaves the whole product fail-closed.
+        self.assertEqual(PSQL_BINARY, "/usr/local/bin/psql")
+        self.assertIn("/usr/local/bin", PostgresPolicySource._environment()["PATH"])
 
     def test_rejects_policy_cidr_as_a_kernel_allow_rule(self) -> None:
         snapshot = normalize_policy_rows([policy_row()])
@@ -183,27 +199,63 @@ class NftContractTests(unittest.TestCase):
         self.assertNotIn("allowed_ipv6", batch)
         self.assertNotIn("ct state new,established", batch)
 
-    def test_ruleset_hash_input_ignores_only_runtime_expiry_countdown(self) -> None:
+    def test_ruleset_hash_input_ignores_allocator_handles_and_expiry_countdowns(
+        self,
+    ) -> None:
         before = {
             "nftables": [
-                {"set": {"name": "allowed_ipv4", "expires": 14_500}},
+                {
+                    "table": {
+                        "family": "inet",
+                        "name": "des_egress",
+                        "handle": 101,
+                    }
+                },
+                {
+                    "set": {
+                        "name": "allowed_ipv4",
+                        "handle": 3,
+                        "expires": 14_500,
+                        "timeout": 15,
+                    }
+                },
                 {"rule": {"expr": [{"match": {"right": 3306}}]}},
             ]
         }
         after = {
             "nftables": [
-                {"set": {"name": "allowed_ipv4", "expires": 9_100}},
+                {
+                    "table": {
+                        "family": "inet",
+                        "name": "des_egress",
+                        "handle": 103,
+                    }
+                },
+                {
+                    "set": {
+                        "name": "allowed_ipv4",
+                        "handle": 3,
+                        "expires": 9_100,
+                        "timeout": 15,
+                    }
+                },
                 {"rule": {"expr": [{"match": {"right": 3306}}]}},
             ]
         }
         self.assertEqual(
-            _without_expiry_counters(before),
-            _without_expiry_counters(after),
+            _without_nft_runtime_metadata(before),
+            _without_nft_runtime_metadata(after),
         )
-        after["nftables"][1]["rule"]["expr"][0]["match"]["right"] = 5432
+        timeout_changed = copy.deepcopy(after)
+        timeout_changed["nftables"][1]["set"]["timeout"] = 10
         self.assertNotEqual(
-            _without_expiry_counters(before),
-            _without_expiry_counters(after),
+            _without_nft_runtime_metadata(before),
+            _without_nft_runtime_metadata(timeout_changed),
+        )
+        after["nftables"][2]["rule"]["expr"][0]["match"]["right"] = 5432
+        self.assertNotEqual(
+            _without_nft_runtime_metadata(before),
+            _without_nft_runtime_metadata(after),
         )
 
     def test_control_route_is_derived_from_default_interface(self) -> None:

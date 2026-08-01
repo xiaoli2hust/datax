@@ -75,6 +75,15 @@ def _arguments() -> argparse.Namespace:
         subparser = subparsers.add_parser(command)
         subparser.add_argument("--candidate-directory", type=Path, required=True)
         subparser.add_argument(
+            "--trusted-linux-evidence-directory",
+            type=Path,
+            required=True,
+            help=(
+                "Independently downloaded Linux evidence artifact from the GitHub-hosted "
+                "build job; it must remain outside the Windows handoff candidate."
+            ),
+        )
+        subparser.add_argument(
             "--schema",
             type=Path,
             default=AUTHORITATIVE_SCHEMA_PATH,
@@ -153,7 +162,7 @@ def _sha256_regular_file(path: Path, expected_metadata: os.stat_result) -> str:
 
 
 def _scan_candidate_files(
-    root: Path, *, excluded_relative_path: str = CANDIDATE_ROOT_NAME
+    root: Path, *, excluded_relative_path: str | None = CANDIDATE_ROOT_NAME
 ) -> tuple[dict[str, Any], ...]:
     descriptors: list[dict[str, Any]] = []
     casefolded_paths: set[str] = set()
@@ -177,7 +186,7 @@ def _scan_candidate_files(
                 continue
             if not stat.S_ISREG(metadata.st_mode):
                 raise ValueError(f"candidate entry is not a regular file: {relative}")
-            if relative == excluded_relative_path:
+            if excluded_relative_path is not None and relative == excluded_relative_path:
                 continue
             if metadata.st_size < 1:
                 raise ValueError(f"candidate file must not be empty: {relative}")
@@ -388,11 +397,44 @@ def _parse_image_lock(path: Path) -> None:
         raise ValueError("image lock is missing one or more required images")
 
 
+def _validate_linux_evidence_handoff(
+    *, root: Path, trusted_linux_evidence_directory: Path
+) -> None:
+    """Bind the Windows handoff copy to an independently downloaded Linux artifact."""
+
+    trusted_root = _resolve_candidate_directory(trusted_linux_evidence_directory)
+    if trusted_root.is_relative_to(root):
+        raise ValueError(
+            "trusted Linux evidence directory must remain outside the Windows handoff candidate"
+        )
+    candidate_linux_evidence = _resolve_candidate_directory(root / "linux-evidence")
+    trusted_files = _scan_candidate_files(trusted_root, excluded_relative_path=None)
+    candidate_files = _scan_candidate_files(
+        candidate_linux_evidence,
+        excluded_relative_path=None,
+    )
+    if trusted_files != candidate_files:
+        trusted_by_path = {item["path"]: item for item in trusted_files}
+        candidate_by_path = {item["path"]: item for item in candidate_files}
+        missing = sorted(set(trusted_by_path) - set(candidate_by_path))
+        extra = sorted(set(candidate_by_path) - set(trusted_by_path))
+        changed = sorted(
+            path
+            for path in set(trusted_by_path) & set(candidate_by_path)
+            if trusted_by_path[path] != candidate_by_path[path]
+        )
+        raise ValueError(
+            "candidate Linux evidence differs from independently downloaded Linux "
+            f"build evidence: missing={missing}, extra={extra}, changed={changed}"
+        )
+
+
 def _validate_cross_file_bindings(
     *,
     root: Path,
     document: dict[str, Any],
     files: tuple[dict[str, Any], ...],
+    trusted_linux_evidence_directory: Path,
 ) -> None:
     identity = document["identity"]
     artifacts = document["artifacts"]
@@ -495,6 +537,22 @@ def _validate_cross_file_bindings(
 
     _parse_image_lock(root / artifacts["images_lock"]["path"])
     _parse_image_lock(root / artifacts["embedded_images_lock"]["path"])
+    linux_images_lock = _require_descriptor(
+        inventory, "linux-evidence/images.release.env"
+    )
+    if (
+        artifacts["images_lock"]["sha256"] != linux_images_lock["sha256"]
+        or (root / artifacts["images_lock"]["path"]).read_bytes()
+        != (root / linux_images_lock["path"]).read_bytes()
+    ):
+        raise ValueError(
+            "candidate image lock is not bound to the Linux build evidence image lock"
+        )
+    _parse_image_lock(root / linux_images_lock["path"])
+    _validate_linux_evidence_handoff(
+        root=root,
+        trusted_linux_evidence_directory=trusted_linux_evidence_directory,
+    )
 
     catalog_path = root / artifacts["requirements_catalog"]["path"]
     _catalog, _entries, catalog_raw = load_catalog(catalog_path)
@@ -601,6 +659,7 @@ def _identity_document(
 def generate_candidate_root(
     *,
     candidate_directory: Path,
+    trusted_linux_evidence_directory: Path,
     schema_path: Path,
     workflow_run_id: str,
     workflow_run_attempt: int,
@@ -664,7 +723,12 @@ def generate_candidate_root(
     schema = _load_schema(schema_path)
     _validate_schema(document, schema)
     _validate_blocked_root_semantics(document)
-    _validate_cross_file_bindings(root=root, document=document, files=files)
+    _validate_cross_file_bindings(
+        root=root,
+        document=document,
+        files=files,
+        trusted_linux_evidence_directory=trusted_linux_evidence_directory,
+    )
     raw = canonical_json_bytes(document)
     descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
     with os.fdopen(descriptor, "wb") as stream:
@@ -673,6 +737,7 @@ def generate_candidate_root(
         os.fsync(stream.fileno())
     validated = validate_candidate_root(
         candidate_directory=root,
+        trusted_linux_evidence_directory=trusted_linux_evidence_directory,
         schema_path=schema_path,
         workflow_run_id=workflow_run_id,
         workflow_run_attempt=workflow_run_attempt,
@@ -694,6 +759,7 @@ def generate_candidate_root(
 def validate_candidate_root(
     *,
     candidate_directory: Path,
+    trusted_linux_evidence_directory: Path,
     schema_path: Path,
     workflow_run_id: str,
     workflow_run_attempt: int,
@@ -742,7 +808,12 @@ def validate_candidate_root(
         raise ValueError(
             f"candidate file set or hash differs from root: missing={missing}, extra={extra}"
         )
-    _validate_cross_file_bindings(root=root, document=document, files=files)
+    _validate_cross_file_bindings(
+        root=root,
+        document=document,
+        files=files,
+        trusted_linux_evidence_directory=trusted_linux_evidence_directory,
+    )
     return {
         "ready": True,
         "code": "BLOCKED_CANDIDATE_ROOT_VALID",
@@ -757,6 +828,7 @@ def main() -> int:
     arguments = _arguments()
     common = {
         "candidate_directory": arguments.candidate_directory,
+        "trusted_linux_evidence_directory": arguments.trusted_linux_evidence_directory,
         "schema_path": arguments.schema,
         "workflow_run_id": arguments.workflow_run_id,
         "workflow_run_attempt": arguments.workflow_run_attempt,

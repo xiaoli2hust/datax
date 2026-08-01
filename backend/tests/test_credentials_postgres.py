@@ -24,22 +24,51 @@ from datax_studio.core.db import (
     PhysicalEndpointIdentity,
     Project,
 )
-from datax_studio.credentials.connectors import DatabaseConnector
+from datax_studio.credentials.connectors import DatabaseConnector, ProbeResult
 from datax_studio.credentials.db import (
     CredentialSecret,
     CredentialSecretEnvelope,
 )
 from datax_studio.credentials.keyring import KekKeyring
-from datax_studio.credentials.network import EndpointPolicyGuard
+from datax_studio.credentials.network import EndpointPolicyGuard, ResolvedEndpoint
 from datax_studio.credentials.schemas import DatasourcePatch, EndpointPolicyPatch
 from datax_studio.credentials.service import CredentialService
+from datax_studio.egress_attestation import EgressVerification
 
 POSTGRES_TEST_URL_ENV = "DATAX_CREDENTIAL_POSTGRES_TEST_URL"
+
+
+class _FixedEgressVerifier:
+    """Controlled attestation for a database-transaction concurrency test.
+
+    This fixture does not run an endpoint probe: its only real external
+    dependency is the isolated PostgreSQL database that exercises row locking
+    and secret/envelope transactions.  Endpoint/egress behavior has separate
+    integration and E3 coverage.
+    """
+
+    def verify_runtime(self) -> EgressVerification:
+        return self._verification()
+
+    def verify_policy(self, **_kwargs: object) -> EgressVerification:
+        return self._verification()
+
+    @staticmethod
+    def _verification() -> EgressVerification:
+        return EgressVerification(
+            policy_engine_version="egress-v1",
+            resolver_policy_version="resolver-v1",
+            network_namespace_id="net:[1]",
+            policy_set_hash="1" * 64,
+            ruleset_hash="2" * 64,
+            checked_at=datetime.now(UTC),
+        )
 
 
 @pytest.fixture
 def postgres_rotation_stack(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> tuple[CredentialService, sessionmaker, Principal, UUID]:
     database_url = os.getenv(POSTGRES_TEST_URL_ENV)
     if not database_url:
@@ -70,6 +99,7 @@ def postgres_rotation_stack(
         guard = EndpointPolicyGuard(
             resolver_policy_version="resolver-v1",
             egress_policy_version="egress-v1",
+            egress_verifier=_FixedEgressVerifier(),
         )
         service = CredentialService(
             sessions=sessions,
@@ -83,6 +113,25 @@ def postgres_rotation_stack(
                 query_timeout_seconds=1,
             ),
         )
+
+        def controlled_probe(
+            _revision: object,
+            *,
+            password: bytearray,
+            resolved: ResolvedEndpoint,
+        ) -> ProbeResult:
+            # The endpoint record intentionally uses a non-routable fixture
+            # address.  This test proves PostgreSQL optimistic-lock behavior,
+            # so it must not silently turn into a network-probe test.
+            del password
+            return ProbeResult(
+                server_identity="postgres-credential-concurrency-fixture",
+                server_version="fixture",
+                peer_ip=resolved.selected_ip,
+                latency_ms=1,
+            )
+
+        monkeypatch.setattr(service.connector, "probe", controlled_probe)
         service.ensure_active_kek_registered()
         now = datetime.now(UTC)
         organization_id = uuid4()

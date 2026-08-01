@@ -58,6 +58,15 @@ def _arguments() -> argparse.Namespace:
             "hosted attestor workflow TCB; this wrapper cannot establish that trust."
         ),
     )
+    parser.add_argument(
+        "--trusted-linux-evidence-directory",
+        type=Path,
+        required=True,
+        help=(
+            "Independently downloaded Linux build evidence, kept outside the Windows "
+            "handoff candidate."
+        ),
+    )
     parser.add_argument("--schema", type=Path, required=True)
     parser.add_argument("--workflow-run-id", required=True)
     parser.add_argument("--workflow-run-attempt", type=int, required=True)
@@ -220,6 +229,7 @@ def verify_candidate_attestation(
     candidate_root_path: Path,
     bundle_path: Path,
     trusted_gh_executable: Path,
+    trusted_linux_evidence_directory: Path,
     schema_path: Path,
     workflow_run_id: str,
     workflow_run_attempt: int,
@@ -253,6 +263,7 @@ def verify_candidate_attestation(
 
     validation_arguments = {
         "candidate_directory": candidate_directory,
+        "trusted_linux_evidence_directory": trusted_linux_evidence_directory,
         "schema_path": schema_path,
         "workflow_run_id": workflow_run_id,
         "workflow_run_attempt": workflow_run_attempt,
@@ -319,6 +330,9 @@ def main() -> int:
             candidate_root_path=arguments.candidate_root,
             bundle_path=arguments.bundle,
             trusted_gh_executable=arguments.trusted_gh_path,
+            trusted_linux_evidence_directory=(
+                arguments.trusted_linux_evidence_directory
+            ),
             schema_path=arguments.schema,
             workflow_run_id=arguments.workflow_run_id,
             workflow_run_attempt=arguments.workflow_run_attempt,

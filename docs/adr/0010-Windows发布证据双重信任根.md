@@ -66,7 +66,22 @@ candidate-root 和 attestation bundle 做密码学验证，并同时固定：
 场景 profile、oracle、Windows E4、缺陷和发布门禁语义验证。密码学来源正确不能把
 `FAIL/BLOCKED/NOT_RUN` 变成 PASS。
 
-### 4. 明确信任声明的上限
+### 4. 签名 Environment 必须在导入证书前失败关闭
+
+签名 job 使用 `windows-candidate-signing` 之前，必须通过 GitHub REST API 读取已存在的
+同名 Environment；YAML 名称或 workflow 首次引用均不构成保护存在。预检要求：
+
+- 恰好一个非空 `required_reviewers` protection rule；
+- reviewer 总数为 1–6，且 User/Team 身份唯一；
+- `prevent_self_review=true`；
+- Environment 缺失、规则为空/重复/畸形、允许自审或 API 读取失败时，均在导入证书、设置
+  signing 变量或调用签名工具前终止。
+
+该预检只确认所读取的 Environment 形状；它不替代 owner 对 secrets 作用域、`main` 与精确
+release tag 部署限制、真实审批记录或受控 Windows runner 的独立取证。后者仍必须以 E4
+release evidence 单独证明。
+
+### 5. 明确信任声明的上限
 
 GitHub artifact attestation 能证明候选根由指定 workflow/commit 产生且之后未被替换；它
 不能自行证明 Windows 机器真的干净、测试脚本没有受运维人员篡改、外部数据库行为真实，
@@ -80,14 +95,14 @@ GitHub artifact attestation 能证明候选根由指定 workflow/commit 产生�
 
 这是受控工程信任链，不宣传成对被攻陷宿主的数学证明。
 
-### 5. 产品运行形态不增加服务器依赖
+### 6. 产品运行形态不增加服务器依赖
 
 上述 GitHub/runner 只参与构建、签名和发布。最终 Windows 用户仍通过 `Setup.exe` 安装，
 在本机 Docker Desktop + WSL2 中运行固定 Linux 容器，通过
 `http://127.0.0.1:17860` 使用产品；不需要自建 Linux 服务器，也不需要把目标 Windows
 电脑长期注册为 GitHub runner。
 
-### 6. 与 ADR-0011 的衔接
+### 7. 与 ADR-0011 的衔接
 
 ADR-0011 将插件/Runtime 的不可变 payload、受保护 harness 的短期资格、detached
 release qualification、最终安装包和公开晋级拆开。这里的双重信任根不被 QR 替代：
@@ -108,12 +123,14 @@ release qualification、最终安装包和公开晋级拆开。这里的双重�
 2. 再把受保护 Windows E4 harness 输出接入候选根，保持未执行项为 `BLOCKED`。
 3. 在 GitHub 托管 job 中使用完整 commit SHA 锁定 attestation action，签发并立即反向验证
    bundle；发布 job 不接受浮动 action tag。
-4. 只有真实 PASS manifest、完整场景结果、可信 attestation 和 P0/P1=0 同时满足时，
+4. 在导入证书前，以 API 快照证明签名 Environment 已存在、只有一个 1–6 人的 required-reviewers
+   规则且禁止 self-review；任何读取/形状失败均不得触及证书。
+5. 只有真实 PASS manifest、完整场景结果、可信 attestation 和 P0/P1=0 同时满足时，
    `--require-pass` 才可返回 `release_approved=true`。
-5. 在 protected environment、一次性 Windows runner、证书、真实数据库和外部复核均未
+6. 在 protected environment、一次性 Windows runner、证书、真实数据库和外部复核均未
    配置前，不触发公开发布，也不上传名为 stable/release 的 EXE。
 
-## 当前实施状态（2026-08-01）
+## 当前实施状态（2026-08-02）
 
 已完成仅限 E1 可审查基础件：
 
@@ -122,10 +139,13 @@ release qualification、最终安装包和公开晋级拆开。这里的双重�
   有序清单；生成器/验证器拒绝重复 JSON key、路径逃逸、大小写冲突、symlink/reparse、
   非普通文件、额外/缺失文件及内容或身份篡改。
 - 生成器交叉核对 release context、最终 release manifest 1.1、Compose、顶层/内嵌 image
-  lock、ACL helper、canonical signer SHA-256 allowlist、acceptance/environment/
+  lock 与 Linux build evidence 生成的 image lock（这三者必须逐字节一致）、ACL helper、
+  canonical signer SHA-256 allowlist、acceptance/environment/
   requirements catalog、SPDX SBOM index 及 Windows build environment；只允许当前 checkout
   的固定权威 Schema，并在 Schema 外独立硬断言 BLOCKED 语义；acceptance 复用现有权威
   Schema、矩阵、catalog、environment/evidence root 和完整语义 validator，而非字段抽查。
+  候选根还要求一个位于 Windows handoff 外的、独立下载 Linux build artifact，并递归比较它和
+  候选内 `linux-evidence/` 的全量文件路径、大小及 SHA-256，不能只比较三份 image lock。
   当前 v1 根只允许
   `BLOCKED/release_approved=false`；场景 profile/result、Windows baseline/harness 时间边界
   和 E3/E4 bundle 必须显式 `null` 并记录阻塞原因，不存在“空字段也算完成”的路径。
@@ -138,9 +158,10 @@ release qualification、最终安装包和公开晋级拆开。这里的双重�
   前，即使低层策略匹配也必须非零返回
   `TRUSTED_ATTESTATION_VERIFIER_TCB_NOT_IMPLEMENTED`，不得返回 `ready=true` 或
   attestation-valid。
-- Release workflow 已增加 E1 接线候选。Windows self-hosted job 上传的顶层
-  `SHA256SUMS` 只作为交接清单；后续 `ubuntu-24.04` 托管 job 必须先完整验证它，再删除该
-  瞬时清单并生成/复核 canonical BLOCKED candidate root，从而避免最终候选同时保留一个
+- Release workflow 已增加 E1 接线候选。`ubuntu-24.04` 托管 job 先独立下载 Linux build artifact
+  并验证其 `SHA256SUMS`；Windows self-hosted job 上传的顶层 `SHA256SUMS` 只作为交接清单，
+  托管 job 随后完整验证该清单和候选内 Linux evidence 的来源绑定，再删除候选顶层的瞬时清单并
+  生成/复核 canonical BLOCKED candidate root，从而避免最终候选同时保留一个
   未覆盖 candidate root 的旧“完整”清单。托管 job 使用固定 commit
   `actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d` 对 candidate root 签发
   provenance；GitHub CLI 固定为 2.97.0，

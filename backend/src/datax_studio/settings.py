@@ -22,7 +22,7 @@ class Settings(BaseSettings):
 
     app_version: str = "0.1.0-dev"
     app_environment: str = "development"
-    database_schema_revision: str = "20260802_0015"
+    database_schema_revision: str = "20260802_0017"
     ui_origin: str = "http://127.0.0.1:17860"
     trusted_host: str = "127.0.0.1"
     database_host: str = "postgres"

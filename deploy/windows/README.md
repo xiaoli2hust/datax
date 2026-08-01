@@ -42,15 +42,19 @@ token HMAC key。Launcher
 `egress_guard_database_password.txt`，仅迁移任务和 `egress-guard` 可读取。
 
 数据库 owner 凭据只提供给受控迁移；API 使用 `datax_api`，Worker 使用
-`datax_worker`，两者密码相互独立，且都无 DDL、TEMP 和对象所有权。当前迁移仍向这两个
-运行角色授予相同的全表 DML 与序列权限，细粒度“API 只创建初始记录、Worker 推进运行态”
-主要由应用层边界执行；在数据库层收紧前，不得声称角色权限已经阻止 API 越权更新执行状态。
+`datax_worker`，两者密码相互独立，且都无 DDL、TEMP 和对象所有权。Worker 的控制、凭据和
+心跳共用一个最多 4 条、无 overflow、5 秒获取超时的 pool；角色上限固定为 12，且 PostgreSQL
+在 30 秒空闲或 15 秒空闲事务后回收该角色会话。正常退出会显式释放 pool；异常压力下 Worker
+保持存活并停止 admission，等待有界回收后重试。该配置不是无限重启或 HA 承诺。迁移仍向两个
+运行角色授予相同的全表 DML 与序列权限，细粒度“API 只创建初始记录、Worker 推进运行态”主要
+由应用层边界执行；在数据库层收紧前，不得声称角色权限已经阻止 API 越权更新执行状态。
 
 `egress-guard` 是唯一拥有 `NET_ADMIN` 的容器；API/Worker 通过
 `network_mode: service:egress-guard` 共享它的 Linux 网络命名空间，二者仍
-`cap_drop: [ALL]`。基础 nftables 策略默认拒绝，只长期允许 Docker DNS、loopback 控制
-端点和 Compose `control` 子网。ACTIVE EndpointPolicy 的 CIDR×port 只作为 selected-IP
-租约准入条件；外部 allow rule 必须是守卫生成的精确 `/32` 或 `/128` + TCP port，
+`cap_drop: [ALL]`。基础 nftables 策略默认拒绝，只长期允许 Docker DNS、完整 `lo` 回环接口
+和 Compose `control` 子网；完整 `lo` 仅支持 guard/API 的随机回包端口，不开放 LAN/WAN
+出口。ACTIVE EndpointPolicy 的 CIDR×port 只作为 selected-IP 租约准入条件；外部 allow rule
+必须是守卫生成的精确 `/32` 或 `/128` + TCP port，
 落入运行时 `control` 子网的 selected IP 即使被策略 CIDR 覆盖也拒绝发放租约，
 逻辑租约 30 秒、建议 5 秒续租，内核元素最多 15 秒。接口与失败关闭规则见
 [`../../docs/contracts/egress-guard.v1.md`](../../docs/contracts/egress-guard.v1.md)。

@@ -11,6 +11,7 @@ from datax_studio.api.models import HealthStatus
 from datax_studio.api.readiness import SystemReadinessProvider
 from datax_studio.auth.db import Base
 from datax_studio.core.db import SystemControl
+from datax_studio.credentials.db import CredentialSecret
 from datax_studio.egress_attestation import (
     EgressAttestationError,
     EgressVerification,
@@ -61,6 +62,11 @@ def _readiness_engine(
         poolclass=StaticPool,
     )
     assert SystemControl.__table__.metadata is Base.metadata
+    # WorkTerminationRequest has a real foreign key to credential_secrets.
+    # Register that owning model explicitly so this standalone SQLite fixture
+    # represents the complete metadata dependency rather than relying on test
+    # collection order from another credentials module.
+    assert CredentialSecret.__table__.metadata is Base.metadata
     Base.metadata.create_all(engine)
     with engine.begin() as connection:
         connection.execute(
@@ -76,7 +82,7 @@ def _readiness_engine(
             text(
                 """
                 INSERT INTO alembic_version (version_num)
-                VALUES ('20260802_0015')
+                VALUES ('20260802_0017')
                 """
             )
         )

@@ -13,7 +13,7 @@ from sqlalchemy import Engine, create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from datax_studio.api.problems import ProblemException
-from datax_studio.core.service import build_control_service
+from datax_studio.core.service import ControlService, build_control_service
 from datax_studio.credentials.service import build_credential_service
 from datax_studio.egress_attestation import (
     EgressAttestationError,
@@ -41,6 +41,14 @@ from datax_studio.worker.storage_attestation import (
 
 LOGGER = logging.getLogger("datax_studio.worker")
 STOP = Event()
+
+# A single V1 Worker has one dispatch thread plus the heartbeat/reconciler.
+# Keep all Worker-owned services on one deliberately bounded pool so a normal
+# restart cannot reserve an independent default pool per service.  The role
+# connection limit is migrated separately and remains the database backstop.
+_WORKER_DATABASE_POOL_SIZE = 4
+_WORKER_DATABASE_MAX_OVERFLOW = 0
+_WORKER_DATABASE_POOL_TIMEOUT_SECONDS = 5
 
 
 @dataclass(frozen=True)
@@ -411,13 +419,80 @@ def _upsert_heartbeat(
         )
 
 
+def create_worker_engine(settings: Settings) -> Engine:
+    """Create the sole bounded PostgreSQL pool owned by a Worker process."""
+
+    return create_engine(
+        settings.database_url,
+        pool_pre_ping=True,
+        future=True,
+        pool_size=_WORKER_DATABASE_POOL_SIZE,
+        max_overflow=_WORKER_DATABASE_MAX_OVERFLOW,
+        pool_timeout=_WORKER_DATABASE_POOL_TIMEOUT_SECONDS,
+    )
+
+
+def initialize_worker_dispatchers(
+    *,
+    settings: Settings,
+    engine: Engine,
+    control: ControlService,
+    reconciler: WorkerReconciler,
+    runtime_manifest: RuntimeManifest | None,
+) -> tuple[ExecutionWorker | None, RecoveryProbeWorker | None]:
+    """Build Worker dispatchers without turning transient database pressure into a crash loop."""
+
+    if runtime_manifest is None:
+        return None, None
+    try:
+        credentials = build_credential_service(settings, engine=engine)
+        recovery = RecoveryService(control)
+        return (
+            ExecutionWorker(
+                settings=settings,
+                control=control,
+                credentials=credentials,
+                reconciler=reconciler,
+                runtime_manifest=runtime_manifest,
+            ),
+            RecoveryProbeWorker(
+                settings=settings,
+                control=control,
+                credentials=credentials,
+                recovery=recovery,
+            ),
+        )
+    except (
+        OSError,
+        ProblemException,
+        SensitiveRuntimeError,
+        SQLAlchemyError,
+        ValueError,
+    ):
+        # A bounded pool timeout or an expired server-side idle session must
+        # leave the process alive and fail admission closed. The main loop
+        # retries after its next heartbeat instead of Compose crash-looping.
+        LOGGER.exception("worker credential or dispatcher initialization failed")
+        return None, None
+
+
 def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     settings = get_settings()
-    engine = create_engine(settings.database_url, pool_pre_ping=True)
+    engine = create_worker_engine(settings)
+    try:
+        _run_worker(settings=settings, engine=engine)
+    finally:
+        # Compose/restart paths may send SIGTERM while the Worker owns idle
+        # connections.  Dispose explicitly instead of depending on garbage
+        # collection or TCP idle detection to release the database-role budget.
+        engine.dispose()
+
+
+def _run_worker(*, settings: Settings, engine: Engine) -> None:
     signal.signal(signal.SIGINT, _stop)
     signal.signal(signal.SIGTERM, _stop)
     identity = RuntimeIdentity.current()
@@ -430,7 +505,7 @@ def main() -> None:
         settings,
         runtime,
     )
-    control = build_control_service(settings)
+    control = build_control_service(settings, engine=engine)
     reconciler = WorkerReconciler(
         control=control,
         sessions=control.sessions,
@@ -462,40 +537,18 @@ def main() -> None:
     execution_worker = None
     recovery_probe_worker = None
 
-    def initialize_dispatchers() -> tuple[
-        ExecutionWorker | None,
-        RecoveryProbeWorker | None,
-    ]:
-        if runtime_manifest is None:
-            return None, None
-        try:
-            credentials = build_credential_service(settings)
-            recovery = RecoveryService(control)
-            return (
-                ExecutionWorker(
-                    settings=settings,
-                    control=control,
-                    credentials=credentials,
-                    reconciler=reconciler,
-                    runtime_manifest=runtime_manifest,
-                ),
-                RecoveryProbeWorker(
-                    settings=settings,
-                    control=control,
-                    credentials=credentials,
-                    recovery=recovery,
-                ),
-            )
-        except (OSError, ValueError, ProblemException, SensitiveRuntimeError):
-            LOGGER.exception("worker credential or dispatcher initialization failed")
-            return None, None
-
     if (
         runtime.ready
         and dynamic_attestation.egress_verified
         and dynamic_attestation.storage_verified
     ):
-        execution_worker, recovery_probe_worker = initialize_dispatchers()
+        execution_worker, recovery_probe_worker = initialize_worker_dispatchers(
+            settings=settings,
+            engine=engine,
+            control=control,
+            reconciler=reconciler,
+            runtime_manifest=runtime_manifest,
+        )
     dispatcher_available = execution_worker is not None and recovery_probe_worker is not None
     startup_reconciled = False
     if startup_reconciliation_allowed(
@@ -547,7 +600,13 @@ def main() -> None:
                 and dynamic_attestation.storage_verified
             )
             if dynamic_gates_ready and not dispatcher_available:
-                execution_worker, recovery_probe_worker = initialize_dispatchers()
+                execution_worker, recovery_probe_worker = initialize_worker_dispatchers(
+                    settings=settings,
+                    engine=engine,
+                    control=control,
+                    reconciler=reconciler,
+                    runtime_manifest=runtime_manifest,
+                )
                 dispatcher_available = (
                     execution_worker is not None and recovery_probe_worker is not None
                 )

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import time
 
 import pytest
 from sqlalchemy import create_engine, text
@@ -37,19 +38,20 @@ def test_runtime_database_roles_have_dml_but_no_ddl_authority() -> None:
         with owner.connect() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == "20260802_0015"
+            ).scalar_one() == "20260802_0017"
             roles = {
                 row.rolname: row
                 for row in connection.execute(
                     text(
                         "SELECT rolname, rolsuper, rolcreatedb, rolcreaterole, "
-                        "rolinherit, rolreplication "
+                        "rolinherit, rolreplication, rolconnlimit "
                         "FROM pg_roles "
                         "WHERE rolname IN ('datax_api', 'datax_worker')"
                     )
                 )
             }
             assert set(roles) == set(runtime_engines)
+            assert roles["datax_worker"].rolconnlimit == 12
             for row in roles.values():
                 assert row.rolsuper is False
                 assert row.rolcreatedb is False
@@ -68,6 +70,13 @@ def test_runtime_database_roles_have_dml_but_no_ddl_authority() -> None:
         for role, engine in runtime_engines.items():
             with engine.connect() as connection:
                 assert connection.execute(text("SELECT current_user")).scalar_one() == role
+                if role == "datax_worker":
+                    assert connection.execute(
+                        text("SHOW idle_session_timeout")
+                    ).scalar_one() == "30s"
+                    assert connection.execute(
+                        text("SHOW idle_in_transaction_session_timeout")
+                    ).scalar_one() == "15s"
                 assert connection.execute(
                     text("SELECT count(*) FROM system_control")
                 ).scalar_one() == 1
@@ -83,4 +92,69 @@ def test_runtime_database_roles_have_dml_but_no_ddl_authority() -> None:
     finally:
         for engine in runtime_engines.values():
             engine.dispose()
+        owner.dispose()
+
+
+def test_worker_role_reclaims_abandoned_sessions() -> None:
+    owner_url = os.getenv(OWNER_URL_ENV)
+    worker_url = os.getenv(WORKER_URL_ENV)
+    if not owner_url or not worker_url:
+        pytest.skip(f"{OWNER_URL_ENV} and {WORKER_URL_ENV} are required")
+
+    owner = create_engine(owner_url, pool_pre_ping=True)
+    worker = create_engine(worker_url, pool_pre_ping=True)
+    try:
+        # Use a short test-only role default to prove that the PostgreSQL
+        # server—not a process-local finalizer—reclaims an abandoned session.
+        with owner.begin() as connection:
+            connection.execute(
+                text("ALTER ROLE datax_worker SET idle_session_timeout TO '1s'")
+            )
+            connection.execute(
+                text(
+                    "ALTER ROLE datax_worker "
+                    "SET idle_in_transaction_session_timeout TO '15s'"
+                )
+            )
+        with worker.connect() as connection:
+            assert connection.execute(
+                text("SHOW idle_session_timeout")
+            ).scalar_one() == "1s"
+            # SQLAlchemy autobegins for SHOW. End that transaction so the
+            # server is specifically testing idle_session_timeout.
+            connection.commit()
+            time.sleep(2)
+            with pytest.raises(DBAPIError):
+                connection.execute(text("SELECT 1"))
+
+        with owner.begin() as connection:
+            connection.execute(
+                text("ALTER ROLE datax_worker SET idle_session_timeout TO '30s'")
+            )
+            connection.execute(
+                text(
+                    "ALTER ROLE datax_worker "
+                    "SET idle_in_transaction_session_timeout TO '1s'"
+                )
+            )
+        with worker.connect() as connection:
+            assert connection.execute(
+                text("SHOW idle_in_transaction_session_timeout")
+            ).scalar_one() == "1s"
+            # Keep SQLAlchemy's implicit transaction open this time.
+            time.sleep(2)
+            with pytest.raises(DBAPIError):
+                connection.execute(text("SELECT 1"))
+    finally:
+        with owner.begin() as connection:
+            connection.execute(
+                text("ALTER ROLE datax_worker SET idle_session_timeout TO '30s'")
+            )
+            connection.execute(
+                text(
+                    "ALTER ROLE datax_worker "
+                    "SET idle_in_transaction_session_timeout TO '15s'"
+                )
+            )
+        worker.dispose()
         owner.dispose()

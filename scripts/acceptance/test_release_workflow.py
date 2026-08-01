@@ -42,14 +42,22 @@ class ReleaseWorkflowTests(unittest.TestCase):
         root_index = names.index(
             "Verify the handoff manifest and establish the canonical blocked root"
         )
+        linux_evidence_index = names.index("Download independently built Linux evidence")
+        handoff_index = names.index("Download the complete blocked Windows handoff candidate")
         attest_index = names.index("Attest the canonical blocked candidate root")
         policy_index = names.index(
             "Re-verify provenance and require the stable TCB blocker"
         )
+        self.assertLess(linux_evidence_index, handoff_index)
+        self.assertLess(handoff_index, root_index)
         self.assertLess(root_index, attest_index)
         self.assertLess(attest_index, policy_index)
 
         root_script = job["steps"][root_index]["run"]
+        self.assertLess(
+            root_script.index('--root "${TRUSTED_LINUX_EVIDENCE_DIRECTORY}"'),
+            root_script.index('--root "${CANDIDATE_DIRECTORY}"'),
+        )
         self.assertLess(
             root_script.index("hash_manifest.py"),
             root_script.index('unlink "${CANDIDATE_DIRECTORY}/SHA256SUMS"'),
@@ -59,7 +67,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
             root_script.index("candidate_root.py \\\n  generate"),
         )
         self.assertIn("candidate_root.py \\\n  validate", root_script)
+        self.assertEqual(
+            root_script.count("--trusted-linux-evidence-directory"),
+            2,
+        )
         self.assertIn("Protected Windows E4 harness evidence is absent.", root_script)
+        policy_script = job["steps"][policy_index]["run"]
+        self.assertIn("--trusted-linux-evidence-directory", policy_script)
 
     def test_all_candidate_artifacts_and_the_policy_remain_explicitly_blocked(
         self,
@@ -80,6 +94,20 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("TRUSTED_ATTESTATION_VERIFIER_TCB_NOT_IMPLEMENTED", hosted_text)
         self.assertNotIn("--require-pass", hosted_text)
         self.assertNotIn("release_approved=true", hosted_text)
+
+    def test_windows_signing_requires_an_existing_reviewer_gate_before_secrets(self) -> None:
+        job = self.workflow["jobs"]["windows-signed-candidate"]
+        self.assertEqual(job["permissions"], {"actions": "read", "contents": "read"})
+        names = [step["name"] for step in job["steps"]]
+        verifier_index = names.index(
+            "Require a preconfigured approval-gated signing environment"
+        )
+        certificate_index = names.index("Require and import the protected signing certificate")
+        self.assertLess(verifier_index, certificate_index)
+        script = job["steps"][verifier_index]["run"]
+        self.assertIn("/environments/$environmentName", script)
+        self.assertIn("verify_signing_environment.py", script)
+        self.assertIn("prevent", (REPOSITORY_ROOT / "scripts/release/verify_signing_environment.py").read_text(encoding="utf-8"))
 
     def test_verifier_download_is_bound_to_the_locked_installer(self) -> None:
         job = self.workflow["jobs"]["hosted-candidate-attestor"]

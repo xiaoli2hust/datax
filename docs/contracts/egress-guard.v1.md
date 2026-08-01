@@ -42,7 +42,8 @@ API/Worker 必须拒绝未知字段、非 `VERIFIED`、超过 15 秒、未来超
 策略集合哈希不匹配，或 `network_namespace_id` 不等于自身 `/proc/self/ns/net` 的响应。
 
 `policies` 证明当前 ACTIVE revision 已进入租约准入集合，不表示整个 CIDR 已被内核
-放行。`ruleset_hash` 是 nftables readback 去除运行时 `expires` 倒计时后的结构哈希。
+放行。`ruleset_hash` 是 nftables readback 去除运行时 `expires` 倒计时和内核分配
+`handle` 后的结构哈希；`handle` 会在同一规则集的原子替换中重新分配，不代表许可语义。
 守卫失联、证明过期、数据库读取/形状/版本失败、nft apply/readback 失败或规则漂移时，
 消费者必须失败关闭。规则漂移会锁存到守卫重启，不能靠下一次轮询自动恢复授权。
 
@@ -94,8 +95,9 @@ attestation 或错误响应记录 token。
   都不得获得新增 capability。
 - API/Worker 使用 `network_mode: service:egress-guard`，必须与 attestation 中的 netns
   完全一致；Launcher 启动后再次读取三个容器的 `/proc/self/ns/net`。
-- 基础规则默认 `policy drop`，只长期允许 Docker DNS、loopback 控制端点和 Compose
-  `control` 子网；外部数据库仅来自 selected-IP 租约。
+- 基础规则默认 `policy drop`，只长期允许 Docker DNS、完整 `lo` 回环接口（使 API/guard
+  的请求与随机回包端口均可达）和 Compose `control` 子网；`lo` 不是 LAN/WAN 路由，不能
+  放宽外部出口。外部数据库仅来自 selected-IP 租约。
 - 规则以单个 nft batch 原子替换并 readback；ACTIVE view 每 5 秒刷新。撤策、数据库失败
   或漂移立即清空全部租约并安装 base-deny。
 - `web` 通过 `egress-guard:8000` 访问共享 netns 内 API；只有 Web 映射

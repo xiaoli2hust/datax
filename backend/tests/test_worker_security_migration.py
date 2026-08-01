@@ -119,4 +119,4 @@ def test_0011_requires_storage_and_egress_facts_for_ready_heartbeat() -> None:
         for statement in operations.executed
     )
     assert operations.altered_columns == ["storage_code"]
-    assert Settings().database_schema_revision == "20260802_0015"
+    assert Settings().database_schema_revision == "20260802_0017"

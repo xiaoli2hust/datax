@@ -48,6 +48,7 @@ class CandidateFixture:
     def __init__(self, root: Path) -> None:
         self.root = root.resolve()
         self.candidate = self.root / "candidate"
+        self.trusted_linux_evidence = self.root / "trusted-linux-evidence"
         self.candidate.mkdir()
         self._write_files()
 
@@ -125,6 +126,7 @@ class CandidateFixture:
                 "workflow_run_attempt": str(RUN_ATTEMPT),
             },
         )
+        shutil.copyfile(images, linux_evidence / "images.release.env")
         catalog = linux_evidence / "requirements-catalog.v1.json"
         catalog.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(CATALOG, catalog)
@@ -167,6 +169,7 @@ class CandidateFixture:
                 "entries": [{"file": f"sbom/{name}"} for name in sbom_names],
             },
         )
+        shutil.copytree(linux_evidence, self.trusted_linux_evidence)
         self._write_json(
             self.candidate / "windows-build-environment.json",
             {
@@ -180,6 +183,7 @@ class CandidateFixture:
     def arguments(self) -> dict[str, object]:
         return {
             "candidate_directory": self.candidate,
+            "trusted_linux_evidence_directory": self.trusted_linux_evidence,
             "schema_path": SCHEMA,
             "workflow_run_id": RUN_ID,
             "workflow_run_attempt": RUN_ATTEMPT,
@@ -364,6 +368,55 @@ class CandidateRootTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "release manifest 1.1"):
                     fixture.generate()
 
+    def test_candidate_image_lock_must_come_from_linux_build_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = CandidateFixture(Path(directory))
+            candidate_lock = fixture.candidate / "images.release.env"
+            altered = candidate_lock.read_text(encoding="utf-8").replace(
+                "2" * 64,
+                "a" * 64,
+                1,
+            )
+            candidate_lock.write_text(altered, encoding="utf-8")
+            shutil.copyfile(
+                candidate_lock,
+                fixture.candidate / "resources/images.release.env",
+            )
+            manifest_path = fixture.candidate / "resources/release-manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["images_sha256"] = hashlib.sha256(
+                candidate_lock.read_bytes()
+            ).hexdigest()
+            self._write_manifest(manifest_path, manifest)
+
+            with self.assertRaisesRegex(
+                ValueError, "not bound to the Linux build evidence"
+            ):
+                fixture.generate()
+
+    def test_candidate_linux_evidence_must_match_an_external_hosted_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = CandidateFixture(Path(directory))
+            sbom_path = fixture.candidate / "linux-evidence/sbom/source.spdx.json"
+            sbom_path.write_text('{"spdxVersion":"SPDX-2.3","tampered":true}\n', encoding="utf-8")
+            with self.assertRaisesRegex(
+                ValueError,
+                "differs from independently downloaded Linux build evidence",
+            ):
+                fixture.generate()
+
+        with tempfile.TemporaryDirectory() as directory:
+            fixture = CandidateFixture(Path(directory))
+            arguments = fixture.arguments()
+            arguments["trusted_linux_evidence_directory"] = (
+                fixture.candidate / "linux-evidence"
+            )
+            with self.assertRaisesRegex(ValueError, "must remain outside"):
+                generate_candidate_root(
+                    **arguments,
+                    scenario_blocked_reasons=["Windows E4 evidence is absent."],
+                )
+
     def test_candidate_root_rejects_schema_invalid_acceptance_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             fixture = CandidateFixture(Path(directory))
@@ -373,6 +426,10 @@ class CandidateRootTests(unittest.TestCase):
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             manifest.pop("generated_at")
             self._write_manifest(manifest_path, manifest)
+            self._write_manifest(
+                fixture.trusted_linux_evidence / "acceptance-manifest.json",
+                manifest,
+            )
             with self.assertRaisesRegex(
                 ValueError, "acceptance schema violation.*generated_at"
             ):
@@ -582,6 +639,44 @@ class CandidateAttestationTests(unittest.TestCase):
                     runner=runner,
                 )
 
+    def test_wrapper_rechecks_independent_linux_evidence_after_attestation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture, gh, bundle = self._fixture_with_tools(root)
+
+            def runner(
+                command: list[str], **_kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                source_sbom = (
+                    fixture.trusted_linux_evidence / "sbom/source.spdx.json"
+                )
+                source_sbom.write_text(
+                    '{"spdxVersion":"SPDX-2.3","changed":true}\n',
+                    encoding="utf-8",
+                )
+                return subprocess.CompletedProcess(
+                    command,
+                    0,
+                    stdout=self._verified_output(fixture),
+                    stderr="",
+                )
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "differs from independently downloaded Linux build evidence",
+            ):
+                verify_candidate_attestation(
+                    candidate_root_path=fixture.root_file,
+                    bundle_path=bundle,
+                    trusted_gh_executable=gh,
+                    **{
+                        key: value
+                        for key, value in fixture.arguments().items()
+                        if key != "candidate_directory"
+                    },
+                    runner=runner,
+                )
+
     def test_bundle_inside_candidate_or_symlinked_gh_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -605,6 +700,7 @@ class CandidateAttestationTests(unittest.TestCase):
             candidate_root=Path("/unused/candidate-root.v1.json"),
             bundle=Path("/unused/bundle.jsonl"),
             trusted_gh_path=Path("/unused/gh"),
+            trusted_linux_evidence_directory=Path("/unused/linux-evidence"),
             schema=SCHEMA,
             workflow_run_id=RUN_ID,
             workflow_run_attempt=RUN_ATTEMPT,

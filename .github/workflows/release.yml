@@ -234,6 +234,7 @@ jobs:
     environment: windows-candidate-signing
     timeout-minutes: 75
     permissions:
+      actions: read
       contents: read
     steps:
       - name: Check out the exact candidate commit
@@ -242,6 +243,57 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
           clean: true
+
+      - name: Set up the signing-environment verifier Python runtime
+        id: signing-environment-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.13"
+
+      - name: Require a preconfigured approval-gated signing environment
+        shell: pwsh
+        env:
+          EXPECTED_ENVIRONMENT: windows-candidate-signing
+          GITHUB_TOKEN: ${{ github.token }}
+          VERIFIER_PYTHON: ${{ steps.signing-environment-python.outputs.python-path }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+          if ([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN) -or
+              [string]::IsNullOrWhiteSpace($env:VERIFIER_PYTHON)) {
+              throw "Signing-environment protection preflight has no GitHub token or verifier Python."
+          }
+          $environmentName = [Uri]::EscapeDataString($env:EXPECTED_ENVIRONMENT)
+          $environmentUri = (
+              "$env:GITHUB_API_URL/repos/$env:GITHUB_REPOSITORY/environments/$environmentName"
+          )
+          $environmentPath = Join-Path `
+              $env:RUNNER_TEMP `
+              "signing-environment-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.json"
+          if (Test-Path -LiteralPath $environmentPath) {
+              throw "Signing-environment response path already exists."
+          }
+          $headers = @{
+              Accept = "application/vnd.github+json"
+              Authorization = "Bearer $env:GITHUB_TOKEN"
+              "X-GitHub-Api-Version" = "2022-11-28"
+          }
+          $response = Invoke-WebRequest `
+              -Uri $environmentUri `
+              -Headers $headers `
+              -UseBasicParsing
+          [IO.File]::WriteAllText(
+              $environmentPath,
+              $response.Content,
+              [Text.UTF8Encoding]::new($false)
+          )
+          & $env:VERIFIER_PYTHON `
+              scripts/release/verify_signing_environment.py `
+              --environment-json $environmentPath `
+              --expected-environment $env:EXPECTED_ENVIRONMENT
+          if ($LASTEXITCODE -ne 0) {
+              throw "GitHub signing environment protection preflight failed."
+          }
 
       - name: Download immutable Linux evidence
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -714,6 +766,12 @@ jobs:
           python -m pip install --disable-pip-version-check
           --require-hashes -r backend/requirements-dev.lock
 
+      - name: Download independently built Linux evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ${{ needs.linux-images.outputs.evidence_artifact }}
+          path: ${{ runner.temp }}/trusted-linux-candidate-evidence
+
       - name: Download the complete blocked Windows handoff candidate
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -725,11 +783,15 @@ jobs:
         shell: bash
         env:
           CANDIDATE_DIRECTORY: ${{ runner.temp }}/blocked-windows-handoff-candidate
+          TRUSTED_LINUX_EVIDENCE_DIRECTORY: ${{ runner.temp }}/trusted-linux-candidate-evidence
           VERSION: ${{ needs.linux-images.outputs.version }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
           test ! -e "${CANDIDATE_DIRECTORY}/candidate-root.v1.json"
+          python scripts/release/hash_manifest.py \
+            verify \
+            --root "${TRUSTED_LINUX_EVIDENCE_DIRECTORY}"
           python scripts/release/hash_manifest.py \
             verify \
             --root "${CANDIDATE_DIRECTORY}"
@@ -739,6 +801,7 @@ jobs:
           python scripts/acceptance/candidate_root.py \
             generate \
             --candidate-directory "${CANDIDATE_DIRECTORY}" \
+            --trusted-linux-evidence-directory "${TRUSTED_LINUX_EVIDENCE_DIRECTORY}" \
             --schema "${GITHUB_WORKSPACE}/docs/contracts/candidate-root.v1.schema.json" \
             --workflow-run-id "${GITHUB_RUN_ID}" \
             --workflow-run-attempt "${GITHUB_RUN_ATTEMPT}" \
@@ -753,6 +816,7 @@ jobs:
           python scripts/acceptance/candidate_root.py \
             validate \
             --candidate-directory "${CANDIDATE_DIRECTORY}" \
+            --trusted-linux-evidence-directory "${TRUSTED_LINUX_EVIDENCE_DIRECTORY}" \
             --schema "${GITHUB_WORKSPACE}/docs/contracts/candidate-root.v1.schema.json" \
             --workflow-run-id "${GITHUB_RUN_ID}" \
             --workflow-run-attempt "${GITHUB_RUN_ATTEMPT}" \
@@ -807,6 +871,7 @@ jobs:
         env:
           ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
           CANDIDATE_DIRECTORY: ${{ runner.temp }}/blocked-windows-handoff-candidate
+          TRUSTED_LINUX_EVIDENCE_DIRECTORY: ${{ runner.temp }}/trusted-linux-candidate-evidence
           TRUSTED_GH_PATH: ${{ steps.trusted-gh.outputs.path }}
           VERSION: ${{ needs.linux-images.outputs.version }}
         run: |
@@ -821,6 +886,7 @@ jobs:
             --candidate-root "${CANDIDATE_DIRECTORY}/candidate-root.v1.json" \
             --bundle "${ATTESTATION_BUNDLE}" \
             --trusted-gh-path "${TRUSTED_GH_PATH}" \
+            --trusted-linux-evidence-directory "${TRUSTED_LINUX_EVIDENCE_DIRECTORY}" \
             --schema "${GITHUB_WORKSPACE}/docs/contracts/candidate-root.v1.schema.json" \
             --workflow-run-id "${GITHUB_RUN_ID}" \
             --workflow-run-attempt "${GITHUB_RUN_ATTEMPT}" \

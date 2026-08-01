@@ -15,6 +15,7 @@ from uuid import UUID, uuid4
 import rfc8785
 from sqlalchemy import (
     DateTime,
+    Engine,
     String,
     Uuid,
     and_,
@@ -271,8 +272,20 @@ class PreflightEvidenceValidator(Protocol):
     ) -> None: ...
 
 
-def build_control_service(settings: Settings) -> ControlService:
-    engine = create_engine(settings.database_url, pool_pre_ping=True, future=True)
+def build_control_service(
+    settings: Settings,
+    *,
+    engine: Engine | None = None,
+) -> ControlService:
+    """Build the control service, optionally on a caller-owned Engine.
+
+    The API owns its normal pool, while the single Worker process passes its
+    bounded pool here. That keeps independently constructed Worker services
+    from each reserving a default SQLAlchemy pool under the Worker login.
+    """
+
+    if engine is None:
+        engine = create_engine(settings.database_url, pool_pre_ping=True, future=True)
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     key = settings.idempotency_hmac_key_file.read_bytes()
     return ControlService(

@@ -18,7 +18,7 @@ import rfc8785
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESSIV
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from sqlalchemy import and_, create_engine, func, or_, select
+from sqlalchemy import Engine, and_, create_engine, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
@@ -226,8 +226,15 @@ class DatasourceConnectionCandidate:
     ssl_mode: str
 
 
-def build_credential_service(settings: Settings) -> CredentialService:
-    engine = create_engine(settings.database_url, pool_pre_ping=True, future=True)
+def build_credential_service(
+    settings: Settings,
+    *,
+    engine: Engine | None = None,
+) -> CredentialService:
+    """Build credential services on an optional caller-owned database pool."""
+
+    if engine is None:
+        engine = create_engine(settings.database_url, pool_pre_ping=True, future=True)
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     integrity_key = settings.idempotency_hmac_key_file.read_bytes()
     if len(integrity_key) != 32:

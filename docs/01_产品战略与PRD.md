@@ -396,7 +396,7 @@ V1 为**单组织、多项目**。组织不提供切换入口；项目是资源�
 |---|---|---|
 | NFR-PERF-001 | 控制面性能 | 在验收数据量和 20 个并发 UI 会话下，非外部依赖的读 API P95 ≤ 800 ms、写 API P95 ≤ 1.5 s。 |
 | NFR-PERF-002 | 运行反馈 | 手动运行提交后 2 秒内返回 Execution；Worker 产生新状态或日志后，正常网络下 UI P95 在 3 秒内可见。 |
-| NFR-SCALE-001 | 单节点容量 | V1 单 Worker 默认最大并行 Execution 为 `1`；超过上限的执行必须保持 `QUEUED`。部署调高并发后仍必须保证同一规范化目标只有一个未释放的 `RESERVED/ACTIVE/RECOVERY_REQUIRED` 锁，并重新完成资源与稳定性验收。 |
+| NFR-SCALE-001 | 单节点容量 | V1 单 Worker 默认最大并行 Execution 为 `1`；超过上限的执行必须保持 `QUEUED`。Worker 只可拥有一个 `pool_size=4`、无 overflow、5 秒获取超时的 PostgreSQL pool；`datax_worker` 的 12 条角色连接上限及 30 秒空闲/15 秒空闲事务服务端超时仅是异常重启残留的有界 backstop，不是无限重试或容量承诺。部署调高并发后仍必须保证同一规范化目标只有一个未释放的 `RESERVED/ACTIVE/RECOVERY_REQUIRED` 锁，并重新完成资源与稳定性验收。 |
 | NFR-REL-001 | 事实一致性 | PostgreSQL 是唯一业务事实源；Worker 使用 `FOR UPDATE SKIP LOCKED` 领取，`LISTEN/NOTIFY` 丢失时由轮询恢复，不得丢失 Execution 或产生伪成功。 |
 | NFR-REL-002 | 故障恢复 | API、Worker、Docker Desktop 或 Windows 重启，以及主机从睡眠恢复后必须对账在途执行；无法确认的状态进入 `LOST`。V1 不承诺睡眠/关机期间运行、不停机或自动故障转移。 |
 | NFR-SEC-001 | 凭据安全 | 凭据使用外部主密钥和 AEAD 加密；响应、日志、审计、预览、导出、异常和测试快照不得包含明文。Worker 每端以 fresh short `FOR UPDATE` 状态锁解密；紧急 secret 撤销/折损与目标独占撤回/到期均须生成持久终止事实，Worker/reconciler 在 admission、每个有界外部 I/O、状态推进、Popen 紧前、tick、oracle 和 heartbeat 消费。已观察到终止后不得创建新连接或进程；数据库提交与 OS/JDBC 边界不可原子，阻塞调用只允许按超时/lease-LOST 保守收敛，真实 E2/E3 之前不得宣称即时停止或完整内存清零。 |

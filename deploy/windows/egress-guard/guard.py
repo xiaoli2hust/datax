@@ -51,7 +51,10 @@ RUNTIME_DIRECTORY = Path("/run/datax-egress-guard")
 PGPASS_PATH = RUNTIME_DIRECTORY / "pgpass"
 ROUTE_PATH = Path("/proc/net/route")
 NFT_BINARY = "/usr/sbin/nft"
-PSQL_BINARY = "/usr/bin/psql"
+# The pinned postgres:15.18-alpine3.24 image installs its client binary in
+# /usr/local/bin. Keep an absolute, image-contract path so the guard never
+# falls back to a user-controlled PATH lookup.
+PSQL_BINARY = "/usr/local/bin/psql"
 NFT_TABLE = "des_egress"
 HASH_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 NETNS_PATTERN = re.compile(r"^net:\[[0-9]+\]$")
@@ -492,13 +495,15 @@ def nft_batch(
                 f"add rule inet {NFT_TABLE} output "
                 "ip daddr 127.0.0.11 tcp dport 53 accept"
             ),
+            # The API and guard share a netns.  Allow the whole loopback
+            # interface rather than only request destination ports: a
+            # loopback server's response has the caller's ephemeral port as
+            # its destination and would otherwise be dropped by this OUTPUT
+            # chain.  This does not create a LAN/WAN route or relax the
+            # selected-IP egress policy.
             (
                 f"add rule inet {NFT_TABLE} output "
-                "ip daddr 127.0.0.1 tcp dport 8000 accept"
-            ),
-            (
-                f"add rule inet {NFT_TABLE} output "
-                "ip daddr 127.0.0.1 tcp dport 17990 accept"
+                'oifname "lo" accept'
             ),
             (
                 f"add rule inet {NFT_TABLE} output "
@@ -632,20 +637,31 @@ class NftablesManager:
             document = json.loads(result.stdout)
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise GuardError("NFT_RULESET_READBACK_INVALID") from exc
-        return sha256_json(_without_expiry_counters(document))
+        return sha256_json(_without_nft_runtime_metadata(document))
 
 
-def _without_expiry_counters(value: object) -> object:
-    """Remove nft runtime countdowns while preserving the enforced structure."""
+def _without_nft_runtime_metadata(value: object) -> object:
+    """Normalize nft readback without erasing enforced rule semantics.
+
+    ``handle`` is allocated afresh when the guard atomically replaces its
+    table.  It identifies a kernel object but does not change what packets
+    the object permits.  Hashing it made an unchanged base-deny policy look
+    different after every five-second refresh, so independently sampled
+    API/Worker attestations could falsely diverge.  ``expires`` is the
+    kernel's live countdown for an existing timeout element and is likewise
+    not the configured policy.  Deliberately retain fields such as
+    ``timeout``, expressions, addresses, ports, hooks and policies: changing
+    any of those must still latch drift.
+    """
 
     if isinstance(value, dict):
         return {
-            key: _without_expiry_counters(item)
+            key: _without_nft_runtime_metadata(item)
             for key, item in value.items()
-            if key != "expires"
+            if key not in {"expires", "handle"}
         }
     if isinstance(value, list):
-        return [_without_expiry_counters(item) for item in value]
+        return [_without_nft_runtime_metadata(item) for item in value]
     return value
 
 
@@ -688,7 +704,7 @@ class PostgresPolicySource:
     @staticmethod
     def _environment() -> dict[str, str]:
         return {
-            "PATH": "/usr/bin:/bin",
+            "PATH": "/usr/local/bin:/usr/bin:/bin",
             "LC_ALL": "C",
             "PGPASSFILE": str(PGPASS_PATH),
             "PGCONNECT_TIMEOUT": "3",

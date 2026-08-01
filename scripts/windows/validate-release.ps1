@@ -569,6 +569,22 @@ if ($setup.Name -cne "DataX-Enterprise-Studio-Setup-$ExpectedVersion-x64.exe" -o
     throw "Candidate executable names or sizes are invalid."
 }
 $imageLock = Assert-ReleaseImageLock -File $images
+$linuxImageLock = Resolve-RequiredFile `
+    -Path (Join-Path $candidateRoot "linux-evidence\images.release.env") `
+    -Description "Linux build image lock"
+Assert-ChildOfCandidate `
+    -Item $linuxImageLock `
+    -RootPrefix $candidatePrefix
+Assert-ReleaseImageLock -File $linuxImageLock | Out-Null
+$topLevelImageHash = (
+    Get-FileHash -LiteralPath $images.FullName -Algorithm SHA256
+).Hash.ToLowerInvariant()
+$linuxImageHash = (
+    Get-FileHash -LiteralPath $linuxImageLock.FullName -Algorithm SHA256
+).Hash.ToLowerInvariant()
+if (-not $topLevelImageHash.Equals($linuxImageHash, [StringComparison]::Ordinal)) {
+    throw "Candidate image lock does not match the Linux build evidence image lock."
+}
 $anonymousPullEvidence = Resolve-RequiredFile `
     -Path (Join-Path $candidateRoot "linux-evidence\anonymous-image-pulls.json") `
     -Description "Anonymous image pull evidence"

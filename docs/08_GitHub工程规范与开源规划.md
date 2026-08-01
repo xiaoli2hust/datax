@@ -8,12 +8,15 @@
 | 发布单位 | Windows 11 x64 已签名 Setup/Launcher、源码标签、镜像摘要、迁移版本、Runtime manifest、哈希与 SBOM |
 | 当前许可证 | 仓库所有者尚未选择；公开源码前必须完成 |
 
-> 当前远端治理边界：截至 2026-08-01，`main` 已启用经典分支保护，严格要求分支最新、
+> 当前远端治理边界：截至 2026-08-02，`main` 已启用经典分支保护，严格要求分支最新、
 > 线性历史、PR、会话解决以及本文列出的 12 个 CI/安全检查，且禁止强推和删除；管理员
 > 同样受约束。当前仓库只有一名维护者，为避免自提交 PR 永久不可合并，审批数暂为 0，
 > 因而不能把该设置表述为独立人工复核。漏洞告警与 Dependabot security updates 已启用。
-> 仓库发布工作流仍生成 `gate_result=BLOCKED` 且需求项为 `NOT_RUN/E0` 的候选证据，
-> 不批准公开发布。
+> `windows-candidate-signing` GitHub Environment 当前尚未配置（2026-08-02 API 返回 0 个
+> environment）；引用不存在的名称会被 GitHub 自动创建为无保护环境。发布工作流因此在导入
+> 签名证书前查询 Environment，要求至少一名 required reviewer 且 `prevent_self_review=true`，
+> 否则失败关闭。该本地预检不替代实际在 GitHub 配置审批人、分支/标签策略和环境专属 secrets。
+> 仓库发布工作流仍生成 `gate_result=BLOCKED` 且需求项为 `NOT_RUN/E0` 的候选证据，不批准公开发布。
 
 > ADR-0011 已接受未来的两阶段插件/Runtime qualification 与发布晋级链：不可变 payload
 > 先在受保护 Windows harness 中取得 Phase A 私有 qualification（不是 E4 或 Plugin Manifest
@@ -199,6 +202,11 @@ Windows release runner 或签名结果已经在线验证。Java 源码也没有�
   CI runner 成功不等于 Windows 11 E4 验收。
 - 签名只在受保护发布环境执行，使用不可导出的代码签名凭据和可信时间戳。Fork PR、
   普通分支与日志不得获得证书私钥或签名服务权限。
+- 签名 job 使用前，`windows-candidate-signing` 必须已在 GitHub 管理面预先创建，并至少配置
+  一名 required reviewer 且禁止发起人自审；工作流会读取 REST Environment 描述并失败关闭。
+  空/隐式创建的 Environment、缺审批、允许 self-review 或 API 不可读均不得触及证书导入。
+  Release Owner 还必须在 GitHub 为 `main` 与精确发布 tag 配置符合本仓库发布策略的部署/规则集
+  限制，并把签名 secrets 仅存于该 Environment；这一远端配置不是 YAML 文件存在就能证明的。
 - 发布流水线必须校验 Authenticode 签名、签名时间戳、发布 SHA-256、版本单调性、
   Setup/Launcher SBOM、第三方许可证清单和固定容器镜像 digest；任一不一致即失败关闭。
 - Linux 镜像锁生成后、Windows 候选包生成前，流水线必须用全新临时
@@ -207,6 +215,12 @@ Windows release runner 或签名结果已经在线验证。Java 源码也没有�
   egress-guard、Worker、Web 或 PostgreSQL 任一镜像不能在无注册表凭据条件下公开读取，
   都不得生成候选安装包。门禁只接受固定仓库的 `repository@sha256:<64 hex>`，不能把
   tag、已登录 runner 的缓存或 Launcher 登录流程当作替代。
+- Windows 候选的顶层 `images.release.env`、安装器内嵌的同名 lock 与 Linux build evidence
+  中生成的 `linux-evidence/images.release.env` 必须逐字节一致；Windows 验证器复核该 lock
+  绑定。托管 attestor 还必须独立下载 Linux build artifact、验证其 `SHA256SUMS`，并让候选根
+  递归比对候选内 `linux-evidence/` 与独立来源的全部文件路径、大小和 SHA-256。仅重新计算
+  自托管 Windows runner 中被替换的 lock/hash 不足以证明其来自已扫描 Linux 构建，也不能证明
+  unsigned Windows 二进制或工具链来自审核源码。
 - Compose 静态策略和运行时探测必须证明只有 Web 映射
   `127.0.0.1:17860`，API/Worker/PostgreSQL 无宿主端口，且未挂载 Docker Socket、
   Windows 命名管道或用户目录。

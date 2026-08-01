@@ -35,8 +35,43 @@ const COMPOSE_TIMEOUT: Duration = Duration::from_secs(180);
 const SYSTEM_BACKUP_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
-const SUPPORTED_MIGRATION_REVISION: &str = "20260802_0015";
+const SUPPORTED_MIGRATION_REVISION: &str = "20260802_0017";
 const IMAGE_ENV_FILE_NAME: &str = "images.release.env";
+const DOCKER_CLI_CONFIG_DIRECTORY_NAME: &str = "docker-cli-config";
+const DOCKER_CLI_CONFIG_FILE_NAME: &str = "config.json";
+// Docker/Compose must never consult a user's registry auths or credential helpers.  This is the
+// complete, intentionally anonymous configuration accepted in the Launcher-owned directory.
+const EMPTY_DOCKER_CLI_CONFIG: &[u8] = br#"{"auths":{}}"#;
+const LOCAL_DOCKER_DESKTOP_ENDPOINTS: [&str; 2] = [
+    "npipe:////./pipe/docker_engine",
+    "npipe:////./pipe/dockerdesktoplinuxengine",
+];
+const CHILD_ENVIRONMENT_REMOVALS: [&str; 24] = [
+    "DOCKER_HOST",
+    "DOCKER_CONTEXT",
+    "DOCKER_TLS_VERIFY",
+    "DOCKER_CERT_PATH",
+    "DOCKER_API_VERSION",
+    "DOCKER_CONFIG",
+    "DOCKER_AUTH_CONFIG",
+    "REGISTRY_AUTH_FILE",
+    "COMPOSE_FILE",
+    "COMPOSE_PROJECT_NAME",
+    "COMPOSE_PROFILES",
+    "COMPOSE_ENV_FILES",
+    "COMPOSE_CONVERT_WINDOWS_PATHS",
+    "COMPOSE_PATH_SEPARATOR",
+    "DES_POSTGRES_IMAGE",
+    "DES_API_IMAGE",
+    "DES_EGRESS_GUARD_IMAGE",
+    "DES_WORKER_IMAGE",
+    "DES_WEB_IMAGE",
+    "DES_SECRET_DIR",
+    "DES_INSTALLATION_ID",
+    "DES_POSTGRES_VOLUME_NAME",
+    "DES_LOG_VOLUME_NAME",
+    "DES_WORKSPACE_VOLUME_NAME",
+];
 const EXPECTED_SERVICES: [&str; 6] = [
     "api",
     "egress-guard",
@@ -195,6 +230,8 @@ struct Installation {
     release_manifest: PathBuf,
     local_app_data: PathBuf,
     app_data_root: PathBuf,
+    docker_cli_config_dir: PathBuf,
+    docker_cli_config_file: PathBuf,
     initialization_state: PathBuf,
     installation_id: PathBuf,
     runtime_generation: PathBuf,
@@ -215,6 +252,7 @@ struct Tools {
     docker: PathBuf,
     compose: PathBuf,
     docker_host: Option<OsString>,
+    docker_cli_config_dir: PathBuf,
     reg: PathBuf,
 }
 
@@ -430,9 +468,9 @@ where
     match action {
         Action::Start => {
             ensure_no_restore_in_progress(&installation.app_data_root)?;
-            let mut tools = Tools::discover(&installation.install_dir)?;
             platform::ensure_hardware_prerequisites(&installation.local_app_data)?;
             let start_tools = StartTools::discover()?;
+            let mut tools = Tools::discover(&installation, &start_tools)?;
             verify_prerequisites(&mut tools, &start_tools, &installation)?;
             ensure_runtime_secrets(&tools, &start_tools, &installation)?;
             verify_compose_config(&tools, &installation, &verified_release.image_lock)?;
@@ -443,7 +481,8 @@ where
             }
         }
         Action::Stop { force } => {
-            let mut tools = Tools::discover(&installation.install_dir)?;
+            let start_tools = StartTools::discover()?;
+            let mut tools = Tools::discover(&installation, &start_tools)?;
             configure_local_docker_endpoint(&mut tools, &installation)?;
             stop(&tools, &installation, force)?;
             Ok(RunOutcome::Stopped)
@@ -455,9 +494,9 @@ where
             secrets_key,
         } => {
             ensure_no_restore_in_progress(&installation.app_data_root)?;
-            let mut tools = Tools::discover(&installation.install_dir)?;
             platform::ensure_hardware_prerequisites(&installation.local_app_data)?;
             let start_tools = StartTools::discover()?;
+            let mut tools = Tools::discover(&installation, &start_tools)?;
             verify_prerequisites(&mut tools, &start_tools, &installation)?;
             let (data_package, secrets_package) = create_system_backup(
                 &tools,
@@ -482,9 +521,9 @@ where
             data_key,
             secrets_key,
         } => {
-            let mut tools = Tools::discover(&installation.install_dir)?;
             platform::ensure_hardware_prerequisites(&installation.local_app_data)?;
             let start_tools = StartTools::discover()?;
+            let mut tools = Tools::discover(&installation, &start_tools)?;
             verify_prerequisites(&mut tools, &start_tools, &installation)?;
             stage_system_restore(
                 &tools,
@@ -641,6 +680,8 @@ impl Installation {
 
         let local_app_data = platform::local_app_data_directory()?;
         let app_data_root = local_app_data.join("DataXEnterpriseStudio");
+        let docker_cli_config_dir = app_data_root.join(DOCKER_CLI_CONFIG_DIRECTORY_NAME);
+        let docker_cli_config_file = docker_cli_config_dir.join(DOCKER_CLI_CONFIG_FILE_NAME);
         let initialization_state = app_data_root.join("initialization-incomplete");
         let installation_id = app_data_root.join("installation-id");
         let runtime_generation = app_data_root.join("runtime-generation.json");
@@ -664,6 +705,8 @@ impl Installation {
             release_manifest,
             local_app_data,
             app_data_root,
+            docker_cli_config_dir,
+            docker_cli_config_file,
             initialization_state,
             installation_id,
             runtime_generation,
@@ -696,17 +739,21 @@ impl Installation {
 }
 
 impl Tools {
-    fn discover(install_dir: &Path) -> Result<Self, LauncherError> {
+    fn discover(
+        installation: &Installation,
+        start_tools: &StartTools,
+    ) -> Result<Self, LauncherError> {
+        ensure_isolated_docker_cli_config(start_tools, installation)?;
         let reg = platform::system32_executable("reg.exe")?;
         let install_path = query_registry_string(
             &reg,
-            install_dir,
+            &installation.install_dir,
             r"HKLM\SOFTWARE\Docker Inc.\Docker Desktop",
             "InstallPath",
         )?
         .or(query_registry_string(
             &reg,
-            install_dir,
+            &installation.install_dir,
             r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Docker Desktop",
             "InstallLocation",
         )?)
@@ -753,15 +800,20 @@ impl Tools {
             docker,
             compose,
             docker_host: None,
+            docker_cli_config_dir: installation.docker_cli_config_dir.clone(),
             reg,
         })
     }
 
     fn docker_environment(&self) -> Vec<(OsString, OsString)> {
-        self.docker_host
-            .as_ref()
-            .map(|host| vec![(OsString::from("DOCKER_HOST"), host.clone())])
-            .unwrap_or_default()
+        let mut environment = vec![(
+            OsString::from("DOCKER_CONFIG"),
+            self.docker_cli_config_dir.as_os_str().to_os_string(),
+        )];
+        if let Some(host) = &self.docker_host {
+            environment.push((OsString::from("DOCKER_HOST"), host.clone()));
+        }
+        environment
     }
 }
 
@@ -776,6 +828,124 @@ impl StartTools {
             netstat: platform::system32_executable("netstat.exe")?,
         })
     }
+}
+
+fn ensure_isolated_docker_cli_config(
+    start_tools: &StartTools,
+    installation: &Installation,
+) -> Result<(), LauncherError> {
+    let local_app_data = installation.app_data_root.parent().ok_or_else(|| {
+        LauncherError::new(
+            "LOCALAPPDATA_UNAVAILABLE",
+            "Windows LOCALAPPDATA 目录结构无效。",
+        )
+    })?;
+    platform::ensure_directory(local_app_data)?;
+    create_controlled_directory(&installation.app_data_root)?;
+    platform::ensure_tree_no_reparse(&installation.app_data_root)?;
+
+    let sid = current_user_sid(start_tools, installation)?;
+    restrict_directory_acl(start_tools, installation, &installation.app_data_root, &sid)?;
+    create_controlled_directory(&installation.docker_cli_config_dir)?;
+    platform::ensure_tree_no_reparse(&installation.docker_cli_config_dir)?;
+    restrict_directory_acl(
+        start_tools,
+        installation,
+        &installation.docker_cli_config_dir,
+        &sid,
+    )?;
+
+    match fs::symlink_metadata(&installation.docker_cli_config_file) {
+        Ok(_) => {
+            platform::ensure_regular_file(&installation.docker_cli_config_file)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut config = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&installation.docker_cli_config_file)
+                .map_err(|_| {
+                    LauncherError::new(
+                        "DOCKER_CONFIG_CREATE_FAILED",
+                        "无法创建 Launcher 受控的空 Docker CLI 配置。",
+                    )
+                })?;
+            config.write_all(EMPTY_DOCKER_CLI_CONFIG).map_err(|_| {
+                LauncherError::new(
+                    "DOCKER_CONFIG_CREATE_FAILED",
+                    "无法写入 Launcher 受控的空 Docker CLI 配置。",
+                )
+            })?;
+            config.sync_all().map_err(|_| {
+                LauncherError::new(
+                    "DOCKER_CONFIG_CREATE_FAILED",
+                    "无法持久化 Launcher 受控的空 Docker CLI 配置。",
+                )
+            })?;
+            platform::ensure_regular_file(&installation.docker_cli_config_file)?;
+        }
+        Err(_) => {
+            return Err(LauncherError::new(
+                "DOCKER_CONFIG_INVALID",
+                "无法检查 Launcher 受控的 Docker CLI 配置。",
+            ));
+        }
+    }
+    restrict_file_acl(
+        start_tools,
+        installation,
+        &installation.docker_cli_config_file,
+        &sid,
+    )?;
+    validate_isolated_docker_cli_config(
+        &installation.docker_cli_config_dir,
+        &installation.docker_cli_config_file,
+    )
+}
+
+fn validate_isolated_docker_cli_config(
+    directory: &Path,
+    config_file: &Path,
+) -> Result<(), LauncherError> {
+    platform::ensure_directory(directory)?;
+    platform::ensure_regular_file(config_file)?;
+    let entries = fs::read_dir(directory).map_err(|_| {
+        LauncherError::new(
+            "DOCKER_CONFIG_INVALID",
+            "无法枚举 Launcher 受控的 Docker CLI 配置目录。",
+        )
+    })?;
+    let mut names = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| {
+            LauncherError::new(
+                "DOCKER_CONFIG_INVALID",
+                "无法读取 Launcher 受控的 Docker CLI 配置目录。",
+            )
+        })?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or_else(|| {
+            LauncherError::new(
+                "DOCKER_CONFIG_INVALID",
+                "Docker CLI 配置目录包含无效文件名。",
+            )
+        })?;
+        names.insert(name.to_owned());
+    }
+    if names.len() != 1 || !names.contains(DOCKER_CLI_CONFIG_FILE_NAME) {
+        return Err(LauncherError::new(
+            "DOCKER_CONFIG_INVALID",
+            "Docker CLI 配置目录必须只包含 Launcher 生成的空 config.json。",
+        ));
+    }
+    let contents = read_bounded_file(config_file, 1024, "DOCKER_CONFIG_INVALID")?;
+    if contents.as_slice() != EMPTY_DOCKER_CLI_CONFIG {
+        return Err(LauncherError::new(
+            "DOCKER_CONFIG_INVALID",
+            "Docker CLI 配置不是受控的匿名配置；已拒绝读取 registry 凭据或 credential helper。",
+        ));
+    }
+    Ok(())
 }
 
 fn verify_release_resources(installation: &Installation) -> Result<VerifiedRelease, LauncherError> {
@@ -1050,31 +1220,27 @@ fn configure_local_docker_endpoint(
             "检测到 DOCKER_HOST/DOCKER_CONTEXT 覆盖。V1 只允许本机 Docker Desktop Linux Engine。",
         ));
     }
-    let context = docker(
-        tools,
-        installation,
-        &[
-            "context",
-            "inspect",
-            "--format",
-            "{{.Endpoints.docker.Host}}",
-        ],
-        PROCESS_TIMEOUT,
-    )?;
-    let endpoint = normalize_text(&context.stdout).trim().to_ascii_lowercase();
-    if !context.status.success()
-        || !matches!(
-            endpoint.as_str(),
-            "npipe:////./pipe/docker_engine" | "npipe:////./pipe/dockerdesktoplinuxengine"
-        )
-    {
-        return Err(LauncherError::new(
-            "LOCAL_DOCKER_CONTEXT_REQUIRED",
-            "Docker 当前上下文不是固定 Docker Desktop 本机 named pipe，已拒绝远程或自定义 Engine。",
-        ));
+    for endpoint in LOCAL_DOCKER_DESKTOP_ENDPOINTS {
+        tools.docker_host = Some(OsString::from(endpoint));
+        let version = docker(
+            tools,
+            installation,
+            &["version", "--format", "{{.Server.Os}}|{{.Server.Arch}}"],
+            PROCESS_TIMEOUT,
+        )?;
+        if version.status.success()
+            && normalize_text(&version.stdout)
+                .trim()
+                .eq_ignore_ascii_case("linux|amd64")
+        {
+            return Ok(());
+        }
     }
-    tools.docker_host = Some(OsString::from(endpoint));
-    Ok(())
+    tools.docker_host = None;
+    Err(LauncherError::new(
+        "LOCAL_DOCKER_CONTEXT_REQUIRED",
+        "Docker Desktop 未在固定本机 named pipe 上提供 Linux/amd64 Engine；已拒绝用户上下文、远程或自定义 Engine。",
+    ))
 }
 
 fn ensure_runtime_secrets(
@@ -2441,15 +2607,13 @@ fn start(
 ) -> Result<bool, LauncherError> {
     let listeners = host_port_listeners(start_tools, installation)?;
     if listeners.iter().any(|address| address != "127.0.0.1") {
-        let _ = compose(
+        return Err(clean_up_unhealthy_start(
             tools,
             installation,
-            &["down", "--remove-orphans", "--timeout", "30"],
-            COMPOSE_TIMEOUT,
-        );
-        return Err(LauncherError::new(
-            "PUBLIC_LISTENER_REJECTED",
-            "检测到 0.0.0.0、::、::1 或其他非 127.0.0.1 的 17860 监听；已安全阻断。",
+            LauncherError::new(
+                "PUBLIC_LISTENER_REJECTED",
+                "检测到 0.0.0.0、::、::1 或其他非 127.0.0.1 的 17860 监听；已安全阻断。",
+            ),
         ));
     }
     if !listeners.is_empty() && !compose_web_is_running(tools, installation)? {
@@ -2459,50 +2623,41 @@ fn start(
         ));
     }
 
-    let up = compose(
+    let up = match compose(
         tools,
         installation,
         &["up", "-d", "--remove-orphans"],
         COMPOSE_TIMEOUT,
-    )?;
+    ) {
+        Ok(output) => output,
+        Err(error) => return Err(clean_up_unhealthy_start(tools, installation, error)),
+    };
     if !up.status.success() {
-        return Err(LauncherError::new(
-            "COMPOSE_START_FAILED",
-            "Docker Compose 启动失败。请检查 Docker Desktop 和签名发布镜像。",
+        return Err(clean_up_unhealthy_start(
+            tools,
+            installation,
+            LauncherError::new(
+                "COMPOSE_START_FAILED",
+                "Docker Compose 启动失败。请检查 Docker Desktop 和签名发布镜像。",
+            ),
         ));
     }
-    let installation_id = read_installation_id(&installation.installation_id)?;
-    if let Err(error) = validate_runtime_volume_identity(tools, installation, &installation_id) {
-        let _ = compose(
-            tools,
-            installation,
-            &["down", "--remove-orphans", "--timeout", "30"],
-            COMPOSE_TIMEOUT,
-        );
-        return Err(error);
-    }
-    if let Err(error) = validate_actual_compose_ports(tools, start_tools, installation) {
-        let _ = compose(
-            tools,
-            installation,
-            &["down", "--remove-orphans", "--timeout", "30"],
-            COMPOSE_TIMEOUT,
-        );
-        return Err(error);
-    }
-    if let Err(error) = verify_shared_network_namespace(tools, installation) {
-        let _ = compose(
-            tools,
-            installation,
-            &["down", "--remove-orphans", "--timeout", "30"],
-            COMPOSE_TIMEOUT,
-        );
-        return Err(error);
+    let start_safety_checks = (|| -> Result<(), LauncherError> {
+        let installation_id = read_installation_id(&installation.installation_id)?;
+        validate_runtime_volume_identity(tools, installation, &installation_id)?;
+        validate_actual_compose_ports(tools, start_tools, installation)?;
+        verify_shared_network_namespace(tools, installation)?;
+        wait_for_http(LIVE_PATH, LIVE_TIMEOUT, "API_LIVE_TIMEOUT")?;
+        verify_container_secret_targets(tools, installation)
+    })();
+    if let Err(error) = start_safety_checks {
+        return Err(clean_up_unhealthy_start(tools, installation, error));
     }
 
-    wait_for_http(LIVE_PATH, LIVE_TIMEOUT, "API_LIVE_TIMEOUT")?;
-    verify_container_secret_targets(tools, installation)?;
-    let resume = lifecycle(tools, installation, "resume")?;
+    let resume = match lifecycle(tools, installation, "resume") {
+        Ok(value) => value,
+        Err(error) => return Err(clean_up_unhealthy_start(tools, installation, error)),
+    };
     if !resume.safe_to_stop {
         return Err(LauncherError::new(
             "RECOVERY_RECONCILIATION_REQUIRED",
@@ -2512,12 +2667,55 @@ fn start(
             ),
         ));
     }
-    wait_for_http(READY_PATH, READY_TIMEOUT, "SERVICE_NOT_READY")?;
+    if let Err(error) = wait_for_http(READY_PATH, READY_TIMEOUT, "SERVICE_NOT_READY") {
+        return Err(clean_up_unhealthy_start(tools, installation, error));
+    }
     if !ensure_bootstrap_admin(tools, installation)? {
         return Ok(false);
     }
     platform::open_browser(UI_URL)?;
     Ok(true)
+}
+
+fn clean_up_unhealthy_start(
+    tools: &Tools,
+    installation: &Installation,
+    primary: LauncherError,
+) -> LauncherError {
+    let cleanup = compose(
+        tools,
+        installation,
+        &["down", "--remove-orphans", "--timeout", "30"],
+        COMPOSE_TIMEOUT,
+    )
+    .and_then(|output| {
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(LauncherError::new(
+                "COMPOSE_START_CLEANUP_FAILED",
+                "启动后自动停止不健康的 Compose 服务失败；named volumes 未被删除。",
+            ))
+        }
+    });
+    merge_unhealthy_start_cleanup_result(primary, cleanup)
+}
+
+fn merge_unhealthy_start_cleanup_result(
+    primary: LauncherError,
+    cleanup: Result<(), LauncherError>,
+) -> LauncherError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup_error) => LauncherError::new(
+            "STARTUP_CLEANUP_FAILED",
+            format!(
+                "启动后的安全核验失败（{}），且自动停止不健康的 Compose 服务失败（{}）。请停止使用本机并人工处置；named volumes 未被删除。",
+                primary.code(),
+                cleanup_error.code(),
+            ),
+        ),
+    }
 }
 
 fn verify_container_secret_targets(
@@ -2907,7 +3105,10 @@ fn ensure_clean_restore_target(
 
     if installation.app_data_root.exists() {
         platform::ensure_directory(&installation.app_data_root)?;
-        ensure_directory_entries_allowed(&installation.app_data_root, &["system-restore"])?;
+        ensure_directory_entries_allowed(
+            &installation.app_data_root,
+            &["system-restore", DOCKER_CLI_CONFIG_DIRECTORY_NAME],
+        )?;
     }
     let restore_root = installation.app_data_root.join("system-restore");
     if restore_root.exists() {
@@ -5250,37 +5451,13 @@ fn run_process_to_new_file(
                 "无法以 create_new 创建 pg_dump staging 文件。",
             )
         })?;
-    let mut command = Command::new(program);
-    command
-        .args(arguments)
-        .current_dir(working_directory)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_remove("DOCKER_HOST")
-        .env_remove("DOCKER_CONTEXT")
-        .env_remove("DOCKER_TLS_VERIFY")
-        .env_remove("DOCKER_CERT_PATH")
-        .env_remove("DOCKER_API_VERSION")
-        .env_remove("COMPOSE_FILE")
-        .env_remove("COMPOSE_PROJECT_NAME")
-        .env_remove("COMPOSE_PROFILES")
-        .env_remove("COMPOSE_ENV_FILES")
-        .env_remove("COMPOSE_CONVERT_WINDOWS_PATHS")
-        .env_remove("COMPOSE_PATH_SEPARATOR")
-        .env_remove("DES_POSTGRES_IMAGE")
-        .env_remove("DES_API_IMAGE")
-        .env_remove("DES_EGRESS_GUARD_IMAGE")
-        .env_remove("DES_WORKER_IMAGE")
-        .env_remove("DES_WEB_IMAGE")
-        .env_remove("DES_SECRET_DIR")
-        .env_remove("DES_INSTALLATION_ID")
-        .env_remove("DES_POSTGRES_VOLUME_NAME")
-        .env_remove("DES_LOG_VOLUME_NAME")
-        .env_remove("DES_WORKSPACE_VOLUME_NAME");
-    for (name, value) in environment {
-        command.env(name, value);
-    }
+    let mut command = controlled_child_command(
+        program,
+        arguments,
+        environment,
+        working_directory,
+        Stdio::null(),
+    );
 
     let mut child = command
         .spawn()
@@ -5349,41 +5526,13 @@ fn run_process_internal(
     timeout: Duration,
     secret_stdin: Option<Zeroizing<Vec<u8>>>,
 ) -> Result<ProcessOutput, LauncherError> {
-    let mut command = Command::new(program);
-    command
-        .args(arguments)
-        .current_dir(working_directory)
-        .stdin(if secret_stdin.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .env_remove("DOCKER_HOST")
-        .env_remove("DOCKER_CONTEXT")
-        .env_remove("DOCKER_TLS_VERIFY")
-        .env_remove("DOCKER_CERT_PATH")
-        .env_remove("DOCKER_API_VERSION")
-        .env_remove("COMPOSE_FILE")
-        .env_remove("COMPOSE_PROJECT_NAME")
-        .env_remove("COMPOSE_PROFILES")
-        .env_remove("COMPOSE_ENV_FILES")
-        .env_remove("COMPOSE_CONVERT_WINDOWS_PATHS")
-        .env_remove("COMPOSE_PATH_SEPARATOR")
-        .env_remove("DES_POSTGRES_IMAGE")
-        .env_remove("DES_API_IMAGE")
-        .env_remove("DES_EGRESS_GUARD_IMAGE")
-        .env_remove("DES_WORKER_IMAGE")
-        .env_remove("DES_WEB_IMAGE")
-        .env_remove("DES_SECRET_DIR")
-        .env_remove("DES_INSTALLATION_ID")
-        .env_remove("DES_POSTGRES_VOLUME_NAME")
-        .env_remove("DES_LOG_VOLUME_NAME")
-        .env_remove("DES_WORKSPACE_VOLUME_NAME");
-    for (name, value) in environment {
-        command.env(name, value);
-    }
+    let stdin = if secret_stdin.is_some() {
+        Stdio::piped()
+    } else {
+        Stdio::null()
+    };
+    let mut command =
+        controlled_child_command(program, arguments, environment, working_directory, stdin);
 
     let mut child = command
         .spawn()
@@ -5466,6 +5615,29 @@ fn run_process_internal(
         stdout,
         stderr,
     })
+}
+
+fn controlled_child_command(
+    program: &Path,
+    arguments: &[OsString],
+    environment: &[(OsString, OsString)],
+    working_directory: &Path,
+    stdin: Stdio,
+) -> Command {
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .current_dir(working_directory)
+        .stdin(stdin)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for name in CHILD_ENVIRONMENT_REMOVALS {
+        command.env_remove(name);
+    }
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    command
 }
 
 fn capture_failure(stream: &str, failure: CaptureFailure) -> LauncherError {
@@ -6891,5 +7063,103 @@ mod tests {
         let private_key_marker = ["-----BEGIN ", "PRIVATE KEY-----\n"].concat();
         assert!(private_pem.starts_with(&private_key_marker));
         assert!(public_pem.starts_with("-----BEGIN PUBLIC KEY-----\n"));
+    }
+
+    #[test]
+    fn isolated_docker_cli_config_rejects_credentials_and_extra_state() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "datax-isolated-docker-config-test-{}-{unique}",
+            std::process::id()
+        ));
+        let directory = root.join(DOCKER_CLI_CONFIG_DIRECTORY_NAME);
+        let config = directory.join(DOCKER_CLI_CONFIG_FILE_NAME);
+        fs::create_dir_all(&directory).unwrap();
+        fs::write(&config, EMPTY_DOCKER_CLI_CONFIG).unwrap();
+        assert!(validate_isolated_docker_cli_config(&directory, &config).is_ok());
+
+        fs::write(&config, br#"{"auths":{},"credsStore":"unexpected"}"#).unwrap();
+        assert_eq!(
+            validate_isolated_docker_cli_config(&directory, &config)
+                .unwrap_err()
+                .code(),
+            "DOCKER_CONFIG_INVALID"
+        );
+
+        fs::write(&config, EMPTY_DOCKER_CLI_CONFIG).unwrap();
+        fs::write(directory.join("credential-helper-state"), b"unexpected").unwrap();
+        assert_eq!(
+            validate_isolated_docker_cli_config(&directory, &config)
+                .unwrap_err()
+                .code(),
+            "DOCKER_CONFIG_INVALID"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn docker_child_environment_overrides_user_config_and_context() {
+        let isolated_config = PathBuf::from(r"C:\DataX\docker-cli-config");
+        let tools = Tools {
+            docker: PathBuf::from("docker.exe"),
+            compose: PathBuf::from("docker-compose.exe"),
+            docker_host: Some(OsString::from(LOCAL_DOCKER_DESKTOP_ENDPOINTS[0])),
+            docker_cli_config_dir: isolated_config.clone(),
+            reg: PathBuf::from("reg.exe"),
+        };
+        let command = controlled_child_command(
+            Path::new("fixed-child.exe"),
+            &[],
+            &tools.docker_environment(),
+            Path::new("."),
+            Stdio::null(),
+        );
+        let values: BTreeMap<String, Option<String>> = command
+            .get_envs()
+            .map(|(name, value)| {
+                (
+                    name.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            values.get("DOCKER_CONFIG"),
+            Some(&Some(isolated_config.to_string_lossy().into_owned()))
+        );
+        assert_eq!(
+            values.get("DOCKER_HOST"),
+            Some(&Some(String::from(LOCAL_DOCKER_DESKTOP_ENDPOINTS[0])))
+        );
+        for forbidden in [
+            "DOCKER_CONTEXT",
+            "DOCKER_AUTH_CONFIG",
+            "REGISTRY_AUTH_FILE",
+            "COMPOSE_FILE",
+        ] {
+            assert_eq!(values.get(forbidden), Some(&None), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn unhealthy_start_cleanup_failure_is_never_reported_as_clean() {
+        let primary = LauncherError::new("API_LIVE_TIMEOUT", "synthetic primary failure");
+        assert_eq!(
+            merge_unhealthy_start_cleanup_result(primary.clone(), Ok(())).code(),
+            "API_LIVE_TIMEOUT"
+        );
+        let error = merge_unhealthy_start_cleanup_result(
+            primary,
+            Err(LauncherError::new(
+                "COMPOSE_START_CLEANUP_FAILED",
+                "synthetic cleanup failure",
+            )),
+        );
+        assert_eq!(error.code(), "STARTUP_CLEANUP_FAILED");
+        assert!(error.message().contains("API_LIVE_TIMEOUT"));
+        assert!(error.message().contains("COMPOSE_START_CLEANUP_FAILED"));
     }
 }

@@ -30,10 +30,14 @@
   `scripts/acceptance/candidate_root.py` 以外部 CI 身份参数绑定固定仓库、release workflow、
   run/attempt、保护环境、source ref、commit、tag、candidate，并把候选目录中除候选根自身
   以外的全部普通文件按安全相对路径、大小和 SHA-256 进行完整有序盘点；Setup、Launcher、
-  final release manifest 1.1、Compose、顶层/内嵌镜像 lock、ACL helper、SPDX SBOM index、
+  final release manifest 1.1、Compose、顶层/内嵌镜像 lock、Linux build evidence 中生成的
+  image lock、ACL helper、SPDX SBOM index、
   acceptance/environment/catalog 和 Windows build environment 还必须映射到该完整盘点并
   通过跨文件身份/hash 校验；manifest 内三项资源摘要与 canonical signer SHA-256 allowlist
-  也须复核。Acceptance 不是抽查少数字段，而是复用权威 Schema、需求矩阵、catalog、
+  也须复核。生成/验证还强制传入候选目录之外的、由 GitHub-hosted attestor 独立下载的
+  Linux build artifact evidence 目录，并递归比较它与候选内 `linux-evidence/` 的全部普通文件路径、大小和
+  SHA-256；三份镜像 lock 仍须逐字节一致，避免 Windows handoff 在交接后替换已扫描的
+  `repository@sha256` 集合。Acceptance 不是抽查少数字段，而是复用权威 Schema、需求矩阵、catalog、
   environment/evidence root 和完整语义 validator。路径逃逸、大小写
   冲突、符号链接/Windows reparse point、额外/缺失/被改文件、重复 JSON key 和非 canonical
   JSON 均失败关闭。校验器只接受当前 checkout 中固定权威 Schema，并在 Schema 外再次硬
@@ -41,7 +45,9 @@
   `release_approved=false`，机器场景 profile/result、Windows baseline、harness 边界和 E3/E4
   证据包必须显式为 `null` 并给出阻塞原因；它不能表达可发布 PASS。Release workflow
   中 Windows job 生成的顶层 `SHA256SUMS` 只负责 self-hosted → GitHub-hosted 的交接完整性；
-  托管 job 验证成功后删除该瞬时清单，再生成 candidate root。最终候选不得保留一个未覆盖
+  托管 job 还会独立下载并验证 Linux build artifact 的 `SHA256SUMS`，再验证候选内
+  `linux-evidence/` 与该来源完全一致；成功后删除候选顶层的瞬时清单，再生成 candidate root。
+  最终候选不得保留一个未覆盖
   candidate root 的旧 `SHA256SUMS` 并把它声称为完整清单，完整库存职责由 canonical
   candidate root 承担。
 - `egress-guard-attestation.v1.schema.json`：共享网络命名空间内出口守卫的实时证明。
@@ -145,8 +151,9 @@ staging 的 E1 候选实现；`LEGACY` 指针原子提交与 Compose 消费也�
    产生，也不验证 Authenticode、物理/虚拟机洁净度或真实设备行为；必须另由受保护 Windows
    runner 执行签名验证和 E4 取证，不能把自声明 `VALID` 当作签名证明。
    Candidate-root Schema、BLOCKED 生成/验证器及
-   `scripts/acceptance/verify_candidate_attestation.py` 的 E1 基础件已经存在。后者先重算完整
-   candidate file set，再以参数数组调用调用方指定绝对路径的 `gh attestation verify`，固定 repository、
+   `scripts/acceptance/verify_candidate_attestation.py` 的 E1 基础件已经存在。后者在前后两次
+   复核完整 candidate file set 以及候选内 Linux evidence 与调用方传入的独立 hosted copy
+   的完整绑定，再以参数数组调用调用方指定绝对路径的 `gh attestation verify`，固定 repository、
    signer workflow/digest、source ref/digest、GitHub Actions OIDC issuer、SLSA predicate，
    并传入 `--deny-self-hosted-runners`；成功后还复核证书中的 hosted runner、精确
    run/attempt URI、workflow、commit、candidate-root subject SHA 和 verified timestamp，最后
@@ -154,8 +161,8 @@ staging 的 E1 候选实现；`LEGACY` 指针原子提交与 Compose 消费也�
    workflow 尚未把该 TCB 锁作为 wrapper 可独立验证的权威 descriptor 前，即使低层策略
    全部匹配，wrapper 也必须非零返回
    `TRUSTED_ATTESTATION_VERIFIER_TCB_NOT_IMPLEMENTED`，不得返回 `ready=true` 或
-   attestation-valid。Release workflow 已有 E1 接线候选：托管 Ubuntu job 下载并先验证
-   Windows 交接清单，生成/复核 BLOCKED candidate root，以固定 commit 的
+   attestation-valid。Release workflow 已有 E1 接线候选：托管 Ubuntu job 先独立下载并验证
+   Linux build artifact，再下载并验证 Windows 交接清单，生成/复核 BLOCKED candidate root，以固定 commit 的
    `actions/attest` 签发 provenance，并通过 `trusted_gh_cli.py` 将 GitHub CLI 2.97.0 的
    release URL、archive SHA-256 和解包后二进制 SHA-256 固定后执行低层反向验证；随后必须
    精确得到上述 TCB blocker 才允许上传名称含 `blocked` 的候选/证明制品。该 workflow 尚未

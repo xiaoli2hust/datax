@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 RUN apk add --no-cache \
         nftables \
         python3 \
+    && test -x /usr/local/bin/psql \
     && rm -rf /var/cache/apk/*
 
 COPY guard.py healthcheck.py /opt/datax-egress-guard/
