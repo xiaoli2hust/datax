@@ -14,10 +14,24 @@
 3.12 patch 版本，用来运行 hash-locked 的检查依赖，并不改变产品 API/Worker 镜像固定的
 Python 3.12.13，也不构成产品 Runtime 的供应链证明。
 
-该工作流若在线成功，最高证据等级也只能是 **E1**。当前仅完成 workflow 源码和本地静态约束
-测试，尚无 GitHub-hosted 实际运行记录。它不创建、上传或保留任何候选安装包；临时
-`nonrelease-installer-preflight.exe`、其非发布资源、NSIS 和 Cargo 输出都只存在于
-GitHub-hosted runner 的临时目录，并在作业结束前删除。
+它不安装 `backend/requirements-dev.lock`，而只安装
+[`windows-hosted-preflight.requirements.lock`](../../scripts/acceptance/windows-hosted-preflight.requirements.lock)
+内的单个 PyYAML 6.0.3 Windows CPython 3.12 x64 wheel 哈希。这个最小依赖只用于解析 workflow
+以执行本预检的静态反向测试，且配合 `--only-binary=:all:` 与 `--require-hashes` 失败关闭。原因是
+完整开发锁文件合法地包含 Linux 侧 `uvloop`，但该依赖没有 Windows 支持；让 hosted Windows
+预检安装它会在真正的 Launcher/NSIS 检查之前无意义地失败。此独立锁文件不改变产品依赖、镜像或
+发布供应链，也不能作为其证明。
+
+该工作流若在线成功，最高证据等级也只能是 **E1**。2026-08-02 的真实运行不是“绿色”的替身：
+第一次 [run 30723692714](https://github.com/xiaoli2hust/datax/actions/runs/30723692714) 在安装
+`3.12.13` 时发现该 patch 不存在于 `windows-2025`，因此在任何编译前失败；把检查器固定到可用的
+`3.12.10` 后，第二次 [run 30723744355](https://github.com/xiaoli2hust/datax/actions/runs/30723744355)
+证明 Python 安装成功，却在安装完整 Linux 开发锁文件中的 `uvloop` 时失败，仍在任何 Launcher、
+NSIS、签名或候选产物之前。本文所述最小 Windows wheel lock 修复该第二个失败条件；修复后的真实
+run 尚待记录，不能预先表述为 E1 通过。
+
+它不创建、上传或保留任何候选安装包；临时 `nonrelease-installer-preflight.exe`、其非发布资源、
+NSIS 和 Cargo 输出都只存在于 GitHub-hosted runner 的临时目录，并在作业结束前删除。
 
 ## 硬边界
 

@@ -7,6 +7,9 @@ import yaml
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_PATH = REPOSITORY_ROOT / ".github/workflows/windows-hosted-preflight.yml"
+REQUIREMENTS_PATH = REPOSITORY_ROOT / (
+    "scripts/acceptance/windows-hosted-preflight.requirements.lock"
+)
 CHECKOUT_ACTION = "actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1"
 PYTHON_ACTION = "actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97"
 NSIS_ARCHIVE_URL = (
@@ -95,6 +98,37 @@ class WindowsHostedPreflightTests(unittest.TestCase):
             "Remove-Item -LiteralPath $preflightRoot -Recurse -Force",
             self.raw,
         )
+
+    def test_static_check_dependency_is_minimal_hash_locked_and_windows_compatible(self) -> None:
+        requirements = REQUIREMENTS_PATH.read_text(encoding="utf-8")
+        self.assertIn(
+            "-r scripts/acceptance/windows-hosted-preflight.requirements.lock",
+            self.raw,
+        )
+        self.assertIn("--only-binary=:all: --require-hashes", self.raw)
+        self.assertNotIn("backend/requirements-dev.lock", self.raw)
+        self.assertIn(
+            "scripts/acceptance/windows-hosted-preflight.requirements.lock",
+            self.workflow["on"]["pull_request"]["paths"],
+        )
+        self.assertIn(
+            "scripts/acceptance/windows-hosted-preflight.requirements.lock",
+            self.workflow["on"]["push"]["paths"],
+        )
+
+        non_comment_lines = [
+            line.strip()
+            for line in requirements.splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        ]
+        self.assertEqual(
+            non_comment_lines,
+            [
+                "pyyaml==6.0.3 \\",
+                "--hash=sha256:5fcd34e47f6e0b794d17de1b4ff496c00986e1c83f7ab2fb8fcfe9616ff7477b",
+            ],
+        )
+        self.assertNotIn("uvloop", "\n".join(non_comment_lines).lower())
 
 
 if __name__ == "__main__":
