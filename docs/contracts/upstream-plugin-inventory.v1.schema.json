@@ -1,0 +1,216 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/upstream-plugin-inventory.v1.schema.json",
+  "title": "Locked Alibaba DataX Reader and Writer Source Inventory V1",
+  "description": "由固定上游源码、根 POM、模块 POM 与 plugin.json 重建的 SOURCE_PRESENT 目录。候选分类不是认证，目录中的插件均不可由普通用户执行。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "certification_policy",
+    "direction_counts",
+    "plugin_count",
+    "plugins",
+    "schema_version",
+    "upstream"
+  ],
+  "properties": {
+    "certification_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_classification_is_certification",
+        "maximum_proven_state",
+        "ordinary_user_executable"
+      ],
+      "properties": {
+        "candidate_classification_is_certification": {
+          "const": false
+        },
+        "maximum_proven_state": {
+          "const": "SOURCE_PRESENT"
+        },
+        "ordinary_user_executable": {
+          "const": false
+        }
+      }
+    },
+    "direction_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "READER",
+        "WRITER"
+      ],
+      "properties": {
+        "READER": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "WRITER": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "plugin_count": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "plugins": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/plugin"
+      }
+    },
+    "schema_version": {
+      "const": "1.0"
+    },
+    "upstream": {
+      "$ref": "#/$defs/upstream"
+    }
+  },
+  "$defs": {
+    "sha1": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "upstream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commit",
+        "repository",
+        "root_pom_path",
+        "root_pom_sha256",
+        "source_manifest_path",
+        "source_manifest_sha256",
+        "source_tree",
+        "tag",
+        "upstream_lock_path",
+        "upstream_lock_sha256"
+      ],
+      "properties": {
+        "commit": {
+          "$ref": "#/$defs/sha1"
+        },
+        "repository": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https://github\\.com/alibaba/DataX\\.git$"
+        },
+        "root_pom_path": {
+          "const": "third_party/alibaba-datax/pom.xml"
+        },
+        "root_pom_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_manifest_path": {
+          "const": "runtime/upstream-files.sha256"
+        },
+        "source_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "source_tree": {
+          "$ref": "#/$defs/sha1"
+        },
+        "tag": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$"
+        },
+        "upstream_lock_path": {
+          "const": "runtime/upstream.lock.json"
+        },
+        "upstream_lock_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "candidate_scope",
+        "certification_state",
+        "direction",
+        "maven_artifact_id",
+        "module",
+        "module_pom_path",
+        "module_pom_sha256",
+        "ordinary_user_executable",
+        "plugin_class",
+        "plugin_json_path",
+        "plugin_json_sha256",
+        "plugin_name"
+      ],
+      "properties": {
+        "candidate_scope": {
+          "type": "string",
+          "enum": [
+            "NONE",
+            "V1_BUSINESS",
+            "INTERNAL_SMOKE"
+          ]
+        },
+        "certification_state": {
+          "const": "SOURCE_PRESENT"
+        },
+        "direction": {
+          "type": "string",
+          "enum": [
+            "READER",
+            "WRITER"
+          ]
+        },
+        "maven_artifact_id": {
+          "$ref": "#/$defs/moduleName"
+        },
+        "module": {
+          "$ref": "#/$defs/moduleName"
+        },
+        "module_pom_path": {
+          "type": "string",
+          "pattern": "^third_party/alibaba-datax/[a-z][a-z0-9._-]{2,63}/pom\\.xml$"
+        },
+        "module_pom_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "ordinary_user_executable": {
+          "const": false
+        },
+        "plugin_class": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 256,
+          "pattern": "^[A-Za-z_$][A-Za-z0-9_$.]+$"
+        },
+        "plugin_json_path": {
+          "type": "string",
+          "pattern": "^third_party/alibaba-datax/[a-z][a-z0-9._-]{2,63}/src/main/resources/plugin\\.json$"
+        },
+        "plugin_json_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "plugin_name": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 64,
+          "pattern": "^[A-Za-z][A-Za-z0-9._-]+$"
+        }
+      }
+    },
+    "moduleName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 64,
+      "pattern": "^[a-z][a-z0-9._-]+$"
+    }
+  }
+}
