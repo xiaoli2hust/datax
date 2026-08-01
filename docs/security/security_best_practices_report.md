@@ -105,6 +105,7 @@ verifier/ID-hash 快照不能证明它已禁用。Release Owner 必须保存 Set
 | guard 单元/HTTP 合约 | 21/21 通过 | E1 |
 | 后端完整测试 | 通过（含预期 skip） | E1/E2 |
 | acceptance 测试 | 64/64 通过（含 hosted Windows 预检和本地 E4 前置观察器负向边界） | E1 |
+| GitHub-hosted Windows 预检 `30724285608` | Windows Server 上的 Launcher 测试/release 构建、固定 NSIS hash、临时 installer 编译与删除均通过；无签名、上传或安装 | E1 |
 | release/Environment/Setup 定向测试 | 20/20 通过 | E1 |
 | Launcher Rust 库测试 | 58/58 通过 | E1 |
 | Rust format + Clippy | 通过 | E1 |

@@ -37,7 +37,12 @@ NSIS、签名或候选产物之前。本文所述最小 Windows wheel lock 修�
 已经通过 Launcher 原生测试与 release 构建，却发现 PowerShell `Invoke-WebRequest` 返回内容的
 SHA-256 不等于固定 NSIS archive；工作流在解压前停止且 finally 清理临时目录。下载器现改为
 显式 `%SystemRoot%\System32\curl.exe`，禁用用户 curl 配置、仅允许 HTTPS 及 HTTPS 重定向，并在
-相同 SHA-256 校验后才解压；修复后的真实 run 仍待记录。
+相同 SHA-256 校验后才解压。第五次
+[run 30724285608](https://github.com/xiaoli2hust/datax/actions/runs/30724285608) 在同一 Windows Server
+runner 完整通过：57 个 Windows 可执行 Launcher 单元测试、release 构建、固定 NSIS archive hash、
+`makensis` 对临时输入的编译，以及生成物删除均成功。日志记录该临时 installer 的输出大小为
+487,477 bytes，随后其完整临时根目录被删除；此记录是可复查的 **E1**，不是签名候选、安装验收或
+E4。
 
 它不创建、上传或保留任何候选安装包；临时 `nonrelease-installer-preflight.exe`、其非发布资源、
 NSIS 和 Cargo 输出都只存在于 GitHub-hosted runner 的临时目录，并在作业结束前删除。
