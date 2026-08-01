@@ -89,7 +89,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             if item["name"] == "Install the hash-locked GitHub CLI verifier"
         )
         script = step["run"]
-        self.assertIn("trusted_gh_cli.py metadata --field archive_url", script)
+        self.assertIn("trusted_gh_cli.py archive-url", script)
         self.assertIn("trusted_gh_cli.py \\\n  install", script)
         self.assertIn("trusted_gh_cli.py \\\n  verify", script)
         self.assertIn("--proto '=https'", script)

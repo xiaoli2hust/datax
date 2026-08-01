@@ -778,7 +778,7 @@ jobs:
           TRUSTED_GH_DIRECTORY: ${{ runner.temp }}/trusted-gh-cli
         run: |
           set -euo pipefail
-          archive_url="$(python scripts/acceptance/trusted_gh_cli.py metadata --field archive_url)"
+          archive_url="$(python scripts/acceptance/trusted_gh_cli.py archive-url)"
           archive_path="${RUNNER_TEMP}/gh_2.97.0_linux_amd64.tar.gz"
           test ! -e "${archive_path}"
           mkdir -p "${TRUSTED_GH_DIRECTORY}"
@@ -859,7 +859,7 @@ jobs:
             "${evidence_directory}/candidate-root.v1.json"
           cp "${ATTESTATION_BUNDLE}" "${evidence_directory}/candidate-root.attestation.json"
           python scripts/acceptance/trusted_gh_cli.py metadata \
-            > "${evidence_directory}/trusted-gh-cli-lock.json"
+            --output "${evidence_directory}/trusted-gh-cli-lock.json"
           echo "evidence_directory=${evidence_directory}" >> "${GITHUB_OUTPUT}"
 
       - name: Upload the canonical blocked candidate

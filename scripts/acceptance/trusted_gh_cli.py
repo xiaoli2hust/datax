@@ -41,17 +41,9 @@ def _arguments() -> argparse.Namespace:
         )
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("archive-url")
     metadata = subparsers.add_parser("metadata")
-    metadata.add_argument(
-        "--field",
-        choices=(
-            "archive_url",
-            "archive_sha256",
-            "archive_member",
-            "executable_sha256",
-            "version",
-        ),
-    )
+    metadata.add_argument("--output", type=Path, required=True)
     install = subparsers.add_parser("install")
     install.add_argument("--archive", type=Path, required=True)
     install.add_argument("--output", type=Path, required=True)
@@ -118,6 +110,22 @@ def trusted_metadata() -> dict[str, str]:
         "release_url": TRUSTED_GH_RELEASE_URL,
         "version": TRUSTED_GH_VERSION,
     }
+
+
+def write_trusted_metadata(*, output_path: Path) -> None:
+    output = _output_path(output_path)
+    payload = (
+        json.dumps(trusted_metadata(), sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode("utf-8")
+    try:
+        descriptor = os.open(output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o444)
+        with os.fdopen(descriptor, "wb") as target:
+            target.write(payload)
+            target.flush()
+            os.fsync(target.fileno())
+    except BaseException:
+        output.unlink(missing_ok=True)
+        raise
 
 
 def install_trusted_gh(*, archive_path: Path, output_path: Path) -> dict[str, Any]:
@@ -216,41 +224,28 @@ def verify_trusted_gh(
 def main() -> int:
     arguments = _arguments()
     try:
-        if arguments.command == "metadata":
-            metadata = trusted_metadata()
-            if arguments.field:
-                print(metadata[arguments.field])
-            else:
-                print(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+        if arguments.command == "archive-url":
+            print(TRUSTED_GH_ARCHIVE_URL)
+        elif arguments.command == "metadata":
+            write_trusted_metadata(output_path=arguments.output)
         elif arguments.command == "install":
-            print(
-                json.dumps(
-                    install_trusted_gh(
-                        archive_path=arguments.archive,
-                        output_path=arguments.output,
-                    ),
-                    sort_keys=True,
-                )
+            install_trusted_gh(
+                archive_path=arguments.archive,
+                output_path=arguments.output,
             )
         else:
-            print(
-                json.dumps(
-                    verify_trusted_gh(executable_path=arguments.executable),
-                    sort_keys=True,
-                )
-            )
+            verify_trusted_gh(executable_path=arguments.executable)
         return 0
     except (
         OSError,
         tarfile.TarError,
         subprocess.SubprocessError,
         ValueError,
-    ) as exc:
+    ):
         print(
             json.dumps(
                 {
                     "code": "TRUSTED_GH_CLI_INVALID",
-                    "detail": str(exc),
                     "ready": False,
                 },
                 sort_keys=True,

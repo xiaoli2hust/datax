@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import subprocess
 import tarfile
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from unittest import mock
 
@@ -28,6 +30,51 @@ class TrustedGitHubCliTests(unittest.TestCase):
             trusted_gh_cli.TRUSTED_GH_EXECUTABLE_SHA256,
             "141507c337e8b202ad398550c3b73d72f5af92e86f71665214538a81efd4c409",
         )
+
+    def test_cli_only_echoes_the_fixed_archive_url(self) -> None:
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(
+                trusted_gh_cli.sys,
+                "argv",
+                ["trusted_gh_cli.py", "archive-url"],
+            ),
+            redirect_stdout(stdout),
+            redirect_stderr(stderr),
+        ):
+            status = trusted_gh_cli.main()
+        self.assertEqual(status, 0)
+        self.assertEqual(stdout.getvalue(), f"{trusted_gh_cli.TRUSTED_GH_ARCHIVE_URL}\n")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_cli_writes_lock_metadata_without_echoing_the_output_path(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory).resolve() / "trusted-gh-lock.json"
+            stdout = io.StringIO()
+            stderr = io.StringIO()
+            with (
+                mock.patch.object(
+                    trusted_gh_cli.sys,
+                    "argv",
+                    [
+                        "trusted_gh_cli.py",
+                        "metadata",
+                        "--output",
+                        str(output),
+                    ],
+                ),
+                redirect_stdout(stdout),
+                redirect_stderr(stderr),
+            ):
+                status = trusted_gh_cli.main()
+            self.assertEqual(status, 0)
+            self.assertEqual(stdout.getvalue(), "")
+            self.assertEqual(stderr.getvalue(), "")
+            self.assertEqual(
+                json.loads(output.read_text(encoding="utf-8")),
+                trusted_gh_cli.trusted_metadata(),
+            )
 
     def test_install_and_verify_exact_locked_executable(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
