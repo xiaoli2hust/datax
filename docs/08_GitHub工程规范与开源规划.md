@@ -8,10 +8,12 @@
 | 发布单位 | Windows 11 x64 已签名 Setup/Launcher、源码标签、镜像摘要、迁移版本、Runtime manifest、哈希与 SBOM |
 | 当前许可证 | 仓库所有者尚未选择；公开源码前必须完成 |
 
-> 当前远端治理边界：下述“受保护主干”是发布目标。当前线上快照为 0 个 ruleset，
-> `main` 未保护；需要先推送当前工作流，再由仓库管理员配置必需检查。工作流文件或本地
-> 扫描结果不能表述为线上合并强制门禁。仓库发布工作流仍生成 `gate_result=BLOCKED`
-> 且需求项为 `NOT_RUN/E0` 的候选证据，不批准公开发布。
+> 当前远端治理边界：截至 2026-08-01，`main` 已启用经典分支保护，严格要求分支最新、
+> 线性历史、PR、会话解决以及本文列出的 12 个 CI/安全检查，且禁止强推和删除；管理员
+> 同样受约束。当前仓库只有一名维护者，为避免自提交 PR 永久不可合并，审批数暂为 0，
+> 因而不能把该设置表述为独立人工复核。漏洞告警与 Dependabot security updates 已启用。
+> 仓库发布工作流仍生成 `gate_result=BLOCKED` 且需求项为 `NOT_RUN/E0` 的候选证据，
+> 不批准公开发布。
 
 ## 1. 仓库目标
 
@@ -114,15 +116,19 @@ Docker Desktop 与 WSL2 是用户自行安装和按适用许可使用的 Windows
 
 ## 5. 主分支保护
 
-仓库管理员应在首次代码 PR 前启用：
+当前 `main` 已启用：
 
-- 必须通过 PR 合并，至少 1 名审批人。
-- 代码所有者路径需要对应审批。
-- 所有必需 CI 状态通过。
+- 必须通过 PR 合并；当前单维护者阶段审批数为 0，增加独立维护者后应提升到至少 1。
+- 所有 12 个必需 CI/安全状态通过：后端与契约、PostgreSQL 迁移往返、前端、Windows
+  Launcher、全历史秘密扫描、依赖审计、Worker Runtime 审计、四语言 CodeQL 和 CodeQL
+  聚合门禁。
 - 分支必须与 `main` 保持最新。
 - 禁止 force push 和删除 `main`。
-- 合并后自动删除分支。
-- 安全敏感目录建议 2 名审批人。
+- 要求线性历史并解决所有会话。
+- 管理员不得绕过以上保护。
+
+代码所有者审批、至少 1 名独立审批人、合并后自动删除分支，以及安全敏感目录 2 名审批
+仍是增加协作者后的治理目标；当前不得把 0 审批配置称为“四眼原则”已经实现。
 
 建议使用 squash merge；PR 标题成为主干提交摘要。
 
@@ -149,13 +155,13 @@ Docker Desktop 与 WSL2 是用户自行安装和按适用许可使用的 Windows
   `BLOCKED` 的候选证据。promotion 默认继续阻断，只有逐项精确且不超过 90 天的例外才
   可放行；这不是“镜像漏洞已清零”。
 - `dependabot.yml` 已配置 GitHub Actions、backend pip、security-tooling pip、npm 和
-  Windows Cargo 的每周版本更新。GitHub 仓库外部设置中的 Dependabot security updates
-  当前仍为 disabled，版本更新配置不能冒充安全更新服务已经启用。
+  Windows Cargo 的每周版本更新；仓库漏洞告警与 Dependabot security updates 已于
+  2026-08-01 在线启用。
 
-这些是仓库配置和本地证据，不是“线上已经通过”的证据。当前改动仍需推送，`main` 尚未
-由 ruleset 强制这些检查；真实 GitHub candidate/release、Grype OS 状态、Windows
-release runner 和签名结果均未在线验证。Java 源码也没有独立的 PR 级 CodeQL 构建分析；
-当前 Maven 暴露主要由最终 Worker 镜像 SBOM/OSV 应用门禁覆盖。
+最新 PR 的 CI、安全工作流与 CodeQL 聚合门禁已在线通过，PR 开放 CodeQL 告警为 0；
+`main` 的经典分支保护已强制上述检查。这不等于 candidate/release、Grype OS 状态、
+Windows release runner 或签名结果已经在线验证。Java 源码也没有独立的 PR 级 CodeQL
+构建分析；当前 Maven 暴露主要由最终 Worker 镜像 SBOM/OSV 应用门禁覆盖。
 
 ### 文档阶段
 
