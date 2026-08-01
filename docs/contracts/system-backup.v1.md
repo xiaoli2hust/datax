@@ -114,7 +114,11 @@ HMAC/KEK 任意重用或未知密钥对象一律失败关闭。`installation_id`
 6. 中断后只允许使用同一包对和秘密继续，或只清理由 journal 记录的 staging 对象。
 
 以上门禁及干净 Windows 11 x64 异机演练完成前，恢复和覆盖升级必须保持失败关闭。普通
-`start` 不得把部分恢复当作全新安装，也不得生成替代 KEK。
+`start` 不得把部分恢复当作全新安装，也不得生成替代 KEK。当前 Launcher 已在
+`start/backup` 的任何初始化或备份读取前检查固定应用数据根下的 `system-restore`；只要
+该状态存在（包括未知、损坏或未完成状态）就返回 `RESTORE_IN_PROGRESS`，检查本身失败则
+返回 `RESTORE_STATE_CHECK_FAILED`。这只是不破坏现有 staging 的 E1 门禁，不代表继续恢复、
+授权清理或 Windows E4 已完成。
 
 ### 6.1 当前已实现的内部 staging 边界
 

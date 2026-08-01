@@ -428,6 +428,7 @@ where
 
     match action {
         Action::Start => {
+            ensure_no_restore_in_progress(&installation.app_data_root)?;
             let mut tools = Tools::discover(&installation.install_dir)?;
             platform::ensure_hardware_prerequisites(&installation.local_app_data)?;
             let start_tools = StartTools::discover()?;
@@ -452,6 +453,7 @@ where
             data_key,
             secrets_key,
         } => {
+            ensure_no_restore_in_progress(&installation.app_data_root)?;
             let mut tools = Tools::discover(&installation.install_dir)?;
             platform::ensure_hardware_prerequisites(&installation.local_app_data)?;
             let start_tools = StartTools::discover()?;
@@ -2969,6 +2971,21 @@ fn ensure_clean_restore_target(
         ));
     }
     Ok(())
+}
+
+fn ensure_no_restore_in_progress(app_data_root: &Path) -> Result<(), LauncherError> {
+    let restore_root = app_data_root.join("system-restore");
+    match fs::symlink_metadata(&restore_root) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(LauncherError::new(
+            "RESTORE_STATE_CHECK_FAILED",
+            "无法证明本机不存在未完成的系统恢复；普通启动和备份已安全阻断。",
+        )),
+        Ok(_) => Err(LauncherError::new(
+            "RESTORE_IN_PROGRESS",
+            "检测到受控 system-restore 状态。普通启动和备份不会把部分恢复初始化为空白安装，也不会生成替代 secret、installation-id 或数据卷；请使用同一包对和恢复秘密继续恢复，或走 journal 授权的清理流程。",
+        )),
+    }
 }
 
 fn ensure_restore_identity_path_absent(path: &Path) -> Result<(), LauncherError> {
@@ -5922,6 +5939,64 @@ mod tests {
         assert!(restore_stage_result_valid(&result));
         result.state = "SUCCEEDED".to_owned();
         assert!(!restore_stage_result_valid(&result));
+    }
+
+    #[test]
+    fn staged_restore_blocks_start_without_initialization_side_effects() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let app_data_root = env::temp_dir().join(format!(
+            "datax-restore-start-guard-test-{}-{unique}",
+            std::process::id()
+        ));
+        let restore_root = app_data_root.join("system-restore");
+        let staging_root = restore_root.join("staging");
+        let journal_directory = restore_root.join("journal");
+        fs::create_dir_all(staging_root.join("data")).unwrap();
+        fs::create_dir_all(staging_root.join("secrets")).unwrap();
+        fs::create_dir_all(&journal_directory).unwrap();
+        let journal_path = journal_directory.join("restore.json");
+        let journal = br#"{"schema_version":"1.0","state":"STAGED_COMMIT_BLOCKED","authentication":{"algorithm":"HMAC-SHA256","key_domain":"DXES-RESTORE-JOURNAL-HMAC-v1","mac_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}"#;
+        fs::write(&journal_path, journal).unwrap();
+
+        let error = ensure_no_restore_in_progress(&app_data_root).unwrap_err();
+
+        assert_eq!(error.code(), "RESTORE_IN_PROGRESS");
+        assert!(error.to_string().contains("普通启动和备份"));
+        assert_eq!(fs::read(&journal_path).unwrap(), journal);
+        for path in [
+            app_data_root.join("initialization-incomplete"),
+            app_data_root.join("installation-id"),
+            app_data_root.join("runtime-generation.json"),
+            app_data_root.join("secrets"),
+        ] {
+            assert!(!path.exists(), "guard created {}", path.display());
+        }
+        assert!(staging_root.join("data").is_dir());
+        assert!(staging_root.join("secrets").is_dir());
+
+        fs::remove_dir_all(app_data_root).unwrap();
+    }
+
+    #[test]
+    fn start_restore_guard_checks_only_the_fixed_restore_root_without_creating_it() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let app_data_root = env::temp_dir().join(format!(
+            "datax-restore-start-guard-absence-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&app_data_root).unwrap();
+        fs::create_dir(app_data_root.join("system-restore-old")).unwrap();
+
+        ensure_no_restore_in_progress(&app_data_root).unwrap();
+
+        assert!(!app_data_root.join("system-restore").exists());
+        fs::remove_dir_all(app_data_root).unwrap();
     }
 
     #[test]
