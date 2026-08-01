@@ -820,6 +820,14 @@ h3 {
   font-size: 12px;
 }
 
+.metadata-purpose-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .scope-columns {
   margin: 20px 0;
 }

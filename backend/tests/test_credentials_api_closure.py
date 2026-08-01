@@ -838,6 +838,34 @@ def test_usage_grants_require_same_project_and_replace_atomically(
     assert forbidden_put.status_code == 403
 
 
+def test_metadata_requires_the_exact_declared_usage_grant(
+    credential_api_stack: CredentialApiStack,
+) -> None:
+    stack = credential_api_stack
+    datasource_id = stack.ids["datasource_a"]
+    granted = stack.client.put(
+        f"/api/v1/datasources/{datasource_id}/grants/"
+        f"{stack.ids['viewer_member_a']}",
+        json={"usages": ["SOURCE_USE"]},
+    )
+    assert granted.status_code == 200, granted.text
+    stack.principal_ref["value"] = _principal(
+        user_id=stack.ids["viewer_a"],
+        organization_id=stack.ids["org_a"],
+        email="viewer-a@example.com",
+        role=Role.DEVELOPER,
+        scope_id=stack.ids["project_a"],
+    )
+
+    denied = stack.client.get(
+        f"/api/v1/datasources/{datasource_id}/schema/tables",
+        params={"usage": "TARGET_USE"},
+    )
+
+    assert denied.status_code == 403
+    assert denied.json()["code"] == "DATASOURCE_USAGE_NOT_GRANTED"
+
+
 def test_datasource_delete_is_soft_blocked_by_active_references_and_audited(
     credential_api_stack: CredentialApiStack,
 ) -> None:
@@ -1472,14 +1500,14 @@ def test_metadata_cursor_pages_without_repeating_and_rejects_scope_changes(
     url = (
         f"/api/v1/datasources/{stack.ids['datasource_a']}/schema/tables"
     )
-    first = stack.client.get(url, params={"limit": 1})
+    first = stack.client.get(url, params={"usage": "SOURCE_USE", "limit": 1})
     assert first.status_code == 200, first.text
     assert [item["table_name"] for item in first.json()["items"]] == ["alpha"]
     cursor = first.json()["next_cursor"]
     assert cursor
     second = stack.client.get(
         url,
-        params={"limit": 1, "cursor": cursor},
+        params={"usage": "SOURCE_USE", "limit": 1, "cursor": cursor},
     )
     assert second.status_code == 200, second.text
     assert [item["table_name"] for item in second.json()["items"]] == ["beta"]
@@ -1495,14 +1523,14 @@ def test_metadata_cursor_pages_without_repeating_and_rejects_scope_changes(
     stack.principal_ref["value"] = other_admin
     wrong_actor = stack.client.get(
         url,
-        params={"limit": 1, "cursor": cursor},
+        params={"usage": "SOURCE_USE", "limit": 1, "cursor": cursor},
     )
     assert wrong_actor.status_code == 400
     assert wrong_actor.json()["code"] == "CURSOR_INVALID"
     stack.principal_ref["value"] = stack.admin_a
     wrong_datasource = stack.client.get(
         f"/api/v1/datasources/{other_datasource_id}/schema/tables",
-        params={"limit": 1, "cursor": cursor},
+        params={"usage": "SOURCE_USE", "limit": 1, "cursor": cursor},
     )
     assert wrong_datasource.status_code == 400
     assert wrong_datasource.json()["code"] == "CURSOR_INVALID"
@@ -1510,12 +1538,23 @@ def test_metadata_cursor_pages_without_repeating_and_rejects_scope_changes(
         url,
         params={
             "limit": 1,
+            "usage": "SOURCE_USE",
             "cursor": cursor,
             "schema_name": "public",
         },
     )
     assert changed_filter.status_code == 400
     assert changed_filter.json()["code"] == "CURSOR_INVALID"
+    changed_usage = stack.client.get(
+        url,
+        params={
+            "usage": "TARGET_USE",
+            "limit": 1,
+            "cursor": cursor,
+        },
+    )
+    assert changed_usage.status_code == 400
+    assert changed_usage.json()["code"] == "CURSOR_INVALID"
     assert connector_calls == [None, ("public", "alpha")]
 
     def metadata_failure(*_args: object, **_kwargs: object) -> None:
@@ -1526,7 +1565,10 @@ def test_metadata_cursor_pages_without_repeating_and_rejects_scope_changes(
         "schema_snapshots",
         metadata_failure,
     )
-    unavailable = stack.client.get(url, params={"limit": 1})
+    unavailable = stack.client.get(
+        url,
+        params={"usage": "SOURCE_USE", "limit": 1},
+    )
     assert unavailable.status_code == 503
     assert unavailable.json()["code"] == "DATASOURCE_METADATA_UNAVAILABLE"
     assert unavailable.json()["retryable"] is True

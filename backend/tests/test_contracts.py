@@ -75,6 +75,12 @@ def test_datasource_patch_and_pagination_contract_cover_immutable_edits() -> Non
             item.get("$ref") == "#/components/parameters/Cursor"
             for item in parameters
         )
+    metadata_parameters = specification["paths"][
+        "/datasources/{datasource_id}/schema/tables"
+    ]["get"]["parameters"]
+    usage = next(item for item in metadata_parameters if item.get("name") == "usage")
+    assert usage["required"] is True
+    assert usage["schema"]["enum"] == ["SOURCE_USE", "TARGET_USE"]
 
 
 def test_all_json_schemas_are_valid_draft_2020_12_schemas() -> None:

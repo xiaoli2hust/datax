@@ -188,7 +188,7 @@ async function sourceChanged(): Promise<void> {
   sourceLoading.value = true;
   error.value = null;
   try {
-    sourceTables.value = await loadAllTables(form.sourceDatasourceId);
+    sourceTables.value = await loadAllTables(form.sourceDatasourceId, "SOURCE_USE");
   } catch (caught) {
     error.value = caught;
   } finally {
@@ -219,7 +219,7 @@ async function targetChanged(): Promise<void> {
   targetLoading.value = true;
   error.value = null;
   try {
-    targetTables.value = await loadAllTables(form.targetDatasourceId);
+    targetTables.value = await loadAllTables(form.targetDatasourceId, "TARGET_USE");
   } catch (caught) {
     error.value = caught;
   } finally {
@@ -227,11 +227,14 @@ async function targetChanged(): Promise<void> {
   }
 }
 
-async function loadAllTables(datasourceId: string): Promise<TableSchema[]> {
+async function loadAllTables(
+  datasourceId: string,
+  usage: "SOURCE_USE" | "TARGET_USE",
+): Promise<TableSchema[]> {
   const collected: TableSchema[] = [];
   let cursor: string | undefined;
   do {
-    const page = await listDatasourceTables(datasourceId, { cursor });
+    const page = await listDatasourceTables(datasourceId, { usage, cursor });
     collected.push(...page.items);
     cursor =
       page.has_more && page.next_cursor

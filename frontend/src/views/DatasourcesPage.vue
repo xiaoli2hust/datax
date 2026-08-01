@@ -22,6 +22,7 @@ import type {
   DatasourceAdminDetail,
   DatasourceSummary,
   DatasourceTestResult,
+  DatasourceUsage,
   EndpointPolicySummary,
   Engine,
   TableSchema,
@@ -66,9 +67,11 @@ const metadataLoadingMore = ref(false);
 const metadataLoadingAll = ref(false);
 const metadataError = ref<unknown>(null);
 const metadataDatasource = ref<DatasourceSummary | null>(null);
+const metadataUsage = ref<DatasourceUsage | null>(null);
 const metadataNextCursor = ref<string | null>(null);
 const metadataHasMore = ref(false);
 const tables = ref<TableSchema[]>([]);
+const metadataRequestToken = ref(0);
 const createKey = ref(newIdempotencyKey());
 
 const form = reactive({
@@ -466,33 +469,65 @@ async function openDetail(item: DatasourceSummary): Promise<void> {
 
 async function loadMetadataPage(append: boolean): Promise<void> {
   const target = metadataDatasource.value;
-  if (!target) return;
+  const usage = metadataUsage.value;
+  if (!target || !usage) return;
+  const requestToken = metadataRequestToken.value;
+  const requestIsCurrent = (): boolean =>
+    metadataRequestToken.value === requestToken &&
+    metadataDatasource.value?.id === target.id &&
+    metadataUsage.value === usage;
   if (append) metadataLoadingMore.value = true;
   else metadataLoading.value = true;
   metadataError.value = null;
   try {
     const page = await listDatasourceTables(target.id, {
+      usage,
       cursor: append ? (metadataNextCursor.value ?? undefined) : undefined,
     });
+    if (!requestIsCurrent()) return;
     if (append) tables.value.push(...page.items);
     else tables.value = page.items;
     metadataNextCursor.value = page.next_cursor;
     metadataHasMore.value = page.has_more;
   } catch (caught) {
-    metadataError.value = caught;
+    if (requestIsCurrent()) metadataError.value = caught;
   } finally {
-    metadataLoading.value = false;
-    metadataLoadingMore.value = false;
+    if (requestIsCurrent()) {
+      metadataLoading.value = false;
+      metadataLoadingMore.value = false;
+    }
   }
 }
 
-async function openMetadata(item: DatasourceSummary): Promise<void> {
+function openMetadata(item: DatasourceSummary): void {
   if (!props.egressReady) {
     ElMessage.error("本机网络出口策略尚未就绪，不能读取数据库元数据。");
     return;
   }
+  metadataRequestToken.value += 1;
+  metadataLoading.value = false;
+  metadataLoadingMore.value = false;
+  metadataLoadingAll.value = false;
   metadataVisible.value = true;
   metadataDatasource.value = item;
+  metadataUsage.value = null;
+  metadataError.value = null;
+  metadataNextCursor.value = null;
+  metadataHasMore.value = false;
+  tables.value = [];
+}
+
+async function loadMetadataForUsage(usage: DatasourceUsage): Promise<void> {
+  if (
+    metadataLoading.value ||
+    metadataLoadingMore.value ||
+    metadataLoadingAll.value
+  ) {
+    return;
+  }
+  metadataRequestToken.value += 1;
+  metadataUsage.value = usage;
+  metadataError.value = null;
   metadataNextCursor.value = null;
   metadataHasMore.value = false;
   tables.value = [];
@@ -501,21 +536,53 @@ async function openMetadata(item: DatasourceSummary): Promise<void> {
 
 async function loadAllMetadata(): Promise<void> {
   if (!metadataHasMore.value || metadataLoadingAll.value) return;
+  const target = metadataDatasource.value;
+  const usage = metadataUsage.value;
+  if (!target || !usage) return;
+  const requestToken = metadataRequestToken.value;
+  const requestIsCurrent = (): boolean =>
+    metadataRequestToken.value === requestToken &&
+    metadataDatasource.value?.id === target.id &&
+    metadataUsage.value === usage;
   metadataLoadingAll.value = true;
   const seen = new Set<string>();
   try {
-    while (metadataHasMore.value && metadataNextCursor.value) {
+    while (
+      requestIsCurrent() &&
+      metadataHasMore.value &&
+      metadataNextCursor.value
+    ) {
       const cursor = metadataNextCursor.value;
       if (seen.has(cursor)) throw new Error("服务端返回了重复分页游标，已停止加载。");
       seen.add(cursor);
       await loadMetadataPage(true);
+      if (!requestIsCurrent()) return;
       if (metadataError.value) break;
     }
   } catch (caught) {
-    metadataError.value = caught;
+    if (requestIsCurrent()) metadataError.value = caught;
   } finally {
-    metadataLoadingAll.value = false;
+    if (requestIsCurrent()) metadataLoadingAll.value = false;
   }
+}
+
+async function retryMetadata(): Promise<void> {
+  const usage = metadataUsage.value;
+  if (!usage) return;
+  await loadMetadataForUsage(usage);
+}
+
+function closeMetadata(): void {
+  metadataRequestToken.value += 1;
+  metadataLoading.value = false;
+  metadataLoadingMore.value = false;
+  metadataLoadingAll.value = false;
+  metadataDatasource.value = null;
+  metadataUsage.value = null;
+  metadataError.value = null;
+  metadataNextCursor.value = null;
+  metadataHasMore.value = false;
+  tables.value = [];
 }
 
 onMounted(() => void load());
@@ -911,8 +978,25 @@ watch(
       v-model="metadataVisible"
       :title="`${metadataDatasource?.name ?? ''} · 表与字段元数据`"
       size="min(840px, 96vw)"
+      @closed="closeMetadata"
     >
-      <ProblemPanel v-if="metadataError" :error="metadataError" :show-retry="false" />
+      <div class="metadata-action">
+        <div class="metadata-purpose-copy">
+          <strong>按本次用途读取</strong>
+          <span>
+            服务端会精确校验 SOURCE_USE 或 TARGET_USE；通用数据源页不会替你假定复制方向。
+          </span>
+        </div>
+        <el-radio-group
+          :model-value="metadataUsage"
+          :disabled="metadataLoading || metadataLoadingMore || metadataLoadingAll"
+          @change="(usage: DatasourceUsage) => loadMetadataForUsage(usage)"
+        >
+          <el-radio-button value="SOURCE_USE">作为复制源</el-radio-button>
+          <el-radio-button value="TARGET_USE">作为复制目标</el-radio-button>
+        </el-radio-group>
+      </div>
+      <ProblemPanel v-if="metadataError" :error="metadataError" @retry="retryMetadata" />
       <el-skeleton v-if="metadataLoading" :rows="8" animated />
       <el-collapse v-else-if="tables.length">
         <el-collapse-item
@@ -935,9 +1019,14 @@ watch(
         </el-collapse-item>
       </el-collapse>
       <EmptyState
-        v-else
+        v-else-if="metadataUsage"
         title="未读取到表元数据"
-        description="当前范围没有表，或服务端尚未返回真实元数据。"
+        description="当前用途范围没有表，或服务端尚未返回真实元数据。"
+      />
+      <EmptyState
+        v-else
+        title="请选择元数据用途"
+        description="只有选择复制源或复制目标后才会发起请求；未获该用途授权时服务端会明确拒绝。"
       />
       <div v-if="tables.length && metadataHasMore" class="page-actions">
         <el-button

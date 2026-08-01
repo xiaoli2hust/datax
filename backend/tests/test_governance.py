@@ -57,20 +57,23 @@ from datax_studio.governance.service import GovernanceService
 class FakeMetadataProbe:
     pages: dict[UUID, TableSchemaPage]
     fail: bool = False
-    calls: list[tuple[UUID, str | None, str | None]] = field(default_factory=list)
+    calls: list[tuple[UUID, str, str | None, str | None]] = field(
+        default_factory=list
+    )
 
     def list_columns(
         self,
         *,
         principal: Principal,
         datasource_id: UUID,
+        usage: str,
         schema_name: str | None,
         table_name: str | None,
         limit: int,
         audit: AuditContext,
     ) -> TableSchemaPage:
         del principal, limit, audit
-        self.calls.append((datasource_id, schema_name, table_name))
+        self.calls.append((datasource_id, usage, schema_name, table_name))
         if self.fail:
             raise RuntimeError("database is offline")
         return self.pages[datasource_id]
@@ -500,15 +503,57 @@ def test_server_fixes_scope_from_real_metadata_and_hashes_canonical_json(
     assert governance_stack.probe.calls == [
         (
             governance_stack.source_datasource_id,
+            "SOURCE_USE",
             "public",
             "orders",
         ),
         (
             governance_stack.target_datasource_id,
+            "TARGET_USE",
             "public",
             "orders_copy",
         ),
     ]
+
+
+def test_transfer_policy_scope_is_admin_only(
+    governance_stack: GovernanceStack,
+) -> None:
+    policy = _create_policy(
+        governance_stack,
+        classification="STANDARD",
+        key="create-policy-admin-read-001",
+    ).value
+    developer = Principal(
+        user_id=governance_stack.member_user_id,
+        organization_id=governance_stack.requester.organization_id,
+        session_id=uuid4(),
+        email="member@example.com",
+        display_name="Member",
+        must_change_password=False,
+        role_assignments=(
+            ScopedRoles(
+                scope_type=ScopeType.PROJECT,
+                scope_id=governance_stack.project_id,
+                roles=[Role.DEVELOPER],
+            ),
+        ),
+    )
+
+    with pytest.raises(ProblemException) as list_failure:
+        governance_stack.service.list_transfer_policies(
+            principal=developer,
+            project_id=governance_stack.project_id,
+            limit=50,
+            cursor=None,
+        )
+    assert list_failure.value.code == "FORBIDDEN"
+    with pytest.raises(ProblemException) as detail_failure:
+        governance_stack.service.get_transfer_policy(
+            principal=developer,
+            transfer_policy_id=policy.id,
+        )
+    assert detail_failure.value.code == "FORBIDDEN"
 
 
 def test_metadata_unavailable_is_503_and_does_not_create_policy(

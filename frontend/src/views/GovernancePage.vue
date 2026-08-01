@@ -525,8 +525,8 @@ async function loadPolicyMetadata(): Promise<void> {
     ] = await Promise.all([
       getDatasourceAdminDetail(policyForm.sourceDatasourceId),
       getDatasourceAdminDetail(policyForm.targetDatasourceId),
-      listDatasourceTables(policyForm.sourceDatasourceId),
-      listDatasourceTables(policyForm.targetDatasourceId),
+      listDatasourceTables(policyForm.sourceDatasourceId, { usage: "SOURCE_USE" }),
+      listDatasourceTables(policyForm.targetDatasourceId, { usage: "TARGET_USE" }),
     ]);
     sourceDetail.value = loadedSourceDetail;
     targetDetail.value = loadedTargetDetail;

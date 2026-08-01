@@ -1952,6 +1952,7 @@ class CredentialService:
         *,
         principal: Principal,
         datasource_id: UUID,
+        usage: str,
         schema_name: str | None,
         table_name: str | None,
         limit: int,
@@ -1969,6 +1970,7 @@ class CredentialService:
                 principal=principal,
                 datasource=datasource,
                 project=project,
+                usage=usage,
             )
             revision, policy_revision = self._current_revisions(
                 session,
@@ -1979,6 +1981,7 @@ class CredentialService:
                 {
                     "datasource_id": str(datasource.id),
                     "datasource_revision_id": str(revision.id),
+                    "usage": usage,
                     "schema_name": schema_name,
                     "table_name": table_name,
                     "order": "schema_name_asc_table_name_asc",
@@ -3387,7 +3390,10 @@ class CredentialService:
         principal: Principal,
         datasource: Datasource,
         project: Project,
+        usage: str,
     ) -> None:
+        if usage not in {"SOURCE_USE", "TARGET_USE"}:
+            raise ValueError("metadata usage is invalid")
         if principal.must_change_password:
             raise ProblemException(
                 status=403,
@@ -3421,7 +3427,7 @@ class CredentialService:
             select(DatasourceUsageGrant.id).where(
                 DatasourceUsageGrant.datasource_id == datasource.id,
                 DatasourceUsageGrant.organization_member_id == membership.id,
-                DatasourceUsageGrant.usage.in_(("SOURCE_USE", "TARGET_USE")),
+                DatasourceUsageGrant.usage == usage,
                 DatasourceUsageGrant.status == "ACTIVE",
             )
         ) is None:
@@ -3429,7 +3435,7 @@ class CredentialService:
                 status=403,
                 code="DATASOURCE_USAGE_NOT_GRANTED",
                 title="缺少数据源用途授权",
-                detail="Developer 只能读取获准 SOURCE_USE 或 TARGET_USE 的数据源元数据。",
+                detail=f"Developer 缺少该数据源的 {usage} 元数据用途授权。",
             )
 
     def _require_project_developer(

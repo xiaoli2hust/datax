@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from threading import Lock
-from typing import Annotated
+from typing import Annotated, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
@@ -374,6 +374,7 @@ def list_datasource_tables(
     request: Request,
     principal: Annotated[Principal, Depends(business_principal)],
     service: Annotated[CredentialService, Depends(get_credential_service)],
+    usage: Annotated[Literal["SOURCE_USE", "TARGET_USE"], Query()],
     schema_name: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
     table_name: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
     cursor: Annotated[
@@ -385,6 +386,7 @@ def list_datasource_tables(
     return service.list_columns(
         principal=principal,
         datasource_id=datasource_id,
+        usage=usage,
         schema_name=schema_name,
         table_name=table_name,
         cursor=cursor,

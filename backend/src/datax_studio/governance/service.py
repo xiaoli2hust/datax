@@ -71,6 +71,7 @@ class MetadataProbe(Protocol):
         *,
         principal: Principal,
         datasource_id: UUID,
+        usage: str,
         schema_name: str | None,
         table_name: str | None,
         limit: int,
@@ -364,16 +365,13 @@ class GovernanceService:
         limit: int,
         cursor: str | None,
     ) -> TransferPolicyPage:
+        self._require_admin_principal(principal)
         with self.sessions() as session:
+            self._require_current_admin(session, principal)
             project = self._project_for_organization(
                 session,
                 principal=principal,
                 project_id=project_id,
-            )
-            self._require_current_project_reader(
-                session,
-                principal=principal,
-                project=project,
             )
             cursor_value = (
                 self._decode_cursor(
@@ -554,16 +552,13 @@ class GovernanceService:
         principal: Principal,
         transfer_policy_id: UUID,
     ) -> TransferPolicyResponse:
+        self._require_admin_principal(principal)
         with self.sessions() as session:
-            policy, project = self._visible_policy(
+            self._require_current_admin(session, principal)
+            policy, _project = self._visible_policy(
                 session,
                 principal=principal,
                 transfer_policy_id=transfer_policy_id,
-            )
-            self._require_current_project_reader(
-                session,
-                principal=principal,
-                project=project,
             )
             return self._transfer_policy_response(session, policy)
 
@@ -1273,6 +1268,7 @@ class GovernanceService:
             source_page = metadata_probe.list_columns(
                 principal=principal,
                 datasource_id=context.source_datasource.id,
+                usage="SOURCE_USE",
                 schema_name=(
                     requested_scope.source.schema
                     if context.source_revision.engine == "POSTGRESQL_15"
@@ -1285,6 +1281,7 @@ class GovernanceService:
             target_page = metadata_probe.list_columns(
                 principal=principal,
                 datasource_id=context.target_datasource.id,
+                usage="TARGET_USE",
                 schema_name=(
                     requested_scope.target.schema
                     if context.target_revision.engine == "POSTGRESQL_15"

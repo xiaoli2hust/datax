@@ -1122,7 +1122,14 @@ paths:
       tags: [Datasources]
       operationId: listDatasourceTables
       summary: 读取表和列元数据
+      description: Admin 可按任一用途检查；Developer 必须声明 SOURCE_USE 或 TARGET_USE，服务端按该精确用途授权，cursor 同时绑定用途。
       parameters:
+        - name: usage
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [SOURCE_USE, TARGET_USE]
         - name: schema_name
           in: query
           required: false
@@ -1161,7 +1168,8 @@ paths:
     get:
       tags: [SecurityPolicies]
       operationId: listTransferPolicies
-      summary: 分页列出项目源到目标传输策略
+      summary: Admin 分页列出项目源到目标传输策略
+      description: 精确物理端点、表、列 scope 和审批信息仅向有效组织级 Admin 返回。
       parameters:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
@@ -1239,7 +1247,8 @@ paths:
     get:
       tags: [SecurityPolicies]
       operationId: getTransferPolicy
-      summary: 获取传输策略及脱敏审批摘要
+      summary: Admin 获取传输策略及脱敏审批摘要
+      description: 精确物理端点、表、列 scope 和审批信息仅向有效组织级 Admin 返回。
       responses:
         '200':
           description: 传输策略

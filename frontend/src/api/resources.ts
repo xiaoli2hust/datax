@@ -188,10 +188,16 @@ export function testDatasource(datasourceId: string): Promise<DatasourceTestResu
 
 export function listDatasourceTables(
   datasourceId: string,
-  params: { schemaName?: string; tableName?: string; cursor?: string } = {},
+  params: {
+    usage: DatasourceUsage;
+    schemaName?: string;
+    tableName?: string;
+    cursor?: string;
+  },
 ): Promise<CursorPage<TableSchema>> {
   return apiGet(
     `/datasources/${datasourceId}/schema/tables${queryString({
+      usage: params.usage,
       schema_name: params.schemaName,
       table_name: params.tableName,
       cursor: params.cursor,

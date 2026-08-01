@@ -425,7 +425,7 @@ cursor 绑定调用用户、Datasource、当前 DatasourceRevision、`schema_nam
 }
 ```
 
-Schema 响应中的列类型是数据库原生规范化字符串，不允许前端自行判定兼容性；兼容性以 Job validate 响应为准。
+Schema 响应中的列类型是数据库原生规范化字符串，不允许前端自行判定兼容性；兼容性以 Job validate 响应为准。元数据请求必须带 `usage=SOURCE_USE|TARGET_USE`；Developer 按精确用途授权，Admin 可按任一用途检查。分页 cursor 绑定该 usage，不能把 SOURCE_USE 的 cursor 改用于 TARGET_USE。
 
 ### 8.7 数据移动授权
 
@@ -439,7 +439,7 @@ Schema 响应中的列类型是数据库原生规范化字符串，不允许前�
 | GET | `/endpoint-connection-evidence/{id}` | Admin | 读取不可变 DNS、selected/peer IP 与 egress 连接证据；项目成员仅见证据 ID |
 | GET | `/datasources/{id}/grants` | Admin | 查看数据源使用授权 |
 | PUT | `/datasources/{id}/grants/{member_id}` | Admin | 原子替换 `SOURCE_USE/TARGET_USE` |
-| GET/POST | `/projects/{id}/transfer-policies` | 项目可读/Admin | 列出/创建源修订到目标修订策略 |
+| GET/POST | `/projects/{id}/transfer-policies` | Admin | 列出/创建源修订到目标修订策略；完整物理端点、表列 scope 和审批信息不向普通项目成员返回 |
 | POST | `/transfer-policies/{id}/submit` | Admin | 提交审批 |
 | POST | `/transfer-policies/{id}/approvals` | 不同 Admin | STANDARD 一人批准，SENSITIVE 两名不同 Admin 批准 |
 
