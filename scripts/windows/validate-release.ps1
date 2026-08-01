@@ -19,11 +19,31 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9a-f]{40}$')]
     [string]$ExpectedCommit,
-    [string]$SigntoolPath
+    [Parameter(Mandatory = $true)]
+    [string]$SigntoolPath,
+    [Parameter(Mandatory = $true)]
+    [string]$CargoPath,
+    [Parameter(Mandatory = $true)]
+    [string]$RustcPath
 )
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+$CargoCompilerOverrideVariables = @(
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_BUILD_RUSTFLAGS",
+    "CARGO_BUILD_RUSTC",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_TARGET_DIR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTC_BOOTSTRAP"
+)
 
 function Resolve-RequiredFile {
     param(
@@ -33,27 +53,133 @@ function Resolve-RequiredFile {
         [string]$Description
     )
 
-    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction Stop
-    $item = Get-Item -LiteralPath $resolved.Path -Force
-    if ($item.PSIsContainer -or
-        ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        throw "$Description must be a non-reparse regular file."
+    try {
+        $fullPath = [IO.Path]::GetFullPath($Path)
+    }
+    catch {
+        throw "$Description path is invalid."
+    }
+    $root = [IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrWhiteSpace($root)) {
+        throw "$Description path is invalid."
+    }
+    if ($fullPath.Length -le $root.Length) {
+        throw "$Description must be a regular file."
+    }
+    $current = $root
+    foreach ($segment in ($fullPath.Substring($root.Length) -split '[\\/]')) {
+        if ([string]::IsNullOrWhiteSpace($segment)) {
+            continue
+        }
+        $current = Join-Path -Path $current -ChildPath $segment
+        try {
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        }
+        catch {
+            throw "$Description path cannot be accessed."
+        }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "$Description path must not contain a reparse point."
+        }
+    }
+    if ($item.PSIsContainer) {
+        throw "$Description must be a regular file."
     }
     return $item
 }
 
-function Resolve-RequiredCommand {
+function Resolve-RequiredExecutable {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Name,
+        [Parameter(Mandatory = $true)]
         [string]$ExplicitPath
     )
 
-    if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
-        return (Resolve-RequiredFile -Path $ExplicitPath -Description $Name).FullName
+    if ([string]::IsNullOrWhiteSpace($ExplicitPath) -or
+        $ExplicitPath -notmatch '^[A-Za-z]:\\') {
+        throw "$Name must be supplied as an explicit local Windows path."
     }
-    $command = Get-Command -Name $Name -CommandType Application -ErrorAction Stop
-    return (Resolve-RequiredFile -Path $command.Source -Description $Name).FullName
+    try {
+        $fullPath = [IO.Path]::GetFullPath($ExplicitPath)
+        $disk = Get-CimInstance `
+            -ClassName Win32_LogicalDisk `
+            -Filter "DeviceID='$($fullPath.Substring(0, 2))'" `
+            -ErrorAction Stop
+    }
+    catch {
+        throw "$Name must be on a local fixed Windows volume."
+    }
+    if ($null -eq $disk -or [int]$disk.DriveType -ne 3) {
+        throw "$Name must be on a local fixed Windows volume."
+    }
+    $resolved = (Resolve-RequiredFile -Path $fullPath -Description $Name).FullName
+    if (-not [IO.Path]::GetFileName($resolved).Equals(
+        $Name,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "$Name path must name $Name."
+    }
+    return $resolved
+}
+
+function Assert-NoCargoCompilerOverrides {
+    foreach ($name in $CargoCompilerOverrideVariables) {
+        $value = [Environment]::GetEnvironmentVariable(
+            $name,
+            [EnvironmentVariableTarget]::Process
+        )
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            throw "Ambient compiler override $name is forbidden for release signing."
+        }
+    }
+    $environment = [Environment]::GetEnvironmentVariables(
+        [EnvironmentVariableTarget]::Process
+    )
+    foreach ($name in $environment.Keys) {
+        $nameText = [string]$name
+        if ($nameText.StartsWith(
+            "CARGO_TARGET_",
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or $nameText -match '^CARGO_PROFILE_[A-Z0-9_]+_RUSTFLAGS$') {
+            throw "Ambient Cargo target or profile compiler override is forbidden for release signing."
+        }
+    }
+}
+
+function Invoke-ConfiguredCargo {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Cargo,
+        [Parameter(Mandatory = $true)]
+        [string]$Rustc,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    Assert-NoCargoCompilerOverrides
+    $previousRustc = [Environment]::GetEnvironmentVariable(
+        "RUSTC",
+        [EnvironmentVariableTarget]::Process
+    )
+    try {
+        [Environment]::SetEnvironmentVariable(
+            "RUSTC",
+            $Rustc,
+            [EnvironmentVariableTarget]::Process
+        )
+        & $Cargo @Arguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo.exe failed with exit code $LASTEXITCODE"
+        }
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable(
+            "RUSTC",
+            $previousRustc,
+            [EnvironmentVariableTarget]::Process
+        )
+    }
 }
 
 function Assert-ChildOfCandidate {
@@ -628,7 +754,7 @@ if ($context.schema_version -ne "1.0" -or
     throw "Release context does not match this candidate."
 }
 
-$signtool = Resolve-RequiredCommand `
+$signtool = Resolve-RequiredExecutable `
     -Name "signtool.exe" `
     -ExplicitPath $SigntoolPath
 $setupSigntoolEvidence = Join-Path $candidateRoot "signtool-setup.txt"
@@ -686,16 +812,17 @@ if ([int]$windows.CurrentBuildNumber -lt 22000 -or
         [Runtime.InteropServices.Architecture]::X64) {
     throw "Release evidence must be generated on Windows 11 client x64."
 }
-$rustc = Resolve-RequiredCommand -Name "rustc.exe"
-$cargo = Resolve-RequiredCommand -Name "cargo.exe"
+Assert-NoCargoCompilerOverrides
+$rustc = Resolve-RequiredExecutable -Name "rustc.exe" -ExplicitPath $RustcPath
+$cargo = Resolve-RequiredExecutable -Name "cargo.exe" -ExplicitPath $CargoPath
 $rustcVersion = [string](& $rustc --version)
 if ($LASTEXITCODE -ne 0) {
     throw "rustc version query failed."
 }
-$cargoVersion = [string](& $cargo --version)
-if ($LASTEXITCODE -ne 0) {
-    throw "cargo version query failed."
-}
+$cargoVersion = [string](Invoke-ConfiguredCargo `
+    -Cargo $cargo `
+    -Rustc $rustc `
+    -Arguments @("--version"))
 $environmentEvidence = [ordered]@{
     schema_version = "1.0"
     candidate_only = $true

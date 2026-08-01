@@ -5,7 +5,14 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$ReleaseImagesFile,
     [string]$OutputDirectory,
+    [Parameter(Mandatory = $true)]
+    [string]$CargoPath,
+    [Parameter(Mandatory = $true)]
+    [string]$RustcPath,
+    [Parameter(Mandatory = $true)]
     [string]$MakensisPath,
+    [Parameter(Mandatory = $true)]
+    [string]$SigntoolPath,
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9A-Fa-f]{40}$')]
     [string]$SigningCertificateThumbprint,
@@ -16,6 +23,21 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+$CargoCompilerOverrideVariables = @(
+    "RUSTC_WRAPPER",
+    "RUSTC_WORKSPACE_WRAPPER",
+    "RUSTFLAGS",
+    "CARGO_ENCODED_RUSTFLAGS",
+    "CARGO_BUILD_RUSTFLAGS",
+    "CARGO_BUILD_RUSTC",
+    "CARGO_BUILD_RUSTC_WRAPPER",
+    "CARGO_TARGET_DIR",
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "RUSTUP_TOOLCHAIN",
+    "RUSTC_BOOTSTRAP"
+)
+
 function Resolve-ExistingFile {
     param(
         [Parameter(Mandatory = $true)]
@@ -24,26 +46,74 @@ function Resolve-ExistingFile {
         [string]$Description
     )
 
-    $resolved = Resolve-Path -LiteralPath $Path -ErrorAction Stop
-    $item = Get-Item -LiteralPath $resolved.Path -Force
-    if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-        throw "$Description must be a non-reparse regular file: $Path"
+    try {
+        $fullPath = [IO.Path]::GetFullPath($Path)
     }
-    return $resolved.Path
+    catch {
+        throw "$Description path is invalid."
+    }
+    $root = [IO.Path]::GetPathRoot($fullPath)
+    if ([string]::IsNullOrWhiteSpace($root)) {
+        throw "$Description path is invalid."
+    }
+    if ($fullPath.Length -le $root.Length) {
+        throw "$Description must be a regular file."
+    }
+    $current = $root
+    foreach ($segment in ($fullPath.Substring($root.Length) -split '[\\/]')) {
+        if ([string]::IsNullOrWhiteSpace($segment)) {
+            continue
+        }
+        $current = Join-Path -Path $current -ChildPath $segment
+        try {
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+        }
+        catch {
+            throw "$Description path cannot be accessed."
+        }
+        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            throw "$Description path must not contain a reparse point."
+        }
+    }
+    if ($item.PSIsContainer) {
+        throw "$Description must be a regular file."
+    }
+    return $fullPath
 }
 
-function Resolve-RequiredCommand {
+function Resolve-RequiredExecutable {
     param(
         [Parameter(Mandatory = $true)]
         [string]$Name,
+        [Parameter(Mandatory = $true)]
         [string]$ExplicitPath
     )
 
-    if (-not [string]::IsNullOrWhiteSpace($ExplicitPath)) {
-        return Resolve-ExistingFile -Path $ExplicitPath -Description $Name
+    if ([string]::IsNullOrWhiteSpace($ExplicitPath) -or
+        $ExplicitPath -notmatch '^[A-Za-z]:\\') {
+        throw "$Name must be supplied as an explicit local Windows path."
     }
-    $command = Get-Command -Name $Name -CommandType Application -ErrorAction Stop
-    return Resolve-ExistingFile -Path $command.Source -Description $Name
+    try {
+        $fullPath = [IO.Path]::GetFullPath($ExplicitPath)
+        $disk = Get-CimInstance `
+            -ClassName Win32_LogicalDisk `
+            -Filter "DeviceID='$($fullPath.Substring(0, 2))'" `
+            -ErrorAction Stop
+    }
+    catch {
+        throw "$Name must be on a local fixed Windows volume."
+    }
+    if ($null -eq $disk -or [int]$disk.DriveType -ne 3) {
+        throw "$Name must be on a local fixed Windows volume."
+    }
+    $resolved = Resolve-ExistingFile -Path $fullPath -Description $Name
+    if (-not [IO.Path]::GetFileName($resolved).Equals(
+        $Name,
+        [StringComparison]::OrdinalIgnoreCase
+    )) {
+        throw "$Name path must name $Name."
+    }
+    return $resolved
 }
 
 function Invoke-Checked {
@@ -56,7 +126,66 @@ function Invoke-Checked {
 
     & $Program @Arguments
     if ($LASTEXITCODE -ne 0) {
-        throw "$Program failed with exit code $LASTEXITCODE"
+        throw "A required external command failed with exit code $LASTEXITCODE"
+    }
+}
+
+function Assert-NoCargoCompilerOverrides {
+    foreach ($name in $CargoCompilerOverrideVariables) {
+        $value = [Environment]::GetEnvironmentVariable(
+            $name,
+            [EnvironmentVariableTarget]::Process
+        )
+        if (-not [string]::IsNullOrWhiteSpace($value)) {
+            throw "Ambient compiler override $name is forbidden for release signing."
+        }
+    }
+    $environment = [Environment]::GetEnvironmentVariables(
+        [EnvironmentVariableTarget]::Process
+    )
+    foreach ($name in $environment.Keys) {
+        $nameText = [string]$name
+        if ($nameText.StartsWith(
+            "CARGO_TARGET_",
+            [StringComparison]::OrdinalIgnoreCase
+        ) -or $nameText -match '^CARGO_PROFILE_[A-Z0-9_]+_RUSTFLAGS$') {
+            throw "Ambient Cargo target or profile compiler override is forbidden for release signing."
+        }
+    }
+}
+
+function Invoke-ConfiguredCargo {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Cargo,
+        [Parameter(Mandatory = $true)]
+        [string]$Rustc,
+        [Parameter(Mandatory = $true)]
+        [string[]]$Arguments
+    )
+
+    Assert-NoCargoCompilerOverrides
+    $previousRustc = [Environment]::GetEnvironmentVariable(
+        "RUSTC",
+        [EnvironmentVariableTarget]::Process
+    )
+    try {
+        [Environment]::SetEnvironmentVariable(
+            "RUSTC",
+            $Rustc,
+            [EnvironmentVariableTarget]::Process
+        )
+        & $Cargo @Arguments
+        if ($LASTEXITCODE -ne 0) {
+            throw "cargo.exe failed with exit code $LASTEXITCODE"
+        }
+    }
+    finally {
+        [Environment]::SetEnvironmentVariable(
+            "RUSTC",
+            $previousRustc,
+            [EnvironmentVariableTarget]::Process
+        )
     }
 }
 
@@ -147,9 +276,11 @@ if ([string]::IsNullOrWhiteSpace($OutputDirectory)) {
     $OutputDirectory = Join-Path $repositoryRoot "dist\windows"
 }
 
-$cargo = Resolve-RequiredCommand -Name "cargo.exe"
-$makensis = Resolve-RequiredCommand -Name "makensis.exe" -ExplicitPath $MakensisPath
-$signtool = Resolve-RequiredCommand -Name "signtool.exe"
+$cargo = Resolve-RequiredExecutable -Name "cargo.exe" -ExplicitPath $CargoPath
+$rustc = Resolve-RequiredExecutable -Name "rustc.exe" -ExplicitPath $RustcPath
+$makensis = Resolve-RequiredExecutable -Name "makensis.exe" -ExplicitPath $MakensisPath
+$signtool = Resolve-RequiredExecutable -Name "signtool.exe" -ExplicitPath $SigntoolPath
+Assert-NoCargoCompilerOverrides
 $composeSource = Resolve-ExistingFile -Path $ComposeFile -Description "Windows Compose file"
 $imagesSource = Resolve-ExistingFile -Path $ReleaseImagesFile -Description "Release image lock"
 $aclScriptSource = Resolve-ExistingFile -Path $aclScriptSource -Description "ACL helper"
@@ -157,10 +288,10 @@ $nsiSource = Resolve-ExistingFile -Path $installerScript -Description "NSIS inst
 $launcherCargoManifest = Resolve-ExistingFile -Path $launcherCargoManifest -Description "Launcher Cargo manifest"
 Read-And-ValidateImageLock -Path $imagesSource
 
-$metadataJson = & $cargo metadata --format-version 1 --no-deps --manifest-path $launcherCargoManifest
-if ($LASTEXITCODE -ne 0) {
-    throw "cargo metadata failed with exit code $LASTEXITCODE"
-}
+$metadataJson = Invoke-ConfiguredCargo -Cargo $cargo -Rustc $rustc -Arguments @(
+    "metadata", "--format-version", "1", "--no-deps",
+    "--manifest-path", $launcherCargoManifest
+)
 $metadata = $metadataJson | ConvertFrom-Json
 $package = @($metadata.packages) |
     Where-Object { $_.name -eq "datax-enterprise-studio-launcher" } |
@@ -224,7 +355,7 @@ $utf8WithoutBom = New-Object -TypeName Text.UTF8Encoding -ArgumentList $false
 $manifestHash = (Get-FileHash -LiteralPath $manifestStaged -Algorithm SHA256).Hash.ToLowerInvariant()
 
 $targetTriple = "x86_64-pc-windows-msvc"
-Invoke-Checked -Program $cargo -Arguments @(
+Invoke-ConfiguredCargo -Cargo $cargo -Rustc $rustc -Arguments @(
     "test", "--locked", "--manifest-path", $launcherCargoManifest
 )
 $previousBinding = [Environment]::GetEnvironmentVariable(
@@ -237,7 +368,7 @@ try {
         $manifestHash,
         [EnvironmentVariableTarget]::Process
     )
-    Invoke-Checked -Program $cargo -Arguments @(
+    Invoke-ConfiguredCargo -Cargo $cargo -Rustc $rustc -Arguments @(
         "build", "--locked",
         "--manifest-path", $launcherCargoManifest,
         "--target", $targetTriple,

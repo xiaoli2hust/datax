@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from datetime import UTC, datetime, timedelta
 from email.message import Message
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -103,6 +104,8 @@ def _payload(
 def _client(
     monkeypatch: pytest.MonkeyPatch,
     payload: dict[str, object],
+    *,
+    lease_creation_capability_file: Path | None = None,
 ) -> LoopbackEgressAttestationClient:
     monkeypatch.setattr(
         "datax_studio.egress_attestation.current_network_namespace_id",
@@ -112,6 +115,11 @@ def _client(
         url="http://127.0.0.1:17990/v1/attestation",
         timeout_seconds=0.5,
         max_age_seconds=5,
+        **(
+            {"lease_creation_capability_file": lease_creation_capability_file}
+            if lease_creation_capability_file is not None
+            else {}
+        ),
     )
     client._opener = _Opener(payload)  # type: ignore[assignment]
     return client
@@ -253,10 +261,13 @@ def _lease_payload(
 
 def test_loopback_lease_create_renew_release_is_exact_and_token_safe(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     revision_id = uuid4()
     lease_id = uuid4()
     policy_hash = "f" * 64
+    capability_file = tmp_path / "egress_lease_creation_capability"
+    capability_file.write_bytes(b"c" * 64)
     client = _client(
         monkeypatch,
         _payload(
@@ -264,6 +275,7 @@ def test_loopback_lease_create_renew_release_is_exact_and_token_safe(
             policy_hash=policy_hash,
             now=datetime.now(UTC),
         ),
+        lease_creation_capability_file=capability_file,
     )
     opener = _LeaseOpener(
         _LeaseResponse(
@@ -316,6 +328,7 @@ def test_loopback_lease_create_renew_release_is_exact_and_token_safe(
         "port": 5432,
     }
     assert create_request.get_header("Content-type") == "application/json"
+    assert create_request.get_header("X-datax-egress-lease-capability") == "c" * 64
     assert renew_request.get_method() == "PUT"
     assert renew_request.data == b""
     assert renew_request.get_header("Authorization") == f"Bearer {'T' * 43}"
@@ -326,9 +339,12 @@ def test_loopback_lease_create_renew_release_is_exact_and_token_safe(
 
 def test_loopback_lease_rejects_echo_mismatch(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     revision_id = uuid4()
     policy_hash = "9" * 64
+    capability_file = tmp_path / "egress_lease_creation_capability"
+    capability_file.write_bytes(b"c" * 64)
     client = _client(
         monkeypatch,
         _payload(
@@ -336,6 +352,7 @@ def test_loopback_lease_rejects_echo_mismatch(
             policy_hash=policy_hash,
             now=datetime.now(UTC),
         ),
+        lease_creation_capability_file=capability_file,
     )
     client._opener = _LeaseOpener(  # type: ignore[assignment]
         _LeaseResponse(
@@ -359,3 +376,34 @@ def test_loopback_lease_rejects_echo_mismatch(
             selected_ip="10.20.30.40",
             port=5432,
         )
+
+
+def test_loopback_lease_create_fails_closed_when_capability_is_absent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    revision_id = uuid4()
+    client = _client(
+        monkeypatch,
+        _payload(
+            revision_id=str(revision_id),
+            policy_hash="f" * 64,
+            now=datetime.now(UTC),
+        ),
+        lease_creation_capability_file=tmp_path / "missing-capability",
+    )
+    opener = _LeaseOpener()
+    client._opener = opener  # type: ignore[assignment]
+
+    with pytest.raises(
+        EgressAttestationError,
+        match="EGRESS_LEASE_CREATION_CAPABILITY_UNAVAILABLE",
+    ):
+        client.create_lease(
+            revision_id=revision_id,
+            policy_hash="f" * 64,
+            selected_ip="10.20.30.40",
+            port=5432,
+        )
+
+    assert opener.requests == []

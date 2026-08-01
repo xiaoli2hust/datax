@@ -1,7 +1,7 @@
 # egress-guard V1 内部契约
 
-本契约只用于 Windows 本地 Compose 内部的 API、Worker、迁移任务与
-`egress-guard`。它不是宿主或产品公网 API。唯一监听地址为共享 Linux 网络命名空间内的
+本契约只用于 Windows 本地 Compose 内部的 API、Worker 与
+`egress-guard`。迁移任务不获得创建租约的能力。它不是宿主或产品公网 API。唯一监听地址为共享 Linux 网络命名空间内的
 `127.0.0.1:17990`，不得发布 `ports`、绑定 LAN 地址或经 `web` 反向代理。
 
 ## 1. 数据库只读接口
@@ -64,6 +64,20 @@ CIDR 只用于准入校验。内核外部规则只允许租约中的规范 IP �
 `control` 子网，落入运行时 `control` 子网的 `selected_ip` 也必须拒绝，不能把内部
 PostgreSQL 或其他控制面容器包装成外部数据源租约。客户端不能提交 lease ID 或 token。
 
+创建请求还必须恰好携带一个、且只携带一个如下请求头；它不是 JSON body 字段：
+
+```text
+X-DataX-Egress-Lease-Capability: <64 ASCII lowercase hex characters>
+```
+
+Launcher 从 32 个 OS CSPRNG 原始字节生成该 64 个 ASCII 小写十六进制字符，并以 Docker
+secret 只读挂载给 `egress-guard`、API 与 Worker；不得挂载给 `migrate`、`postgres` 或
+`web`。API/Worker 环境中只能出现固定 secret **路径**
+`/run/secrets/egress_lease_creation_capability`，不得出现 secret 值。守卫必须在读取 body、
+读取策略或调用 controller/nftables 前校验此头；格式合法时使用常量时间比较。缺失、重复、
+格式错误或值不匹配一律返回同一个 `401 LEASE_CREATION_AUTH_INVALID`，不区分原因。
+该能力值不得进入响应、attestation、错误、数据库、Job JSON、DataX 子进程环境或任何日志。
+
 成功返回 `201`/`createResponse`。`lease_id` 和 32-byte 随机 bearer token 均由守卫
 生成；token 只在本次响应出现，守卫仅在内存保存其域分离 SHA-256，禁止日志、数据库、
 attestation 或错误响应记录 token。
@@ -83,6 +97,7 @@ attestation 或错误响应记录 token。
 | HTTP | code | 处理 |
 |---|---|---|
 | 400 | `LEASE_REQUEST_INVALID` | 请求形状、编码、IP 或端口无效 |
+| 401 | `LEASE_CREATION_AUTH_INVALID` | 创建能力头缺失、重复、格式错误或不匹配；不暴露具体原因 |
 | 401 | `LEASE_AUTH_INVALID` | bearer 缺失、格式错误或不匹配 |
 | 404 | `LEASE_NOT_FOUND` | 路径或租约不存在 |
 | 409 | `LEASE_POLICY_NOT_ACTIVE` | 请求不在当前 ACTIVE revision 的 CIDR×port 内，或 selected IP 落入运行时 `control` 子网 |
@@ -102,6 +117,13 @@ attestation 或错误响应记录 token。
   或漂移立即清空全部租约并安装 base-deny。
 - `web` 通过 `egress-guard:8000` 访问共享 netns 内 API；只有 Web 映射
   `127.0.0.1:17860`。
+
+创建能力阻断的是不能读取 Docker secret 的普通同 netns 调用者，**不是**恶意同 UID 代码
+隔离边界。DataX 是 Worker 的子进程，因而与 Worker 共享 UID、文件系统和该 secret 挂载；
+若 Worker/DataX 发生任意同 UID RCE，攻击代码可以读取该文件，单靠已净化的 DataX 环境
+不能消除此风险。V1 的固定可信镜像、固定内置插件和禁止上传/自定义插件缩小可执行代码
+来源，但不把该残余风险伪装成已消除的 sandbox。此限制仅为 E1 设计/单元测试边界，不能
+替代干净 Windows 11 x64 + Docker Desktop/WSL2 上的 E4 验收。
 
 这些代码、Schema 和单元测试不是 Windows 实机证据。必须在干净 Windows 11 x64 +
 Docker Desktop/WSL2 上验证 nftables 语法/能力、守卫死亡 15 秒失效、FQDN 二次解析偏移、

@@ -4,8 +4,10 @@ import hashlib
 import json
 import os
 import re
+import stat
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlsplit
@@ -18,12 +20,18 @@ ATTESTATION_SCHEMA_VERSION = "1.0"
 _HASH_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 _NETWORK_NAMESPACE_PATTERN = re.compile(r"^net:\[[0-9]+\]$")
 _BEARER_TOKEN_PATTERN = re.compile(r"^[A-Za-z0-9_-]{43}$")
+_LEASE_CREATION_CAPABILITY_PATTERN = re.compile(r"^[a-f0-9]{64}$")
+_LEASE_CREATION_CAPABILITY_HEADER = "X-DataX-Egress-Lease-Capability"
+_LEASE_CREATION_CAPABILITY_PATH = Path(
+    "/run/secrets/egress_lease_creation_capability"
+)
 _MAX_RESPONSE_BYTES = 64 * 1024
 _MAX_LEASE_RESPONSE_BYTES = 16 * 1024
 _LEASE_ERROR_CODES = frozenset(
     {
         "LEASE_REQUEST_INVALID",
         "LEASE_AUTH_INVALID",
+        "LEASE_CREATION_AUTH_INVALID",
         "LEASE_NOT_FOUND",
         "LEASE_POLICY_NOT_ACTIVE",
         "LEASE_LIMIT_REACHED",
@@ -176,6 +184,7 @@ class LoopbackEgressAttestationClient:
         max_age_seconds: float,
         policy_engine_version: str = POLICY_ENGINE_VERSION,
         resolver_policy_version: str = RESOLVER_POLICY_VERSION,
+        lease_creation_capability_file: Path = _LEASE_CREATION_CAPABILITY_PATH,
     ) -> None:
         parsed = urlsplit(url)
         if (
@@ -200,6 +209,7 @@ class LoopbackEgressAttestationClient:
         self.max_age_seconds = max_age_seconds
         self.policy_engine_version = policy_engine_version
         self.resolver_policy_version = resolver_policy_version
+        self.lease_creation_capability_file = lease_creation_capability_file
         self._lease_collection_url = (
             f"http://127.0.0.1:{parsed.port}/v1/leases"
         )
@@ -363,6 +373,7 @@ class LoopbackEgressAttestationClient:
             ).encode("ascii"),
             expected_status=201,
             bearer_token=None,
+            lease_creation_capability=self._read_lease_creation_capability(),
         )
         return self._parse_lease_response(
             response,
@@ -381,6 +392,7 @@ class LoopbackEgressAttestationClient:
             body=b"",
             expected_status=200,
             bearer_token=lease.bearer_token,
+            lease_creation_capability=None,
         )
         renewed = self._parse_lease_response(
             response,
@@ -402,6 +414,7 @@ class LoopbackEgressAttestationClient:
             body=b"",
             expected_status=204,
             bearer_token=lease.bearer_token,
+            lease_creation_capability=None,
             expect_json=False,
         )
         if response is not None:
@@ -415,6 +428,7 @@ class LoopbackEgressAttestationClient:
         body: bytes,
         expected_status: int,
         bearer_token: str | None,
+        lease_creation_capability: str | None,
         expect_json: bool = True,
     ) -> dict[str, object] | None:
         headers = {
@@ -423,6 +437,17 @@ class LoopbackEgressAttestationClient:
         }
         if method == "POST":
             headers["Content-Type"] = "application/json"
+            if (
+                lease_creation_capability is None
+                or _LEASE_CREATION_CAPABILITY_PATTERN.fullmatch(
+                    lease_creation_capability
+                )
+                is None
+            ):
+                raise EgressAttestationError(
+                    "EGRESS_LEASE_CREATION_CAPABILITY_UNAVAILABLE"
+                )
+            headers[_LEASE_CREATION_CAPABILITY_HEADER] = lease_creation_capability
         if bearer_token is not None:
             if _BEARER_TOKEN_PATTERN.fullmatch(bearer_token) is None:
                 raise EgressAttestationError("EGRESS_LEASE_AUTH_INVALID")
@@ -462,6 +487,48 @@ class LoopbackEgressAttestationClient:
         if not isinstance(payload, dict):
             raise EgressAttestationError("EGRESS_LEASE_RESPONSE_INVALID")
         return payload
+
+    def _read_lease_creation_capability(self) -> str:
+        """Read the Launcher-managed lease control secret only for POST.
+
+        The secret never becomes part of a DataX job or child process
+        environment.  This is caller authentication inside the shared
+        loopback namespace, not a hostile same-UID process boundary.
+        """
+
+        path = self.lease_creation_capability_file
+        try:
+            metadata = path.lstat()
+        except OSError as exc:
+            raise EgressAttestationError(
+                "EGRESS_LEASE_CREATION_CAPABILITY_UNAVAILABLE"
+            ) from exc
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or path.is_symlink()
+            or metadata.st_size != 64
+        ):
+            raise EgressAttestationError("EGRESS_LEASE_CREATION_CAPABILITY_UNAVAILABLE")
+
+        raw: bytearray | None = None
+        try:
+            raw = bytearray(path.read_bytes())
+            value = raw.decode("ascii")
+            if (
+                len(raw) != 64
+                or _LEASE_CREATION_CAPABILITY_PATTERN.fullmatch(value) is None
+            ):
+                raise EgressAttestationError(
+                    "EGRESS_LEASE_CREATION_CAPABILITY_UNAVAILABLE"
+                )
+            return value
+        except (OSError, UnicodeDecodeError) as exc:
+            raise EgressAttestationError(
+                "EGRESS_LEASE_CREATION_CAPABILITY_UNAVAILABLE"
+            ) from exc
+        finally:
+            if raw is not None:
+                raw[:] = b"\x00" * len(raw)
 
     @staticmethod
     def _lease_http_error_code(error: HTTPError) -> str:

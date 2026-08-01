@@ -14,6 +14,11 @@
    PATH/当前目录命中。Compose 也直接调用同一安装根中的已签名固定插件，不走用户插件
    搜索路径。
 4. 校验 WSL2、Docker Desktop 本机 Linux/amd64 Engine、named-pipe context 和 Compose v2。
+   受控 Docker/Compose 子进程不继承用户 `DOCKER_CONFIG`、context、TLS/认证、
+   `DOCKER_DEFAULT_PLATFORM`、BuildKit、上/小写 proxy 或 Compose
+   env-file/project/profile/行为/输出覆盖；只接收 Launcher 派生的值、匿名 CLI config 和
+   已验证 local pipe。Docker Desktop daemon 的组织代理属于独立前置。此项目前是 E1 代码
+   契约，尚未由 Windows Docker Desktop 实测。
 5. Launcher 自身必须有有效 Authenticode；其编译期摘要绑定
    `resources/release-manifest.json`。清单 `schema_version=1.1` 除锁定
    `compose.yaml`、`images.release.env` 和 `secure-acl.ps1` 外，还包含 1–8 个严格排序、
@@ -104,7 +109,10 @@ launcher.exe backup ^
 - Launcher 先进入 draining 并确认没有活动 Execution/RecoveryProbe，停止应用写入，
   用固定 PostgreSQL 容器生成
   `pg_dump --format=custom --compress=0 --serializable-deferrable`，再停止 PostgreSQL。
-  Worker helper 以 `network=none`、只读根文件系统和 `cap_drop=ALL` 运行。
+  Worker helper 以 `network=none`、只读根文件系统和 `cap_drop=ALL` 运行。每个 helper 有
+  角色/不透明 ID 标签与不泄露安装身份的确定性名称；timeout、CLI/capture 或 helper 结果
+  错误后，只能验证 immutable container ID 和双标签后强制删除该 ID。清理不能证明、标签
+  不匹配或名称重用时返回 `HELPER_CLEANUP_FAILED`，不删未知容器或 named volume；当前仅 E1。
 - `.dxdata` 只含一致性逻辑 dump、`des-log-data` 脱敏日志和三个固定发布元数据；
   `des-workspace-data`、任何 `job.json` 与物理 PostgreSQL volume 永不挂载到 helper。
   helper 会用全部私密运行 secret 做精确泄露扫描，并对日志做结构化二次脱敏检查。

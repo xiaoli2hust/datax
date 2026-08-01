@@ -227,10 +227,12 @@ jobs:
     name: Sign and verify the Windows candidate
     needs: linux-images
     runs-on:
-      - self-hosted
-      - windows
-      - x64
-      - datax-release-windows11
+      group: datax-release-signing
+      labels:
+        - self-hosted
+        - windows
+        - x64
+        - datax-release-windows11
     environment: windows-candidate-signing
     timeout-minutes: 75
     permissions:
@@ -328,6 +330,8 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           foreach ($path in @(
+              "scripts/windows/build-installer.ps1",
+              "scripts/windows/validate-release.ps1",
               "scripts/release/finalize_windows_publisher_binding.ps1",
               "scripts/release/verify_windows_publisher_binding.ps1"
           )) {
@@ -343,6 +347,136 @@ jobs:
                   throw "PowerShell parse failed: $path"
               }
           }
+
+      - name: Require a clean checkout and configured local signing tools
+        shell: pwsh
+        env:
+          CARGO_PATH: ${{ vars.CARGO_PATH }}
+          MAKENSIS_PATH: ${{ vars.MAKENSIS_PATH }}
+          RUSTC_PATH: ${{ vars.RUSTC_PATH }}
+          SIGNTOOL_PATH: ${{ vars.SIGNTOOL_PATH }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+          git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) {
+              throw "The signing checkout has tracked modifications."
+          }
+          $status = @(
+              git status --porcelain=v1 --untracked-files=all
+          )
+          if ($status.Count -ne 0) {
+              throw "The signing checkout has staged or untracked files."
+          }
+          function Assert-ConfiguredLocalExecutable {
+              param(
+                  [Parameter(Mandatory = $true)]
+                  [string]$Name,
+                  [Parameter(Mandatory = $true)]
+                  [string]$Candidate
+              )
+
+              if ([string]::IsNullOrWhiteSpace($Candidate) -or
+                  $Candidate -notmatch '^[A-Za-z]:\\') {
+                  throw "Configured path for $Name is missing or not local."
+              }
+              try {
+                  $fullPath = [IO.Path]::GetFullPath($Candidate)
+                  $disk = Get-CimInstance `
+                      -ClassName Win32_LogicalDisk `
+                      -Filter "DeviceID='$($fullPath.Substring(0, 2))'" `
+                      -ErrorAction Stop
+              }
+              catch {
+                  throw "Configured path for $Name is not on a local fixed volume."
+              }
+              if ($null -eq $disk -or [int]$disk.DriveType -ne 3) {
+                  throw "Configured path for $Name is not on a local fixed volume."
+              }
+              $root = [IO.Path]::GetPathRoot($fullPath)
+              if ([string]::IsNullOrWhiteSpace($root)) {
+                  throw "Configured path for $Name is invalid."
+              }
+              if ($fullPath.Length -le $root.Length) {
+                  throw "Configured path for $Name is not a regular executable."
+              }
+              $current = $root
+              foreach ($segment in ($fullPath.Substring($root.Length) -split '[\\/]')) {
+                  if ([string]::IsNullOrWhiteSpace($segment)) {
+                      continue
+                  }
+                  $current = Join-Path -Path $current -ChildPath $segment
+                  try {
+                      $item = Get-Item `
+                          -LiteralPath $current `
+                          -Force `
+                          -ErrorAction Stop
+                  }
+                  catch {
+                      throw "Configured path for $Name cannot be accessed."
+                  }
+                  if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                      throw "Configured path for $Name contains a reparse point."
+                  }
+              }
+              if ($item.PSIsContainer -or
+                  $item.Length -le 0 -or
+                  -not [IO.Path]::GetFileName($item.FullName).Equals(
+                      $Name,
+                      [StringComparison]::OrdinalIgnoreCase
+                  )) {
+                  throw "Configured path for $Name is not a regular executable."
+              }
+          }
+          function Assert-NoCargoCompilerOverrides {
+              $forbiddenVariables = @(
+                  "RUSTC_WRAPPER",
+                  "RUSTC_WORKSPACE_WRAPPER",
+                  "RUSTFLAGS",
+                  "CARGO_ENCODED_RUSTFLAGS",
+                  "CARGO_BUILD_RUSTFLAGS",
+                  "CARGO_BUILD_RUSTC",
+                  "CARGO_BUILD_RUSTC_WRAPPER",
+                  "CARGO_TARGET_DIR",
+                  "CARGO_HOME",
+                  "RUSTUP_HOME",
+                  "RUSTUP_TOOLCHAIN",
+                  "RUSTC_BOOTSTRAP"
+              )
+              foreach ($name in $forbiddenVariables) {
+                  $value = [Environment]::GetEnvironmentVariable(
+                      $name,
+                      [EnvironmentVariableTarget]::Process
+                  )
+                  if (-not [string]::IsNullOrWhiteSpace($value)) {
+                      throw "Ambient compiler override $name is forbidden for release signing."
+                  }
+              }
+              $environment = [Environment]::GetEnvironmentVariables(
+                  [EnvironmentVariableTarget]::Process
+              )
+              foreach ($name in $environment.Keys) {
+                  $nameText = [string]$name
+                  if ($nameText.StartsWith(
+                      "CARGO_TARGET_",
+                      [StringComparison]::OrdinalIgnoreCase
+                  ) -or $nameText -match '^CARGO_PROFILE_[A-Z0-9_]+_RUSTFLAGS$') {
+                      throw "Ambient Cargo target or profile compiler override is forbidden for release signing."
+                  }
+              }
+          }
+          $requiredTools = [ordered]@{
+              "cargo.exe" = $env:CARGO_PATH
+              "makensis.exe" = $env:MAKENSIS_PATH
+              "rustc.exe" = $env:RUSTC_PATH
+              "signtool.exe" = $env:SIGNTOOL_PATH
+          }
+          foreach ($entry in $requiredTools.GetEnumerator()) {
+              Assert-ConfiguredLocalExecutable `
+                  -Name $entry.Key `
+                  -Candidate ([string]$entry.Value)
+          }
+          Assert-NoCargoCompilerOverrides
 
       - name: Require and import the protected signing certificate
         id: signing-certificate
@@ -565,7 +699,10 @@ jobs:
           VERSION: ${{ needs.linux-images.outputs.version }}
           SIGNER_THUMBPRINT: ${{ steps.signing-certificate.outputs.thumbprint }}
           SIGNER_ALLOWLIST_PATH: ${{ steps.signing-certificate.outputs.allowlist_path }}
+          CARGO_PATH: ${{ vars.CARGO_PATH }}
+          RUSTC_PATH: ${{ vars.RUSTC_PATH }}
           MAKENSIS_PATH: ${{ vars.MAKENSIS_PATH }}
+          SIGNTOOL_PATH: ${{ vars.SIGNTOOL_PATH }}
           TIMESTAMP_URL: https://timestamp.digicert.com
         run: |
           $ErrorActionPreference = "Stop"
@@ -583,26 +720,38 @@ jobs:
                     "images.release.env"
               )
               OutputDirectory = $outputDirectory
+              CargoPath = $env:CARGO_PATH
+              RustcPath = $env:RUSTC_PATH
+              MakensisPath = $env:MAKENSIS_PATH
+              SigntoolPath = $env:SIGNTOOL_PATH
               SigningCertificateThumbprint = $env:SIGNER_THUMBPRINT
               TimestampUrl = $env:TIMESTAMP_URL
-          }
-          if (-not [string]::IsNullOrWhiteSpace($env:MAKENSIS_PATH)) {
-              $parameters["MakensisPath"] = $env:MAKENSIS_PATH
           }
           & .\scripts\windows\build-installer.ps1 @parameters
           $bindingParameters = @{
               ProductVersion = $env:VERSION
               BuildOutputDirectory = $outputDirectory
+              CargoPath = $env:CARGO_PATH
+              RustcPath = $env:RUSTC_PATH
+              MakensisPath = $env:MAKENSIS_PATH
+              SigntoolPath = $env:SIGNTOOL_PATH
               SigningCertificateThumbprint = $env:SIGNER_THUMBPRINT
               AllowedSignerFile = $env:SIGNER_ALLOWLIST_PATH
               TimestampUrl = $env:TIMESTAMP_URL
           }
-          if (-not [string]::IsNullOrWhiteSpace($env:MAKENSIS_PATH)) {
-              $bindingParameters["MakensisPath"] = $env:MAKENSIS_PATH
-          }
           & .\scripts\release\finalize_windows_publisher_binding.ps1 `
             @bindingParameters
           "output_directory=$outputDirectory" >> $env:GITHUB_OUTPUT
+
+      - name: Recheck tracked sources before candidate assembly
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+          git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) {
+              throw "The signing toolchain modified tracked candidate sources before assembly."
+          }
 
       - name: Assemble and verify the signed candidate evidence
         id: candidate
@@ -612,6 +761,8 @@ jobs:
           SIGNER_THUMBPRINT: ${{ steps.signing-certificate.outputs.thumbprint }}
           BUILD_OUTPUT: ${{ steps.build.outputs.output_directory }}
           SIGNER_ALLOWLIST_PATH: ${{ steps.signing-certificate.outputs.allowlist_path }}
+          CARGO_PATH: ${{ vars.CARGO_PATH }}
+          RUSTC_PATH: ${{ vars.RUSTC_PATH }}
           SIGNTOOL_PATH: ${{ vars.SIGNTOOL_PATH }}
         run: |
           $ErrorActionPreference = "Stop"
@@ -671,14 +822,24 @@ jobs:
               ExpectedSignerThumbprint = $env:SIGNER_THUMBPRINT
               ExpectedVersion = $env:VERSION
               ExpectedCommit = $env:GITHUB_SHA
-          }
-          if (-not [string]::IsNullOrWhiteSpace($env:SIGNTOOL_PATH)) {
-              $parameters["SigntoolPath"] = $env:SIGNTOOL_PATH
+              CargoPath = $env:CARGO_PATH
+              RustcPath = $env:RUSTC_PATH
+              SigntoolPath = $env:SIGNTOOL_PATH
           }
           & .\scripts\windows\validate-release.ps1 @parameters
           & .\scripts\release\verify-hash-manifest.ps1 `
             -RootDirectory $candidateDirectory
           "directory=$candidateDirectory" >> $env:GITHUB_OUTPUT
+
+      - name: Recheck tracked sources after all toolchain execution
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+          git diff --quiet HEAD --
+          if ($LASTEXITCODE -ne 0) {
+              throw "The signing toolchain modified tracked candidate sources after assembly."
+          }
 
       - name: Remove imported signing certificates
         if: always()

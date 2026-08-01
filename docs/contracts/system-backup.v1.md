@@ -42,7 +42,9 @@ journal 或 staging 文件存在都不能表述为“Windows 可恢复门禁已�
   `network=none`、只读根文件系统、`cap_drop=ALL`、`no-new-privileges`。
 - 密码只经标准输入传给一次性 helper，不得进入参数、环境、日志、JSON 结果或 Git。
 - DATA/SECRETS 两把恢复 key 必须与安装目录、应用数据目录和运行 secret 目录路径分离，
-  并与全部数据库密码、JWT、HMAC、KEK 及 32-byte secret 的十六进制编码做值域分离。
+  并与全部数据库密码、JWT、HMAC、KEK 及 32-byte secret 的十六进制编码做值域分离。该
+  集合包括 `egress_lease_creation_capability`；它是 32 个 OS CSPRNG 原始字节编码成的
+  64 个 ASCII 小写十六进制字符，且必须与四个数据库角色密码分别不同。
 
 ## 3. DATA 固定 allowlist
 
@@ -60,7 +62,8 @@ DATA 包只允许以下归档项：
 
 - `des-workspace-data`、任何运行时工作目录或 `job.json`；
 - `des-postgres-data` 物理卷、数据库数据目录、WAL 或 Docker volume tar；
-- Launcher keyring、数据库密码、JWT 私钥、HMAC、KEK、数据源明文凭据；
+- Launcher keyring、数据库密码、`egress_lease_creation_capability`、JWT 私钥、HMAC、
+  KEK、数据源明文凭据；
 - 未知元数据文件、链接、设备、FIFO、socket 或未声明归档路径。
 
 导出 DATA 前，helper 必须读取并校验固定 secret 集合但不得将其归档，用于：
@@ -72,6 +75,14 @@ DATA 包只允许以下归档项：
 发现疑似泄露时返回 `BACKUP_SECRET_LEAK_DETECTED` 或
 `BACKUP_DATA_ALLOWLIST_REJECTED`，且不得发布 `.dxdata`。
 
+当前 Launcher 的运行集合恰好包含十个文件：四个数据库角色密码、
+`egress_lease_creation_capability`、JWT 公私钥、两个 HMAC key 和当前
+`credential-kek-v1.key`。备份验证将前九个名称视为固定 allowlist，并要求至少一个符合
+`credential-kek-[a-z0-9][a-z0-9_.-]{0,62}.key` 的 32-byte KEK，以支持已批准的历史 KEK
+保留；缺失固定名称、未知名称、链接/特殊文件、长度或格式错误，或该能力值与任一数据库
+密码复用都返回 `BACKUP_SECRET_SET_INVALID`。这些值只用于 SECRETS 包的加密归档和 DATA
+泄露扫描，绝不写入 manifest、结果或日志。
+
 ## 4. DATA/SECRETS 分包
 
 一次受控备份固定产生两类包：
@@ -79,12 +90,12 @@ DATA 包只允许以下归档项：
 | 包 | 后缀 | 内容 | 保管要求 |
 |---|---|---|---|
 | 数据包 | `.dxdata` | PostgreSQL 逻辑 dump、脱敏日志、固定发布/迁移元数据 | 可放入受控备份介质 |
-| 密钥包 | `.dxkeys` | PostgreSQL 管理密码、egress-guard/API/Worker 独立数据库角色密码、JWT 密钥、HMAC、全部受支持 KEK | 与数据包分开保管 |
+| 密钥包 | `.dxkeys` | PostgreSQL 管理密码、egress-guard/API/Worker 独立数据库角色密码、`egress_lease_creation_capability`、JWT 密钥、HMAC、全部受支持 KEK | 与数据包分开保管 |
 
 两包必须使用不同的高熵恢复秘密。密钥包通过
 `related_data_backup_id` 精确绑定数据包；检查时还要比较 `installation_id`、产品版本和
-迁移版本。缺包、错包、错密码、密钥集合不完整、公私钥不匹配、四类数据库角色密码/
-HMAC/KEK 任意重用或未知密钥对象一律失败关闭。`installation_id` 位于加密清单内，不以
+迁移版本。缺包、错包、错密码、密钥集合不完整、公私钥不匹配、四类数据库角色密码、
+`egress_lease_creation_capability`、HMAC/KEK 任意重用或未知密钥对象一律失败关闭。`installation_id` 位于加密清单内，不以
 明文文件名泄露。
 
 ## 5. 加密与归档完整性
@@ -137,7 +148,7 @@ datax-studio-system-backup stage-restore-pair \
 
 - DATA 与 SECRETS 的恢复秘密按该顺序作为恰好两行标准输入传入；不得进入参数、环境、
   journal 或结果。两把秘密必须不同，且在 SECRETS 解包后再次证明没有复用任一数据库
-  密码、JWT、HMAC、KEK 或 32-byte secret 的十六进制编码。
+  密码、`egress_lease_creation_capability`、JWT、HMAC、KEK 或 32-byte secret 的十六进制编码。
 - helper 先完整认证两包，核对 `related_data_backup_id`、`installation_id`、产品版本、
   迁移版本，并把 DATA 中 `release-manifest.json` 的 SHA-256 与已签名 Launcher 内置绑定值
   比较。该比较只证明包内发布元数据属于当前已签名制品；helper 自身不能替代 Launcher 的

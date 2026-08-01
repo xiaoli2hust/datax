@@ -73,6 +73,7 @@ services:
     restart: unless-stopped
     secrets:
       - egress_guard_database_password
+      - egress_lease_creation_capability
     read_only: true
     tmpfs:
       - /run/datax-egress-guard:rw,noexec,nosuid,size=4m
@@ -102,6 +103,7 @@ services:
     environment:
       <<: *backend-environment
       DES_DATABASE_USER: datax_api
+      DES_EGRESS_LEASE_CREATION_CAPABILITY_FILE: /run/secrets/egress_lease_creation_capability
     secrets:
       - source: api_database_password
         target: database_password
@@ -113,6 +115,7 @@ services:
       - idempotency_hmac_key
       - source: credential_kek_v1
         target: credential-kek-v1.key
+      - egress_lease_creation_capability
     volumes:
       - log-data:/var/lib/datax-studio/logs
     read_only: true
@@ -148,6 +151,7 @@ services:
       <<: *backend-environment
       DES_DATABASE_USER: datax_worker
       DES_SENSITIVE_RUNTIME_ROOT: /tmp/datax-studio-sensitive
+      DES_EGRESS_LEASE_CREATION_CAPABILITY_FILE: /run/secrets/egress_lease_creation_capability
     secrets:
       - source: worker_database_password
         target: database_password
@@ -157,6 +161,7 @@ services:
       - idempotency_hmac_key
       - source: credential_kek_v1
         target: credential-kek-v1.key
+      - egress_lease_creation_capability
     volumes:
       - log-data:/var/lib/datax-studio/logs
       - workspace-data:/var/lib/datax-studio/runs
@@ -206,6 +211,8 @@ secrets:
     file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/postgres_password.txt
   egress_guard_database_password:
     file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/egress_guard_database_password.txt
+  egress_lease_creation_capability:
+    file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/egress_lease_creation_capability
   api_database_password:
     file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/api_database_password.txt
   worker_database_password:

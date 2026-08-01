@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     egress_attestation_url: str = "http://127.0.0.1:17990/v1/attestation"
     egress_attestation_timeout_seconds: float = Field(default=0.5, gt=0, le=5)
     egress_attestation_max_age_seconds: float = Field(default=15, gt=0, le=30)
+    egress_lease_creation_capability_file: Path = Path(
+        "/run/secrets/egress_lease_creation_capability"
+    )
     datasource_connect_timeout_seconds: int = Field(default=5, ge=1, le=30)
     datasource_query_timeout_seconds: int = Field(default=10, ge=1, le=60)
     jwt_issuer: str = "datax-enterprise-studio"

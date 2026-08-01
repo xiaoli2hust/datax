@@ -29,6 +29,8 @@ _FORBIDDEN_KEYS = frozenset(
         "jvm",
         "jvmParameters",
         "plugin",
+        # This Launcher/guard control capability is never a DataX job option.
+        "egress_lease_creation_capability",
     }
 )
 _TYPE_TOKEN = re.compile(r"^\s*([a-zA-Z]+(?:\s+[a-zA-Z]+)*)")

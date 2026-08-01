@@ -7,6 +7,12 @@
 当前仓库所在 Mac 只用于开发验证；最终 Compose 必须运行并验收在另一台 Windows 11
 x64 电脑的 Docker Desktop + WSL2 中。
 
+每次 Docker/Compose 调用均由 Launcher 以固定参数和 Launcher-owned 环境启动：它不继承
+用户 `DOCKER_CONFIG`、context、TLS/认证、`DOCKER_DEFAULT_PLATFORM`、BuildKit、上/小写 proxy
+或 Compose env-file/project/profile/行为/输出覆盖，并只注入经校验的匿名 CLI config、固定
+local named pipe 与发布清单派生的值。Docker Desktop daemon 的组织级代理是独立前置，不通过
+这个子进程环境传递。此处描述的是 Rust E1 契约，真实 Windows/Docker Desktop 的行为仍待 E4。
+
 仓库已提供 `backend/Dockerfile.worker`：它从锁定的上游源码、JDK 与插件集合构建
 Linux/amd64 DataX Runtime，并在镜像内生成
 `/opt/datax/runtime-manifest.json`。开发环境已经完成过容器构建与固定 stream smoke；
@@ -83,6 +89,12 @@ volume、真实 `pg_restore`、数据库/审计链/日志/密钥证据重算、�
 installation-id 原子提交和升级路径仍未实现，必须失败关闭。该候选尚未经过真实
 Windows 11 备份/完整恢复验收，具体边界见
 [`../../docs/contracts/system-backup.v1.md`](../../docs/contracts/system-backup.v1.md)。
+
+DATA、SECRETS 与 restore staging helper 有 role+不透明 ID 标签及安装/用户或恢复输入派生的
+确定性名称。若 Docker CLI timeout、被终止或 helper/结果校验失败，Launcher 仅从精确名称取得
+immutable container ID，复核两项标签后才 `docker container rm --force <id>`；名称重用、标签
+不符、inspect/remove 失败一律返回 `HELPER_CLEANUP_FAILED`，不会删除未知容器或 named volume。
+该清理仍仅有 E1 单元测试，真实 Windows timeout 收敛待验。
 
 开发者可以在明确设置 `DES_SECRET_DIR` 后，显式叠加仅供开发的 build override：
 

@@ -26,6 +26,9 @@ def _runtime_settings(tmp_path: Path) -> SimpleNamespace:
         egress_attestation_url="http://127.0.0.1:17990/v1/attestation",
         egress_attestation_timeout_seconds=0.5,
         egress_attestation_max_age_seconds=15.0,
+        egress_lease_creation_capability_file=(
+            tmp_path / "egress_lease_creation_capability"
+        ),
         datasource_connect_timeout_seconds=5,
         datasource_query_timeout_seconds=10,
         kek_keyring_dir=tmp_path,
@@ -134,6 +137,9 @@ def test_worker_main_disposes_the_shared_engine_on_clean_stop(
             egress_attestation_url="http://127.0.0.1:17990/v1/attestation",
             egress_attestation_timeout_seconds=0.5,
             egress_attestation_max_age_seconds=15.0,
+            egress_lease_creation_capability_file=Path(
+                "/unused/egress_lease_creation_capability"
+            ),
             egress_policy_version="des-nftables-egress-v1",
             resolver_policy_version="des-system-dns-v1",
             log_volume_path=Path("/unused/logs"),

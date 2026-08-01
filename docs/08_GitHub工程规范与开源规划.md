@@ -16,6 +16,9 @@
 > environment）；引用不存在的名称会被 GitHub 自动创建为无保护环境。发布工作流因此在导入
 > 签名证书前查询 Environment，要求至少一名 required reviewer 且 `prevent_self_review=true`，
 > 否则失败关闭。该本地预检不替代实际在 GitHub 配置审批人、分支/标签策略和环境专属 secrets。
+> 当前也没有可用 self-hosted runner；签名 job 只能路由到专用
+> `datax-release-signing` runner group 中同时带有 `self-hosted/windows/x64/datax-release-windows11`
+> labels 的机器。缺组或缺 runner 应保持排队/阻断，不能回退到任意同标签 runner。
 > 仓库发布工作流仍生成 `gate_result=BLOCKED` 且需求项为 `NOT_RUN/E0` 的候选证据，不批准公开发布。
 
 > ADR-0011 已接受未来的两阶段插件/Runtime qualification 与发布晋级链：不可变 payload
@@ -205,6 +208,21 @@ Windows release runner 或签名结果已经在线验证。Java 源码也没有�
 - 签名 job 使用前，`windows-candidate-signing` 必须已在 GitHub 管理面预先创建，并至少配置
   一名 required reviewer 且禁止发起人自审；工作流会读取 REST Environment 描述并失败关闭。
   空/隐式创建的 Environment、缺审批、允许 self-review 或 API 不可读均不得触及证书导入。
+  签名 job 还固定要求 `datax-release-signing` runner group 与
+  `self-hosted/windows/x64/datax-release-windows11` 标签交集；该 group 只能向本仓库暴露可还原、
+  一次性 Windows Release runner，不能把宽泛的默认组或单一标签当作等价隔离。
+  `CARGO_PATH`、`MAKENSIS_PATH`、`RUSTC_PATH` 与 `SIGNTOOL_PATH` 必须作为发布环境配置的
+  显式本机绝对路径提供；工作流在导入 PFX 前拒绝空路径、网络/相对路径、重解析点、错误文件名
+  或 dirty/untracked checkout，还拒绝 `RUSTC_WRAPPER`、`RUSTFLAGS`、
+  `CARGO_ENCODED_RUSTFLAGS`、`CARGO_BUILD_RUSTFLAGS`、`CARGO_TARGET_*`、`CARGO_HOME`
+  等环境覆盖。Cargo 调用把 `RUSTC` 固定为显式 `RUSTC_PATH`，并在候选组装/验证后、证书
+  清理和候选上传前重新检查 tracked source。该最终 `git diff` 只覆盖 tracked source，不覆盖
+  后来建立的 untracked 工作区输入或 `RUNNER_TEMP` 候选输出。拒绝环境中的 `CARGO_HOME` 只会
+  使 Cargo 回落到 runner 用户 profile 的默认 Cargo home；该 profile 的 config/cache 仍须作为
+  runner provisioning/ACL 门禁单独取证。绝对路径和结构检查只消除经 `PATH` 选择工具和显而易见的
+  工作区污染；它不证明所执行字节就是批准工具，不能消除检查后到执行前的替换（TOCTOU），也不证明
+  工具 hash/Authenticode、父目录 ACL、runner 恢复基线或私钥不可导出性。因此仍只是 E1，不能关闭
+  FP-P1-015。
   Release Owner 还必须在 GitHub 为 `main` 与精确发布 tag 配置符合本仓库发布策略的部署/规则集
   限制，并把签名 secrets 仅存于该 Environment；这一远端配置不是 YAML 文件存在就能证明的。
 - 发布流水线必须校验 Authenticode 签名、签名时间戳、发布 SHA-256、版本单调性、
@@ -301,8 +319,10 @@ Bug Issue 应包含版本、环境、复现步骤、预期/实际、脱敏日志
 - 干净 Windows 11 x64 VM 的 `E2E-WIN-001`、`E2E-WIN-002`、四方向 DataX、
   签名/哈希、端口、恢复和备份证据。
 
-当前 release workflow 只生成 Linux 工程候选和显式 `BLOCKED` manifest；没有签名 Setup、
-真实 Windows 11 E4、四方向 DataX、外部 WORM 或恢复证据时，不得创建公开发布结论。
+当前远端因缺少 signing Environment 和受限 Windows runner，release workflow 不能实际生成
+签名 Setup。即使未来补齐这些前置条件，现有 workflow 也只会生成名称和根语义均为
+`BLOCKED` 的候选，而非公开 release；没有真实 Windows 11 E4、四方向 DataX、外部 WORM
+或恢复证据时，不得创建公开发布结论。
 
 禁止使用可漂移的 `latest` 作为发布依据；禁止只上传 ZIP、未签名 EXE 或镜像后宣称
 Windows 可交付。版本制品、哈希、SBOM、许可证与证据包必须原子发布或整体撤回。

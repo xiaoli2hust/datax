@@ -32,8 +32,8 @@ class AcceptanceManifestTests(unittest.TestCase):
         self.assertEqual(document["requirement_count"], 81)
         self.assertEqual(document["v1_must_count"], 80)
         self.assertEqual(document["post_v1_count"], 1)
-        self.assertEqual(document["entry_count"], 90)
-        self.assertEqual(len(entries), 90)
+        self.assertEqual(document["entry_count"], 91)
+        self.assertEqual(len(entries), 91)
         self.assertTrue(
             {"PERF-001", "PERF-002", "SEC-001", "SEC-002", "SEC-003"}.isdisjoint(
                 entry.test_id for entry in entries
@@ -70,6 +70,7 @@ class AcceptanceManifestTests(unittest.TestCase):
                 "REC-WIN-INIT-001",
                 "REC-WIN-WORKER-DB-001",
                 "SEC-WIN-DOCKER-CLI-001",
+                "SEC-EGRESS-LEASE-001",
                 "SEC-WIN-IMAGE-PULL-001",
                 "SEC-WIN-TMPFS-001",
             },

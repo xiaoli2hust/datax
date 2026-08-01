@@ -25,7 +25,10 @@
 1. **Windows E4 harness**：专用、受保护、可还原到已登记干净基线的 Windows 11 x64
    自托管 runner 执行安装、Docker Desktop/WSL2、端口/LAN、四方向 DataX、故障、备份
    恢复和卸载场景。该 runner 是物理行为证据的操作信任根，不运行 PR 代码，不接受来自
-   待验证 manifest 的命令、路径、测试集合或期望结果。
+   待验证 manifest 的命令、路径、测试集合或期望结果。签名 workflow 只能以
+   `runs-on.group=datax-release-signing` 加
+   `self-hosted/windows/x64/datax-release-windows11` labels 路由到该隔离组；缺组或缺 runner
+   必须阻断，不能因任意同标签 runner 可用而回退。
 2. **候选根 attestor**：后续 GitHub 托管 runner 重新下载 Windows 证据，验证候选根和
    全部哈希，再使用 GitHub Actions OIDC/Sigstore artifact attestation 对候选根签发构建
    来源证明。发布 validator 必须要求该证明来自固定仓库、固定 release workflow、受保护
@@ -76,6 +79,17 @@ candidate-root 和 attestation bundle 做密码学验证，并同时固定：
 - `prevent_self_review=true`；
 - Environment 缺失、规则为空/重复/畸形、允许自审或 API 读取失败时，均在导入证书、设置
   signing 变量或调用签名工具前终止。
+
+`cargo.exe`、`makensis.exe`、`rustc.exe` 与 `signtool.exe` 必须由发布环境显式提供本机
+绝对路径；workflow 和 release scripts 不得从 PATH 自动发现。导入 PFX 前必须拒绝 dirty/
+untracked checkout、相对/网络/重解析工具路径和错误文件名，还必须拒绝 Cargo wrapper、flags、
+target/home 等环境覆盖。Cargo 调用必须把 `RUSTC` 固定为显式 rustc 路径；候选组装/验证后、
+证书清理和候选上传前还必须复核 tracked source 未变化。该最终复核不盘点随后出现的 untracked
+输入或候选输出。拒绝环境 `CARGO_HOME` 只使 Cargo 使用 runner profile 的默认 Cargo home，
+其 config/cache 仍是 provisioning/ACL 的独立取证对象。这是对 PATH shim 和意外工作区污染的
+最小失败关闭：绝对路径不证明执行字节的工具身份，也不能阻止检查后/执行前替换（TOCTOU）。它不
+替代工具 hash/签名、父目录 ACL、受保护且可还原的一次性 runner，或不可导出 HSM/远程签名；这些
+仍是 E3/E4 门禁。
 
 该预检只确认所读取的 Environment 形状；它不替代 owner 对 secrets 作用域、`main` 与精确
 release tag 部署限制、真实审批记录或受控 Windows runner 的独立取证。后者仍必须以 E4
@@ -169,6 +183,12 @@ release qualification、最终安装包和公开晋级拆开。这里的双重�
   `trusted_gh_cli.py` 硬锁并在调用前复核。低层 provenance 全部匹配后，workflow 仍必须精确
   得到 `TRUSTED_ATTESTATION_VERIFIER_TCB_NOT_IMPLEMENTED`，并只上传名称含 `blocked` 的
   完整候选及证明制品；该接线不会批准发布。
+- Windows signing job 现在还固定选择 `datax-release-signing` runner group 与四个精确标签，
+  并要求发布环境给出 `CARGO_PATH`、`MAKENSIS_PATH`、`RUSTC_PATH`、`SIGNTOOL_PATH`；它在
+  导入 PFX 前检查 checkout 和工具路径，工具执行后重查 tracked source。当前远端没有该组的
+  runner 或 signing Environment，因此这只是静态 E1 fail-closed 控制。绝对路径不等于工具
+  身份或不可替换性，仍不是受控 runner、工具 hash/ACL、TOCTOU 防护、不可导出证书或 Windows
+  E4 证据。
 
 尚未完成：上述 workflow 尚未在受保护 Windows runner、真实签名 secrets 和 GitHub
 attestation 服务上运行，因而没有真实 bundle/反向验证证据；机器场景 profile/result 契约、

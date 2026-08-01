@@ -245,6 +245,7 @@ def build_credential_service(
         max_age_seconds=settings.egress_attestation_max_age_seconds,
         policy_engine_version=settings.egress_policy_version,
         resolver_policy_version=settings.resolver_policy_version,
+        lease_creation_capability_file=settings.egress_lease_creation_capability_file,
     )
     guard = EndpointPolicyGuard(
         resolver_policy_version=settings.resolver_policy_version,

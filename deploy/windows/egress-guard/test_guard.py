@@ -4,9 +4,11 @@ import copy
 import http.client
 import ipaddress
 import json
+import tempfile
 import threading
 import unittest
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from unittest.mock import patch
 
 from guard import (
@@ -25,6 +27,7 @@ from guard import (
     normalize_lease_request,
     normalize_policy_rows,
     parse_control_route,
+    read_lease_creation_capability,
 )
 
 
@@ -514,10 +517,12 @@ class LeaseHttpContractTests(unittest.TestCase):
             state=self.state,
         )
         self.controller.refresh_once()
+        self.lease_creation_capability = "c" * 64
         self.server = AttestationServer(
             ("127.0.0.1", 0),
             self.state,
             self.controller,
+            self.lease_creation_capability.encode("ascii"),
         )
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -548,13 +553,19 @@ class LeaseHttpContractTests(unittest.TestCase):
             connection.close()
         return response.status, json.loads(payload) if payload else None
 
+    def lease_headers(self, content_type: str = "application/json") -> dict[str, str]:
+        return {
+            "Content-Type": content_type,
+            "X-DataX-Egress-Lease-Capability": self.lease_creation_capability,
+        }
+
     def test_create_renew_release_and_error_contract(self) -> None:
         body = json.dumps(lease_request(), separators=(",", ":")).encode()
         status, granted = self.request(
             "POST",
             "/v1/leases",
             body=body,
-            headers={"Content-Type": "application/json"},
+            headers=self.lease_headers(),
         )
         self.assertEqual(status, 201)
         self.assertIsNotNone(granted)
@@ -590,7 +601,7 @@ class LeaseHttpContractTests(unittest.TestCase):
             "POST",
             "/v1/leases",
             body=json.dumps(request).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=self.lease_headers(),
         )
         self.assertEqual((status, error), (409, {"code": "LEASE_POLICY_NOT_ACTIVE"}))
 
@@ -599,7 +610,7 @@ class LeaseHttpContractTests(unittest.TestCase):
             "POST",
             "/v1/leases",
             body=json.dumps(invalid_revision).encode(),
-            headers={"Content-Type": "application/json"},
+            headers=self.lease_headers(),
         )
         self.assertEqual((status, error), (400, {"code": "LEASE_REQUEST_INVALID"}))
 
@@ -607,9 +618,64 @@ class LeaseHttpContractTests(unittest.TestCase):
             "POST",
             "/v1/leases",
             body=b"{}",
-            headers={"Content-Type": "text/plain"},
+            headers=self.lease_headers("text/plain"),
         )
         self.assertEqual((status, error), (400, {"code": "LEASE_REQUEST_INVALID"}))
+
+    def test_post_requires_the_exact_capability_before_body_or_controller_access(self) -> None:
+        # The controller has loaded one policy snapshot during setUp.  Missing
+        # or wrong control capabilities must fail before body parsing or a
+        # second controller load can occur.
+        self.assertEqual(self.policies.loads, 1)
+        for headers in (
+            {"Content-Type": "application/json"},
+            {
+                "Content-Type": "application/json",
+                "X-DataX-Egress-Lease-Capability": "d" * 64,
+            },
+        ):
+            with self.subTest(headers=headers):
+                status, error = self.request(
+                    "POST",
+                    "/v1/leases",
+                    body=b"not-json",
+                    headers=headers,
+                )
+                self.assertEqual(
+                    (status, error),
+                    (401, {"code": "LEASE_CREATION_AUTH_INVALID"}),
+                )
+        self.assertEqual(self.policies.loads, 1)
+
+        status, error = self.request(
+            "POST",
+            "/v1/leases",
+            body=b"not-json",
+            headers={
+                "Content-Type": "application/json",
+                "X-DataX-Egress-Lease-Capability": self.lease_creation_capability,
+            },
+        )
+        self.assertEqual((status, error), (400, {"code": "LEASE_REQUEST_INVALID"}))
+
+
+class LeaseCreationCapabilityLoaderTests(unittest.TestCase):
+    def test_loader_refuses_absent_or_noncanonical_capability(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            path = Path(temporary_directory) / "egress_lease_creation_capability"
+            with self.assertRaisesRegex(GuardError, "LEASE_CREATION_CAPABILITY_UNAVAILABLE"):
+                read_lease_creation_capability(path)
+
+            path.write_bytes(b"c" * 63)
+            with self.assertRaisesRegex(GuardError, "LEASE_CREATION_CAPABILITY_INVALID"):
+                read_lease_creation_capability(path)
+
+            path.write_bytes(b"C" * 64)
+            with self.assertRaisesRegex(GuardError, "LEASE_CREATION_CAPABILITY_INVALID"):
+                read_lease_creation_capability(path)
+
+            path.write_bytes(b"c" * 64)
+            self.assertEqual(read_lease_creation_capability(path), b"c" * 64)
 
 
 if __name__ == "__main__":

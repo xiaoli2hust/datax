@@ -38,11 +38,15 @@ ManifestDPIAware true
 !define PRODUCT_KEY "Software\DataXEnterpriseStudio"
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\DataXEnterpriseStudio"
 !define START_MENU_DIR "DataX Enterprise Studio"
+!define INSTALL_DIRECTORY "$LOCALAPPDATA\Programs\DataXEnterpriseStudio"
 
 Name "${PRODUCT_NAME}"
 Caption "${PRODUCT_NAME} ${PRODUCT_VERSION}"
 OutFile "${OUTPUT_FILE}"
-InstallDir "$LOCALAPPDATA\Programs\DataXEnterpriseStudio"
+InstallDir "${INSTALL_DIRECTORY}"
+; Do not permit the default /NCRC switch to bypass the installer's own
+; corruption check. Authenticode remains the release trust control.
+CRCCheck force
 BrandingText "${PRODUCT_NAME}"
 
 VIProductVersion "${FILE_VERSION}"
@@ -67,6 +71,19 @@ VIAddVersionKey /LANG=2052 "LegalCopyright" "Copyright (c) DataX Enterprise Stud
 
 Function .onInit
   SetRegView 64
+  SetShellVarContext current
+  ; NSIS accepts /D=<path> by default. V1 has one fixed per-user installation
+  ; root, so reject any command-line override before extracting a single file.
+  StrCmp $INSTDIR "${INSTALL_DIRECTORY}" installer_directory_verified installer_directory_rejected
+
+installer_directory_rejected:
+  MessageBox MB_OK|MB_ICONSTOP "安装目录必须是当前用户的 %LOCALAPPDATA%\Programs\DataXEnterpriseStudio；不支持 /D 覆盖。安装已终止。"
+  Abort
+
+installer_directory_verified:
+  ; The release verifier is extracted to $PLUGINSDIR below. Do not rely on an
+  ; incidental plug-in invocation to create that directory first.
+  InitPluginsDir
   ${IfNot} ${RunningX64}
     MessageBox MB_OK|MB_ICONSTOP "仅支持 Windows 11 x64。安装已终止。"
     Abort
@@ -141,7 +158,7 @@ Function StopExistingSameVersion
     Return
   ${EndIf}
   ReadRegStr $1 HKCU "${PRODUCT_KEY}" "InstallDir"
-  ${If} $1 != "$LOCALAPPDATA\Programs\DataXEnterpriseStudio"
+  ${If} $1 != "${INSTALL_DIRECTORY}"
     MessageBox MB_OK|MB_ICONSTOP "现有版本安装路径不是固定每用户目录，无法安全覆盖。"
     Abort
   ${EndIf}
@@ -162,7 +179,8 @@ Section "DataX Enterprise Studio" SEC_MAIN
   SectionIn RO
   SetRegView 64
   SetShellVarContext current
-  Call StopExistingSameVersion
+  SetOverwrite on
+  AllowSkipFiles off
 
   SetOutPath "$PLUGINSDIR\release-check"
   File "/oname=launcher.exe" "${LAUNCHER_EXE}"
@@ -177,6 +195,15 @@ Section "DataX Enterprise Studio" SEC_MAIN
       "Setup、Launcher 或发布资源的签名身份/完整性核验失败。安装已安全终止，未写入程序目录。"
     Abort
   ${EndIf}
+
+  ; Preserve a healthy existing same-version installation until the incoming
+  ; Setup, Launcher, and resources have passed their complete detached check.
+  Call StopExistingSameVersion
+
+  ; Installed release resources are intentionally read-only. A same-version
+  ; repair must clear that attribute explicitly and fail rather than allowing a
+  ; user to skip a resource whose replacement could not be written.
+  Call NormalizeExistingResourceAttributes
 
   SetOutPath "$INSTDIR"
   File "/oname=launcher.exe" "${LAUNCHER_EXE}"
@@ -222,6 +249,16 @@ Function un.onInit
   SetRegView 64
   SetShellVarContext current
 
+  ; NSIS may execute an uninstaller from a temporary self-copy. Resolve the
+  ; only supported target from the persisted install record, then bind $INSTDIR
+  ; back to the fixed per-user root before any stop or delete operation.
+  ReadRegStr $0 HKCU "${PRODUCT_KEY}" "InstallDir"
+  ${If} $0 != "${INSTALL_DIRECTORY}"
+    MessageBox MB_OK|MB_ICONSTOP "无法证明这是当前用户受支持的 DataX Enterprise Studio 安装目录；为避免删除错误路径，卸载已终止。"
+    Abort
+  ${EndIf}
+  StrCpy $INSTDIR "${INSTALL_DIRECTORY}"
+
   MessageBox MB_YESNO|MB_ICONEXCLAMATION|MB_DEFBUTTON2 \
     "卸载只删除当前用户的程序文件和快捷方式。$\r$\n$\r$\n以下内容会保留：$\r$\n%LOCALAPPDATA%\DataXEnterpriseStudio$\r$\nDocker named volumes（包括数据库、日志和工作目录）。$\r$\n$\r$\n继续前，卸载程序会尝试安全停止服务；存在活动 Attempt 时会拒绝卸载。是否继续？" \
     IDYES continue_uninstall
@@ -254,6 +291,38 @@ launcher_stop_unverified:
     "将继续卸载程序，但服务停止状态未经验证。不会删除 %LOCALAPPDATA%\DataXEnterpriseStudio 或 Docker named volumes。"
 
 launcher_stop_verified:
+FunctionEnd
+
+Function NormalizeExistingResourceAttributes
+  IfFileExists "$INSTDIR\resources\compose.yaml" 0 normalize_images
+  ClearErrors
+  SetFileAttributes "$INSTDIR\resources\compose.yaml" NORMAL
+  IfErrors normalize_failed
+
+normalize_images:
+  IfFileExists "$INSTDIR\resources\images.release.env" 0 normalize_acl
+  ClearErrors
+  SetFileAttributes "$INSTDIR\resources\images.release.env" NORMAL
+  IfErrors normalize_failed
+
+normalize_acl:
+  IfFileExists "$INSTDIR\resources\secure-acl.ps1" 0 normalize_manifest
+  ClearErrors
+  SetFileAttributes "$INSTDIR\resources\secure-acl.ps1" NORMAL
+  IfErrors normalize_failed
+
+normalize_manifest:
+  IfFileExists "$INSTDIR\resources\release-manifest.json" 0 normalize_complete
+  ClearErrors
+  SetFileAttributes "$INSTDIR\resources\release-manifest.json" NORMAL
+  IfErrors normalize_failed
+
+normalize_complete:
+  Return
+
+normalize_failed:
+  MessageBox MB_OK|MB_ICONSTOP "无法解除现有发布资源的只读属性，无法安全完成同版本修复。安装已终止。"
+  Abort
 FunctionEnd
 
 Section "Uninstall"

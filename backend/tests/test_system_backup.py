@@ -78,6 +78,7 @@ def _secret_root(tmp_path: Path) -> Path:
     private_key = Ed25519PrivateKey.generate()
     (root / "postgres_password.txt").write_bytes(b"1" * 64)
     (root / "egress_guard_database_password.txt").write_bytes(b"2" * 64)
+    (root / "egress_lease_creation_capability").write_bytes(b"f" * 64)
     (root / "api_database_password.txt").write_bytes(b"3" * 64)
     (root / "worker_database_password.txt").write_bytes(b"4" * 64)
     (root / "jwt_private_key.pem").write_bytes(
@@ -256,6 +257,9 @@ def test_restore_pair_is_authenticated_and_stages_without_claiming_commit(
         staging / "data" / "logs" / EXECUTION_ID / f"{ATTEMPT_ID}.log"
     ).read_bytes() == b"INFO password=[REDACTED]\nINFO completed\n"
     assert (staging / "secrets" / "secrets" / "credential-kek-v1.key").read_bytes() == b"k" * 32
+    assert (
+        staging / "secrets" / "secrets" / "egress_lease_creation_capability"
+    ).read_bytes() == b"f" * 64
     journal_value = json.loads(journal.read_text(encoding="ascii"))
     assert journal_value["state"] == "STAGED_COMMIT_BLOCKED"
     assert journal_value["authentication"]["algorithm"] == "HMAC-SHA256"
@@ -627,11 +631,45 @@ def test_export_rejects_reused_database_role_passwords(tmp_path: Path) -> None:
     assert not any(output.iterdir())
 
 
+def test_export_rejects_missing_or_reused_egress_lease_creation_capability(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    secrets = _secret_root(tmp_path)
+    (secrets / "egress_lease_creation_capability").unlink()
+    with pytest.raises(BackupError) as missing:
+        system_backup.export_secrets(
+            output_dir=output,
+            password=_password(),
+            installation_id=INSTALLATION_ID,
+            product_version=PRODUCT_VERSION,
+            migration_revision=MIGRATION_REVISION,
+            related_data_backup_id="1" * 32,
+            secret_root=secrets,
+        )
+    assert missing.value.code == "BACKUP_SECRET_SET_INVALID"
+
+    (secrets / "egress_lease_creation_capability").write_bytes(b"2" * 64)
+    with pytest.raises(BackupError, match="域分离"):
+        system_backup.export_secrets(
+            output_dir=output,
+            password=_password(),
+            installation_id=INSTALLATION_ID,
+            product_version=PRODUCT_VERSION,
+            migration_revision=MIGRATION_REVISION,
+            related_data_backup_id="1" * 32,
+            secret_root=secrets,
+        )
+    assert not any(output.iterdir())
+
+
 @pytest.mark.parametrize(
     "content",
     [
         b'INFO password="plaintext-password"\n',
         b"INFO exact-secret=" + (b"k" * 32) + b"\n",
+        b"INFO control-secret=" + (b"f" * 64) + b"\n",
         b'{"job":{"content":[{"reader":{},"writer":{}}]}}\n',
         b"-----BEGIN PRIVATE KEY-----\nunknown\n",
     ],

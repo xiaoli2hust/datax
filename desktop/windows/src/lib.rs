@@ -46,21 +46,61 @@ const LOCAL_DOCKER_DESKTOP_ENDPOINTS: [&str; 2] = [
     "npipe:////./pipe/docker_engine",
     "npipe:////./pipe/dockerdesktoplinuxengine",
 ];
-const CHILD_ENVIRONMENT_REMOVALS: [&str; 24] = [
+// Docker and Compose behaviour is selected only by Launcher-owned arguments and
+// environment. Do not let an ambient platform, proxy, registry, build, or
+// lifecycle override alter a command that can touch local volumes or runtime
+// secrets. Docker Desktop's daemon-level organization proxy is a separate,
+// user/organization-managed prerequisite and is not inherited through this CLI.
+const CHILD_ENVIRONMENT_REMOVALS: &[&str] = &[
     "DOCKER_HOST",
     "DOCKER_CONTEXT",
+    "DOCKER_TLS",
     "DOCKER_TLS_VERIFY",
     "DOCKER_CERT_PATH",
     "DOCKER_API_VERSION",
     "DOCKER_CONFIG",
     "DOCKER_AUTH_CONFIG",
+    "DOCKER_DEFAULT_PLATFORM",
+    "DOCKER_CUSTOM_HEADERS",
+    "DOCKER_CONTENT_TRUST",
+    "DOCKER_CLI_EXPERIMENTAL",
+    "DOCKER_CLI_HINTS",
+    "DOCKER_HIDE_LEGACY_COMMANDS",
+    "DOCKER_SCAN_SUGGEST",
+    "DOCKER_BUILDKIT",
     "REGISTRY_AUTH_FILE",
+    "BUILDKIT_HOST",
+    "BUILDKIT_PROGRESS",
+    "BUILDKIT_COLORS",
     "COMPOSE_FILE",
     "COMPOSE_PROJECT_NAME",
     "COMPOSE_PROFILES",
     "COMPOSE_ENV_FILES",
+    "COMPOSE_DISABLE_ENV_FILE",
     "COMPOSE_CONVERT_WINDOWS_PATHS",
     "COMPOSE_PATH_SEPARATOR",
+    "COMPOSE_IGNORE_ORPHANS",
+    "COMPOSE_REMOVE_ORPHANS",
+    "COMPOSE_PARALLEL_LIMIT",
+    "COMPOSE_ANSI",
+    "COMPOSE_STATUS_STDOUT",
+    "COMPOSE_MENU",
+    "COMPOSE_EXPERIMENTAL",
+    "COMPOSE_PROGRESS",
+    "COMPOSE_BAKE",
+    "COMPOSE_COMPATIBILITY",
+    "COMPOSE_DOCKER_CLI_BUILD",
+    "COMPOSE_INTERACTIVE_NO_CLI",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "FTP_PROXY",
+    "ALL_PROXY",
+    "NO_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "ftp_proxy",
+    "all_proxy",
+    "no_proxy",
     "DES_POSTGRES_IMAGE",
     "DES_API_IMAGE",
     "DES_EGRESS_GUARD_IMAGE",
@@ -82,12 +122,18 @@ const EXPECTED_SERVICES: [&str; 6] = [
 ];
 const VOLUME_IDENTITY_LABEL: &str = "com.xiaoli.datax.installation-id";
 const VOLUME_ROLE_LABEL: &str = "com.xiaoli.datax.volume-role";
+const HELPER_CONTAINER_ROLE_LABEL: &str = "com.xiaoli.datax.helper-role";
+const HELPER_CONTAINER_ID_LABEL: &str = "com.xiaoli.datax.helper-id";
+const BACKUP_DATA_HELPER_ROLE: &str = "backup-data";
+const BACKUP_SECRETS_HELPER_ROLE: &str = "backup-secrets";
+const RESTORE_STAGE_HELPER_ROLE: &str = "restore-stage";
+const HELPER_CONTAINER_INSPECT_FORMAT: &str = r#"{{ index .Config.Labels "com.xiaoli.datax.helper-role" }}|{{ index .Config.Labels "com.xiaoli.datax.helper-id" }}"#;
 const RUNTIME_VOLUMES: [(&str, &str); 3] = [
     ("des-postgres-data", "postgres-data"),
     ("des-log-data", "log-data"),
     ("des-workspace-data", "workspace-data"),
 ];
-const RUNTIME_SECRET_COUNT: usize = 9;
+const RUNTIME_SECRET_COUNT: usize = 10;
 const MAX_RUNTIME_SECRET_BYTES: u64 = 4096;
 const VERIFY_CONTAINER_SECRETS_SCRIPT: &str = concat!(
     "import os,stat,sys\n",
@@ -96,7 +142,8 @@ const VERIFY_CONTAINER_SECRETS_SCRIPT: &str = concat!(
     "'/run/secrets/jwt_public_key.pem':(1,4096),",
     "'/run/secrets/refresh_token_hmac_key':(32,32),",
     "'/run/secrets/idempotency_hmac_key':(32,32),",
-    "'/run/secrets/credential-kek-v1.key':(32,32)}\n",
+    "'/run/secrets/credential-kek-v1.key':(32,32),",
+    "'/run/secrets/egress_lease_creation_capability':(64,64)}\n",
     "try:\n",
     " ok=all(stat.S_ISREG(os.lstat(p).st_mode) and lo<=os.lstat(p).st_size<=hi ",
     "for p,(lo,hi) in spec.items())\n",
@@ -107,7 +154,8 @@ const VERIFY_WORKER_SECRETS_SCRIPT: &str = concat!(
     "import os,stat\n",
     "spec={'/run/secrets/database_password':(64,64),",
     "'/run/secrets/idempotency_hmac_key':(32,32),",
-    "'/run/secrets/credential-kek-v1.key':(32,32)}\n",
+    "'/run/secrets/credential-kek-v1.key':(32,32),",
+    "'/run/secrets/egress_lease_creation_capability':(64,64)}\n",
     "try:\n",
     " ok=all(stat.S_ISREG(os.lstat(p).st_mode) and lo<=os.lstat(p).st_size<=hi ",
     "for p,(lo,hi) in spec.items())\n",
@@ -116,9 +164,11 @@ const VERIFY_WORKER_SECRETS_SCRIPT: &str = concat!(
 );
 const VERIFY_EGRESS_GUARD_SECRET_SCRIPT: &str = concat!(
     "import os,stat\n",
-    "p='/run/secrets/egress_guard_database_password'\n",
+    "spec={'/run/secrets/egress_guard_database_password':(64,64),",
+    "'/run/secrets/egress_lease_creation_capability':(64,64)}\n",
     "try:\n",
-    " s=os.lstat(p); ok=stat.S_ISREG(s.st_mode) and s.st_size==64\n",
+    " ok=all(stat.S_ISREG(os.lstat(p).st_mode) and os.lstat(p).st_size==64 ",
+    "for p in spec)\n",
     "except OSError:\n ok=False\n",
     "raise SystemExit(0 if ok else 4)\n",
 );
@@ -238,6 +288,7 @@ struct Installation {
     secret_dir: PathBuf,
     postgres_secret: PathBuf,
     egress_guard_database_secret: PathBuf,
+    egress_lease_creation_capability: PathBuf,
     api_database_secret: PathBuf,
     worker_database_secret: PathBuf,
     jwt_private_key: PathBuf,
@@ -269,6 +320,13 @@ struct ProcessOutput {
     status: ExitStatus,
     stdout: Vec<u8>,
     stderr: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HelperContainer {
+    name: String,
+    role: &'static str,
+    opaque_id: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -374,6 +432,7 @@ struct PreparedRestore {
     staging_root: PathBuf,
     journal_directory: PathBuf,
     journal_path: PathBuf,
+    current_user_sid: String,
 }
 
 #[derive(Debug)]
@@ -688,6 +747,7 @@ impl Installation {
         let secret_dir = app_data_root.join("secrets");
         let postgres_secret = secret_dir.join("postgres_password.txt");
         let egress_guard_database_secret = secret_dir.join("egress_guard_database_password.txt");
+        let egress_lease_creation_capability = secret_dir.join("egress_lease_creation_capability");
         let api_database_secret = secret_dir.join("api_database_password.txt");
         let worker_database_secret = secret_dir.join("worker_database_password.txt");
         let jwt_private_key = secret_dir.join("jwt_private_key.pem");
@@ -713,6 +773,7 @@ impl Installation {
             secret_dir,
             postgres_secret,
             egress_guard_database_secret,
+            egress_lease_creation_capability,
             api_database_secret,
             worker_database_secret,
             jwt_private_key,
@@ -1314,6 +1375,7 @@ fn ensure_existing_runtime_secrets(
         "Worker 运行数据库密码",
     )?;
     validate_database_secret_domain_separation(installation)?;
+    ensure_egress_lease_creation_capability(start_tools, installation, sid, storage_was_existing)?;
     ensure_auth_secret_bundle(start_tools, installation, sid, storage_was_existing)?;
     ensure_credential_kek(start_tools, installation, sid, storage_was_existing)
 }
@@ -1322,6 +1384,7 @@ fn runtime_secret_paths(installation: &Installation) -> [&Path; RUNTIME_SECRET_C
     [
         installation.postgres_secret.as_path(),
         installation.egress_guard_database_secret.as_path(),
+        installation.egress_lease_creation_capability.as_path(),
         installation.api_database_secret.as_path(),
         installation.worker_database_secret.as_path(),
         installation.jwt_private_key.as_path(),
@@ -1729,6 +1792,74 @@ fn validate_database_secret_domain_separation(
         return Err(LauncherError::new(
             "DATABASE_SECRET_DOMAIN_SEPARATION_FAILED",
             "迁移管理员、出口守卫、API 与 Worker 必须使用四个独立的 32-byte 随机数据库密码。",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_egress_lease_creation_capability(
+    start_tools: &StartTools,
+    installation: &Installation,
+    sid: &str,
+    storage_was_existing: bool,
+) -> Result<(), LauncherError> {
+    let existed = installation.egress_lease_creation_capability.exists();
+    ensure_runtime_database_secret(
+        start_tools,
+        installation,
+        sid,
+        storage_was_existing,
+        &installation.egress_lease_creation_capability,
+        "EGRESS_LEASE_CREATION_CAPABILITY",
+        "出口租约创建能力密钥",
+    )?;
+    if let Err(error) = validate_egress_lease_creation_capability_domain_separation(installation) {
+        if !existed {
+            let _ = fs::remove_file(&installation.egress_lease_creation_capability);
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn validate_egress_lease_creation_capability_domain_separation(
+    installation: &Installation,
+) -> Result<(), LauncherError> {
+    let postgres = Zeroizing::new(read_bounded_file(
+        &installation.postgres_secret,
+        64,
+        "EGRESS_LEASE_CREATION_CAPABILITY_DOMAIN_SEPARATION_FAILED",
+    )?);
+    let guard = Zeroizing::new(read_bounded_file(
+        &installation.egress_guard_database_secret,
+        64,
+        "EGRESS_LEASE_CREATION_CAPABILITY_DOMAIN_SEPARATION_FAILED",
+    )?);
+    let api = Zeroizing::new(read_bounded_file(
+        &installation.api_database_secret,
+        64,
+        "EGRESS_LEASE_CREATION_CAPABILITY_DOMAIN_SEPARATION_FAILED",
+    )?);
+    let worker = Zeroizing::new(read_bounded_file(
+        &installation.worker_database_secret,
+        64,
+        "EGRESS_LEASE_CREATION_CAPABILITY_DOMAIN_SEPARATION_FAILED",
+    )?);
+    let capability = Zeroizing::new(read_bounded_file(
+        &installation.egress_lease_creation_capability,
+        64,
+        "EGRESS_LEASE_CREATION_CAPABILITY_DOMAIN_SEPARATION_FAILED",
+    )?);
+    if !independent_database_password_set_valid(&[
+        postgres.as_slice(),
+        guard.as_slice(),
+        api.as_slice(),
+        worker.as_slice(),
+        capability.as_slice(),
+    ]) {
+        return Err(LauncherError::new(
+            "EGRESS_LEASE_CREATION_CAPABILITY_DOMAIN_SEPARATION_FAILED",
+            "出口租约创建能力密钥必须与四个数据库密码分别使用独立的 32-byte 随机值。",
         ));
     }
     Ok(())
@@ -3041,7 +3172,8 @@ fn stage_system_restore(
         docker_writable_bind_mount(&prepared.staging_root, "/restore/staging")?,
         docker_writable_bind_mount(&prepared.journal_directory, "/restore/journal")?,
     ];
-    let mut arguments = restore_stage_container_arguments(&image_lock.worker, &mounts);
+    let helper = restore_stage_helper_container(&prepared);
+    let mut arguments = restore_stage_container_arguments(&image_lock.worker, &mounts, &helper);
     arguments.extend([
         OsString::from("stage-restore-pair"),
         OsString::from("--data-input"),
@@ -3064,16 +3196,17 @@ fn stage_system_restore(
             )
         })?),
     ]);
-    let mut output = run_process_with_secret_stdin(
-        &tools.docker,
+    let result = run_helper_with_cleanup(
+        tools,
+        installation,
+        &helper,
         &arguments,
-        &tools.docker_environment(),
-        &installation.install_dir,
-        SYSTEM_BACKUP_TIMEOUT,
         restore_password_pair_stdin(&prepared.data_key, &prepared.secrets_key),
+        |mut output| {
+            output.stderr.zeroize();
+            parse_restore_stage_output(&output)
+        },
     )?;
-    output.stderr.zeroize();
-    let result = parse_restore_stage_output(&output)?;
 
     platform::ensure_regular_file(&prepared.journal_path)?;
     let sid = current_user_sid(start_tools, installation)?;
@@ -3323,6 +3456,7 @@ fn prepare_restore_staging(
             LauncherError::new("RESTORE_PATH_INVALID", "无法规范化恢复 journal 目录。")
         })?,
         journal_path,
+        current_user_sid: sid,
     })
 }
 
@@ -4024,7 +4158,8 @@ fn export_data_package(
         )?,
         docker_writable_bind_mount(&prepared.data_output, "/backup/output")?,
     ];
-    let mut arguments = backup_container_arguments(&image_lock.worker, &mounts);
+    let helper = backup_helper_container(BACKUP_DATA_HELPER_ROLE, prepared);
+    let mut arguments = backup_container_arguments(&image_lock.worker, &mounts, &helper);
     arguments.extend([
         OsString::from("export-data"),
         OsString::from("--output-dir"),
@@ -4044,22 +4179,24 @@ fn export_data_package(
         OsString::from("--secret-root-for-scan"),
         OsString::from("/backup/secrets"),
     ]);
-    let output = run_process_with_secret_stdin(
-        &tools.docker,
-        &arguments,
-        &tools.docker_environment(),
-        &installation.install_dir,
-        SYSTEM_BACKUP_TIMEOUT,
-        backup_password_stdin(&prepared.data_key),
-    )?;
-    validate_system_backup_result(
-        output,
-        start_tools,
+    run_helper_with_cleanup(
+        tools,
         installation,
-        &prepared.data_output,
-        "DATA",
-        ".dxdata",
-        &prepared.current_user_sid,
+        &helper,
+        &arguments,
+        backup_password_stdin(&prepared.data_key),
+        |mut output| {
+            output.stderr.zeroize();
+            validate_system_backup_result(
+                output,
+                start_tools,
+                installation,
+                &prepared.data_output,
+                "DATA",
+                ".dxdata",
+                &prepared.current_user_sid,
+            )
+        },
     )
 }
 
@@ -4080,7 +4217,8 @@ fn export_secrets_package(
         )?,
         docker_writable_bind_mount(&prepared.secrets_output, "/backup/output")?,
     ];
-    let mut arguments = backup_container_arguments(&image_lock.worker, &mounts);
+    let helper = backup_helper_container(BACKUP_SECRETS_HELPER_ROLE, prepared);
+    let mut arguments = backup_container_arguments(&image_lock.worker, &mounts, &helper);
     arguments.extend([
         OsString::from("export-secrets"),
         OsString::from("--output-dir"),
@@ -4096,49 +4234,97 @@ fn export_secrets_package(
         OsString::from("--secret-root"),
         OsString::from("/backup/secrets"),
     ]);
-    let output = run_process_with_secret_stdin(
-        &tools.docker,
-        &arguments,
-        &tools.docker_environment(),
-        &installation.install_dir,
-        SYSTEM_BACKUP_TIMEOUT,
-        backup_password_stdin(&prepared.secrets_key),
-    )?;
-    validate_system_backup_result(
-        output,
-        start_tools,
+    run_helper_with_cleanup(
+        tools,
         installation,
-        &prepared.secrets_output,
-        "SECRETS",
-        ".dxkeys",
-        &prepared.current_user_sid,
+        &helper,
+        &arguments,
+        backup_password_stdin(&prepared.secrets_key),
+        |mut output| {
+            output.stderr.zeroize();
+            validate_system_backup_result(
+                output,
+                start_tools,
+                installation,
+                &prepared.secrets_output,
+                "SECRETS",
+                ".dxkeys",
+                &prepared.current_user_sid,
+            )
+            .map(|(path, _)| path)
+        },
     )
-    .map(|(path, _)| path)
 }
 
-fn backup_container_arguments(image: &str, mounts: &[OsString]) -> Vec<OsString> {
-    let mut arguments = [
-        "run",
-        "--rm",
-        "--network",
-        "none",
-        "--read-only",
-        "--cap-drop",
-        "ALL",
-        "--security-opt",
-        "no-new-privileges:true",
-        "--pids-limit",
-        "64",
-        "--memory",
-        "512m",
-        "--cpus",
-        "1",
-        "--tmpfs",
-        "/tmp:rw,noexec,nosuid,size=16m",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect::<Vec<_>>();
+fn backup_helper_container(role: &'static str, prepared: &PreparedBackup) -> HelperContainer {
+    helper_container_identity(
+        role,
+        &[&prepared.installation_id, &prepared.current_user_sid],
+    )
+}
+
+fn restore_stage_helper_container(prepared: &PreparedRestore) -> HelperContainer {
+    let data_input = prepared.data_input.to_string_lossy();
+    let secrets_input = prepared.secrets_input.to_string_lossy();
+    let staging_root = prepared.staging_root.to_string_lossy();
+    helper_container_identity(
+        RESTORE_STAGE_HELPER_ROLE,
+        &[
+            &prepared.current_user_sid,
+            data_input.as_ref(),
+            secrets_input.as_ref(),
+            staging_root.as_ref(),
+        ],
+    )
+}
+
+fn helper_container_identity(role: &'static str, identity_fields: &[&str]) -> HelperContainer {
+    let mut digest = Sha256::new();
+    digest.update(b"DataXEnterpriseStudio.helper-container.v1\0");
+    digest.update(role.as_bytes());
+    for field in identity_fields {
+        digest.update([0]);
+        digest.update(field.as_bytes());
+    }
+    let digest = hex_lower(&digest.finalize());
+    let opaque_id = digest[..32].to_owned();
+    HelperContainer {
+        name: format!("des-{role}-{opaque_id}"),
+        role,
+        opaque_id,
+    }
+}
+
+fn backup_container_arguments(
+    image: &str,
+    mounts: &[OsString],
+    helper: &HelperContainer,
+) -> Vec<OsString> {
+    let mut arguments = vec![
+        OsString::from("run"),
+        OsString::from("--rm"),
+        OsString::from("--name"),
+        OsString::from(&helper.name),
+        OsString::from("--label"),
+        OsString::from(format!("{HELPER_CONTAINER_ROLE_LABEL}={}", helper.role)),
+        OsString::from("--label"),
+        OsString::from(format!("{HELPER_CONTAINER_ID_LABEL}={}", helper.opaque_id)),
+        OsString::from("--network"),
+        OsString::from("none"),
+        OsString::from("--read-only"),
+        OsString::from("--cap-drop"),
+        OsString::from("ALL"),
+        OsString::from("--security-opt"),
+        OsString::from("no-new-privileges:true"),
+        OsString::from("--pids-limit"),
+        OsString::from("64"),
+        OsString::from("--memory"),
+        OsString::from("512m"),
+        OsString::from("--cpus"),
+        OsString::from("1"),
+        OsString::from("--tmpfs"),
+        OsString::from("/tmp:rw,noexec,nosuid,size=16m"),
+    ];
     for mount in mounts {
         arguments.push(OsString::from("--mount"));
         arguments.push(mount.clone());
@@ -4151,19 +4337,217 @@ fn backup_container_arguments(image: &str, mounts: &[OsString]) -> Vec<OsString>
     arguments
 }
 
-fn restore_stage_container_arguments(image: &str, mounts: &[OsString]) -> Vec<OsString> {
-    let mut arguments = backup_container_arguments(image, mounts);
+fn restore_stage_container_arguments(
+    image: &str,
+    mounts: &[OsString],
+    helper: &HelperContainer,
+) -> Vec<OsString> {
+    let mut arguments = backup_container_arguments(image, mounts, helper);
     let insertion = arguments.len().saturating_sub(3);
     arguments.splice(
         insertion..insertion,
         [
-            OsString::from("--name"),
-            OsString::from("des-restore-stage"),
             OsString::from("--label"),
             OsString::from("com.xiaoli.datax.restore-role=stage-pair"),
         ],
     );
     arguments
+}
+
+fn run_helper_with_cleanup<T>(
+    tools: &Tools,
+    installation: &Installation,
+    helper: &HelperContainer,
+    arguments: &[OsString],
+    secret_stdin: Zeroizing<Vec<u8>>,
+    validate: impl FnOnce(ProcessOutput) -> Result<T, LauncherError>,
+) -> Result<T, LauncherError> {
+    let operation = run_process_with_secret_stdin(
+        &tools.docker,
+        arguments,
+        &tools.docker_environment(),
+        &installation.install_dir,
+        SYSTEM_BACKUP_TIMEOUT,
+        secret_stdin,
+    )
+    .and_then(validate);
+    match operation {
+        Ok(value) => Ok(value),
+        Err(primary) => Err(merge_helper_cleanup_result(
+            primary,
+            helper,
+            cleanup_helper_container(tools, installation, helper),
+        )),
+    }
+}
+
+fn merge_helper_cleanup_result(
+    primary: LauncherError,
+    helper: &HelperContainer,
+    cleanup: Result<(), LauncherError>,
+) -> LauncherError {
+    match cleanup {
+        Ok(()) => primary,
+        Err(cleanup_error) => LauncherError::new(
+            "HELPER_CLEANUP_FAILED",
+            format!(
+                "受控 {} helper 失败（{}），且其 Docker 容器的身份核验或强制清理失败（{}）。请停止使用本机并人工处置；Launcher 不会把该操作报告为成功。",
+                helper.role,
+                primary.code(),
+                cleanup_error.code(),
+            ),
+        ),
+    }
+}
+
+fn cleanup_helper_container(
+    tools: &Tools,
+    installation: &Installation,
+    helper: &HelperContainer,
+) -> Result<(), LauncherError> {
+    let Some(container_id) = find_named_helper_container_id(tools, installation, helper)? else {
+        return Ok(());
+    };
+
+    let inspected = docker(
+        tools,
+        installation,
+        &[
+            "container",
+            "inspect",
+            "--format",
+            HELPER_CONTAINER_INSPECT_FORMAT,
+            &container_id,
+        ],
+        PROCESS_TIMEOUT,
+    );
+    let inspected = match inspected {
+        Ok(output) if output.status.success() => output,
+        Ok(_) | Err(_) => {
+            return helper_cleanup_id_gone_or_error(
+                tools,
+                installation,
+                helper,
+                &container_id,
+                "无法读取受控 helper 容器的不可变身份标签。",
+            );
+        }
+    };
+    let expected_labels = format!("{}|{}", helper.role, helper.opaque_id);
+    if normalize_text(&inspected.stdout).trim() != expected_labels {
+        return Err(LauncherError::new(
+            "HELPER_CLEANUP_IDENTITY_MISMATCH",
+            "同名 Docker 容器的受控 helper 标签不匹配；Launcher 不会删除未验证容器。",
+        ));
+    }
+
+    let removed = docker(
+        tools,
+        installation,
+        &["container", "rm", "--force", &container_id],
+        PROCESS_TIMEOUT,
+    );
+    match removed {
+        Ok(output) if output.status.success() => {}
+        Ok(_) | Err(_) => {
+            return helper_cleanup_id_gone_or_error(
+                tools,
+                installation,
+                helper,
+                &container_id,
+                "无法强制停止并删除已验证的受控 helper 容器。",
+            );
+        }
+    }
+    if find_named_helper_container_id(tools, installation, helper)?.is_some() {
+        return Err(LauncherError::new(
+            "HELPER_CLEANUP_VERIFY_FAILED",
+            "强制清理后仍检测到同名 helper 容器；Launcher 已安全阻断。",
+        ));
+    }
+    Ok(())
+}
+
+fn helper_cleanup_id_gone_or_error(
+    tools: &Tools,
+    installation: &Installation,
+    helper: &HelperContainer,
+    expected_id: &str,
+    message: &str,
+) -> Result<(), LauncherError> {
+    match find_named_helper_container_id(tools, installation, helper) {
+        Ok(None) => Ok(()),
+        Ok(Some(actual_id)) if actual_id == expected_id => {
+            Err(LauncherError::new("HELPER_CLEANUP_REMOVE_FAILED", message))
+        }
+        Ok(Some(_)) => Err(LauncherError::new(
+            "HELPER_CLEANUP_IDENTITY_MISMATCH",
+            "受控 helper 的名称在清理期间被重用；Launcher 不会删除新的未验证容器。",
+        )),
+        Err(_) => Err(LauncherError::new(
+            "HELPER_CLEANUP_INSPECTION_FAILED",
+            "无法确认失败 helper 容器是否已经消失；Launcher 已安全阻断。",
+        )),
+    }
+}
+
+fn find_named_helper_container_id(
+    tools: &Tools,
+    installation: &Installation,
+    helper: &HelperContainer,
+) -> Result<Option<String>, LauncherError> {
+    let name_filter = format!("name=^/{}$", helper.name);
+    let listed = docker(
+        tools,
+        installation,
+        &[
+            "container",
+            "ls",
+            "--all",
+            "--filter",
+            &name_filter,
+            "--format",
+            "{{.ID}}",
+        ],
+        PROCESS_TIMEOUT,
+    )
+    .map_err(|_| {
+        LauncherError::new(
+            "HELPER_CLEANUP_INSPECTION_FAILED",
+            "无法枚举失败 helper 容器；Launcher 已安全阻断。",
+        )
+    })?;
+    if !listed.status.success() {
+        return Err(LauncherError::new(
+            "HELPER_CLEANUP_INSPECTION_FAILED",
+            "Docker 拒绝枚举失败 helper 容器；Launcher 已安全阻断。",
+        ));
+    }
+    parse_helper_container_id(&listed.stdout)
+}
+
+fn parse_helper_container_id(output: &[u8]) -> Result<Option<String>, LauncherError> {
+    let normalized = normalize_text(output);
+    let ids = normalized
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    match ids.as_slice() {
+        [] => Ok(None),
+        [identifier]
+            if (12..=64).contains(&identifier.len())
+                && identifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) =>
+        {
+            Ok(Some((*identifier).to_owned()))
+        }
+        _ => Err(LauncherError::new(
+            "HELPER_CLEANUP_IDENTITY_INVALID",
+            "Docker 返回了多个或格式无效的同名 helper 容器身份；Launcher 不会猜测删除目标。",
+        )),
+    }
 }
 
 fn docker_bind_mount(source: &Path, target: &str) -> Result<OsString, LauncherError> {
@@ -4922,11 +5306,19 @@ fn validate_rendered_service_secrets(
             ("refresh_token_hmac_key", "refresh_token_hmac_key"),
             ("idempotency_hmac_key", "idempotency_hmac_key"),
             ("credential_kek_v1", "credential-kek-v1.key"),
+            (
+                "egress_lease_creation_capability",
+                "egress_lease_creation_capability",
+            ),
         ],
         "worker" => &[
             ("worker_database_password", "database_password"),
             ("idempotency_hmac_key", "idempotency_hmac_key"),
             ("credential_kek_v1", "credential-kek-v1.key"),
+            (
+                "egress_lease_creation_capability",
+                "egress_lease_creation_capability",
+            ),
         ],
         "postgres" => &[("postgres_password", "postgres_password")],
         "migrate" => &[
@@ -4938,10 +5330,16 @@ fn validate_rendered_service_secrets(
             ("api_database_password", "api_database_password"),
             ("worker_database_password", "worker_database_password"),
         ],
-        "egress-guard" => &[(
-            "egress_guard_database_password",
-            "egress_guard_database_password",
-        )],
+        "egress-guard" => &[
+            (
+                "egress_guard_database_password",
+                "egress_guard_database_password",
+            ),
+            (
+                "egress_lease_creation_capability",
+                "egress_lease_creation_capability",
+            ),
+        ],
         "web" => &[],
         _ => {
             return Err(LauncherError::new(
@@ -5125,6 +5523,20 @@ fn validate_rendered_network_security(
             return Err(LauncherError::new(
                 "COMPOSE_EGRESS_CONTRACT_REJECTED",
                 "出口守卫数据库密码路径只能提供给一次性迁移服务。",
+            ));
+        }
+        let lease_creation_capability_path = environment
+            .get("DES_EGRESS_LEASE_CREATION_CAPABILITY_FILE")
+            .and_then(serde_json::Value::as_str);
+        let requires_lease_creation_capability = matches!(service, "api" | "worker");
+        if (requires_lease_creation_capability
+            && lease_creation_capability_path
+                != Some("/run/secrets/egress_lease_creation_capability"))
+            || (!requires_lease_creation_capability && lease_creation_capability_path.is_some())
+        {
+            return Err(LauncherError::new(
+                "COMPOSE_EGRESS_CONTRACT_REJECTED",
+                "出口租约创建能力路径只能以固定 target 提供给 API 和 Worker。",
             ));
         }
         for (name, expected) in [
@@ -5631,7 +6043,7 @@ fn controlled_child_command(
         .stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    for name in CHILD_ENVIRONMENT_REMOVALS {
+    for &name in CHILD_ENVIRONMENT_REMOVALS {
         command.env_remove(name);
     }
     for (name, value) in environment {
@@ -6037,11 +6449,13 @@ mod tests {
 
     #[test]
     fn backup_helper_command_is_networkless_and_never_mounts_workspace() {
+        let helper = helper_container_identity(BACKUP_DATA_HELPER_ROLE, &["installation", "sid"]);
         let arguments = backup_container_arguments(
             "ghcr.io/xiaoli2hust/datax-studio-worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &[OsString::from(
                 "type=volume,source=des-log-data,target=/backup/logs,readonly,volume-nocopy",
             )],
+            &helper,
         );
         let text = arguments
             .iter()
@@ -6049,6 +6463,11 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("--network\nnone"));
+        assert!(text.contains(&format!("--name\n{}", helper.name)));
+        assert!(text.contains(&format!(
+            "{HELPER_CONTAINER_ROLE_LABEL}={BACKUP_DATA_HELPER_ROLE}"
+        )));
+        assert!(text.contains(&format!("{HELPER_CONTAINER_ID_LABEL}={}", helper.opaque_id)));
         assert!(text.contains("--read-only"));
         assert!(text.contains("--cap-drop\nALL"));
         assert!(text.contains("source=des-log-data"));
@@ -6186,11 +6605,13 @@ mod tests {
 
     #[test]
     fn restore_stage_container_is_named_networkless_and_bounded() {
+        let helper = helper_container_identity(RESTORE_STAGE_HELPER_ROLE, &["sid", "restore"]);
         let arguments = restore_stage_container_arguments(
             "worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             &[OsString::from(
                 "type=bind,source=C:\\backup\\data.dxdata,target=/restore/input/data.dxdata,readonly",
             )],
+            &helper,
         );
         let text = arguments
             .iter()
@@ -6198,7 +6619,16 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("--network\nnone"));
-        assert!(text.contains("--name\ndes-restore-stage"));
+        assert!(text.contains(&format!("--name\n{}", helper.name)));
+        assert_eq!(
+            arguments.iter().filter(|value| *value == "--name").count(),
+            1
+        );
+        assert!(!text.contains("--name\ndes-restore-stage\n"));
+        assert!(text.contains(&format!(
+            "{HELPER_CONTAINER_ROLE_LABEL}={RESTORE_STAGE_HELPER_ROLE}"
+        )));
+        assert!(text.contains(&format!("{HELPER_CONTAINER_ID_LABEL}={}", helper.opaque_id)));
         assert!(text.contains("com.xiaoli.datax.restore-role=stage-pair"));
         assert!(text.contains("--read-only"));
         assert!(text.contains("--cap-drop\nALL"));
@@ -6212,6 +6642,40 @@ mod tests {
             .position(|value| value == "--entrypoint")
             .unwrap();
         assert!(name_index < entrypoint_index);
+    }
+
+    #[test]
+    fn helper_container_names_are_opaque_deterministic_and_installation_scoped() {
+        let first =
+            helper_container_identity(BACKUP_DATA_HELPER_ROLE, &["installation-a", "sid-a"]);
+        let repeated =
+            helper_container_identity(BACKUP_DATA_HELPER_ROLE, &["installation-a", "sid-a"]);
+        let different =
+            helper_container_identity(BACKUP_DATA_HELPER_ROLE, &["installation-b", "sid-a"]);
+        assert_eq!(first, repeated);
+        assert_ne!(first.name, different.name);
+        assert!(first.name.starts_with("des-backup-data-"));
+        assert_eq!(first.opaque_id.len(), 32);
+        assert!(is_lower_hex_string(&first.opaque_id, 32));
+        assert!(!first.name.contains("installation-a"));
+    }
+
+    #[test]
+    fn helper_cleanup_accepts_only_one_lower_hex_container_id() {
+        assert_eq!(
+            parse_helper_container_id(b"abcdef012345\n").unwrap(),
+            Some(String::from("abcdef012345"))
+        );
+        assert_eq!(parse_helper_container_id(b"\r\n").unwrap(), None);
+        for output in [
+            b"ABCDEF012345\n".as_slice(),
+            b"abcdef012345\n123456abcdef\n",
+        ] {
+            assert_eq!(
+                parse_helper_container_id(output).unwrap_err().code(),
+                "HELPER_CLEANUP_IDENTITY_INVALID"
+            );
+        }
     }
 
     #[test]
@@ -6504,7 +6968,10 @@ mod tests {
                 },
                 "egress-guard": {
                     "image": lock.egress_guard,
-                    "secrets": ["egress_guard_database_password"],
+                    "secrets": [
+                        "egress_guard_database_password",
+                        "egress_lease_creation_capability"
+                    ],
                     "cap_drop": ["ALL"],
                     "cap_add": ["NET_ADMIN"],
                     "read_only": true,
@@ -6524,7 +6991,8 @@ mod tests {
                         {"source": "jwt_public_key", "target": "/run/secrets/jwt_public_key.pem"},
                         "refresh_token_hmac_key",
                         "idempotency_hmac_key",
-                        {"source": "credential_kek_v1", "target": "credential-kek-v1.key"}
+                        {"source": "credential_kek_v1", "target": "credential-kek-v1.key"},
+                        "egress_lease_creation_capability"
                     ],
                     "volumes": [{
                         "type": "volume",
@@ -6540,6 +7008,7 @@ mod tests {
                         "DES_EGRESS_POLICY_VERSION": "des-nftables-egress-v1",
                         "DES_RESOLVER_POLICY_VERSION": "des-system-dns-v1",
                         "DES_EGRESS_ATTESTATION_URL": "http://127.0.0.1:17990/v1/attestation",
+                        "DES_EGRESS_LEASE_CREATION_CAPABILITY_FILE": "/run/secrets/egress_lease_creation_capability",
                         "DES_DATABASE_USER": "datax_api",
                         "DES_DATABASE_PASSWORD_FILE": "/run/secrets/database_password"
                     },
@@ -6550,7 +7019,8 @@ mod tests {
                     "secrets": [
                         {"source": "worker_database_password", "target": "database_password"},
                         "idempotency_hmac_key",
-                        {"source": "credential_kek_v1", "target": "/run/secrets/credential-kek-v1.key"}
+                        {"source": "credential_kek_v1", "target": "/run/secrets/credential-kek-v1.key"},
+                        "egress_lease_creation_capability"
                     ],
                     "cap_drop": ["ALL"],
                     "depends_on": {
@@ -6560,6 +7030,7 @@ mod tests {
                         "DES_EGRESS_POLICY_VERSION": "des-nftables-egress-v1",
                         "DES_RESOLVER_POLICY_VERSION": "des-system-dns-v1",
                         "DES_EGRESS_ATTESTATION_URL": "http://127.0.0.1:17990/v1/attestation",
+                        "DES_EGRESS_LEASE_CREATION_CAPABILITY_FILE": "/run/secrets/egress_lease_creation_capability",
                         "DES_DATABASE_USER": "datax_worker",
                         "DES_DATABASE_PASSWORD_FILE": "/run/secrets/database_password",
                         "DES_WORKSPACE_VOLUME_PATH": "/var/lib/datax-studio/runs"
@@ -6614,6 +7085,14 @@ mod tests {
         forged_boolean["services"]["api"]["environment"]["DES_EGRESS_ENFORCEMENT_VERIFIED"] =
             serde_json::Value::String(String::from("true"));
         assert!(validate_rendered_compose(forged_boolean.to_string().as_bytes(), &lock).is_err());
+
+        let mut wrong_capability_target = rendered.clone();
+        wrong_capability_target["services"]["worker"]["environment"]["DES_EGRESS_LEASE_CREATION_CAPABILITY_FILE"] =
+            serde_json::Value::String(String::from("/run/secrets/not-the-capability"));
+        assert!(
+            validate_rendered_compose(wrong_capability_target.to_string().as_bytes(), &lock)
+                .is_err()
+        );
 
         let mut wrong_workspace_path = rendered.clone();
         wrong_workspace_path["services"]["worker"]["environment"]["DES_WORKSPACE_VOLUME_PATH"] =
@@ -6848,13 +7327,14 @@ mod tests {
         let second = b"abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
         let third = b"1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let fourth = b"2123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let fifth = b"3123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         assert!(independent_database_passwords_valid(first, second));
         assert!(independent_database_password_set_valid(&[
-            first, second, third, fourth
+            first, second, third, fourth, fifth
         ]));
         assert!(!independent_database_passwords_valid(first, first));
         assert!(!independent_database_password_set_valid(&[
-            first, second, third, third
+            first, second, third, fourth, fourth
         ]));
         assert!(!independent_database_passwords_valid(
             first,
@@ -6911,6 +7391,7 @@ mod tests {
 
     #[test]
     fn incomplete_initialization_recovers_only_before_any_runtime_use() {
+        assert_eq!(RUNTIME_SECRET_COUNT, 10);
         assert_eq!(
             initialization_recovery_decision([false; 3], false, 0),
             InitializationRecoveryDecision::RegenerateSecrets,
@@ -7101,7 +7582,7 @@ mod tests {
     }
 
     #[test]
-    fn docker_child_environment_overrides_user_config_and_context() {
+    fn docker_child_environment_overrides_user_config_and_all_ambient_controls() {
         let isolated_config = PathBuf::from(r"C:\DataX\docker-cli-config");
         let tools = Tools {
             docker: PathBuf::from("docker.exe"),
@@ -7134,12 +7615,10 @@ mod tests {
             values.get("DOCKER_HOST"),
             Some(&Some(String::from(LOCAL_DOCKER_DESKTOP_ENDPOINTS[0])))
         );
-        for forbidden in [
-            "DOCKER_CONTEXT",
-            "DOCKER_AUTH_CONFIG",
-            "REGISTRY_AUTH_FILE",
-            "COMPOSE_FILE",
-        ] {
+        for &forbidden in CHILD_ENVIRONMENT_REMOVALS {
+            if matches!(forbidden, "DOCKER_CONFIG" | "DOCKER_HOST") {
+                continue;
+            }
             assert_eq!(values.get(forbidden), Some(&None), "{forbidden}");
         }
     }
@@ -7161,5 +7640,21 @@ mod tests {
         assert_eq!(error.code(), "STARTUP_CLEANUP_FAILED");
         assert!(error.message().contains("API_LIVE_TIMEOUT"));
         assert!(error.message().contains("COMPOSE_START_CLEANUP_FAILED"));
+    }
+
+    #[test]
+    fn helper_cleanup_failure_is_never_reported_as_helper_success() {
+        let helper = helper_container_identity(BACKUP_DATA_HELPER_ROLE, &["installation", "sid"]);
+        let error = merge_helper_cleanup_result(
+            LauncherError::new("PROCESS_TIMEOUT", "synthetic helper timeout"),
+            &helper,
+            Err(LauncherError::new(
+                "HELPER_CLEANUP_REMOVE_FAILED",
+                "synthetic cleanup failure",
+            )),
+        );
+        assert_eq!(error.code(), "HELPER_CLEANUP_FAILED");
+        assert!(error.message().contains("PROCESS_TIMEOUT"));
+        assert!(error.message().contains("HELPER_CLEANUP_REMOVE_FAILED"));
     }
 }

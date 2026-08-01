@@ -56,6 +56,7 @@ RESTORE_JOURNAL_STATES: Final = {
 FIXED_SECRET_SPECS: Final = {
     "postgres_password.txt": ("hex", 64, 64),
     "egress_guard_database_password.txt": ("hex", 64, 64),
+    "egress_lease_creation_capability": ("hex", 64, 64),
     "api_database_password.txt": ("hex", 64, 64),
     "worker_database_password.txt": ("hex", 64, 64),
     "jwt_private_key.pem": ("pem", 1, 4096),
@@ -795,17 +796,21 @@ def _load_validated_secret_values(root: Path) -> dict[str, bytearray]:
         symmetric = [bytes(values[name]) for name in symmetric_names]
         if len(set(symmetric)) != len(symmetric):
             raise BackupError("BACKUP_SECRET_SET_INVALID", "HMAC/KEK 密钥未实现域分离。")
-        database_passwords = [
+        hex_control_secrets = [
             bytes(values[name])
             for name in (
                 "postgres_password.txt",
                 "egress_guard_database_password.txt",
+                "egress_lease_creation_capability",
                 "api_database_password.txt",
                 "worker_database_password.txt",
             )
         ]
-        if len(set(database_passwords)) != len(database_passwords):
-            raise BackupError("BACKUP_SECRET_SET_INVALID", "数据库角色密码未实现域分离。")
+        if len(set(hex_control_secrets)) != len(hex_control_secrets):
+            raise BackupError(
+                "BACKUP_SECRET_SET_INVALID",
+                "数据库角色密码和出口租约创建能力密钥未实现域分离。",
+            )
         private_key = serialization.load_pem_private_key(
             bytes(values["jwt_private_key.pem"]),
             password=None,

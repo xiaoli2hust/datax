@@ -96,4 +96,5 @@ def test_worker_has_the_complete_minimum_secret_closure() -> None:
         "worker_database_password",
         "idempotency_hmac_key",
         "credential_kek_v1",
+        "egress_lease_creation_capability",
     }

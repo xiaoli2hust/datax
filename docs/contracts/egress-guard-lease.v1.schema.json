@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://github.com/xiaoli2hust/datax/docs/contracts/egress-guard-lease.v1.schema.json",
   "title": "DataX Enterprise Studio egress guard selected-IP lease v1",
+  "description": "此 Schema 只描述 JSON body。POST /v1/leases 还必须恰好携带一个 X-DataX-Egress-Lease-Capability 请求头，其值为 64 个 ASCII 小写十六进制字符；该能力头不属于 body，且不得出现在响应或日志中。",
   "oneOf": [
     {
       "$ref": "#/$defs/createRequest"
@@ -37,6 +38,7 @@
       ]
     },
     "createRequest": {
+      "description": "仅 POST body。传输层还要求恰好一个 X-DataX-Egress-Lease-Capability: <64 ASCII lowercase hex characters> 请求头。",
       "type": "object",
       "additionalProperties": false,
       "required": [

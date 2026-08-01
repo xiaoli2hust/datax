@@ -2,7 +2,9 @@
 
 `DataXEnterpriseStudio.nsi` 生成 Windows 11 x64 的每用户 `Setup.exe`：
 
-- 默认安装到 `%LOCALAPPDATA%\Programs\DataXEnterpriseStudio`；
+- 固定安装到 `%LOCALAPPDATA%\Programs\DataXEnterpriseStudio`；`.onInit` 拒绝 NSIS
+  默认 `/D=<path>` 覆盖，`CRCCheck force` 拒绝 `/NCRC` 跳过自身损坏校验（CRC 不是
+  Authenticode 信任证明）；
 - 安装签名 `launcher.exe`、固定 `compose.yaml`、发布镜像锁、受控 ACL helper 和
   带 SHA-256 的发布清单；
 - 写入程序目录前，先在 NSIS 临时目录运行签名 Launcher：校验自身信任链、发布清单
@@ -10,13 +12,15 @@
   允许证书签名；缺失、无效、证书不匹配或资源被替换时不写入程序目录；
 - 创建桌面启动快捷方式、开始菜单启动/安全停止/卸载快捷方式；
 - 安装前拒绝 Windows Server、Windows on Arm、Windows 10、安装卷空间不足和降级覆盖；
-- 当前自动升级前备份/迁移尚未完成，因此旧版本覆盖升级会 fail closed，同版本修复也必须
-  先安全停止；
+- 当前自动升级前备份/迁移尚未完成，因此旧版本覆盖升级会 fail closed；同版本修复先在
+  临时目录完成候选 Setup/Launcher/资源核验，才安全停止旧服务，并用 no-skip、显式解除
+  受控资源只读属性的方式修复，任一步失败都中止；
 - 不包含、不下载、不安装 Docker Desktop 或 WSL2，也不代替用户接受第三方条款；
 - 卸载前调用 Launcher 的安全停止路径；活动 Attempt 时默认取消。若 Docker/Launcher
   缺失、离线或资源损坏导致无法验证停止，用户经过默认“否”的二次警告后仍可只卸载程序，
   页面明确提示容器可能继续运行；
-- 卸载仅删除程序文件和快捷方式，保留
+- 卸载从当前用户注册表记录重新绑定固定安装根（避免临时 self-copy 指向错误路径），仅删除
+  程序文件和快捷方式，保留
   `%LOCALAPPDATA%\DataXEnterpriseStudio` 及 Docker named volumes。
 
 这是每用户安装模型：当前登录用户本身不属于该用户会话内的安全隔离边界。Launcher 每次
@@ -36,6 +40,14 @@ Setup 变成可信程序；用户/组织在首次执行前仍必须通过 Window
 {"schema_version":"1.0","allowed_authenticode_signer_certificate_sha256":["<64 lowercase hex>"]}
 ```
 
+签名 job 还必须只使用 `datax-release-signing` runner group 中带精确 Windows 标签的机器，
+并显式提供本机固定盘、非重解析的 `CARGO_PATH`、`RUSTC_PATH`、`MAKENSIS_PATH` 与
+`SIGNTOOL_PATH`。导入 PFX 前会拒绝 dirty/untracked checkout、Cargo wrapper/flags/target/home
+环境覆盖；Cargo 进程把 `RUSTC` 固定为 `RUSTC_PATH`。这只是 PATH 和常见环境注入的 E1
+失败关闭：拒绝环境 `CARGO_HOME` 仍会回落到 runner profile 的默认 Cargo home，工具字节/
+目录 ACL、链接器、TOCTOU 和私钥不可导出性必须由受控 runner provisioning 与 Windows E3/E4
+证据单独证明。
+
 流水线先核验实际 PFX 证书 DER SHA-256 属于该受保护、严格排序去重的允许集，再由
 `scripts/release/finalize_windows_publisher_binding.ps1` 生成清单 1.1、重建并用同一证书
 签名 Launcher/Setup。Linux 阶段还必须先以全新空 `DOCKER_CONFIG`、不继承 registry
@@ -45,7 +57,9 @@ Setup 变成可信程序；用户/组织在首次执行前仍必须通过 Window
 `scripts/windows/build-installer.ps1` 只会生成清单 1.0 的中间制品；新版 Launcher 会
 fail closed，该路径不能作为正式或可安装发布物，也不存在 unsigned 发布路径。
 
-输出名固定为 `DataX-Enterprise-Studio-Setup-<version>-x64.exe`。Launcher 已接入
+输出名固定为 `DataX-Enterprise-Studio-Setup-<version>-x64.exe`。`/D`、`/NCRC`、候选先验签、
+只读 repair 与卸载根绑定目前由 `scripts/acceptance/test_windows_installer_source.py` 静态检查，
+仅为 E1；未在 Windows 上用 NSIS 编译或执行签名 Setup，不能称为安装验收。Launcher 已接入
 一次性 Admin helper/Windows 原生引导对话框，但尚无真实 Windows 验收。由于仓库所有者
 尚未选择原创代码许可证、固定发布镜像仍未生成、兼容升级闭环未交付，当前目录只是
 fail-closed 安装器骨架，不是可发布安装包。即使构建成功，仍需在干净 Windows 11 x64

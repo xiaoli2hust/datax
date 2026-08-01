@@ -9,6 +9,7 @@ from datax_studio.core.schemas import JobSpecV1
 from datax_studio.worker.job_builder import (
     RuntimeConnection,
     UnsafeJobSpec,
+    _assert_safe_job_shape,
     build_datax_job,
     build_oracle_mappings,
     write_job_file,
@@ -121,7 +122,19 @@ def test_generator_supports_only_the_certified_four_directions(
         "preSql",
         "postSql",
         "transformer",
+        "egress_lease_creation_capability",
     }.intersection(str(job))
+
+
+def test_control_capability_cannot_be_rendered_into_a_datax_job() -> None:
+    with pytest.raises(UnsafeJobSpec, match="forbidden keys"):
+        _assert_safe_job_shape(
+            {
+                "job": {
+                    "egress_lease_creation_capability": "c" * 64,
+                }
+            }
+        )
 
 
 def test_mysql_writer_is_explicit_insert_but_postgres_omits_unsupported_mode() -> None:

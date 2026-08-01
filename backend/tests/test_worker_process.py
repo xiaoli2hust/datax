@@ -225,3 +225,44 @@ def test_managed_process_forces_private_mode_for_runtime_created_files(
 
     assert result.returncode == 0
     assert stat.S_IMODE((workspace / "raw-runtime.log").stat().st_mode) == 0o600
+
+
+def test_managed_process_does_not_inherit_egress_lease_control_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    capability = "c" * 64
+    monkeypatch.setenv(
+        "DES_EGRESS_LEASE_CREATION_CAPABILITY_FILE",
+        "/run/secrets/egress_lease_creation_capability",
+    )
+    # Production passes only the path, never this value.  Keep this hostile
+    # ambient-value regression case to prove the DataX child receives the
+    # fixed allowlist rather than inheriting Launcher/Worker variables.
+    monkeypatch.setenv("DES_EGRESS_LEASE_CREATION_CAPABILITY", capability)
+
+    result = run_managed_process(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import os;"
+                "print(os.environ.get('DES_EGRESS_LEASE_CREATION_CAPABILITY_FILE'));"
+                "print(os.environ.get('DES_EGRESS_LEASE_CREATION_CAPABILITY'))"
+            ),
+        ],
+        workspace=tmp_path / "workspace",
+        log_path=tmp_path / "logs" / "execution.log",
+        secrets=[capability.encode("ascii")],
+        timeout_seconds=5,
+        tick=lambda: ProcessAction.CONTINUE,
+        process_started=lambda _identity: None,
+        poll_seconds=0.01,
+        pid_start_time_reader=lambda _pid: 1,
+    )
+
+    log = result.log.path.read_bytes()
+    assert result.returncode == 0
+    assert log == b"None\nNone\n"
+    assert capability.encode("ascii") not in log
+    assert b"[REDACTED]" not in log

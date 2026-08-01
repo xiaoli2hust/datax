@@ -109,6 +109,166 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("verify_signing_environment.py", script)
         self.assertIn("prevent", (REPOSITORY_ROOT / "scripts/release/verify_signing_environment.py").read_text(encoding="utf-8"))
 
+    def test_windows_signing_uses_the_dedicated_runner_group(self) -> None:
+        job = self.workflow["jobs"]["windows-signed-candidate"]
+        self.assertEqual(
+            job["runs-on"],
+            {
+                "group": "datax-release-signing",
+                "labels": [
+                    "self-hosted",
+                    "windows",
+                    "x64",
+                    "datax-release-windows11",
+                ],
+            },
+        )
+
+    def test_windows_signing_checks_a_clean_checkout_and_tools_before_pfx(self) -> None:
+        job = self.workflow["jobs"]["windows-signed-candidate"]
+        names = [step["name"] for step in job["steps"]]
+        preflight_index = names.index(
+            "Require a clean checkout and configured local signing tools"
+        )
+        certificate_index = names.index(
+            "Require and import the protected signing certificate"
+        )
+        self.assertLess(preflight_index, certificate_index)
+
+        preflight = job["steps"][preflight_index]
+        self.assertEqual(
+            preflight["env"],
+            {
+                "CARGO_PATH": "${{ vars.CARGO_PATH }}",
+                "MAKENSIS_PATH": "${{ vars.MAKENSIS_PATH }}",
+                "RUSTC_PATH": "${{ vars.RUSTC_PATH }}",
+                "SIGNTOOL_PATH": "${{ vars.SIGNTOOL_PATH }}",
+            },
+        )
+        script = preflight["run"]
+        self.assertIn("git diff --quiet HEAD --", script)
+        self.assertIn(
+            "git status --porcelain=v1 --untracked-files=all",
+            script,
+        )
+        self.assertIn("Assert-ConfiguredLocalExecutable", script)
+        self.assertIn("Get-CimInstance", script)
+        self.assertIn("Win32_LogicalDisk", script)
+        self.assertIn("ReparsePoint", script)
+        self.assertIn("Assert-NoCargoCompilerOverrides", script)
+        for tool, variable in (
+            ("cargo.exe", "CARGO_PATH"),
+            ("makensis.exe", "MAKENSIS_PATH"),
+            ("rustc.exe", "RUSTC_PATH"),
+            ("signtool.exe", "SIGNTOOL_PATH"),
+        ):
+            self.assertIn(f'"{tool}" = $env:{variable}', script)
+        for variable in (
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_BUILD_RUSTFLAGS",
+            "CARGO_TARGET_DIR",
+            "CARGO_HOME",
+        ):
+            self.assertIn(f'"{variable}"', script)
+
+    def test_windows_release_scripts_require_configured_non_path_tools(self) -> None:
+        expected = {
+            "scripts/windows/build-installer.ps1": (
+                "CargoPath",
+                "RustcPath",
+                "MakensisPath",
+                "SigntoolPath",
+            ),
+            "scripts/release/finalize_windows_publisher_binding.ps1": (
+                "CargoPath",
+                "RustcPath",
+                "MakensisPath",
+                "SigntoolPath",
+            ),
+            "scripts/windows/validate-release.ps1": (
+                "CargoPath",
+                "RustcPath",
+                "SigntoolPath",
+            ),
+        }
+        for relative_path, parameters in expected.items():
+            source = (REPOSITORY_ROOT / relative_path).read_text(encoding="utf-8")
+            self.assertNotIn("Get-Command", source)
+            self.assertIn("function Resolve-RequiredExecutable", source)
+            self.assertIn("Get-CimInstance", source)
+            self.assertIn("Win32_LogicalDisk", source)
+            self.assertIn("ReparsePoint", source)
+            self.assertIn("function Assert-NoCargoCompilerOverrides", source)
+            self.assertIn("function Invoke-ConfiguredCargo", source)
+            self.assertIn('"RUSTC"', source)
+            self.assertNotIn("& $cargo", source)
+            for variable in (
+                "RUSTC_WRAPPER",
+                "RUSTFLAGS",
+                "CARGO_ENCODED_RUSTFLAGS",
+                "CARGO_BUILD_RUSTFLAGS",
+                "CARGO_TARGET_DIR",
+                "CARGO_HOME",
+            ):
+                self.assertIn(f'"{variable}"', source)
+            for parameter in parameters:
+                self.assertIn(
+                    f"[Parameter(Mandatory = $true)]\n    [string]${parameter}",
+                    source,
+                )
+
+    def test_workflow_passes_the_mandatory_tool_paths_to_each_release_script(self) -> None:
+        job = self.workflow["jobs"]["windows-signed-candidate"]
+        names = [step["name"] for step in job["steps"]]
+        self.assertLess(
+            names.index("Recheck tracked sources before candidate assembly"),
+            names.index("Assemble and verify the signed candidate evidence"),
+        )
+        self.assertLess(
+            names.index("Assemble and verify the signed candidate evidence"),
+            names.index("Recheck tracked sources after all toolchain execution"),
+        )
+        self.assertLess(
+            names.index("Recheck tracked sources after all toolchain execution"),
+            names.index("Remove imported signing certificates"),
+        )
+        self.assertLess(
+            names.index("Recheck tracked sources after all toolchain execution"),
+            names.index("Upload signed candidate artifact and evidence"),
+        )
+        final_recheck = job["steps"][
+            names.index("Recheck tracked sources after all toolchain execution")
+        ]["run"]
+        self.assertIn("git diff --quiet HEAD --", final_recheck)
+
+        build = next(
+            step
+            for step in job["steps"]
+            if step["name"] == "Build and sign Launcher and Setup"
+        )["run"]
+        for parameter, variable in (
+            ("CargoPath", "CARGO_PATH"),
+            ("RustcPath", "RUSTC_PATH"),
+            ("MakensisPath", "MAKENSIS_PATH"),
+            ("SigntoolPath", "SIGNTOOL_PATH"),
+        ):
+            self.assertEqual(build.count(f"{parameter} = $env:{variable}"), 2)
+
+        candidate = next(
+            step
+            for step in job["steps"]
+            if step["name"] == "Assemble and verify the signed candidate evidence"
+        )["run"]
+        for parameter, variable in (
+            ("CargoPath", "CARGO_PATH"),
+            ("RustcPath", "RUSTC_PATH"),
+            ("SigntoolPath", "SIGNTOOL_PATH"),
+        ):
+            self.assertIn(f"{parameter} = $env:{variable}", candidate)
+
     def test_verifier_download_is_bound_to_the_locked_installer(self) -> None:
         job = self.workflow["jobs"]["hosted-candidate-attestor"]
         step = next(

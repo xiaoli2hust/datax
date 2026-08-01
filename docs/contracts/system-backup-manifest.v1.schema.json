@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://datax-enterprise-studio.local/schemas/system-backup-manifest.v1.schema.json",
   "title": "DataX Enterprise Studio System Backup Manifest V1",
-  "description": "通过 AEAD 和归档 allowlist 校验的 Windows 本地工作站备份清单。DATA 仅含一致性 PostgreSQL 逻辑备份、脱敏日志和固定发布元数据；SECRETS 独立加密并按 related_data_backup_id 配对。",
+  "description": "通过 AEAD 和归档 allowlist 校验的 Windows 本地工作站备份清单。DATA 仅含一致性 PostgreSQL 逻辑备份、脱敏日志和固定发布元数据；SECRETS 独立加密并按 related_data_backup_id 配对。当前 Launcher 的运行 secret 集合恰好为十个文件：postgres_password.txt、egress_guard_database_password.txt、egress_lease_creation_capability、api_database_password.txt、worker_database_password.txt、jwt_private_key.pem、jwt_public_key.pem、refresh_token_hmac_key、idempotency_hmac_key、credential-kek-v1.key；备份验证允许受支持的历史 credential-kek-* 文件，但其余固定名称不得缺失或替换。manifest 仅证明加密 secrets 树，不得含任何 secret 值。",
   "oneOf": [
     {
       "$ref": "#/$defs/dataManifest"
