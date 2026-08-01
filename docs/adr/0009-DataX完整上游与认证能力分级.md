@@ -4,7 +4,7 @@
 - 日期：2026-08-01
 - 决策者：仓库所有者
 - 关联：`docs/14_第一性原理问题台账与开发修复计划.md`、
-  `docs/contracts/plugin-manifest.v1.schema.json`、
+  `docs/contracts/plugin-manifest.v2.schema.json`（v1 仅保留为历史契约）、
   `docs/contracts/upstream-plugin-inventory.v1.schema.json`、
   `runtime/upstream-plugin-inventory.v1.json`、`runtime/upstream.lock.json`
 
@@ -79,8 +79,9 @@ MySQL 8/PostgreSQL 15 的四个 Reader/Writer manifest 声明为认证能力。
 
 - 新增由上游 `pom.xml`、`plugin.json`、构建产物和许可清单共同生成的插件 inventory；
   手工清单只能作为审核输入，不能成为发布事实源。
-- Plugin Manifest 下一版本必须表达状态、上游模块、方向、版本范围、依赖/许可摘要、
-  参数与敏感字段、网络/文件能力、oracle 类型、E3/E4 证据引用和阻断原因。
+- `plugin-manifest.v2` 已表达状态、上游模块/哈希、方向、依赖/许可状态、
+  参数与敏感字段、网络/文件边界、oracle 类型、候选绑定、E3/E4 证据引用、
+  有效期和阻断原因；公开契约不允许测试注入证据。
 - Worker 启动证明实际镜像内插件集合及摘要与 release manifest 完全一致；多出、缺少或
   摘要不符都必须 fail closed。
 - Setup/Launcher 只消费已经发布的固定镜像；不会因为本机存在额外 JAR 而扩展能力。
@@ -102,6 +103,19 @@ Reader/Writer 模块（31 Reader、41 Writer），没有用手抄插件名代替
 72 项只覆盖根 POM 中的 Reader/Writer 模块。本切片尚未生成 Transformer、任务模板、
 DataX 核心/配置以及任意 SQL、`preSql/postSql`、脚本转换等原生功能的机器 inventory；
 因此不能把“72 个 Reader/Writer 已登记”表述为“DataX 全部功能已盘点”或“全功能已实现”。
+
+### 7. 已落地的第二安全切片：E1 失败关闭
+
+`GET /plugins` 已改为消费 v2 能力契约，Runtime 心跳只能把当前四个制品
+提升到最多 `PACKAGED`。生产 `ControlService` 默认注入 deny-all 证据源；
+普通 Execution API 创建、恢复 `rerun`、Worker 领取和 Worker 建立工作区/解密凭据前
+四个检查点各复检一次。
+UI 从目录渲染 Reader/Writer 并对非 E4 能力显示阻断原因。明确的内部测试
+依赖注入可验证门禁正路，但不能通过公开 Schema 或 `/plugins` 冒充发布事实。
+
+受信的生产发布证明读取器尚未实现，当前 `WINDOWS_E4_CERTIFIED=0`。
+因此该切片只证明“不会把未取证能力当成已认证能力运行”，不证明四方向
+DataX E3、Windows E4 或全部 DataX 功能已完成。
 
 ## 后果
 

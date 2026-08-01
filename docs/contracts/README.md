@@ -5,7 +5,8 @@
 - `openapi.yaml`：HTTP API。
 - `job-spec.v1.schema.json`：平台任务契约。
 - `schema-snapshot.v1.schema.json`：MySQL/PostgreSQL 表结构的确定性、无秘密快照；发布校验与 Worker preflight 共同使用。
-- `plugin-manifest.v1.schema.json`：认证插件能力与参数 UI 契约。
+- `plugin-manifest.v2.schema.json`：现行插件能力、分级认证、依赖/许可、证据与 UI 阻断契约。
+- `plugin-manifest.v1.schema.json`：仅保留为历史契约，不再由当前 `/plugins` 返回。
 - `upstream-plugin-inventory.v1.schema.json`：从固定 Alibaba DataX 根 POM、模块 POM 与
   `plugin.json` 重建的 Reader/Writer 源码能力目录。对应规范化制品位于
   `runtime/upstream-plugin-inventory.v1.json`；当前 72 项都只证明 `SOURCE_PRESENT`，固定
@@ -36,7 +37,11 @@
   JSON 均失败关闭。校验器只接受当前 checkout 中固定权威 Schema，并在 Schema 外再次硬
   断言 BLOCKED 语义，调用方不能用宽松 `--schema` 放开。当前 `1.0` 只允许 `root_status=BLOCKED`、
   `release_approved=false`，机器场景 profile/result、Windows baseline、harness 边界和 E3/E4
-  证据包必须显式为 `null` 并给出阻塞原因；它不能表达可发布 PASS。
+  证据包必须显式为 `null` 并给出阻塞原因；它不能表达可发布 PASS。Release workflow
+  中 Windows job 生成的顶层 `SHA256SUMS` 只负责 self-hosted → GitHub-hosted 的交接完整性；
+  托管 job 验证成功后删除该瞬时清单，再生成 candidate root。最终候选不得保留一个未覆盖
+  candidate root 的旧 `SHA256SUMS` 并把它声称为完整清单，完整库存职责由 canonical
+  candidate root 承担。
 - `egress-guard-attestation.v1.schema.json`：共享网络命名空间内出口守卫的实时证明。
 - `egress-guard-lease.v1.schema.json`：精确 selected-IP `/32|/128 + TCP port` 短租约请求与响应。
 - `egress-guard.v1.md`：守卫只读数据库视图、loopback HTTP、nftables 和 fail-closed 边界。
@@ -138,10 +143,16 @@ staging 的 E1 候选实现；`LEGACY` 指针原子提交与 Compose 消费也�
    并传入 `--deny-self-hosted-runners`；成功后还复核证书中的 hosted runner、精确
    run/attempt URI、workflow、commit、candidate-root subject SHA 和 verified timestamp，最后
    再次重算文件集。但路径/文件类型检查不能证明该 verifier 二进制可信；托管 attestor
-   workflow 尚未固定其路径、版本和摘要前，即使低层策略全部匹配，wrapper 也必须非零返回
+   workflow 尚未把该 TCB 锁作为 wrapper 可独立验证的权威 descriptor 前，即使低层策略
+   全部匹配，wrapper 也必须非零返回
    `TRUSTED_ATTESTATION_VERIFIER_TCB_NOT_IMPLEMENTED`，不得返回 `ready=true` 或
-   attestation-valid。该基础件尚未接入 release workflow，也没有机器场景 catalog、受保护
-   Windows E4 harness、托管 attestor 真实 bundle 或完整发布语义编排。因此
+   attestation-valid。Release workflow 已有 E1 接线候选：托管 Ubuntu job 下载并先验证
+   Windows 交接清单，生成/复核 BLOCKED candidate root，以固定 commit 的
+   `actions/attest` 签发 provenance，并通过 `trusted_gh_cli.py` 将 GitHub CLI 2.97.0 的
+   release URL、archive SHA-256 和解包后二进制 SHA-256 固定后执行低层反向验证；随后必须
+   精确得到上述 TCB blocker 才允许上传名称含 `blocked` 的候选/证明制品。该 workflow 尚未
+   在受保护 Windows runner 与真实签名 secrets 上执行，也没有机器场景 catalog、受保护
+   Windows E4 harness、真实 bundle 证据或完整发布语义编排。因此
    `--require-pass` 仍无条件返回 `TRUSTED_RELEASE_ATTESTATION_NOT_IMPLEMENTED`；非发布校验
    即使得到结构 `gate_result=PASS`，也固定返回 `release_approved=false`。
 10. `data_effect=CONFIRMED` 只表示目标影响已测得，测得值可以是 0 行，不代表内容正确；

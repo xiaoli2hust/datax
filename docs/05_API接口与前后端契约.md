@@ -327,7 +327,19 @@ HTTPS。本人改密成功后保留当前 session、撤销其他 session；Admin
 
 ### 8.5 Plugin
 
-`GET /plugins` 返回四个只读认证 manifest：MySQL Reader/Writer、PostgreSQL Reader/Writer。没有 POST、上传、启用第三方插件或安装接口。
+`GET /plugins` 的 operationId 为 `listPluginCapabilities`，返回四个只读
+`plugin-manifest.v2`。响应分开 `certification_state`、
+`ordinary_user_executable`、`evidence` 和 `block_reasons`，并包含上游模块/哈希、
+依赖许可状态、网络/文件范围和 oracle 契约。当前生产默认无受信
+Windows E4 证据源，因此 Runtime 健康的四插件最多为 `PACKAGED`、
+`ordinary_user_executable=false`。公开 Schema 不接受或返回测试注入证据。
+没有 POST、上传、启用第三方插件或安装接口。
+
+`POST /jobs/{job_id}/executions` 在创建 `QUEUED+RESERVED` 之前校验发布版本
+绑定的 Reader/Writer E4 证据；`POST /executions/{execution_id}/rerun` 在创建
+新的恢复执行前做同一校验。Worker 在领取事务和建立工作区/解密凭据前各复检一次。
+这四个检查点遇到降级、哈希/候选不匹配、证据过期、依赖未盘点或许可未审查时，
+统一失败关闭为 `PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED`。
 
 ### 8.6 Datasource
 
@@ -503,6 +515,10 @@ control 子网的独立 netns 之前，执行前 preflight 对任一 `EXACT_FQDN
 `latest_execution_state`。任务列表和版本历史均按服务端不透明 cursor 翻页；cursor
 绑定项目、授权主体、筛选条件与排序，筛选变化后复用旧 cursor 必须返回
 `400 CURSOR_INVALID`。前端不得只筛当前页后宣称结果完整。
+
+任务摘要必须同时返回 `latest_published_reader_plugin` 与
+`latest_published_writer_plugin`；运行按钮只能按这两个不可变 JobVersion 绑定值查询当前
+认证目录，不能用发布后仍可修改的 `draft_spec` 代替已发布版本。
 
 归档仍通过 `PATCH /jobs/{job_id}` 和 `If-Match` 完成。存在非终态 Execution 时返回
 `409 JOB_ACTIVE_EXECUTION`；归档只改变可变 `SyncJob` 生命周期，不删除或覆盖任何

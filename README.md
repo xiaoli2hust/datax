@@ -23,6 +23,13 @@ DataX Enterprise Studio 是面向企业内部数据工程团队的 DataX 可视�
 其他上游能力未达 `WINDOWS_E4_CERTIFIED` 前不得在普通用户 UI 中执行，也不得
 宣称稳定支持。
 
+`GET /api/v1/plugins` 现按 `plugin-manifest.v2` 返回上游锁定、制品、
+依赖/许可、网络/文件边界、oracle、候选证据和阻断原因。
+生产默认没有可信 Windows E4 证据源，因此四个 V1 候选最多只会
+显示为 `PACKAGED` 且 `ordinary_user_executable=false`；普通 Execution 创建、
+恢复 `rerun`、Worker 领取和 Worker 启动四个检查点都会失败关闭。测试注入证据不属于公开契约，
+也不会被 `/plugins` 序列化为普通用户可执行事实。
+
 ## V1 一句话范围
 
 在一台 Windows 11 x64 电脑上，以本地工作站方式支持 MySQL 8 与 PostgreSQL 15 之间安全地执行一次性离线全量表复制。每次执行要求源表从运行前检查开始到独立 oracle 完成始终保持静默；目标表由用户预先创建且为空并可核验，Operator/DBA 还必须提交有版本、有限有效期的目标外部独占声明，并在知悉窗口被破坏时立即报告。平台只做 `insert-only` 写入，不把 DataX 退出码 `0` 单独当作业务成功。

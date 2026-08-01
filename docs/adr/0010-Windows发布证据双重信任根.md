@@ -123,12 +123,22 @@ GitHub artifact attestation 能证明候选根由指定 workflow/commit 产生�
   前，即使低层策略匹配也必须非零返回
   `TRUSTED_ATTESTATION_VERIFIER_TCB_NOT_IMPLEMENTED`，不得返回 `ready=true` 或
   attestation-valid。
+- Release workflow 已增加 E1 接线候选。Windows self-hosted job 上传的顶层
+  `SHA256SUMS` 只作为交接清单；后续 `ubuntu-24.04` 托管 job 必须先完整验证它，再删除该
+  瞬时清单并生成/复核 canonical BLOCKED candidate root，从而避免最终候选同时保留一个
+  未覆盖 candidate root 的旧“完整”清单。托管 job 使用固定 commit
+  `actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d` 对 candidate root 签发
+  provenance；GitHub CLI 固定为 2.97.0，
+  release URL、Linux amd64 archive SHA-256 与解包后二进制 SHA-256 均由
+  `trusted_gh_cli.py` 硬锁并在调用前复核。低层 provenance 全部匹配后，workflow 仍必须精确
+  得到 `TRUSTED_ATTESTATION_VERIFIER_TCB_NOT_IMPLEMENTED`，并只上传名称含 `blocked` 的
+  完整候选及证明制品；该接线不会批准发布。
 
-尚未完成：机器场景 profile/result 契约、受保护 Windows E4 harness、GitHub 托管 attestor
-job 对 verifier 路径/版本/摘要的固定、真实 attestation bundle、release workflow 接线，
-以及 attestation 后的完整
-acceptance/oracle/E4/P0-P1 聚合门禁。本切片没有修改 `.github/workflows/release.yml`，也没有
-放开 `validate_acceptance_manifest.py --require-pass`；正式发布仍稳定返回
+尚未完成：上述 workflow 尚未在受保护 Windows runner、真实签名 secrets 和 GitHub
+attestation 服务上运行，因而没有真实 bundle/反向验证证据；机器场景 profile/result 契约、
+受保护 Windows E4 harness、把固定 verifier TCB 变成 wrapper 可独立验证的权威 descriptor，
+以及 attestation 后的完整 acceptance/oracle/E4/P0-P1 聚合门禁也均未完成。本切片没有放开
+`validate_acceptance_manifest.py --require-pass`；正式发布仍稳定返回
 `TRUSTED_RELEASE_ATTESTATION_NOT_IMPLEMENTED`。
 
 ## 后果
