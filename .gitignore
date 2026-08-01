@@ -33,7 +33,7 @@ runtime-artifacts/
 work/
 logs/
 !backend/src/datax_studio/logs/
-!backend/src/datax_studio/logs/**
+!backend/src/datax_studio/logs/*.py
 backups/
 .local/
 .runtime/
