@@ -6,6 +6,7 @@ import { newIdempotencyKey } from "../api/client";
 import {
   listJobs,
   listJobVersions,
+  listPluginCapabilities,
   previewJob,
   publishJob,
   updateJob,
@@ -19,6 +20,7 @@ import { formatTime, shortId } from "../lib/display";
 import type {
   JobPreview,
   JobVersion,
+  PluginCapability,
   SyncJob,
   ValidationReport,
 } from "../types";
@@ -34,6 +36,9 @@ const emit = defineEmits<{
 }>();
 
 const items = ref<SyncJob[]>([]);
+const pluginCapabilities = ref<PluginCapability[]>([]);
+const pluginCapabilitiesLoading = ref(false);
+const pluginCapabilitiesError = ref<unknown>(null);
 const loading = ref(false);
 const loadingMore = ref(false);
 const error = ref<unknown>(null);
@@ -62,6 +67,59 @@ const compareLeftId = ref("");
 const compareRightId = ref("");
 const selectedJob = ref<SyncJob | null>(null);
 const publishKeys = new Map<string, string>();
+const readerCapabilities = computed(() =>
+  pluginCapabilities.value.filter((item) => item.direction === "READER"),
+);
+const writerCapabilities = computed(() =>
+  pluginCapabilities.value.filter((item) => item.direction === "WRITER"),
+);
+
+async function loadPluginCatalog(): Promise<void> {
+  pluginCapabilitiesLoading.value = true;
+  pluginCapabilitiesError.value = null;
+  try {
+    pluginCapabilities.value = (await listPluginCapabilities()).items;
+  } catch (caught) {
+    pluginCapabilitiesError.value = caught;
+    pluginCapabilities.value = [];
+  } finally {
+    pluginCapabilitiesLoading.value = false;
+  }
+}
+
+function executionBlockReason(job: SyncJob): string | null {
+  if (
+    !job.latest_published_reader_plugin ||
+    !job.latest_published_writer_plugin
+  ) {
+    return "未获取最新发布版本绑定的 Reader/Writer 插件事实，已安全禁用执行。";
+  }
+  const required = [
+    job.latest_published_reader_plugin,
+    job.latest_published_writer_plugin,
+  ];
+  for (const pluginName of required) {
+    const capability = pluginCapabilities.value.find(
+      (item) => item.datax_plugin_name === pluginName,
+    );
+    if (!capability) {
+      return `未获取 ${pluginName} 的当前认证事实，已安全禁用执行。`;
+    }
+    if (
+      capability.certification_state !== "WINDOWS_E4_CERTIFIED" ||
+      !capability.ordinary_user_executable
+    ) {
+      const reasons = capability.block_reasons.join("、") || "WINDOWS_E4_EVIDENCE_MISSING";
+      return `${capability.display_name} 当前为 ${capability.certification_state}；阻断原因：${reasons}。`;
+    }
+  }
+  return null;
+}
+
+function requestRun(job: SyncJob): void {
+  if (executionBlockReason(job)) return;
+  emit("run", job.id);
+}
 
 async function load(append = false): Promise<void> {
   if (append) loadingMore.value = true;
@@ -289,7 +347,10 @@ function endpointSummary(job: SyncJob): string {
   return `${source.table.schema_name}.${source.table.table_name} → ${target.table.schema_name}.${target.table.table_name}`;
 }
 
-onMounted(() => void load());
+onMounted(() => {
+  void load();
+  void loadPluginCatalog();
+});
 watch(() => props.projectId, () => void load());
 watch(wizardVisible, (visible) => {
   if (!visible) editingJob.value = null;
@@ -315,6 +376,14 @@ watch(wizardVisible, (visible) => {
       description="没有调度、DAG、任意 SQL、脚本转换、插件上传或 DataX JSON 导入入口。"
     />
     <el-alert
+      v-if="pluginCapabilitiesError || (!pluginCapabilitiesLoading && !pluginCapabilities.some((item) => item.ordinary_user_executable))"
+      type="warning"
+      :closable="false"
+      show-icon
+      title="当前没有可供普通用户执行的 Windows E4 认证能力"
+      description="源码存在、构建成功或已打包都不等于 Windows 真实验收。运行按钮会保持禁用，具体原因来自 /plugins 能力目录。"
+    />
+    <el-alert
       v-if="!canDevelop"
       type="info"
       :closable="false"
@@ -336,12 +405,20 @@ watch(wizardVisible, (visible) => {
         <el-option label="已归档" value="ARCHIVED" />
       </el-select>
       <el-select v-model="filters.readerPlugin" clearable placeholder="全部 Reader" @change="load()">
-        <el-option label="MySQL 8 Reader" value="mysqlreader" />
-        <el-option label="PostgreSQL 15 Reader" value="postgresqlreader" />
+        <el-option
+          v-for="plugin in readerCapabilities"
+          :key="plugin.datax_plugin_name"
+          :label="`${plugin.display_name} · ${plugin.certification_state}`"
+          :value="plugin.datax_plugin_name"
+        />
       </el-select>
       <el-select v-model="filters.writerPlugin" clearable placeholder="全部 Writer" @change="load()">
-        <el-option label="MySQL 8 Writer" value="mysqlwriter" />
-        <el-option label="PostgreSQL 15 Writer" value="postgresqlwriter" />
+        <el-option
+          v-for="plugin in writerCapabilities"
+          :key="plugin.datax_plugin_name"
+          :label="`${plugin.display_name} · ${plugin.certification_state}`"
+          :value="plugin.datax_plugin_name"
+        />
       </el-select>
       <el-select
         v-model="filters.latestExecutionState"
@@ -468,7 +545,9 @@ watch(wizardVisible, (visible) => {
               size="small"
               type="success"
               plain
-              @click="emit('run', row.id)"
+              :disabled="Boolean(executionBlockReason(row))"
+              :title="executionBlockReason(row) ?? '已绑定当前 Windows E4 证据'"
+              @click="requestRun(row)"
             >
               运行已发布版本
             </el-button>

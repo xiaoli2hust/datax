@@ -353,6 +353,10 @@ class RecoveryService:
                     title="恢复证据与原目标不匹配",
                     detail="不会使用不匹配的空表证据再次执行。",
                 )
+            self.control.require_job_version_plugin_certification(
+                version=version,
+                now=now,
+            )
             execution_request = ExecutionCreate(
                 job_version_id=version.id,
                 source_quiescence_confirmation=(request.source_quiescence_confirmation),

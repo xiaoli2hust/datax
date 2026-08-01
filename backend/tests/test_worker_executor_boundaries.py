@@ -95,6 +95,45 @@ def test_datax_verify_full_exact_ip_is_blocked_until_ip_san_is_certified() -> No
     assert failure.value.code == "DATAX_VERIFY_FULL_IP_UNCERTIFIED"
 
 
+def test_worker_start_rechecks_windows_e4_before_workspace_or_credentials() -> None:
+    calls: list[tuple[str, object]] = []
+
+    def reject_certification(**_kwargs: object) -> None:
+        calls.append(("certification", None))
+        raise ProblemException(
+            status=409,
+            code="PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED",
+            title="certification required",
+        )
+
+    worker = object.__new__(ExecutionWorker)
+    worker.control = SimpleNamespace(
+        require_job_version_plugin_certification=reject_certification,
+    )
+    worker._load_context = lambda _claim: SimpleNamespace(  # type: ignore[method-assign]
+        version=SimpleNamespace()
+    )
+    worker._create_workspace = lambda _claim: pytest.fail(  # type: ignore[method-assign]
+        "workspace must remain behind the E4 gate"
+    )
+    worker._fail_current_state = (  # type: ignore[method-assign]
+        lambda **kwargs: calls.append(("failed", kwargs["code"]))
+    )
+    claim = ClaimedExecution(
+        execution_id=uuid4(),
+        attempt_id=uuid4(),
+        fence_epoch=1,
+        lease_token="x" * 32,
+    )
+
+    worker.run_claimed(claim)
+
+    assert calls == [
+        ("certification", None),
+        ("failed", "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED"),
+    ]
+
+
 def test_datax_phase_records_unobserved_peer_evidence_before_process_start(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

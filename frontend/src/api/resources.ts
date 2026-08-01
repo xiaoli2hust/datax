@@ -15,6 +15,7 @@ import type {
   JobPreview,
   JobVersion,
   LogPage,
+  PluginCapabilityPage,
   Project,
   ProjectMember,
   ProjectRole,
@@ -48,6 +49,10 @@ function queryString(params: Record<string, string | number | boolean | null | u
   }
   const serialized = query.toString();
   return serialized.length > 0 ? `?${serialized}` : "";
+}
+
+export function listPluginCapabilities(): Promise<PluginCapabilityPage> {
+  return apiGet("/plugins");
 }
 
 export function listUsers(cursor?: string): Promise<CursorPage<User>> {

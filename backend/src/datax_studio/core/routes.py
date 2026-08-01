@@ -72,13 +72,12 @@ def get_control_service(request: Request) -> ControlService:
 @router.get(
     "/plugins",
     response_model=PluginPage,
-    response_model_exclude_none=True,
 )
-def list_certified_plugins(
+def list_plugin_capabilities(
     principal: Annotated[Principal, Depends(business_principal)],
     service: Annotated[ControlService, Depends(get_control_service)],
 ) -> PluginPage:
-    return service.list_certified_plugins(principal=principal)
+    return service.list_plugin_capabilities(principal=principal)
 
 
 @router.get("/projects", response_model=ProjectPage)

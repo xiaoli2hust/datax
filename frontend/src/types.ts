@@ -87,6 +87,35 @@ export interface Project {
 }
 
 export type Engine = "MYSQL_8" | "POSTGRESQL_15";
+export type PluginName =
+  | "mysqlreader"
+  | "mysqlwriter"
+  | "postgresqlreader"
+  | "postgresqlwriter";
+export type PluginCertificationState =
+  | "SOURCE_PRESENT"
+  | "BUILD_VERIFIED"
+  | "PACKAGED"
+  | "CONTRACTED"
+  | "E3_CERTIFIED"
+  | "WINDOWS_E4_CERTIFIED"
+  | "BLOCKED";
+
+export interface PluginCapability {
+  schema_version: "2.0";
+  name: string;
+  display_name: string;
+  engine: Engine;
+  direction: "READER" | "WRITER";
+  datax_plugin_name: PluginName;
+  certification_state: PluginCertificationState;
+  ordinary_user_executable: boolean;
+  block_reasons: string[];
+}
+
+export interface PluginCapabilityPage {
+  items: PluginCapability[];
+}
 
 export interface DatasourceSummary {
   id: string;
@@ -210,7 +239,7 @@ export type OracleLogicalType =
 export interface JobSpecEndpoint {
   datasource_id: string;
   datasource_revision_id: string;
-  plugin_name: "mysqlreader" | "postgresqlreader" | "mysqlwriter" | "postgresqlwriter";
+  plugin_name: PluginName;
   table: {
     schema_name: string;
     table_name: string;
@@ -270,6 +299,8 @@ export interface SyncJob {
   validated_spec_hash: string | null;
   latest_published_version_id: string | null;
   latest_published_version_no: number | null;
+  latest_published_reader_plugin: "mysqlreader" | "postgresqlreader" | null;
+  latest_published_writer_plugin: "mysqlwriter" | "postgresqlwriter" | null;
   latest_execution_process_state: ProcessState | null;
   latest_execution_at: string | null;
   row_version: number;

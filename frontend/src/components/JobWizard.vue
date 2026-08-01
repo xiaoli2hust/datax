@@ -7,6 +7,7 @@ import {
   createJob,
   listDatasources,
   listDatasourceTables,
+  listPluginCapabilities,
   updateJob,
 } from "../api/resources";
 import type {
@@ -14,6 +15,7 @@ import type {
   DatasourceSummary,
   JobSpec,
   OracleLogicalType,
+  PluginCapability,
   SyncJob,
   TableSchema,
 } from "../types";
@@ -39,6 +41,7 @@ const loading = ref(false);
 const submitting = ref(false);
 const error = ref<unknown>(null);
 const datasources = ref<DatasourceSummary[]>([]);
+const pluginCapabilities = ref<PluginCapability[]>([]);
 const sourceTables = ref<TableSchema[]>([]);
 const targetTables = ref<TableSchema[]>([]);
 const sourceLoading = ref(false);
@@ -77,6 +80,16 @@ const activeDatasources = computed(() =>
     (item) => item.status === "ACTIVE" && item.credential_status === "READY",
   ),
 );
+const sourcePluginCapability = computed(() =>
+  sourceDatasource.value
+    ? capabilityFor(sourceDatasource.value.engine, "READER")
+    : undefined,
+);
+const targetPluginCapability = computed(() =>
+  targetDatasource.value
+    ? capabilityFor(targetDatasource.value.engine, "WRITER")
+    : undefined,
+);
 const selectedMappings = computed(() => mappings.value.filter((mapping) => mapping.enabled));
 const duplicateTargets = computed(() => {
   const counts = new Map<string, number>();
@@ -99,12 +112,14 @@ const canNext = computed(() => {
   if (step.value === 1) {
     return Boolean(
       sourceDatasource.value &&
+        isExecutableCapability(sourcePluginCapability.value) &&
         sourceTable.value?.oracle_compatible,
     );
   }
   if (step.value === 2) {
     return Boolean(
       targetDatasource.value &&
+        isExecutableCapability(targetPluginCapability.value) &&
         targetTable.value?.oracle_compatible &&
         targetTable.value.target_insert_compatible &&
         mappingComplete.value,
@@ -127,9 +142,42 @@ function tableKey(table: TableSchema): string {
   return `${table.schema_name}\u0000${table.table_name}`;
 }
 
+function capabilityFor(
+  engine: DatasourceSummary["engine"],
+  direction: "READER" | "WRITER",
+): PluginCapability | undefined {
+  return pluginCapabilities.value.find(
+    (item) => item.engine === engine && item.direction === direction,
+  );
+}
+
+function isExecutableCapability(capability: PluginCapability | undefined): boolean {
+  return Boolean(
+    capability?.certification_state === "WINDOWS_E4_CERTIFIED" &&
+      capability.ordinary_user_executable,
+  );
+}
+
+function capabilityLabel(
+  datasource: DatasourceSummary,
+  direction: "READER" | "WRITER",
+): string {
+  const capability = capabilityFor(datasource.engine, direction);
+  if (!capability) return `${datasource.name} · 未获取认证事实`;
+  return `${datasource.name} · ${capability.display_name} · ${capability.certification_state}`;
+}
+
+function capabilityBlockDescription(capability: PluginCapability | undefined): string {
+  if (!capability) return "未获取当前插件认证事实，已安全禁用。";
+  if (isExecutableCapability(capability)) return "当前候选已绑定有效的 Windows E4 证据。";
+  const reasons = capability.block_reasons.join("、") || "WINDOWS_E4_EVIDENCE_MISSING";
+  return `${capability.display_name} 当前为 ${capability.certification_state}；阻断原因：${reasons}。`;
+}
+
 function reset(): void {
   step.value = 0;
   error.value = null;
+  pluginCapabilities.value = [];
   form.name = "";
   form.description = "";
   form.sourceDatasourceId = "";
@@ -171,6 +219,16 @@ async function loadDatasources(): Promise<void> {
     datasources.value = [];
   } finally {
     loading.value = false;
+  }
+}
+
+async function loadCapabilities(): Promise<void> {
+  pluginCapabilities.value = [];
+  try {
+    pluginCapabilities.value = (await listPluginCapabilities()).items;
+  } catch (caught) {
+    pluginCapabilities.value = [];
+    throw caught;
   }
 }
 
@@ -301,12 +359,22 @@ function buildSpec(): JobSpec {
   if (!source || !target || !sourceTableValue || !targetTableValue || !mappingComplete.value) {
     throw new Error("任务表单尚未完成。");
   }
+  const reader = capabilityFor(source.engine, "READER");
+  const writer = capabilityFor(target.engine, "WRITER");
+  if (
+    !reader ||
+    !writer ||
+    !isExecutableCapability(reader) ||
+    !isExecutableCapability(writer)
+  ) {
+    throw new Error("当前 Reader/Writer 未通过 Windows E4 认证，不能生成可执行任务草稿。");
+  }
   return {
     schema_version: "1.0",
     source: {
       datasource_id: source.id,
       datasource_revision_id: sourceRevisionId.value,
-      plugin_name: source.engine === "MYSQL_8" ? "mysqlreader" : "postgresqlreader",
+      plugin_name: reader.datax_plugin_name,
       table: {
         schema_name: sourceTableValue.schema_name,
         table_name: sourceTableValue.table_name,
@@ -315,7 +383,7 @@ function buildSpec(): JobSpec {
     target: {
       datasource_id: target.id,
       datasource_revision_id: targetRevisionId.value,
-      plugin_name: target.engine === "MYSQL_8" ? "mysqlwriter" : "postgresqlwriter",
+      plugin_name: writer.datax_plugin_name,
       table: {
         schema_name: targetTableValue.schema_name,
         table_name: targetTableValue.table_name,
@@ -403,7 +471,7 @@ async function submit(): Promise<void> {
 
 async function initialize(): Promise<void> {
   reset();
-  await loadDatasources();
+  await Promise.all([loadDatasources(), loadCapabilities()]);
   const job = props.job;
   if (!job) return;
   form.name = job.name;
@@ -531,8 +599,9 @@ watch(visible, (isVisible) => {
               <el-option
                 v-for="source in activeDatasources"
                 :key="source.id"
-                :label="`${source.name} · ${source.engine}`"
+                :label="capabilityLabel(source, 'READER')"
                 :value="source.id"
+                :disabled="!isExecutableCapability(capabilityFor(source.engine, 'READER'))"
               />
             </el-select>
           </el-form-item>
@@ -556,10 +625,10 @@ watch(visible, (isVisible) => {
           </el-form-item>
         </el-form>
         <el-alert
-          type="info"
+          :type="isExecutableCapability(sourcePluginCapability) ? 'info' : 'warning'"
           :closable="false"
-          title="源表静默责任"
-          description="本向导不会用复选框伪装数据库快照。真正执行前，Operator 必须重新提交全窗口静默确认。"
+          :title="isExecutableCapability(sourcePluginCapability) ? '源表静默责任' : 'Reader 当前不可执行'"
+          :description="isExecutableCapability(sourcePluginCapability) ? '本向导不会用复选框伪装数据库快照。真正执行前，Operator 必须重新提交全窗口静默确认。' : capabilityBlockDescription(sourcePluginCapability)"
         />
       </div>
 
@@ -575,8 +644,9 @@ watch(visible, (isVisible) => {
               <el-option
                 v-for="target in activeDatasources.filter((item) => item.id !== form.sourceDatasourceId)"
                 :key="target.id"
-                :label="`${target.name} · ${target.engine}`"
+                :label="capabilityLabel(target, 'WRITER')"
                 :value="target.id"
+                :disabled="!isExecutableCapability(capabilityFor(target.engine, 'WRITER'))"
               />
             </el-select>
           </el-form-item>
@@ -599,6 +669,14 @@ watch(visible, (isVisible) => {
             </el-select>
           </el-form-item>
         </div>
+
+        <el-alert
+          v-if="targetDatasource && !isExecutableCapability(targetPluginCapability)"
+          type="warning"
+          :closable="false"
+          title="Writer 当前不可执行"
+          :description="capabilityBlockDescription(targetPluginCapability)"
+        />
 
         <el-table v-if="mappings.length" :data="mappings" row-key="source.name" max-height="380">
           <el-table-column label="复制" width="72">

@@ -102,13 +102,19 @@ from datax_studio.core.schemas import (
     JobVersionPage,
     JobVersionResponse,
     PhysicalEndpointIdentityResponse,
+    PluginAccess,
     PluginArtifact,
     PluginCapabilities,
     PluginConnectionField,
+    PluginDependency,
+    PluginEvidence,
     PluginFieldConstraints,
     PluginManifest,
+    PluginOracle,
     PluginPage,
     PluginRuntime,
+    PluginSupplyChain,
+    PluginUpstream,
     ProjectCreate,
     ProjectPage,
     ProjectPatch,
@@ -126,6 +132,11 @@ from datax_studio.core.schemas import (
 from datax_studio.egress_attestation import (
     POLICY_ENGINE_VERSION,
     RESOLVER_POLICY_VERSION,
+)
+from datax_studio.plugin_certification import (
+    DenyAllPluginCertificationSource,
+    PluginCertificationSource,
+    certification_block_reasons,
 )
 from datax_studio.recovery.gates import ensure_recovery_gate
 from datax_studio.schema_snapshot import (
@@ -267,6 +278,7 @@ class ControlService:
         worker_stale_seconds: float = 20.0,
         resolver_policy_version: str = RESOLVER_POLICY_VERSION,
         egress_policy_version: str = POLICY_ENGINE_VERSION,
+        plugin_certification_source: PluginCertificationSource | None = None,
     ) -> None:
         if len(integrity_hmac_key) < 32:
             raise ValueError("control-plane integrity HMAC key must contain at least 32 bytes")
@@ -276,6 +288,9 @@ class ControlService:
         self._worker_stale_seconds = worker_stale_seconds
         self._resolver_policy_version = resolver_policy_version
         self._egress_policy_version = egress_policy_version
+        self._plugin_certification_source = (
+            plugin_certification_source or DenyAllPluginCertificationSource()
+        )
 
     # ------------------------------------------------------------------
     # Projects
@@ -822,9 +837,10 @@ class ControlService:
             return self._project_response(project)
 
     # ------------------------------------------------------------------
-    # Certified plugin manifest derived from the attested current runtime.
+    # Plugin capability catalog derived from current runtime facts. Runtime
+    # readiness can prove PACKAGED, never Windows E4 certification by itself.
     # ------------------------------------------------------------------
-    def list_certified_plugins(
+    def list_plugin_capabilities(
         self,
         *,
         principal: Principal,
@@ -846,6 +862,7 @@ class ControlService:
                             wh.runtime_code,
                             wh.oracle_code,
                             wh.datax_release,
+                            wh.runtime_sha256,
                             wh.mysqlreader_plugin_sha256,
                             wh.postgresqlreader_plugin_sha256,
                             wh.mysqlwriter_plugin_sha256,
@@ -893,6 +910,7 @@ class ControlService:
             and row["runtime_code"] == "RUNTIME_OK"
             and row["oracle_code"] == "ORACLE_OK"
             and row["datax_release"] == "datax_v202309"
+            and re.fullmatch(r"[a-f0-9]{64}", str(row["runtime_sha256"] or ""))
             and not bool(row["draining"])
             and row["host_boot_id"] is not None
             and row["host_boot_id"] == row["control_host_boot_id"]
@@ -998,6 +1016,8 @@ class ControlService:
                 "READER",
                 "datax/plugin/reader/mysqlreader/"
                 "mysqlreader-0.0.1-SNAPSHOT.jar",
+                "c4ffc40c90af4068999178ac7297bb2066de59b8dccfa6e8e956b48327487206",
+                "86ef9813bfc558048a99e32ffaf4889a48f2f082b0f692dc73770f5385161e8f",
             ),
             (
                 "mysqlwriter",
@@ -1006,6 +1026,8 @@ class ControlService:
                 "WRITER",
                 "datax/plugin/writer/mysqlwriter/"
                 "mysqlwriter-0.0.1-SNAPSHOT.jar",
+                "b83fe2a8eb0d1e535b84914e5fa169722bd085686eb11d63841e92a6d7cf1b2c",
+                "2c5914e3625f3c32e79d661407ec4644e94905037c78e1aa21391e0174c2d3ed",
             ),
             (
                 "postgresqlreader",
@@ -1014,6 +1036,8 @@ class ControlService:
                 "READER",
                 "datax/plugin/reader/postgresqlreader/"
                 "postgresqlreader-0.0.1-SNAPSHOT.jar",
+                "f14129fe23f6ca90bfc36b3c3bf64ff8d53288053af26e666411dde47211a835",
+                "5f298fb97165625ae5de9c32cb8454128feaa9c7ef8856f943f7683191291b32",
             ),
             (
                 "postgresqlwriter",
@@ -1022,24 +1046,109 @@ class ControlService:
                 "WRITER",
                 "datax/plugin/writer/postgresqlwriter/"
                 "postgresqlwriter-0.0.1-SNAPSHOT.jar",
+                "d29dcd149b37c269e8e741184172a69ce80cd6ffc69503440fdd9d4afe49e4c4",
+                "1ea3e7ef4deebb90b36e4c7b1cb1e91852abbe9d6db0d52eee7a42fa037589f6",
             ),
         )
         manifests: list[PluginManifest] = []
-        for name, display_name, engine, direction, path in definitions:
+        now = utc_now()
+        runtime_sha256 = str(row["runtime_sha256"])
+        for (
+            name,
+            display_name,
+            engine,
+            direction,
+            path,
+            module_pom_sha256,
+            plugin_json_sha256,
+        ) in definitions:
+            record = self._plugin_certification_source.get_record(name)
+            record_block_reasons = (
+                certification_block_reasons(
+                    record,
+                    expected_plugin_name=name,
+                    expected_plugin_sha256=plugin_hashes[name],
+                    expected_runtime_sha256=runtime_sha256,
+                    current_candidate_id=(
+                        self._plugin_certification_source.current_candidate_id
+                    ),
+                    current_candidate_commit=(
+                        self._plugin_certification_source.current_candidate_commit
+                    ),
+                    current_worker_image_digest=(
+                        self._plugin_certification_source.current_worker_image_digest
+                    ),
+                    now=now,
+                )
+                if record is not None
+                else [
+                    "DEPENDENCY_INVENTORY_INCOMPLETE",
+                    "LICENSE_REVIEW_REQUIRED",
+                    "E3_EVIDENCE_MISSING",
+                    "WINDOWS_E4_EVIDENCE_MISSING",
+                ]
+            )
+            if record is not None and record.source == "TEST_INJECTION":
+                record_block_reasons = [
+                    *record_block_reasons,
+                    "NON_RELEASE_TEST_EVIDENCE",
+                ]
+            e4_certified = (
+                record is not None
+                and record.source == "TRUSTED_RELEASE_ATTESTATION"
+                and not record_block_reasons
+            )
             manifests.append(
                 PluginManifest(
-                    schema_version="1.0",
+                    schema_version="2.0",
                     name=name,
                     display_name=display_name,
                     engine=engine,
                     direction=direction,
                     datax_plugin_name=name,
                     datax_release="datax_v202309",
+                    upstream=PluginUpstream(
+                        repository="https://github.com/alibaba/DataX.git",
+                        tag="datax_v202309",
+                        commit="9a1f88751e24314b083a74f1b83ef56d69ce98bd",
+                        tree="534508f96331c4b9f3737ea4e8294cc56aedc67d",
+                        module=name,
+                        module_pom_sha256=module_pom_sha256,
+                        plugin_json_sha256=plugin_json_sha256,
+                    ),
                     artifact=PluginArtifact(
                         relative_path=path,
                         sha256=plugin_hashes[name],
                     ),
                     runtime=PluginRuntime(jdk_major=8, python_major=3),
+                    supply_chain=PluginSupplyChain(
+                        dependency_inventory_status=(
+                            "COMPLETE" if e4_certified else "INCOMPLETE"
+                        ),
+                        license_review_status=(
+                            "CLEARED" if e4_certified else "REVIEW_REQUIRED"
+                        ),
+                        dependency_inventory_ref=(
+                            record.dependency_inventory_ref if e4_certified else None
+                        ),
+                        license_review_ref=(
+                            record.license_review_ref if e4_certified else None
+                        ),
+                        dependencies=(
+                            [
+                                PluginDependency(
+                                    name=item.name,
+                                    version=item.version,
+                                    license_expression=item.license_expression,
+                                    license_file=item.license_file,
+                                    redistribution_status=item.redistribution_status,
+                                )
+                                for item in record.dependencies
+                            ]
+                            if e4_certified
+                            else []
+                        ),
+                    ),
                     connection_fields=connection_fields,
                     capabilities=PluginCapabilities(
                         schema_introspection=True,
@@ -1056,10 +1165,62 @@ class ControlService:
                         supports_transformer=False,
                         supports_custom_parameters=False,
                     ),
-                    status="CERTIFIED",
+                    access=PluginAccess(
+                        network_scope="APPROVED_DATABASE_ENDPOINT_ONLY",
+                        filesystem_scope="PRIVATE_RUNTIME_ONLY",
+                        allows_arbitrary_sql=False,
+                        allows_host_paths=False,
+                        allows_shell=False,
+                        allows_user_plugins=False,
+                    ),
+                    oracle=PluginOracle(
+                        kind="RELATIONAL_MULTISET_V1",
+                        schema_version="1.0",
+                        required_for_e3=True,
+                    ),
+                    certification_state=(
+                        "WINDOWS_E4_CERTIFIED"
+                        if e4_certified
+                        else ("BLOCKED" if record is not None else "PACKAGED")
+                    ),
+                    ordinary_user_executable=e4_certified,
+                    evidence=PluginEvidence(
+                        source=(
+                            "TRUSTED_RELEASE_ATTESTATION"
+                            if e4_certified
+                            else "CURRENT_RUNTIME_ATTESTATION"
+                        ),
+                        candidate_id=(record.candidate_id if e4_certified else None),
+                        candidate_commit=(
+                            record.candidate_commit if e4_certified else None
+                        ),
+                        worker_image_digest=(
+                            record.worker_image_digest if e4_certified else None
+                        ),
+                        runtime_sha256=runtime_sha256,
+                        e3_evidence_ref=(
+                            record.e3_evidence_ref if e4_certified else None
+                        ),
+                        windows_e4_evidence_ref=(
+                            record.windows_e4_evidence_ref if e4_certified else None
+                        ),
+                        valid_until=(record.valid_until if e4_certified else None),
+                    ),
+                    block_reasons=([] if e4_certified else record_block_reasons),
                 )
             )
         return PluginPage(items=manifests)
+
+    def require_job_version_plugin_certification(
+        self,
+        *,
+        version: JobVersion,
+        now: datetime | None = None,
+    ) -> None:
+        self._plugin_certification_source.require_job_version(
+            version=version,
+            now=now or utc_now(),
+        )
 
     # ------------------------------------------------------------------
     # Endpoint policy revisions (non-secret, no network connection)
@@ -2376,6 +2537,10 @@ class ControlService:
                         title="任务版本不可执行",
                         detail="请选择当前任务的已发布不可变版本。",
                     )
+                self.require_job_version_plugin_certification(
+                    version=version,
+                    now=now,
+                )
                 spec = JobSpecV1.model_validate(version.spec_json)
                 self._check_job_spec_resources(session, job.project_id, spec)
                 policy = session.get(TransferPolicy, version.transfer_policy_id)
@@ -3111,6 +3276,19 @@ class ControlService:
             ):
                 execution.queue_eligibility_state = "BLOCKED"
                 execution.queue_block_reason = "TRANSFER_POLICY_NOT_ACTIVE"
+                execution.queue_state_changed_at = now
+                execution.state_version += 1
+                return None
+            try:
+                self.require_job_version_plugin_certification(
+                    version=version,
+                    now=now,
+                )
+            except ProblemException as exc:
+                if exc.code != "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED":
+                    raise
+                execution.queue_eligibility_state = "BLOCKED"
+                execution.queue_block_reason = "PLUGIN_E4_CERTIFICATION_BLOCKED"
                 execution.queue_state_changed_at = now
                 execution.state_version += 1
                 return None
@@ -5452,13 +5630,17 @@ class ControlService:
         )
 
     def _job_response(self, session: Session, job: SyncJob) -> JobResponse:
-        latest_version_no = (
-            session.scalar(
-                select(JobVersion.version_no).where(
+        latest_version = (
+            session.execute(
+                select(
+                    JobVersion.version_no,
+                    JobVersion.reader_plugin_name,
+                    JobVersion.writer_plugin_name,
+                ).where(
                     JobVersion.id == job.latest_published_version_id,
                     JobVersion.job_id == job.id,
                 )
-            )
+            ).first()
             if job.latest_published_version_id is not None
             else None
         )
@@ -5478,7 +5660,19 @@ class ControlService:
             draft_spec_hash=job.draft_spec_hash,
             validated_spec_hash=job.validated_spec_hash,
             latest_published_version_id=job.latest_published_version_id,
-            latest_published_version_no=latest_version_no,
+            latest_published_version_no=(
+                latest_version.version_no if latest_version is not None else None
+            ),
+            latest_published_reader_plugin=(
+                latest_version.reader_plugin_name
+                if latest_version is not None
+                else None
+            ),
+            latest_published_writer_plugin=(
+                latest_version.writer_plugin_name
+                if latest_version is not None
+                else None
+            ),
             latest_execution_process_state=(
                 latest_execution.process_state
                 if latest_execution is not None

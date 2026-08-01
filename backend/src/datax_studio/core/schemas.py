@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Literal
@@ -227,6 +228,37 @@ class Engine(StrEnum):
     POSTGRESQL_15 = "POSTGRESQL_15"
 
 
+_PLUGIN_MANIFEST_IDENTITIES: dict[
+    tuple[str, str],
+    tuple[str, str, str, str],
+] = {
+    ("MYSQL_8", "READER"): (
+        "mysqlreader",
+        "datax/plugin/reader/mysqlreader/mysqlreader-0.0.1-SNAPSHOT.jar",
+        "c4ffc40c90af4068999178ac7297bb2066de59b8dccfa6e8e956b48327487206",
+        "86ef9813bfc558048a99e32ffaf4889a48f2f082b0f692dc73770f5385161e8f",
+    ),
+    ("MYSQL_8", "WRITER"): (
+        "mysqlwriter",
+        "datax/plugin/writer/mysqlwriter/mysqlwriter-0.0.1-SNAPSHOT.jar",
+        "b83fe2a8eb0d1e535b84914e5fa169722bd085686eb11d63841e92a6d7cf1b2c",
+        "2c5914e3625f3c32e79d661407ec4644e94905037c78e1aa21391e0174c2d3ed",
+    ),
+    ("POSTGRESQL_15", "READER"): (
+        "postgresqlreader",
+        "datax/plugin/reader/postgresqlreader/postgresqlreader-0.0.1-SNAPSHOT.jar",
+        "f14129fe23f6ca90bfc36b3c3bf64ff8d53288053af26e666411dde47211a835",
+        "5f298fb97165625ae5de9c32cb8454128feaa9c7ef8856f943f7683191291b32",
+    ),
+    ("POSTGRESQL_15", "WRITER"): (
+        "postgresqlwriter",
+        "datax/plugin/writer/postgresqlwriter/postgresqlwriter-0.0.1-SNAPSHOT.jar",
+        "d29dcd149b37c269e8e741184172a69ce80cd6ffc69503440fdd9d4afe49e4c4",
+        "1ea3e7ef4deebb90b36e4c7b1cb1e91852abbe9d6db0d52eee7a42fa037589f6",
+    ),
+}
+
+
 class HostKind(StrEnum):
     EXACT_FQDN = "EXACT_FQDN"
     EXACT_IP = "EXACT_IP"
@@ -299,6 +331,111 @@ class PluginRuntime(StrictModel):
     python_major: Literal[3]
 
 
+class PluginUpstream(StrictModel):
+    repository: Literal["https://github.com/alibaba/DataX.git"]
+    tag: Literal["datax_v202309"]
+    commit: Literal["9a1f88751e24314b083a74f1b83ef56d69ce98bd"]
+    tree: Literal["534508f96331c4b9f3737ea4e8294cc56aedc67d"]
+    module: Literal[
+        "mysqlreader",
+        "mysqlwriter",
+        "postgresqlreader",
+        "postgresqlwriter",
+    ]
+    module_pom_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    plugin_json_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class PluginDependency(StrictModel):
+    name: str = Field(min_length=1, max_length=128)
+    version: str = Field(min_length=1, max_length=64)
+    license_expression: str = Field(min_length=1, max_length=128)
+    license_file: str = Field(
+        min_length=1,
+        max_length=300,
+        pattern=r"^[A-Za-z0-9_./-]+$",
+    )
+    redistribution_status: Literal[
+        "DOCUMENTED",
+        "REVIEW_REQUIRED",
+        "BLOCKED",
+    ]
+
+    @field_validator("license_file")
+    @classmethod
+    def require_contained_license_path(cls, value: str) -> str:
+        if value.startswith("/") or ".." in value.split("/"):
+            raise ValueError(
+                "dependency license_file must be a contained relative path"
+            )
+        return value
+
+
+class PluginSupplyChain(StrictModel):
+    dependency_inventory_status: Literal["COMPLETE", "INCOMPLETE", "BLOCKED"]
+    license_review_status: Literal["CLEARED", "REVIEW_REQUIRED", "BLOCKED"]
+    dependency_inventory_ref: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9._/:-]{1,300}$",
+    )
+    license_review_ref: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9._/:-]{1,300}$",
+    )
+    dependencies: list[PluginDependency] = Field(default_factory=list, max_length=64)
+
+
+class PluginAccess(StrictModel):
+    network_scope: Literal["APPROVED_DATABASE_ENDPOINT_ONLY"]
+    filesystem_scope: Literal["PRIVATE_RUNTIME_ONLY"]
+    allows_arbitrary_sql: Literal[False]
+    allows_host_paths: Literal[False]
+    allows_shell: Literal[False]
+    allows_user_plugins: Literal[False]
+
+
+class PluginOracle(StrictModel):
+    kind: Literal["RELATIONAL_MULTISET_V1"]
+    schema_version: Literal["1.0"]
+    required_for_e3: Literal[True]
+
+
+class PluginEvidence(StrictModel):
+    source: Literal[
+        "CURRENT_RUNTIME_ATTESTATION",
+        "TRUSTED_RELEASE_ATTESTATION",
+    ]
+    candidate_id: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9._-]{8,128}$",
+    )
+    candidate_commit: str | None = Field(
+        default=None,
+        pattern=r"^[a-f0-9]{40}$",
+    )
+    worker_image_digest: str | None = Field(
+        default=None,
+        pattern=r"^sha256:[a-f0-9]{64}$",
+    )
+    runtime_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    e3_evidence_ref: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9._/:-]{1,300}$",
+    )
+    windows_e4_evidence_ref: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9._/:-]{1,300}$",
+    )
+    valid_until: datetime | None = None
+
+    @field_validator("valid_until")
+    @classmethod
+    def require_aware_valid_until(cls, value: datetime | None) -> datetime | None:
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
+            raise ValueError("plugin evidence valid_until must be timezone-aware")
+        return value
+
+
 class PluginFieldConstraints(StrictModel):
     minimum: int | None = None
     maximum: int | None = None
@@ -343,7 +480,7 @@ class PluginCapabilities(StrictModel):
 
 
 class PluginManifest(StrictModel):
-    schema_version: Literal["1.0"]
+    schema_version: Literal["2.0"]
     name: str = Field(pattern=r"^[a-z][a-z0-9._-]{2,63}$")
     display_name: str = Field(min_length=1, max_length=128)
     engine: Engine
@@ -355,14 +492,95 @@ class PluginManifest(StrictModel):
         "postgresqlwriter",
     ]
     datax_release: Literal["datax_v202309"]
+    upstream: PluginUpstream
     artifact: PluginArtifact
     runtime: PluginRuntime
+    supply_chain: PluginSupplyChain
     connection_fields: list[PluginConnectionField] = Field(
         min_length=6,
         max_length=8,
     )
     capabilities: PluginCapabilities
-    status: Literal["CERTIFIED"]
+    access: PluginAccess
+    oracle: PluginOracle
+    certification_state: Literal[
+        "SOURCE_PRESENT",
+        "BUILD_VERIFIED",
+        "PACKAGED",
+        "CONTRACTED",
+        "E3_CERTIFIED",
+        "WINDOWS_E4_CERTIFIED",
+        "BLOCKED",
+    ]
+    ordinary_user_executable: bool
+    evidence: PluginEvidence
+    block_reasons: list[str] = Field(max_length=32)
+
+    @model_validator(mode="after")
+    def require_honest_certification_state(self) -> PluginManifest:
+        (
+            expected_name,
+            expected_artifact_path,
+            expected_pom_sha256,
+            expected_plugin_json_sha256,
+        ) = _PLUGIN_MANIFEST_IDENTITIES[(self.engine.value, self.direction)]
+        if (
+            self.name,
+            self.datax_plugin_name,
+            self.upstream.module,
+            self.artifact.relative_path,
+            self.upstream.module_pom_sha256,
+            self.upstream.plugin_json_sha256,
+        ) != (
+            expected_name,
+            expected_name,
+            expected_name,
+            expected_artifact_path,
+            expected_pom_sha256,
+            expected_plugin_json_sha256,
+        ):
+            raise ValueError(
+                "plugin identity must match the locked engine/direction upstream mapping"
+            )
+        if self.certification_state == "WINDOWS_E4_CERTIFIED":
+            if not self.ordinary_user_executable or self.block_reasons:
+                raise ValueError(
+                    "Windows E4 capability must be executable and unblocked"
+                )
+            if (
+                self.supply_chain.dependency_inventory_status != "COMPLETE"
+                or self.supply_chain.license_review_status != "CLEARED"
+                or self.supply_chain.dependency_inventory_ref is None
+                or self.supply_chain.license_review_ref is None
+                or not self.supply_chain.dependencies
+                or any(
+                    dependency.redistribution_status != "DOCUMENTED"
+                    for dependency in self.supply_chain.dependencies
+                )
+            ):
+                raise ValueError(
+                    "Windows E4 capability requires cleared supply-chain review"
+                )
+            if (
+                self.evidence.source != "TRUSTED_RELEASE_ATTESTATION"
+                or self.evidence.candidate_id is None
+                or self.evidence.candidate_commit is None
+                or self.evidence.worker_image_digest is None
+                or self.evidence.e3_evidence_ref is None
+                or self.evidence.windows_e4_evidence_ref is None
+                or self.evidence.valid_until is None
+            ):
+                raise ValueError(
+                    "Windows E4 capability requires complete candidate evidence"
+                )
+        elif self.ordinary_user_executable or not self.block_reasons:
+            raise ValueError("non-E4 capability must be blocked for ordinary users")
+        if any(
+            not re.fullmatch(r"[A-Z][A-Z0-9_]{2,127}", item)
+            for item in self.block_reasons
+        ):
+            raise ValueError("plugin block reasons must be stable uppercase codes")
+        return self
 
 
 class PluginPage(StrictModel):
@@ -503,6 +721,12 @@ class JobResponse(StrictModel):
     validated_spec_hash: str | None
     latest_published_version_id: UUID | None
     latest_published_version_no: int | None = Field(default=None, ge=1)
+    latest_published_reader_plugin: Literal[
+        "mysqlreader", "postgresqlreader"
+    ] | None
+    latest_published_writer_plugin: Literal[
+        "mysqlwriter", "postgresqlwriter"
+    ] | None
     latest_execution_process_state: ProcessStateValue | None
     latest_execution_at: datetime | None
     row_version: int = Field(ge=1)

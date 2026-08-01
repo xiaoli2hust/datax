@@ -552,11 +552,17 @@ paths:
   /plugins:
     get:
       tags: [Plugins]
-      operationId: listCertifiedPlugins
-      summary: 获取四个只读认证插件 manifest
+      operationId: listPluginCapabilities
+      summary: 获取当前 DataX 能力目录与认证状态
+      description: |
+        返回当前 Runtime 中四个 V1 候选 Reader/Writer 的制品、上游、
+        依赖/许可审查、访问边界、oracle 和证据状态。源码存在、
+        构建成功或已打包均不等于普通用户可执行；只有
+        certification_state=WINDOWS_E4_CERTIFIED 且 ordinary_user_executable=true
+        、证据仍在有效期并绑定当前候选时才能创建和启动 Execution。
       responses:
         '200':
-          description: 插件 manifest 列表
+          description: 插件能力与证据状态列表
           content:
             application/json:
               schema:
@@ -569,9 +575,13 @@ paths:
                     minItems: 4
                     maxItems: 4
                     items:
-                      $ref: './plugin-manifest.v1.schema.json'
+                      $ref: './plugin-manifest.v2.schema.json'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
 
   /endpoint-policies:
     get:
@@ -4478,6 +4488,8 @@ components:
         - validated_spec_hash
         - latest_published_version_id
         - latest_published_version_no
+        - latest_published_reader_plugin
+        - latest_published_writer_plugin
         - latest_execution_process_state
         - latest_execution_at
         - row_version
@@ -4510,6 +4522,12 @@ components:
         latest_published_version_no:
           type: [integer, 'null']
           minimum: 1
+        latest_published_reader_plugin:
+          type: [string, 'null']
+          enum: [mysqlreader, postgresqlreader, null]
+        latest_published_writer_plugin:
+          type: [string, 'null']
+          enum: [mysqlwriter, postgresqlwriter, null]
         latest_execution_process_state:
           oneOf:
             - $ref: '#/components/schemas/ProcessState'

@@ -11,7 +11,8 @@ import pytest
 import rfc8785
 from fastapi.testclient import TestClient
 from jsonschema import Draft202012Validator, FormatChecker
-from sqlalchemy import create_engine, select, text
+from pydantic import ValidationError
+from sqlalchemy import create_engine, func, select, text
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
@@ -49,13 +50,23 @@ from datax_studio.core.db import (
     TargetNamespace,
     TransferPolicy,
 )
-from datax_studio.core.schemas import ClaimedExecution, CredentialBinding
+from datax_studio.core.schemas import (
+    ClaimedExecution,
+    CredentialBinding,
+    PluginDependency,
+    PluginManifest,
+)
 from datax_studio.core.service import (
     ControlService,
     ValidationMaterial,
     _filtered_cursor_scope,
 )
 from datax_studio.credentials.routes import get_credential_service
+from datax_studio.plugin_certification import (
+    CertifiedDependency,
+    ExplicitTestPluginCertificationSource,
+    PluginCertificationRecord,
+)
 from datax_studio.recovery.db import RecoveryGate
 from datax_studio.schema_snapshot import schema_snapshot_hash
 from datax_studio.settings import Settings
@@ -85,6 +96,74 @@ class PublishedJob:
     target_datasource_revision_id: UUID
     target_endpoint_policy_revision_id: UUID
     target_table_identity_hash: str
+
+
+_TEST_CANDIDATE_ID = "test-candidate-0001"
+_TEST_CANDIDATE_COMMIT = "9" * 40
+_TEST_WORKER_IMAGE = f"sha256:{'8' * 64}"
+_TEST_RUNTIME_SHA256 = "d" * 64
+_TEST_PLUGIN_HASHES = {
+    "mysqlreader": "b" * 64,
+    "mysqlwriter": "e" * 64,
+    "postgresqlreader": "f" * 64,
+    "postgresqlwriter": "c" * 64,
+}
+
+
+def _explicit_test_plugin_certification(
+    *,
+    valid_until: datetime | None = None,
+) -> ExplicitTestPluginCertificationSource:
+    expiry = valid_until or datetime.now(UTC) + timedelta(days=1)
+    dependency = CertifiedDependency(
+        name="com.alibaba.datax:datax-common",
+        version="0.0.1-SNAPSHOT",
+        license_expression="Apache-2.0",
+        license_file="third_party/alibaba-datax/license.txt",
+    )
+    return ExplicitTestPluginCertificationSource(
+        current_candidate_id=_TEST_CANDIDATE_ID,
+        current_candidate_commit=_TEST_CANDIDATE_COMMIT,
+        current_worker_image_digest=_TEST_WORKER_IMAGE,
+        records={
+            name: PluginCertificationRecord(
+                plugin_name=name,  # type: ignore[arg-type]
+                certification_state="WINDOWS_E4_CERTIFIED",
+                ordinary_user_executable=True,
+                source="TEST_INJECTION",
+                candidate_id=_TEST_CANDIDATE_ID,
+                candidate_commit=_TEST_CANDIDATE_COMMIT,
+                worker_image_digest=_TEST_WORKER_IMAGE,
+                runtime_sha256=_TEST_RUNTIME_SHA256,
+                plugin_sha256=plugin_sha256,
+                e3_evidence_ref=f"test/e3/{name}",
+                windows_e4_evidence_ref=f"test/windows-e4/{name}",
+                dependency_inventory_ref=f"test/dependencies/{name}",
+                license_review_ref=f"test/licenses/{name}",
+                dependencies=(dependency,),
+                valid_until=expiry,
+            )
+            for name, plugin_sha256 in _TEST_PLUGIN_HASHES.items()
+        },
+    )
+
+
+def _test_plugin_certification_with_override(
+    plugin_name: str,
+    **changes: object,
+) -> ExplicitTestPluginCertificationSource:
+    base = _explicit_test_plugin_certification()
+    records: dict[str, PluginCertificationRecord] = {}
+    for name in _TEST_PLUGIN_HASHES:
+        record = base.get_record(name)
+        assert record is not None
+        records[name] = replace(record, **changes) if name == plugin_name else record
+    return ExplicitTestPluginCertificationSource(
+        current_candidate_id=_TEST_CANDIDATE_ID,
+        current_candidate_commit=_TEST_CANDIDATE_COMMIT,
+        current_worker_image_digest=_TEST_WORKER_IMAGE,
+        records=records,
+    )
 
 
 @pytest.fixture
@@ -162,6 +241,7 @@ def core_stack() -> CoreStack:
     service = ControlService(
         sessions=sessions,
         integrity_hmac_key=b"core-control-plane-test-key-0001",
+        plugin_certification_source=_explicit_test_plugin_certification(),
     )
     app = create_app(
         settings=Settings(app_version="test", trusted_host="testserver"),
@@ -1751,6 +1831,8 @@ def test_job_list_filters_cursor_scope_and_archive_gate(
     ]
     summary = latest_execution.json()["items"][0]
     assert summary["latest_published_version_no"] == 1
+    assert summary["latest_published_reader_plugin"] == "mysqlreader"
+    assert summary["latest_published_writer_plugin"] == "postgresqlwriter"
     assert summary["latest_execution_process_state"] == "QUEUED"
     assert summary["latest_execution_at"] is not None
     blocked_archive = core_stack.client.patch(
@@ -1845,6 +1927,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
                     runtime_code TEXT NOT NULL,
                     oracle_code TEXT NOT NULL,
                     datax_release TEXT,
+                    runtime_sha256 TEXT,
                     mysqlreader_plugin_sha256 TEXT,
                     postgresqlreader_plugin_sha256 TEXT,
                     mysqlwriter_plugin_sha256 TEXT,
@@ -1866,6 +1949,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
                     runtime_code,
                     oracle_code,
                     datax_release,
+                    runtime_sha256,
                     mysqlreader_plugin_sha256,
                     postgresqlreader_plugin_sha256,
                     mysqlwriter_plugin_sha256,
@@ -1880,6 +1964,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
                     'RUNTIME_OK',
                     'ORACLE_OK',
                     'datax_v202309',
+                    :runtime_sha256,
                     :mysqlreader,
                     :postgresqlreader,
                     :mysqlwriter,
@@ -1892,10 +1977,11 @@ def test_plugins_are_derived_from_current_worker_attestation(
                 """
             ),
             {
-                "mysqlreader": "1" * 64,
-                "postgresqlreader": "2" * 64,
-                "mysqlwriter": "3" * 64,
-                "postgresqlwriter": "4" * 64,
+                "runtime_sha256": _TEST_RUNTIME_SHA256,
+                "mysqlreader": _TEST_PLUGIN_HASHES["mysqlreader"],
+                "postgresqlreader": _TEST_PLUGIN_HASHES["postgresqlreader"],
+                "mysqlwriter": _TEST_PLUGIN_HASHES["mysqlwriter"],
+                "postgresqlwriter": _TEST_PLUGIN_HASHES["postgresqlwriter"],
                 "reconcile_epoch": reconcile_epoch.hex,
                 "reconciled_at": now,
                 "updated_at": now,
@@ -1916,7 +2002,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
     schema = json.loads(
         (
             Path(__file__).parents[2]
-            / "docs/contracts/plugin-manifest.v1.schema.json"
+            / "docs/contracts/plugin-manifest.v2.schema.json"
         ).read_text(encoding="utf-8")
     )
     validator = Draft202012Validator(
@@ -1925,6 +2011,397 @@ def test_plugins_are_derived_from_current_worker_attestation(
     )
     for item in payload["items"]:
         assert list(validator.iter_errors(item)) == []
+        assert item["certification_state"] == "BLOCKED"
+        assert item["ordinary_user_executable"] is False
+        assert "NON_RELEASE_TEST_EVIDENCE" in item["block_reasons"]
+        assert item["evidence"]["source"] == "CURRENT_RUNTIME_ATTESTATION"
+        assert "TEST_INJECTION" not in json.dumps(item)
+
+    identity_mutations = (
+        ("name", lambda item: item.__setitem__("name", "mysqlwriter")),
+        (
+            "datax_plugin_name",
+            lambda item: item.__setitem__("datax_plugin_name", "mysqlwriter"),
+        ),
+        (
+            "upstream.module",
+            lambda item: item["upstream"].__setitem__("module", "mysqlwriter"),
+        ),
+        (
+            "upstream.module_pom_sha256",
+            lambda item: item["upstream"].__setitem__(
+                "module_pom_sha256",
+                "b83fe2a8eb0d1e535b84914e5fa169722bd085686eb11d63841e92a6d7cf1b2c",
+            ),
+        ),
+        (
+            "upstream.plugin_json_sha256",
+            lambda item: item["upstream"].__setitem__(
+                "plugin_json_sha256",
+                "2c5914e3625f3c32e79d661407ec4644e94905037c78e1aa21391e0174c2d3ed",
+            ),
+        ),
+        (
+            "artifact.relative_path",
+            lambda item: item["artifact"].__setitem__(
+                "relative_path",
+                "datax/plugin/writer/mysqlwriter/mysqlwriter-0.0.1-SNAPSHOT.jar",
+            ),
+        ),
+        (
+            "engine",
+            lambda item: item.__setitem__("engine", "POSTGRESQL_15"),
+        ),
+    )
+    for label, mutate in identity_mutations:
+        invalid_identity = json.loads(json.dumps(payload["items"][0]))
+        mutate(invalid_identity)
+        assert list(validator.iter_errors(invalid_identity)), label
+        with pytest.raises(ValidationError) as identity_error:
+            PluginManifest.model_validate_json(json.dumps(invalid_identity))
+        assert any(
+            error["loc"] == ()
+            and "locked engine/direction upstream mapping" in error["msg"]
+            for error in identity_error.value.errors()
+        ), label
+
+    e4_contract_probe = json.loads(json.dumps(payload["items"][0]))
+    e4_contract_probe.update(
+        certification_state="WINDOWS_E4_CERTIFIED",
+        ordinary_user_executable=True,
+        block_reasons=[],
+    )
+    e4_contract_probe["supply_chain"] = {
+        "dependency_inventory_status": "COMPLETE",
+        "license_review_status": "CLEARED",
+        "dependency_inventory_ref": "release/dependencies/mysqlreader.json",
+        "license_review_ref": "release/licenses/mysqlreader.json",
+        "dependencies": [
+            {
+                "name": "com.alibaba.datax:datax-common",
+                "version": "0.0.1-SNAPSHOT",
+                "license_expression": "Apache-2.0",
+                "license_file": "third_party/alibaba-datax/license.txt",
+                "redistribution_status": "REVIEW_REQUIRED",
+            }
+        ],
+    }
+    e4_contract_probe["evidence"] = {
+        "source": "TRUSTED_RELEASE_ATTESTATION",
+        "candidate_id": _TEST_CANDIDATE_ID,
+        "candidate_commit": _TEST_CANDIDATE_COMMIT,
+        "worker_image_digest": _TEST_WORKER_IMAGE,
+        "runtime_sha256": _TEST_RUNTIME_SHA256,
+        "e3_evidence_ref": "release/e3/mysqlreader.json",
+        "windows_e4_evidence_ref": "release/e4/mysqlreader.json",
+        "valid_until": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
+    }
+    schema_errors = list(validator.iter_errors(e4_contract_probe))
+    assert any(
+        list(error.absolute_path)
+        == ["supply_chain", "dependencies", 0, "redistribution_status"]
+        and error.validator == "const"
+        for error in schema_errors
+    )
+    with pytest.raises(ValidationError) as supply_chain_error:
+        PluginManifest.model_validate_json(json.dumps(e4_contract_probe))
+    assert any(
+        error["loc"] == ()
+        and "requires cleared supply-chain review" in error["msg"]
+        for error in supply_chain_error.value.errors()
+    )
+
+    e4_contract_probe["supply_chain"]["dependencies"][0]["redistribution_status"] = (
+        "DOCUMENTED"
+    )
+    e4_contract_probe["evidence"]["source"] = "TEST_INJECTION"
+    schema_errors = list(validator.iter_errors(e4_contract_probe))
+    assert any(
+        list(error.absolute_path) == ["evidence", "source"]
+        and error.validator in {"enum", "const"}
+        for error in schema_errors
+    )
+    with pytest.raises(ValidationError) as evidence_source_error:
+        PluginManifest.model_validate_json(json.dumps(e4_contract_probe))
+    assert any(
+        error["loc"] == ("evidence", "source")
+        and error["type"] == "literal_error"
+        for error in evidence_source_error.value.errors()
+    )
+
+    e4_contract_probe["evidence"]["source"] = "TRUSTED_RELEASE_ATTESTATION"
+    e4_contract_probe["evidence"]["valid_until"] = "2026-08-02T00:00:00"
+    schema_errors = list(validator.iter_errors(e4_contract_probe))
+    assert any(
+        list(error.absolute_path) == ["evidence", "valid_until"]
+        and error.validator == "format"
+        for error in schema_errors
+    )
+    with pytest.raises(ValidationError) as evidence_timestamp_error:
+        PluginManifest.model_validate_json(json.dumps(e4_contract_probe))
+    assert any(
+        error["loc"] == ("evidence", "valid_until")
+        and "timezone-aware" in error["msg"]
+        for error in evidence_timestamp_error.value.errors()
+    )
+
+    production_service = ControlService(
+        sessions=core_stack.sessions,
+        integrity_hmac_key=b"production-deny-default-test-key",
+    )
+    production_catalog = production_service.list_plugin_capabilities(
+        principal=core_stack.principal,
+    )
+    assert {item.certification_state for item in production_catalog.items} == {
+        "PACKAGED"
+    }
+    assert not any(item.ordinary_user_executable for item in production_catalog.items)
+    assert all(item.block_reasons for item in production_catalog.items)
+
+    base_source = _explicit_test_plugin_certification()
+    damaged_records = {
+        name: base_source.get_record(name) for name in _TEST_PLUGIN_HASHES
+    }
+    assert all(record is not None for record in damaged_records.values())
+    damaged_dependency = CertifiedDependency(
+        name="\x00",
+        version="",
+        license_expression="\x00",
+        license_file="licenses/../secret",
+        redistribution_status="REVIEW_REQUIRED",  # type: ignore[arg-type]
+    )
+    mysqlreader_record = damaged_records["mysqlreader"]
+    assert mysqlreader_record is not None
+    damaged_records["mysqlreader"] = replace(
+        mysqlreader_record,
+        plugin_name="mysqlwriter",  # type: ignore[arg-type]
+        certification_state="PACKAGED",
+        ordinary_user_executable=False,
+        candidate_id="bad",
+        candidate_commit="bad",
+        worker_image_digest="bad",
+        runtime_sha256="bad",
+        plugin_sha256="bad",
+        e3_evidence_ref=None,
+        windows_e4_evidence_ref=None,
+        dependency_inventory_ref=None,
+        license_review_ref=None,
+        dependencies=(damaged_dependency, damaged_dependency),
+        valid_until=None,
+    )
+    damaged_service = ControlService(
+        sessions=core_stack.sessions,
+        integrity_hmac_key=b"damaged-certification-catalog-key-1",
+        plugin_certification_source=ExplicitTestPluginCertificationSource(
+            current_candidate_id=_TEST_CANDIDATE_ID,
+            current_candidate_commit=_TEST_CANDIDATE_COMMIT,
+            current_worker_image_digest=_TEST_WORKER_IMAGE,
+            records={
+                name: record
+                for name, record in damaged_records.items()
+                if record is not None
+            },
+        ),
+    )
+    original_service = core_stack.client.app.state.control_service
+    core_stack.client.app.state.control_service = damaged_service
+    try:
+        damaged_response = core_stack.client.get("/api/v1/plugins")
+    finally:
+        core_stack.client.app.state.control_service = original_service
+    assert damaged_response.status_code == 200, damaged_response.text
+    damaged_payload = damaged_response.json()
+    damaged_mysqlreader = next(
+        item
+        for item in damaged_payload["items"]
+        if item["datax_plugin_name"] == "mysqlreader"
+    )
+    assert damaged_mysqlreader["certification_state"] == "BLOCKED"
+    assert damaged_mysqlreader["ordinary_user_executable"] is False
+    assert 16 < len(damaged_mysqlreader["block_reasons"]) <= 32
+    assert list(validator.iter_errors(damaged_mysqlreader)) == []
+
+    dependency_validator = Draft202012Validator(schema["$defs"]["dependency"])
+    for invalid_license_file in ("/tmp/LICENSE", "licenses/../secret"):
+        invalid_dependency = {
+            "name": "example",
+            "version": "1.0.0",
+            "license_expression": "Apache-2.0",
+            "license_file": invalid_license_file,
+            "redistribution_status": "DOCUMENTED",
+        }
+        dependency_errors = list(
+            dependency_validator.iter_errors(invalid_dependency)
+        )
+        assert any(
+            list(error.absolute_path) == ["license_file"]
+            and error.validator == "pattern"
+            for error in dependency_errors
+        )
+        with pytest.raises(ValidationError) as dependency_path_error:
+            PluginDependency.model_validate_json(json.dumps(invalid_dependency))
+        assert any(
+            error["loc"] == ("license_file",)
+            and "contained relative path" in error["msg"]
+            for error in dependency_path_error.value.errors()
+        )
+
+    inventory = json.loads(
+        (
+            Path(__file__).parents[2] / "runtime/upstream-plugin-inventory.v1.json"
+        ).read_text(encoding="utf-8")
+    )
+    locked = {
+        item["plugin_name"]: item
+        for item in inventory["plugins"]
+        if item["plugin_name"] in _TEST_PLUGIN_HASHES
+    }
+    for item in payload["items"]:
+        source = locked[item["datax_plugin_name"]]
+        assert item["upstream"]["module_pom_sha256"] == source["module_pom_sha256"]
+        assert item["upstream"]["plugin_json_sha256"] == source["plugin_json_sha256"]
+
+
+def test_execution_api_rejects_production_default_without_windows_e4(
+    core_stack: CoreStack,
+) -> None:
+    published = _seed_published_job(core_stack, "default-e4-deny")
+    with core_stack.sessions() as session:
+        before = session.scalar(select(func.count(Execution.id))) or 0
+    production_service = ControlService(
+        sessions=core_stack.sessions,
+        integrity_hmac_key=b"production-default-deny-api-key-01",
+    )
+    original = core_stack.client.app.state.control_service
+    core_stack.client.app.state.control_service = production_service
+    try:
+        response = core_stack.client.post(
+            f"/api/v1/jobs/{published.job_id}/executions",
+            headers={"Idempotency-Key": "execution-production-e4-deny-001"},
+            json=_execution_request(published.job_version_id),
+        )
+    finally:
+        core_stack.client.app.state.control_service = original
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED"
+    assert response.json()["details"]["block_reasons"] == [
+        "WINDOWS_E4_EVIDENCE_MISSING"
+    ]
+    with core_stack.sessions() as session:
+        assert (session.scalar(select(func.count(Execution.id))) or 0) == before
+
+
+@pytest.mark.parametrize(
+    ("changes", "expected_reason"),
+    [
+        (
+            {
+                "certification_state": "PACKAGED",
+                "ordinary_user_executable": False,
+            },
+            "NOT_WINDOWS_E4_CERTIFIED",
+        ),
+        ({"plugin_sha256": "0" * 64}, "PLUGIN_HASH_MISMATCH"),
+        ({"candidate_id": "other-candidate-0002"}, "CANDIDATE_ID_NOT_CURRENT"),
+        (
+            {"valid_until": datetime.now(UTC) - timedelta(seconds=1)},
+            "EVIDENCE_EXPIRED",
+        ),
+        (
+            {"valid_until": datetime.now().replace(tzinfo=None)},
+            "EVIDENCE_TIMESTAMP_INVALID",
+        ),
+        (
+            {
+                "dependencies": (
+                    CertifiedDependency(
+                        name="unsafe-dependency",
+                        version="1.0.0",
+                        license_expression="Apache-2.0",
+                        license_file="licenses/../secret",
+                    ),
+                )
+            },
+            "DEPENDENCY_LICENSE_PATH_INVALID",
+        ),
+        (
+            {
+                "dependencies": (
+                    CertifiedDependency(
+                        name="unreviewed-dependency",
+                        version="1.0.0",
+                        license_expression="UNKNOWN",
+                        license_file="third_party/licenses/UNKNOWN.txt",
+                        redistribution_status="REVIEW_REQUIRED",  # type: ignore[arg-type]
+                    ),
+                )
+            },
+            "DEPENDENCY_REDISTRIBUTION_NOT_DOCUMENTED",
+        ),
+    ],
+)
+def test_plugin_certification_rejects_downgrade_forgery_mismatch_and_expiry(
+    core_stack: CoreStack,
+    changes: dict[str, object],
+    expected_reason: str,
+) -> None:
+    published = _seed_published_job(core_stack, f"negative-{expected_reason.lower()}")
+    service = ControlService(
+        sessions=core_stack.sessions,
+        integrity_hmac_key=b"negative-certification-gate-key-01",
+        plugin_certification_source=_test_plugin_certification_with_override(
+            "mysqlreader",
+            **changes,
+        ),
+    )
+    with core_stack.sessions() as session:
+        version = session.get(JobVersion, published.job_version_id)
+        assert version is not None
+        with pytest.raises(ProblemException) as blocked:
+            service.require_job_version_plugin_certification(version=version)
+
+    assert blocked.value.code == "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED"
+    assert expected_reason in blocked.value.details["block_reasons"]
+
+
+def test_worker_claim_rechecks_expired_e4_and_blocks_queued_execution(
+    core_stack: CoreStack,
+) -> None:
+    published = _seed_published_job(core_stack, "worker-e4-expired")
+    created = core_stack.client.post(
+        f"/api/v1/jobs/{published.job_id}/executions",
+        headers={"Idempotency-Key": "execution-worker-e4-expired-001"},
+        json=_execution_request(published.job_version_id),
+    )
+    assert created.status_code == 202, created.text
+    execution_id = UUID(created.json()["id"])
+    expired_service = ControlService(
+        sessions=core_stack.sessions,
+        integrity_hmac_key=b"worker-expired-certification-key-01",
+        plugin_certification_source=_explicit_test_plugin_certification(
+            valid_until=datetime.now(UTC) - timedelta(seconds=1),
+        ),
+    )
+
+    def credential_selector_must_not_run(
+        *_args: object, **_kwargs: object
+    ) -> CredentialBinding:
+        raise AssertionError("credential selection must remain behind the E4 gate")
+
+    claim = expired_service.claim_next_execution(
+        worker_id="worker-1",
+        host_boot_id="boot-1",
+        cgroup_identity="container:test",
+        credential_selector=credential_selector_must_not_run,
+    )
+    assert claim is None
+    with core_stack.sessions() as session:
+        execution = session.get(Execution, execution_id)
+        assert execution is not None
+        assert execution.process_state == "QUEUED"
+        assert execution.queue_eligibility_state == "BLOCKED"
+        assert execution.queue_block_reason == "PLUGIN_E4_CERTIFICATION_BLOCKED"
 
 
 def _seed_published_job(core_stack: CoreStack, label: str) -> PublishedJob:

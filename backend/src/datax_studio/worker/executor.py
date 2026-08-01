@@ -217,8 +217,20 @@ class ExecutionWorker:
 
     def run_claimed(self, claim: ClaimedExecution) -> None:
         context = self._load_context(claim)
-        workspace = self._create_workspace(claim)
         state = "STARTING"
+        try:
+            self.control.require_job_version_plugin_certification(
+                version=context.version,
+            )
+        except ProblemException as exc:
+            self._fail_current_state(
+                claim=claim,
+                state=state,
+                code=exc.code,
+                oracle_started=False,
+            )
+            return
+        workspace = self._create_workspace(claim)
         log_path = (
             self.settings.log_volume_path / str(claim.execution_id) / f"{claim.attempt_id}.log"
         )
