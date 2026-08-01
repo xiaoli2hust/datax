@@ -18,8 +18,9 @@ RPO/RTO 仍为 `NOT_RUN/BLOCKED`。
 
 因此普通单包 `restore_package` 固定返回 `RESTORE_PAIR_REQUIRED`。内部
 `stage-restore-pair` 成功完成认证与解包后也必须返回非成功状态
-`RESTORE_STAGED_COMMIT_BLOCKED`；Launcher 接受完整 restore 参数只用于返回稳定的
-`RESTORE_ATOMIC_VOLUME_COMMIT_UNAVAILABLE`，不得启动 staging、覆盖卷或开放升级。代码、
+`RESTORE_STAGED_COMMIT_BLOCKED`。Launcher 的完整 restore 参数入口已接入这一 E1 helper：
+必须先证明没有旧身份、代际、运行 secret、产品容器或产品卷，只用固定无网络容器读取两行
+标准输入中的恢复秘密，并在成功 staging 后继续返回同一阻断码；不得创建/覆盖卷或开放升级。代码、
 journal 或 staging 文件存在都不能表述为“Windows 可恢复门禁已通过”。
 
 ## 2. 停写与一致性边界
@@ -184,6 +185,6 @@ restore journal、新随机 volume、代际 secret 目录和 Docker staging 尚�
 5. 在干净 Windows 11 x64 上覆盖掉电、Docker/WSL2 中断、错包/错密码/错版本、空间不足、
    `pg_restore` 失败、证据失败、提交中断和旧卷保留的 E4 演练。
 
-上述接入和真实演练未完成前，`launcher.exe restore ...` 必须稳定返回
-`RESTORE_ATOMIC_VOLUME_COMMIT_UNAVAILABLE` 且不读取恢复 key、不停止服务、不创建 staging
-对象、不修改运行卷。
+上述接入和真实演练未完成前，`launcher.exe restore ...` 只能在干净目标完成受认证 E1
+staging，并稳定返回 `RESTORE_STAGED_COMMIT_BLOCKED`；不得停止既有服务、创建或修改运行卷、
+提交活动代际或返回恢复成功。

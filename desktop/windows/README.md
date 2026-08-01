@@ -115,8 +115,9 @@ launcher.exe backup ^
   journal 解包到全新空 staging，并在成功 staging 后返回
   `RESTORE_STAGED_COMMIT_BLOCKED`。这不是 PostgreSQL 恢复，也不会触碰运行卷。
 - `launcher.exe restore --data-input ... --secrets-input ... --data-key ... --secrets-key ...`
-  仅作为稳定失败关闭入口，固定返回
-  `RESTORE_ATOMIC_VOLUME_COMMIT_UNAVAILABLE`，不读取 key、不停止服务、不创建 staging。
+  先证明目标没有旧身份、代际、运行 secret、产品容器或产品卷，再用固定 Worker 镜像在
+  `network=none` 中认证/配对双包；两把 key 只通过恰好两行标准输入传递。成功只写受 ACL
+  保护的 journal/staging 并返回 `RESTORE_STAGED_COMMIT_BLOCKED`，不创建运行卷。
   新空 named volume、隔离 `pg_restore`、证据重算、原子提交及干净 Windows 11 x64
   异机演练完成前，Launcher 恢复和覆盖升级继续关闭。
   详细契约见

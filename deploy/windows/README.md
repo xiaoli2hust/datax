@@ -70,8 +70,9 @@ OS 状态及 Windows release runner 尚无在线验证结果。
 当前 Launcher 已有候选备份导出路径：在受控停机后，将 `.dxdata` 与 `.dxkeys` 分别写入
 用户选择的两个不同本地目录，并使用两把不同密钥加密；DATA 包只含 PostgreSQL
 custom-format 逻辑 dump、脱敏日志和固定发布元数据，SECRETS 包含本机基础设施 secret。
-内部 helper 已能完整认证/配对双包，以两把恢复秘密认证 journal，并只解包到全新空
-staging；成功仍返回 `RESTORE_STAGED_COMMIT_BLOCKED`，只达到 E1。新空 PostgreSQL
+Launcher 已在确认无旧身份、代际、产品容器和产品卷的干净目标后，以固定无网络 helper
+完整认证/配对双包、用两把恢复秘密认证 journal，并只解包到受 ACL 保护的空 staging；
+成功仍返回 `RESTORE_STAGED_COMMIT_BLOCKED`，只达到 E1。新空 PostgreSQL
 volume、真实 `pg_restore`、数据库/审计链/日志/密钥证据重算、卷/secret/
 installation-id 原子提交和升级路径仍未实现，必须失败关闭。该候选尚未经过真实
 Windows 11 备份/完整恢复验收，具体边界见

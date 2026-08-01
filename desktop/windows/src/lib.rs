@@ -313,6 +313,30 @@ struct SystemBackupResult {
     package_sha256: String,
 }
 
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct RestoreStageResult {
+    schema_version: String,
+    code: String,
+    journal_id: String,
+    state: String,
+    data_backup_id: String,
+    secrets_backup_id: String,
+    installation_id: String,
+    next_required_gate: String,
+}
+
+#[derive(Debug)]
+struct PreparedRestore {
+    data_input: PathBuf,
+    secrets_input: PathBuf,
+    data_key: Zeroizing<Vec<u8>>,
+    secrets_key: Zeroizing<Vec<u8>>,
+    staging_root: PathBuf,
+    journal_directory: PathBuf,
+    journal_path: PathBuf,
+}
+
 #[derive(Debug)]
 struct PreparedBackup {
     data_output: PathBuf,
@@ -333,6 +357,14 @@ struct BackupStaging {
 struct BackupRequestPaths<'a> {
     data_output: &'a Path,
     secrets_output: &'a Path,
+    data_key: &'a Path,
+    secrets_key: &'a Path,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RestoreRequestPaths<'a> {
+    data_input: &'a Path,
+    secrets_input: &'a Path,
     data_key: &'a Path,
     secrets_key: &'a Path,
 }
@@ -447,11 +479,22 @@ where
             data_key,
             secrets_key,
         } => {
-            let _ = (data_input, secrets_input, data_key, secrets_key);
-            Err(LauncherError::new(
-                "RESTORE_ATOMIC_VOLUME_COMMIT_UNAVAILABLE",
-                "配对包 staging helper 已实现，但新空 PostgreSQL volume 的 pg_restore、证据重算和原子卷提交尚未闭合；Launcher 不会覆盖或替换现有运行卷。",
-            ))
+            let mut tools = Tools::discover(&installation.install_dir)?;
+            platform::ensure_hardware_prerequisites(&installation.local_app_data)?;
+            let start_tools = StartTools::discover()?;
+            verify_prerequisites(&mut tools, &start_tools, &installation)?;
+            stage_system_restore(
+                &tools,
+                &start_tools,
+                &installation,
+                &verified_release.image_lock,
+                RestoreRequestPaths {
+                    data_input: &data_input,
+                    secrets_input: &secrets_input,
+                    data_key: &data_key,
+                    secrets_key: &secrets_key,
+                },
+            )
         }
         Action::VerifyRelease { installer } => {
             platform::ensure_local_disk_path(&installer)?;
@@ -561,7 +604,7 @@ fn help_text() -> String {
         "stop：先执行容器内安全停止预检；存在活动 Attempt 时拒绝停止。",
         "stop --force：确认风险后强制停止；不删除 Docker named volumes。",
         "backup --data-output <本地目录> --secrets-output <另一目录> --data-key <64位小写hex文件> --secrets-key <另一64位小写hex文件>：安全停机后生成分离加密备份；四个路径不得重合，两个 key 内容必须不同。",
-        "restore --data-input <.dxdata> --secrets-input <.dxkeys> --data-key <key文件> --secrets-key <key文件>：当前仅返回 RESTORE_ATOMIC_VOLUME_COMMIT_UNAVAILABLE，不修改运行卷；内部 staging helper 不等于系统恢复。",
+        "restore --data-input <.dxdata> --secrets-input <.dxkeys> --data-key <key文件> --secrets-key <key文件>：只在干净目标认证并 staging 配对包，随后返回 RESTORE_STAGED_COMMIT_BLOCKED；不创建运行卷，不等于系统恢复。",
         "verify-release --installer <Setup.exe>：安装器内部使用的发布签名一致性核验。",
     ]
     .join("\n")
@@ -2782,6 +2825,374 @@ fn encode_bootstrap_password(
     Ok(stdin)
 }
 
+fn stage_system_restore(
+    tools: &Tools,
+    start_tools: &StartTools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+    request: RestoreRequestPaths<'_>,
+) -> Result<RunOutcome, LauncherError> {
+    ensure_clean_restore_target(tools, installation)?;
+    let prepared = prepare_restore_staging(start_tools, installation, request)?;
+    let mounts = vec![
+        docker_bind_mount(&prepared.data_input, "/restore/input/data.dxdata")?,
+        docker_bind_mount(&prepared.secrets_input, "/restore/input/secrets.dxkeys")?,
+        docker_writable_bind_mount(&prepared.staging_root, "/restore/staging")?,
+        docker_writable_bind_mount(&prepared.journal_directory, "/restore/journal")?,
+    ];
+    let mut arguments = restore_stage_container_arguments(&image_lock.worker, &mounts);
+    arguments.extend([
+        OsString::from("stage-restore-pair"),
+        OsString::from("--data-input"),
+        OsString::from("/restore/input/data.dxdata"),
+        OsString::from("--secrets-input"),
+        OsString::from("/restore/input/secrets.dxkeys"),
+        OsString::from("--staging-root"),
+        OsString::from("/restore/staging"),
+        OsString::from("--journal"),
+        OsString::from("/restore/journal/restore.json"),
+        OsString::from("--expected-product-version"),
+        OsString::from(env!("CARGO_PKG_VERSION")),
+        OsString::from("--expected-migration-revision"),
+        OsString::from(SUPPORTED_MIGRATION_REVISION),
+        OsString::from("--expected-release-manifest-sha256"),
+        OsString::from(RELEASE_MANIFEST_BOUND_SHA256.ok_or_else(|| {
+            LauncherError::new(
+                "RELEASE_BINDING_MISSING",
+                "Launcher 构建未绑定发布清单，已拒绝恢复 staging。",
+            )
+        })?),
+    ]);
+    let mut output = run_process_with_secret_stdin(
+        &tools.docker,
+        &arguments,
+        &tools.docker_environment(),
+        &installation.install_dir,
+        SYSTEM_BACKUP_TIMEOUT,
+        restore_password_pair_stdin(&prepared.data_key, &prepared.secrets_key),
+    )?;
+    output.stderr.zeroize();
+    let result = parse_restore_stage_output(&output)?;
+
+    platform::ensure_regular_file(&prepared.journal_path)?;
+    let sid = current_user_sid(start_tools, installation)?;
+    restrict_file_acl(start_tools, installation, &prepared.journal_path, &sid)?;
+    restrict_directory_acl(start_tools, installation, &prepared.staging_root, &sid)?;
+    Err(LauncherError::new(
+        "RESTORE_STAGED_COMMIT_BLOCKED",
+        format!(
+            "恢复包已认证并写入受控 staging（journal={}，installation={}）；新空 PostgreSQL volume、pg_restore、证据重算和 RESTORE 代际提交尚未执行。",
+            result.journal_id, result.installation_id
+        ),
+    ))
+}
+
+fn ensure_clean_restore_target(
+    tools: &Tools,
+    installation: &Installation,
+) -> Result<(), LauncherError> {
+    let generations = installation.app_data_root.join("generations");
+    for path in [
+        &installation.initialization_state,
+        &installation.installation_id,
+        &installation.runtime_generation,
+        &installation.secret_dir,
+        &generations,
+    ] {
+        ensure_restore_identity_path_absent(path)?;
+    }
+
+    if installation.app_data_root.exists() {
+        platform::ensure_directory(&installation.app_data_root)?;
+        ensure_directory_entries_allowed(&installation.app_data_root, &["system-restore"])?;
+    }
+    let restore_root = installation.app_data_root.join("system-restore");
+    if restore_root.exists() {
+        platform::ensure_directory(&restore_root)?;
+        ensure_directory_entries_allowed(&restore_root, &["staging", "journal"])?;
+    }
+
+    let containers = docker(
+        tools,
+        installation,
+        &["ps", "--all", "--format", "{{.Names}}"],
+        PROCESS_TIMEOUT,
+    )?;
+    if !containers.status.success()
+        || normalize_text(&containers.stdout).lines().any(|name| {
+            let name = name.trim();
+            name.starts_with("datax-enterprise-studio-") || name.starts_with("des-restore-")
+        })
+    {
+        return Err(LauncherError::new(
+            "RESTORE_PRODUCT_CONTAINER_PRESENT",
+            "检测到产品或恢复容器；干净目标恢复不会停止、复用或覆盖它。",
+        ));
+    }
+
+    let volumes = docker(
+        tools,
+        installation,
+        &["volume", "ls", "--quiet"],
+        PROCESS_TIMEOUT,
+    )?;
+    if !volumes.status.success()
+        || normalize_text(&volumes.stdout)
+            .lines()
+            .any(|name| is_product_volume_name(name.trim()))
+    {
+        return Err(LauncherError::new(
+            "RESTORE_PRODUCT_VOLUME_PRESENT",
+            "检测到产品 named volume；V1 恢复不会覆盖、重命名或删除已有卷。",
+        ));
+    }
+    let labeled_volumes = docker(
+        tools,
+        installation,
+        &[
+            "volume",
+            "ls",
+            "--quiet",
+            "--filter",
+            "label=com.xiaoli.datax.volume-role",
+        ],
+        PROCESS_TIMEOUT,
+    )?;
+    if !labeled_volumes.status.success()
+        || normalize_text(&labeled_volumes.stdout)
+            .lines()
+            .any(|name| !name.trim().is_empty())
+    {
+        return Err(LauncherError::new(
+            "RESTORE_PRODUCT_VOLUME_PRESENT",
+            "检测到带产品角色标签的 named volume；V1 恢复不会复用或删除它。",
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_restore_identity_path_absent(path: &Path) -> Result<(), LauncherError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(_) => Err(LauncherError::new(
+            "RESTORE_CLEAN_TARGET_REQUIRED",
+            "恢复只允许没有初始化日志、安装身份、活动代际或运行 secret 的干净目标。",
+        )),
+        Err(_) => Err(LauncherError::new(
+            "RESTORE_TARGET_CHECK_FAILED",
+            "无法证明恢复目标不存在旧身份对象。",
+        )),
+    }
+}
+
+fn ensure_directory_entries_allowed(path: &Path, allowed: &[&str]) -> Result<(), LauncherError> {
+    let entries = fs::read_dir(path).map_err(|_| {
+        LauncherError::new("RESTORE_TARGET_CHECK_FAILED", "无法枚举干净恢复目标目录。")
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|_| {
+            LauncherError::new(
+                "RESTORE_TARGET_CHECK_FAILED",
+                "无法读取干净恢复目标目录项。",
+            )
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            return Err(LauncherError::new(
+                "RESTORE_CLEAN_TARGET_REQUIRED",
+                "恢复目标包含无法识别的目录项。",
+            ));
+        };
+        if !allowed.contains(&name.as_str()) {
+            return Err(LauncherError::new(
+                "RESTORE_CLEAN_TARGET_REQUIRED",
+                "恢复目标包含不属于当前受认证 journal 的对象。",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn is_product_volume_name(name: &str) -> bool {
+    RUNTIME_VOLUMES.iter().any(|(fixed, _)| name == *fixed)
+        || ["des-postgres-", "des-log-", "des-workspace-"]
+            .iter()
+            .any(|prefix| {
+                name.strip_prefix(prefix)
+                    .is_some_and(|suffix| is_lower_hex_string(suffix, 32))
+            })
+}
+
+fn is_lower_hex_string(value: &str, expected_length: usize) -> bool {
+    value.len() == expected_length
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn prepare_restore_staging(
+    start_tools: &StartTools,
+    installation: &Installation,
+    request: RestoreRequestPaths<'_>,
+) -> Result<PreparedRestore, LauncherError> {
+    let data_input = validate_restore_package_file(request.data_input, ".dxdata")?;
+    let secrets_input = validate_restore_package_file(request.secrets_input, ".dxkeys")?;
+    let data_key_path = validate_backup_key_file(request.data_key)?;
+    let secrets_key_path = validate_backup_key_file(request.secrets_key)?;
+    let install_dir = fs::canonicalize(&installation.install_dir)
+        .map_err(|_| LauncherError::new("RESTORE_PATH_INVALID", "无法规范化安装目录。"))?;
+    let paths = [
+        &data_input,
+        &secrets_input,
+        &data_key_path,
+        &secrets_key_path,
+    ];
+    for (index, left) in paths.iter().enumerate() {
+        if left.starts_with(&install_dir)
+            || paths
+                .iter()
+                .skip(index + 1)
+                .any(|right| paths_overlap(left, right))
+        {
+            return Err(LauncherError::new(
+                "RESTORE_PATH_OVERLAP_REJECTED",
+                "恢复包、两把 key 与安装资源路径必须彼此分离。",
+            ));
+        }
+    }
+
+    create_controlled_directory(&installation.app_data_root)?;
+    platform::ensure_directory(&installation.app_data_root)?;
+    let sid = current_user_sid(start_tools, installation)?;
+    restrict_directory_acl(start_tools, installation, &installation.app_data_root, &sid)?;
+    let restore_root = installation.app_data_root.join("system-restore");
+    let staging_root = restore_root.join("staging");
+    let journal_directory = restore_root.join("journal");
+    for directory in [&restore_root, &staging_root, &journal_directory] {
+        create_controlled_directory(directory)?;
+        platform::ensure_directory(directory)?;
+        restrict_directory_acl(start_tools, installation, directory, &sid)?;
+    }
+    ensure_directory_entries_allowed(&restore_root, &["staging", "journal"])?;
+    ensure_directory_entries_allowed(&journal_directory, &["restore.json"])?;
+    let journal_path = journal_directory.join("restore.json");
+    if journal_path.exists() {
+        platform::ensure_regular_file(&journal_path)?;
+        restrict_file_acl(start_tools, installation, &journal_path, &sid)?;
+    } else {
+        ensure_directory_entries_allowed(&staging_root, &[])?;
+    }
+
+    restrict_file_acl(start_tools, installation, request.data_key, &sid)?;
+    restrict_file_acl(start_tools, installation, request.secrets_key, &sid)?;
+    let data_key = read_backup_key(&data_key_path)?;
+    let secrets_key = read_backup_key(&secrets_key_path)?;
+    if constant_time_bytes_equal(&data_key, &secrets_key) {
+        return Err(LauncherError::new(
+            "RESTORE_KEY_REUSE_REJECTED",
+            "DATA 与 SECRETS 恢复 key 必须不同。",
+        ));
+    }
+    Ok(PreparedRestore {
+        data_input,
+        secrets_input,
+        data_key,
+        secrets_key,
+        staging_root: fs::canonicalize(staging_root).map_err(|_| {
+            LauncherError::new("RESTORE_PATH_INVALID", "无法规范化恢复 staging 目录。")
+        })?,
+        journal_directory: fs::canonicalize(journal_directory).map_err(|_| {
+            LauncherError::new("RESTORE_PATH_INVALID", "无法规范化恢复 journal 目录。")
+        })?,
+        journal_path,
+    })
+}
+
+fn validate_restore_package_file(path: &Path, suffix: &str) -> Result<PathBuf, LauncherError> {
+    platform::ensure_local_disk_path(path)?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| LauncherError::new("RESTORE_PACKAGE_INVALID", "恢复包路径缺少父目录。"))?;
+    platform::ensure_tree_no_reparse(parent)?;
+    platform::ensure_regular_file(path)?;
+    let valid_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.ends_with(suffix) && name.len() > suffix.len());
+    if !valid_name {
+        return Err(LauncherError::new(
+            "RESTORE_PACKAGE_INVALID",
+            "恢复包扩展名与 DATA/SECRETS 角色不匹配。",
+        ));
+    }
+    fs::canonicalize(path)
+        .map_err(|_| LauncherError::new("RESTORE_PACKAGE_INVALID", "无法规范化恢复包路径。"))
+}
+
+fn restore_password_pair_stdin(data_key: &[u8], secrets_key: &[u8]) -> Zeroizing<Vec<u8>> {
+    let mut stdin = Zeroizing::new(Vec::with_capacity(data_key.len() + secrets_key.len() + 2));
+    stdin.extend_from_slice(data_key);
+    stdin.push(b'\n');
+    stdin.extend_from_slice(secrets_key);
+    stdin.push(b'\n');
+    stdin
+}
+
+fn parse_restore_stage_output(output: &ProcessOutput) -> Result<RestoreStageResult, LauncherError> {
+    if output.status.code() == Some(3) {
+        let result: RestoreStageResult = serde_json::from_slice(&output.stdout).map_err(|_| {
+            LauncherError::new(
+                "RESTORE_HELPER_RESPONSE_INVALID",
+                "恢复 staging helper 返回了无效响应。",
+            )
+        })?;
+        if restore_stage_result_valid(&result) {
+            return Ok(result);
+        }
+        return Err(LauncherError::new(
+            "RESTORE_HELPER_RESPONSE_INVALID",
+            "恢复 staging helper 返回了矛盾状态。",
+        ));
+    }
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).map_err(|_| {
+        LauncherError::new(
+            "RESTORE_STAGE_HELPER_FAILED",
+            "恢复包认证或 staging 失败，helper 未返回受支持的错误结构。",
+        )
+    })?;
+    let object = value.as_object();
+    let code = object
+        .and_then(|value| value.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| is_stable_error_code(value));
+    Err(LauncherError::new(
+        code.unwrap_or("RESTORE_STAGE_HELPER_FAILED"),
+        "恢复包认证或 staging 失败；没有创建或修改活动运行代际。",
+    ))
+}
+
+fn restore_stage_result_valid(result: &RestoreStageResult) -> bool {
+    result.schema_version == "1.0"
+        && result.code == "RESTORE_STAGED_COMMIT_BLOCKED"
+        && result.state == "STAGED_COMMIT_BLOCKED"
+        && result.next_required_gate == "PG_RESTORE_NEW_EMPTY_VOLUME_AND_ATOMIC_COMMIT"
+        && is_lower_hex_string(&result.journal_id, 32)
+        && is_lower_hex_string(&result.data_backup_id, 32)
+        && is_lower_hex_string(&result.secrets_backup_id, 32)
+        && is_lower_hex_string(&result.installation_id, 64)
+}
+
+fn is_stable_error_code(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_uppercase())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 fn create_system_backup(
     tools: &Tools,
     start_tools: &StartTools,
@@ -3518,6 +3929,21 @@ fn backup_container_arguments(image: &str, mounts: &[OsString]) -> Vec<OsString>
         OsString::from("datax-studio-system-backup"),
         OsString::from(image),
     ]);
+    arguments
+}
+
+fn restore_stage_container_arguments(image: &str, mounts: &[OsString]) -> Vec<OsString> {
+    let mut arguments = backup_container_arguments(image, mounts);
+    let insertion = arguments.len().saturating_sub(3);
+    arguments.splice(
+        insertion..insertion,
+        [
+            OsString::from("--name"),
+            OsString::from("des-restore-stage"),
+            OsString::from("--label"),
+            OsString::from("com.xiaoli.datax.restore-role=stage-pair"),
+        ],
+    );
     arguments
 }
 
@@ -5466,6 +5892,77 @@ mod tests {
         assert_eq!(stdin.len(), 65);
         assert_eq!(stdin.last(), Some(&b'\n'));
         assert_eq!(stdin.iter().filter(|byte| **byte == b'\n').count(), 1);
+    }
+
+    #[test]
+    fn restore_passwords_are_exactly_two_separate_stdin_lines() {
+        let data = b"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let secrets = b"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let stdin = restore_password_pair_stdin(data, secrets);
+        assert_eq!(stdin.len(), 130);
+        assert_eq!(stdin.iter().filter(|byte| **byte == b'\n').count(), 2);
+        assert_eq!(&stdin[..64], data);
+        assert_eq!(&stdin[65..129], secrets);
+        assert_eq!(stdin[64], b'\n');
+        assert_eq!(stdin[129], b'\n');
+    }
+
+    #[test]
+    fn restore_stage_response_requires_non_success_gate_and_exact_ids() {
+        let mut result = RestoreStageResult {
+            schema_version: "1.0".to_owned(),
+            code: "RESTORE_STAGED_COMMIT_BLOCKED".to_owned(),
+            journal_id: "a".repeat(32),
+            state: "STAGED_COMMIT_BLOCKED".to_owned(),
+            data_backup_id: "b".repeat(32),
+            secrets_backup_id: "c".repeat(32),
+            installation_id: "d".repeat(64),
+            next_required_gate: "PG_RESTORE_NEW_EMPTY_VOLUME_AND_ATOMIC_COMMIT".to_owned(),
+        };
+        assert!(restore_stage_result_valid(&result));
+        result.state = "SUCCEEDED".to_owned();
+        assert!(!restore_stage_result_valid(&result));
+    }
+
+    #[test]
+    fn restore_clean_target_recognizes_fixed_random_and_labeled_volume_names() {
+        assert!(is_product_volume_name("des-postgres-data"));
+        assert!(is_product_volume_name(&format!(
+            "des-workspace-{}",
+            "a".repeat(32)
+        )));
+        assert!(!is_product_volume_name("des-workspace-a"));
+        assert!(!is_product_volume_name("unrelated-volume"));
+    }
+
+    #[test]
+    fn restore_stage_container_is_named_networkless_and_bounded() {
+        let arguments = restore_stage_container_arguments(
+            "worker@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            &[OsString::from(
+                "type=bind,source=C:\\backup\\data.dxdata,target=/restore/input/data.dxdata,readonly",
+            )],
+        );
+        let text = arguments
+            .iter()
+            .map(|value| value.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("--network\nnone"));
+        assert!(text.contains("--name\ndes-restore-stage"));
+        assert!(text.contains("com.xiaoli.datax.restore-role=stage-pair"));
+        assert!(text.contains("--read-only"));
+        assert!(text.contains("--cap-drop\nALL"));
+        assert!(text.contains("/restore/input/data.dxdata,readonly"));
+        let name_index = arguments
+            .iter()
+            .position(|value| value == "--name")
+            .unwrap();
+        let entrypoint_index = arguments
+            .iter()
+            .position(|value| value == "--entrypoint")
+            .unwrap();
+        assert!(name_index < entrypoint_index);
     }
 
     #[test]
