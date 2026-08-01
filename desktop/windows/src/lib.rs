@@ -7619,7 +7619,24 @@ mod tests {
             if matches!(forbidden, "DOCKER_CONFIG" | "DOCKER_HOST") {
                 continue;
             }
-            assert_eq!(values.get(forbidden), Some(&None), "{forbidden}");
+            let configured_removal = {
+                #[cfg(windows)]
+                {
+                    // Windows environment variable names are case-insensitive. `Command`
+                    // therefore represents HTTP_PROXY/http_proxy as one entry, even though
+                    // either removal controls the inherited variable at process launch.
+                    values.get(forbidden).or_else(|| {
+                        values.iter().find_map(|(name, value)| {
+                            name.eq_ignore_ascii_case(forbidden).then_some(value)
+                        })
+                    })
+                }
+                #[cfg(not(windows))]
+                {
+                    values.get(forbidden)
+                }
+            };
+            assert_eq!(configured_removal, Some(&None), "{forbidden}");
         }
     }
 

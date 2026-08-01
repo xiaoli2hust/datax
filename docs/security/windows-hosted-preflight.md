@@ -27,8 +27,13 @@ Python 3.12.13，也不构成产品 Runtime 的供应链证明。
 `3.12.13` 时发现该 patch 不存在于 `windows-2025`，因此在任何编译前失败；把检查器固定到可用的
 `3.12.10` 后，第二次 [run 30723744355](https://github.com/xiaoli2hust/datax/actions/runs/30723744355)
 证明 Python 安装成功，却在安装完整 Linux 开发锁文件中的 `uvloop` 时失败，仍在任何 Launcher、
-NSIS、签名或候选产物之前。本文所述最小 Windows wheel lock 修复该第二个失败条件；修复后的真实
-run 尚待记录，不能预先表述为 E1 通过。
+NSIS、签名或候选产物之前。本文所述最小 Windows wheel lock 修复该第二个失败条件。第三次
+[run 30723926366](https://github.com/xiaoli2hust/datax/actions/runs/30723926366) 因此成功安装最小
+依赖、编译 Launcher 并运行其 57 个单元测试；其中 56 个通过，剩余一个错误地要求
+`Command::get_envs()` 把 `HTTP_PROXY` 与 `http_proxy` 表示为两条独立移除记录。Windows 环境变量
+名是大小写不敏感的，实际受控子进程仍在启动前移除二者的同一有效变量。测试现只在 Windows 对
+该观察结果作大小写无关匹配，在其他平台仍逐项精确断言；修复后的真实 run 尚待记录，不能预先
+表述为 E1 通过。
 
 它不创建、上传或保留任何候选安装包；临时 `nonrelease-installer-preflight.exe`、其非发布资源、
 NSIS 和 Cargo 输出都只存在于 GitHub-hosted runner 的临时目录，并在作业结束前删除。
