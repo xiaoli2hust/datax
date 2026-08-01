@@ -154,6 +154,23 @@ def _audit() -> AuditContext:
     )
 
 
+def test_password_request_fingerprint_is_deterministic_keyed_and_non_plaintext(
+    tmp_path: Path,
+) -> None:
+    service = _service(_sqlite_sessions(), KekKeyring(tmp_path))
+    first_password = bytearray(b"first datasource password")
+    second_password = bytearray(b"second datasource password")
+
+    first = service._password_request_fingerprint(first_password)
+    replay = service._password_request_fingerprint(first_password)
+    second = service._password_request_fingerprint(second_password)
+
+    assert first == replay
+    assert first != second
+    assert first_password.hex() not in first
+    assert second_password.hex() not in second
+
+
 def test_aad_is_exact_and_ciphertext_is_randomized_and_bound() -> None:
     organization_id = UUID("11111111-1111-1111-1111-111111111111")
     project_id = UUID("22222222-2222-2222-2222-222222222222")

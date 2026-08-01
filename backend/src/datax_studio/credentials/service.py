@@ -15,6 +15,9 @@ from typing import Any
 from uuid import UUID, uuid4
 
 import rfc8785
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESSIV
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from sqlalchemy import and_, create_engine, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -105,6 +108,12 @@ from datax_studio.worker.schema_probe import SchemaProbeError, assert_snapshot_m
 
 _LOGGER = logging.getLogger(__name__)
 _IDEMPOTENCY_HASH_DOMAIN = b"DataXEnterpriseStudio\x00IdempotencyRequestHash\x00v1\x00"
+_PASSWORD_REQUEST_FINGERPRINT_DOMAIN = (
+    b"DataXEnterpriseStudio\x00DatasourcePasswordRequestFingerprint\x00v1"
+)
+_PASSWORD_REQUEST_FINGERPRINT_KDF_INFO = (
+    b"DataXEnterpriseStudio\x00DatasourcePasswordRequestFingerprintKey\x00v1"
+)
 _AUDIT_USER_AGENT_HASH_DOMAIN = b"DataXEnterpriseStudio\x00AuditUserAgentHash\x00v1\x00"
 _CURSOR_DOMAIN = b"DataXEnterpriseStudio\x00CredentialCursor\x00v1\x00"
 _HOSTNAME_PATTERN = re.compile(
@@ -268,6 +277,13 @@ class CredentialService:
         self.keyring = keyring
         self.active_kek_version = active_kek_version
         self.integrity_hmac_key = integrity_hmac_key
+        fingerprint_key = HKDF(
+            algorithm=hashes.SHA512(),
+            length=64,
+            salt=None,
+            info=_PASSWORD_REQUEST_FINGERPRINT_KDF_INFO,
+        ).derive(integrity_hmac_key)
+        self._password_request_fingerprint_cipher = AESSIV(fingerprint_key)
         self.guard = guard
         self.connector = connector
 
@@ -807,7 +823,9 @@ class CredentialService:
         self._require_admin(principal)
         password = bytearray(request.password.get_secret_value().encode("utf-8"))
         request_body = request.model_dump(mode="json", exclude={"password"})
-        request_body["password_hmac"] = self._password_request_hmac(password)
+        request_body["password_fingerprint"] = self._password_request_fingerprint(
+            password
+        )
         now = utc_now()
         try:
             with self.sessions.begin() as session:
@@ -4015,11 +4033,10 @@ class CredentialService:
         )
         session.flush()
 
-    def _password_request_hmac(self, password: bytearray) -> str:
-        return hmac.digest(
-            self.integrity_hmac_key,
-            b"DataXEnterpriseStudio\x00DatasourcePasswordRequest\x00v1\x00" + password,
-            "sha256",
+    def _password_request_fingerprint(self, password: bytearray) -> str:
+        return self._password_request_fingerprint_cipher.encrypt(
+            bytes(password),
+            [_PASSWORD_REQUEST_FINGERPRINT_DOMAIN],
         ).hex()
 
     def _idempotency_hash(
