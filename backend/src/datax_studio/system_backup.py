@@ -2436,15 +2436,114 @@ def _common_export_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--migration-revision", required=True)
 
 
+def _public_helper_payload(result: dict[str, Any]) -> dict[str, Any]:
+    """Rebuild the helper response from a closed, non-secret output contract."""
+    if not isinstance(result, dict):
+        raise BackupError("BACKUP_HELPER_RESPONSE_INVALID", "备份 helper 响应类型无效。")
+    code = result.get("code")
+    if code is None:
+        kind = result.get("kind")
+        if kind not in {"DATA", "SECRETS"}:
+            raise BackupError("BACKUP_HELPER_RESPONSE_INVALID", "备份清单类型无效。")
+        _validate_manifest(result, kind)
+        return dict(result)
+    if not isinstance(code, str) or not re.fullmatch(r"[A-Z][A-Z0-9_]{0,127}", code):
+        raise BackupError("BACKUP_HELPER_RESPONSE_INVALID", "备份 helper 响应码无效。")
+    if code == "BACKUP_CREATED":
+        expected = {
+            "schema_version",
+            "code",
+            "kind",
+            "backup_id",
+            "filename",
+            "package_bytes",
+            "package_sha256",
+        }
+        kind = result.get("kind")
+        suffix = ".dxdata" if kind == "DATA" else ".dxkeys"
+        backup_id = result.get("backup_id")
+        if (
+            set(result) != expected
+            or result.get("schema_version") != "1.0"
+            or kind not in {"DATA", "SECRETS"}
+            or not isinstance(backup_id, str)
+            or not BACKUP_ID.fullmatch(backup_id)
+            or result.get("filename") != f"{backup_id}{suffix}"
+            or not _is_json_integer(result.get("package_bytes"))
+            or result["package_bytes"] <= 0
+            or not isinstance(result.get("package_sha256"), str)
+            or not LOWER_HEX_64.fullmatch(result["package_sha256"])
+        ):
+            raise BackupError("BACKUP_HELPER_RESPONSE_INVALID", "备份创建响应无效。")
+        return {key: result[key] for key in sorted(expected)}
+    response_fields = {
+        "RESTORE_STAGED_COMMIT_BLOCKED": {
+            "schema_version",
+            "code",
+            "journal_id",
+            "state",
+            "data_backup_id",
+            "secrets_backup_id",
+            "installation_id",
+            "next_required_gate",
+        },
+        "RESTORE_STAGING_CLEANED": {
+            "schema_version",
+            "code",
+            "journal_id",
+            "state",
+        },
+    }
+    if code in response_fields:
+        expected = response_fields[code]
+        if (
+            set(result) != expected
+            or result.get("schema_version") != "1.0"
+            or not isinstance(result.get("journal_id"), str)
+            or not BACKUP_ID.fullmatch(result["journal_id"])
+        ):
+            raise BackupError("BACKUP_HELPER_RESPONSE_INVALID", "恢复 helper 响应无效。")
+        if code == "RESTORE_STAGED_COMMIT_BLOCKED" and (
+            result.get("state") != "STAGED_COMMIT_BLOCKED"
+            or result.get("next_required_gate")
+            != "PG_RESTORE_NEW_EMPTY_VOLUME_AND_ATOMIC_COMMIT"
+            or any(
+                not isinstance(result.get(field), str)
+                or not pattern.fullmatch(result[field])
+                for field, pattern in (
+                    ("data_backup_id", BACKUP_ID),
+                    ("secrets_backup_id", BACKUP_ID),
+                    ("installation_id", LOWER_HEX_64),
+                )
+            )
+        ):
+            raise BackupError("BACKUP_HELPER_RESPONSE_INVALID", "恢复 staging 响应无效。")
+        if code == "RESTORE_STAGING_CLEANED" and result.get("state") != "CLEANED":
+            raise BackupError("BACKUP_HELPER_RESPONSE_INVALID", "恢复清理响应无效。")
+        return {key: result[key] for key in sorted(expected)}
+    if set(result) != {"schema_version", "code", "message"}:
+        raise BackupError("BACKUP_HELPER_RESPONSE_INVALID", "备份 helper 错误响应无效。")
+    message = result.get("message")
+    if (
+        result.get("schema_version") != "1.0"
+        or not isinstance(message, str)
+        or not 1 <= len(message) <= 512
+        or any(character in message for character in ("\x00", "\r", "\n"))
+    ):
+        raise BackupError("BACKUP_HELPER_RESPONSE_INVALID", "备份 helper 错误响应无效。")
+    return {"schema_version": "1.0", "code": code, "message": message}
+
+
 def _emit(result: dict[str, Any]) -> None:
-    print(
-        json.dumps(
-            result,
-            ensure_ascii=True,
-            separators=(",", ":"),
-            sort_keys=True,
-        )
-    )
+    public_payload = _public_helper_payload(result)
+    encoded = json.dumps(
+        public_payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    sys.stdout.buffer.write(encoded + b"\n")
+    sys.stdout.buffer.flush()
 
 
 def main(argv: list[str] | None = None) -> int:

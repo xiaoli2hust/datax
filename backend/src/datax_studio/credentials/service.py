@@ -4016,11 +4016,11 @@ class CredentialService:
         session.flush()
 
     def _password_request_hmac(self, password: bytearray) -> str:
-        return hmac.new(
+        return hmac.digest(
             self.integrity_hmac_key,
             b"DataXEnterpriseStudio\x00DatasourcePasswordRequest\x00v1\x00" + password,
-            hashlib.sha256,
-        ).hexdigest()
+            "sha256",
+        ).hex()
 
     def _idempotency_hash(
         self,

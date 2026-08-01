@@ -438,6 +438,27 @@ def test_restore_cli_returns_non_success_for_staging_only(
     assert result["code"] == "RESTORE_STAGED_COMMIT_BLOCKED"
 
 
+def test_helper_output_rejects_fields_outside_public_contract(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    with pytest.raises(BackupError) as raised:
+        system_backup._emit(
+            {
+                "schema_version": "1.0",
+                "code": "BACKUP_CREATED",
+                "kind": "DATA",
+                "backup_id": "b" * 32,
+                "filename": f"{'b' * 32}.dxdata",
+                "package_bytes": 1,
+                "package_sha256": "c" * 64,
+                "unexpected": "must-not-be-emitted",
+            }
+        )
+
+    assert raised.value.code == "BACKUP_HELPER_RESPONSE_INVALID"
+    assert capsys.readouterr().out == ""
+
+
 def test_secret_backup_is_separate_and_bound_to_data_id(tmp_path: Path) -> None:
     data_result, _, secret_root = _export_data(tmp_path)
     output = tmp_path / "secret-output"

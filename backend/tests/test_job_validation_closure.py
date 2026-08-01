@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import hashlib
+import hmac
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -71,7 +71,7 @@ class _ContractSchemaProbeBoundary(DatabaseConnector):
         *,
         guard: EndpointPolicyGuard,
         snapshots: dict[UUID, SchemaSnapshot],
-        password_hashes: dict[UUID, str],
+        passwords: dict[UUID, bytes],
     ) -> None:
         super().__init__(
             guard=guard,
@@ -79,7 +79,7 @@ class _ContractSchemaProbeBoundary(DatabaseConnector):
             query_timeout_seconds=1,
         )
         self._snapshots = snapshots
-        self._password_hashes = password_hashes
+        self._passwords = passwords
         self.calls: list[UUID] = []
 
     def schema_snapshots(
@@ -103,9 +103,7 @@ class _ContractSchemaProbeBoundary(DatabaseConnector):
             if revision.engine == "MYSQL_8"
             else snapshot.schema_name
         )
-        assert hashlib.sha256(password).hexdigest() == self._password_hashes[
-            revision.id
-        ]
+        assert hmac.compare_digest(password, self._passwords[revision.id])
         self.calls.append(revision.id)
         return [snapshot.model_copy(deep=True)], resolved.selected_ip, False
 
@@ -289,9 +287,9 @@ def _credential_service_at_database_boundary(
             source_revision.id: source_snapshot,
             target_revision.id: target_snapshot,
         },
-        password_hashes={
-            source_revision.id: hashlib.sha256(source_password).hexdigest(),
-            target_revision.id: hashlib.sha256(target_password).hexdigest(),
+        passwords={
+            source_revision.id: bytes(source_password),
+            target_revision.id: bytes(target_password),
         },
     )
     service = CredentialService(

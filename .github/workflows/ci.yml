@@ -96,7 +96,7 @@ jobs:
         env:
           POSTGRES_DB: datax_studio
           POSTGRES_USER: datax_studio
-          POSTGRES_PASSWORD: 3333333333333333333333333333333333333333333333333333333333333333
+          POSTGRES_PASSWORD: "3333333333333333333333333333333333333333333333333333333333333333"
         ports:
           - 5432:5432
         options: >-
@@ -207,7 +207,7 @@ jobs:
       - name: Install the pinned Rust toolchain
         shell: pwsh
         run: |
-          rustup toolchain install 1.97.0 --profile minimal
+          rustup toolchain install 1.97.0 --profile minimal --component clippy
           rustup default 1.97.0
 
       - name: Test and lint the native launcher

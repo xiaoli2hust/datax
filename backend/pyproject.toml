@@ -55,6 +55,9 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
 
+[tool.ruff.lint.isort]
+known-first-party = ["datax_studio"]
+
 [tool.coverage.run]
 branch = true
 source = ["datax_studio"]
