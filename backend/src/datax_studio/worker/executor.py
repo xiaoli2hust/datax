@@ -111,6 +111,10 @@ class VerificationCanceled(RuntimeError):
     """Internal control signal after the Worker acknowledges cancellation."""
 
 
+class VerificationTerminated(RuntimeError):
+    """Internal safety-stop signal; never report it as operator cancellation."""
+
+
 class LeaseKeeper:
     def __init__(
         self,
@@ -124,6 +128,7 @@ class LeaseKeeper:
         self.lease_seconds = lease_seconds
         self._stop = threading.Event()
         self._lost = threading.Event()
+        self._terminated = threading.Event()
         self._thread = threading.Thread(
             target=self._run,
             name=f"lease-{claim.execution_id}",
@@ -144,6 +149,8 @@ class LeaseKeeper:
         self._thread.join(timeout=max(1.0, self.lease_seconds / 2))
 
     def assert_owned(self) -> None:
+        if self._terminated.is_set():
+            raise VerificationTerminated
         if self._lost.is_set():
             raise ProblemException(
                 status=409,
@@ -160,6 +167,12 @@ class LeaseKeeper:
                     claim=self.claim,
                     lease_seconds=self.lease_seconds,
                 )
+            except ProblemException as exc:
+                if exc.code == "WORK_TERMINATION_PENDING":
+                    self._terminated.set()
+                else:
+                    self._lost.set()
+                return
             except BaseException:
                 self._lost.set()
                 return
@@ -215,6 +228,20 @@ class ExecutionWorker:
     def prepare_admission(self) -> None:
         self.sensitive_runtime.prepare_and_cleanup()
 
+    def _write_job_file_after_control(
+        self,
+        *,
+        claim: ClaimedExecution,
+        lease: LeaseKeeper,
+        job_file: Path,
+        datax_job: dict[str, Any],
+    ) -> None:
+        """Do not materialize a plaintext DataX file after an observed stop."""
+
+        self._poll_execution_control(claim=claim, lease=lease)
+        write_job_file(job_file, datax_job)
+        datax_job.clear()
+
     def run_claimed(self, claim: ClaimedExecution) -> None:
         context = self._load_context(claim)
         state = "STARTING"
@@ -265,44 +292,53 @@ class ExecutionWorker:
             lease_seconds=self.settings.worker_lease_seconds,
         ) as lease:
             try:
-                with (
-                    self.control.sessions() as secret_session,
-                    ExitStack() as stack,
-                ):
+                initial_action = self.reconciler.poll_claim_action(claim)
+                if initial_action == ProcessAction.TERMINATE:
+                    self.reconciler.complete_claimed_termination(
+                        claim=claim,
+                        oracle_started=False,
+                    )
+                    return
+                if initial_action == ProcessAction.CANCEL:
+                    self.reconciler.complete_claimed_cancel(
+                        claim=claim,
+                        oracle_started=False,
+                    )
+                    return
+                if initial_action == ProcessAction.FENCE_LOST:
+                    lease.assert_owned()
+                    raise RuntimeError("execution fence was lost")
+                with ExitStack() as stack:
+                    # Each worker decrypt uses its own short secret-status
+                    # transaction.  Poll between the two sides so a revoke
+                    # that wins after source plaintext is released cannot
+                    # cause a target decrypt or any external connection.
+                    self._poll_execution_control(claim=claim, lease=lease)
                     source_password = stack.enter_context(
-                        self.credentials.decrypted_password(
-                            secret_session,
+                        self.credentials.decrypted_worker_password(
                             datasource_id=context.source_datasource.id,
                             secret_id=self._required(context.execution.source_secret_id),
                             envelope_id=self._required(context.execution.source_secret_envelope_id),
                         )
                     )
+                    self._poll_execution_control(claim=claim, lease=lease)
                     target_password = stack.enter_context(
-                        self.credentials.decrypted_password(
-                            secret_session,
+                        self.credentials.decrypted_worker_password(
                             datasource_id=context.target_datasource.id,
                             secret_id=self._required(context.execution.target_secret_id),
                             envelope_id=self._required(context.execution.target_secret_envelope_id),
                         )
                     )
+                    self._poll_execution_control(claim=claim, lease=lease)
                     preflight = self._preflight(
                         claim=claim,
                         context=context,
                         workspace=workspace,
                         source_password=source_password,
                         target_password=target_password,
+                        lease=lease,
                     )
-                    lease.assert_owned()
-                    cancel_action = self.reconciler.poll_claim_action(claim)
-                    if cancel_action == ProcessAction.CANCEL:
-                        self.reconciler.complete_claimed_cancel(
-                            claim=claim,
-                            oracle_started=False,
-                        )
-                        return
-                    if cancel_action == ProcessAction.FENCE_LOST:
-                        lease.assert_owned()
-                        raise RuntimeError("execution fence was lost")
+                    self._poll_execution_control(claim=claim, lease=lease)
                     self.control.record_claimed_preflight(
                         claim=claim,
                         runtime_preflight=RuntimePreflight(
@@ -317,8 +353,12 @@ class ExecutionWorker:
                         ),
                         evidence_validator=(self.credentials.validate_preflight_evidence),
                     )
-                    write_job_file(job_file, preflight.datax_job)
-                    preflight.datax_job.clear()
+                    self._write_job_file_after_control(
+                        claim=claim,
+                        lease=lease,
+                        job_file=job_file,
+                        datax_job=preflight.datax_job,
+                    )
                     self.control.transition_claimed_execution(
                         claim=claim,
                         expected_state="STARTING",
@@ -327,6 +367,9 @@ class ExecutionWorker:
                         verification_state="NOT_STARTED",
                     )
                     state = "RUNNING"
+                    # Do not let a stop that races the STARTING -> RUNNING
+                    # transition reach the process launcher.
+                    self._poll_execution_control(claim=claim, lease=lease)
                     process_result = self._run_datax(
                         claim=claim,
                         context=context,
@@ -360,6 +403,12 @@ class ExecutionWorker:
                                 "the DataX process was terminated."
                             ),
                             summary_parse_status="FAILED",
+                        )
+                        return
+                    if process_result.end_reason == ProcessEndReason.TERMINATED:
+                        self.reconciler.complete_claimed_termination(
+                            claim=claim,
+                            oracle_started=False,
                         )
                         return
                     if process_result.end_reason == ProcessEndReason.CANCELED:
@@ -465,6 +514,12 @@ class ExecutionWorker:
                     oracle_started=verification_run.oracle_started,
                 )
                 return
+            except VerificationTerminated:
+                self.reconciler.complete_claimed_termination(
+                    claim=claim,
+                    oracle_started=verification_run.oracle_started,
+                )
+                return
             except ProblemException as exc:
                 if exc.code == "EXECUTION_CANCEL_PENDING":
                     # transition_claimed_execution observed a cancel request
@@ -472,6 +527,16 @@ class ExecutionWorker:
                     # non-cancel terminal outcome. Finish the accepted cancel
                     # instead, regardless of which terminal branch raced it.
                     self._converge_accepted_cancel(
+                        claim=claim,
+                        oracle_started=verification_run.oracle_started,
+                    )
+                    return
+                if exc.code in {
+                    "WORK_TERMINATION_PENDING",
+                    "TARGET_EXCLUSIVITY_NOT_ACTIVE",
+                    "TARGET_EXCLUSIVITY_BROKEN",
+                }:
+                    self.reconciler.complete_claimed_termination(
                         claim=claim,
                         oracle_started=verification_run.oracle_started,
                     )
@@ -513,17 +578,26 @@ class ExecutionWorker:
         workspace: Path,
         source_password: bytearray,
         target_password: bytearray,
+        lease: LeaseKeeper,
     ) -> PreflightResult:
+        # Preflight uses real DNS/JDBC/database reads.  Every bounded external
+        # operation is surrounded by a durable control poll so a newly
+        # observed safety stop never permits the next connection or query.
+        # A single already-blocked connector call remains bounded by its
+        # driver timeout and the leased Attempt recovery path.
+        self._poll_execution_control(claim=claim, lease=lease)
         source_resolved = self.credentials.guard.resolve(
             context.source_policy,
             host=context.source_revision.host,
             port=context.source_revision.port,
         )
+        self._poll_execution_control(claim=claim, lease=lease)
         target_resolved = self.credentials.guard.resolve(
             context.target_policy,
             host=context.target_revision.host,
             port=context.target_revision.port,
         )
+        self._poll_execution_control(claim=claim, lease=lease)
         self._assert_datax_endpoint_pinning(
             revision=context.source_revision,
             policy=context.source_policy,
@@ -538,12 +612,22 @@ class ExecutionWorker:
             context.source_revision,
             password=source_password,
             resolved=source_resolved,
+            control_callback=lambda: self._poll_execution_control(
+                claim=claim,
+                lease=lease,
+            ),
         )
+        self._poll_execution_control(claim=claim, lease=lease)
         target_probe = self.credentials.connector.probe(
             context.target_revision,
             password=target_password,
             resolved=target_resolved,
+            control_callback=lambda: self._poll_execution_control(
+                claim=claim,
+                lease=lease,
+            ),
         )
+        self._poll_execution_control(claim=claim, lease=lease)
         self._assert_physical_endpoint(
             context=context,
             revision=context.source_revision,
@@ -574,28 +658,47 @@ class ExecutionWorker:
             schema_name=context.target_namespace.normalized_schema_name,
             table_name=context.target_namespace.normalized_table_name,
         )
+        self._poll_execution_control(claim=claim, lease=lease)
         with self.credentials.connector.connection(
             context.source_revision,
             password=source_password,
             resolved=source_resolved,
             read_only=True,
+            control_callback=lambda: self._poll_execution_control(
+                claim=claim,
+                lease=lease,
+            ),
         ) as connection:
             source_snapshot = probe_schema_snapshot(
                 connection,
                 engine=context.source_revision.engine,
                 identity=source_identity,
+                control_callback=lambda: self._poll_execution_control(
+                    claim=claim,
+                    lease=lease,
+                ),
             )
+        self._poll_execution_control(claim=claim, lease=lease)
         with self.credentials.connector.connection(
             context.target_revision,
             password=target_password,
             resolved=target_resolved,
             read_only=True,
+            control_callback=lambda: self._poll_execution_control(
+                claim=claim,
+                lease=lease,
+            ),
         ) as connection:
             target_snapshot = probe_schema_snapshot(
                 connection,
                 engine=context.target_revision.engine,
                 identity=target_identity,
+                control_callback=lambda: self._poll_execution_control(
+                    claim=claim,
+                    lease=lease,
+                ),
             )
+        self._poll_execution_control(claim=claim, lease=lease)
         assert_snapshot_matches_job(
             source_snapshot,
             expected_hash=context.version.source_schema_hash,
@@ -613,11 +716,16 @@ class ExecutionWorker:
             source_engine=context.source_revision.engine,
             target_engine=context.target_revision.engine,
         )
+        self._poll_execution_control(claim=claim, lease=lease)
         with self.credentials.connector.connection(
             context.source_revision,
             password=source_password,
             resolved=source_resolved,
             stream=True,
+            control_callback=lambda: self._poll_execution_control(
+                claim=claim,
+                lease=lease,
+            ),
         ) as connection:
             source_peer = self.credentials.connector.connection_peer_ip(
                 connection,
@@ -632,7 +740,12 @@ class ExecutionWorker:
                 mappings=mappings,
                 spool_directory=workspace / "oracle-preflight",
                 oracle=self.oracle,
+                control_callback=lambda: self._poll_execution_control(
+                    claim=claim,
+                    lease=lease,
+                ),
             )
+        self._poll_execution_control(claim=claim, lease=lease)
         source_evidence_id = self._persist_connection_evidence(
             claim=claim,
             operation_kind="PREFLIGHT",
@@ -641,10 +754,15 @@ class ExecutionWorker:
             peer_ip=source_peer,
             observed_at=source_observed_at,
         )
+        self._poll_execution_control(claim=claim, lease=lease)
         with self.credentials.connector.connection(
             context.target_revision,
             password=target_password,
             resolved=target_resolved,
+            control_callback=lambda: self._poll_execution_control(
+                claim=claim,
+                lease=lease,
+            ),
         ) as connection:
             target_peer = self.credentials.connector.connection_peer_ip(
                 connection,
@@ -656,7 +774,12 @@ class ExecutionWorker:
                 engine=context.target_revision.engine,
                 schema_name=context.spec.target.table.schema_name,
                 table_name=context.spec.target.table.table_name,
+                control_callback=lambda: self._poll_execution_control(
+                    claim=claim,
+                    lease=lease,
+                ),
             )
+        self._poll_execution_control(claim=claim, lease=lease)
         target_evidence_id = self._persist_connection_evidence(
             claim=claim,
             operation_kind="PREFLIGHT",
@@ -727,6 +850,7 @@ class ExecutionWorker:
                 "fence_epoch": claim.fence_epoch,
             },
         )
+        self._poll_execution_control(claim=claim, lease=lease)
         return PreflightResult(
             source_summary=source_summary,
             source_resolved=source_resolved,
@@ -805,14 +929,17 @@ class ExecutionWorker:
         source_resolved: ResolvedEndpoint,
         target_resolved: ResolvedEndpoint,
     ) -> ManagedProcessResult:
+        self._poll_execution_control(claim=claim, lease=lease)
         self.credentials.guard.verify_rebinding(
             context.source_policy,
             source_resolved,
         )
+        self._poll_execution_control(claim=claim, lease=lease)
         self.credentials.guard.verify_rebinding(
             context.target_policy,
             target_resolved,
         )
+        self._poll_execution_control(claim=claim, lease=lease)
         runtime_root = self.settings.runtime_manifest_path.parent
         command = build_datax_command(
             java_path=self.settings.java_binary_path,
@@ -849,13 +976,24 @@ class ExecutionWorker:
                 peer_observation_status="ENFORCED_NOT_OBSERVED",
                 observed_at=evidence_observed_at,
             )
+            # This is the last control point before run_managed_process
+            # creates the DataX process group.  A termination observed here
+            # must never reach Popen.
+            self._poll_execution_control(claim=claim, lease=lease)
 
             def tick() -> ProcessAction:
+                if lease._terminated.is_set():  # noqa: SLF001
+                    return ProcessAction.TERMINATE
                 if lease._lost.is_set():  # noqa: SLF001
                     return ProcessAction.FENCE_LOST
                 if source_egress.lost or target_egress.lost:
                     return ProcessAction.EGRESS_LOST
                 return self.reconciler.poll_claim_action(claim)
+
+            def pre_start_check() -> None:
+                source_egress.assert_active()
+                target_egress.assert_active()
+                self._poll_execution_control(claim=claim, lease=lease)
 
             result = run_managed_process(
                 command,
@@ -872,6 +1010,7 @@ class ExecutionWorker:
                 maximum_log_bytes=self.settings.execution_log_limit_bytes,
                 maximum_line_bytes=(self.settings.execution_log_line_limit_bytes),
                 poll_seconds=self.settings.worker_control_poll_seconds,
+                pre_start_check=pre_start_check,
             )
             if result.end_reason != ProcessEndReason.EGRESS_LOST:
                 source_egress.assert_active()
@@ -896,17 +1035,21 @@ class ExecutionWorker:
             host=context.source_revision.host,
             port=context.source_revision.port,
         )
+        self._poll_verification_control(claim=claim, lease=lease)
         target_resolved = self.credentials.guard.resolve(
             context.target_policy,
             host=context.target_revision.host,
             port=context.target_revision.port,
         )
+        self._poll_verification_control(claim=claim, lease=lease)
         mappings = build_oracle_mappings(
             context.spec,
             source_engine=context.source_revision.engine,
             target_engine=context.target_revision.engine,
         )
         self._assert_current_schemas(
+            claim=claim,
+            lease=lease,
             context=context,
             source_password=source_password,
             target_password=target_password,
@@ -914,66 +1057,75 @@ class ExecutionWorker:
             target_resolved=target_resolved,
         )
         self._poll_verification_control(claim=claim, lease=lease)
-        with (
-            self.credentials.connector.connection(
-                context.source_revision,
-                password=source_password,
-                resolved=source_resolved,
-                stream=True,
-            ) as source_connection,
-            self.credentials.connector.connection(
+        with self.credentials.connector.connection(
+            context.source_revision,
+            password=source_password,
+            resolved=source_resolved,
+            stream=True,
+            control_callback=lambda: self._poll_verification_control(
+                claim=claim,
+                lease=lease,
+            ),
+        ) as source_connection:
+            self._poll_verification_control(claim=claim, lease=lease)
+            with self.credentials.connector.connection(
                 context.target_revision,
                 password=target_password,
                 resolved=target_resolved,
                 stream=True,
-            ) as target_connection,
-        ):
-            source_peer = self.credentials.connector.connection_peer_ip(
-                source_connection,
-                engine=context.source_revision.engine,
-            )
-            target_peer = self.credentials.connector.connection_peer_ip(
-                target_connection,
-                engine=context.target_revision.engine,
-            )
-            source_observed_at = datetime.now(UTC)
-            target_observed_at = datetime.now(UTC)
-            self._persist_connection_evidence(
-                claim=claim,
-                operation_kind="ORACLE",
-                revision_id=context.source_revision.id,
-                resolved=source_resolved,
-                peer_ip=source_peer,
-                observed_at=source_observed_at,
-            )
-            self._persist_connection_evidence(
-                claim=claim,
-                operation_kind="ORACLE",
-                revision_id=context.target_revision.id,
-                resolved=target_resolved,
-                peer_ip=target_peer,
-                observed_at=target_observed_at,
-            )
-            self._poll_verification_control(claim=claim, lease=lease)
-            self.control.mark_claimed_oracle_started(claim=claim)
-            verification_run.oracle_started = True
-            reads = verify_databases(
-                source_connection,
-                target_connection,
-                source_engine=context.source_revision.engine,
-                target_engine=context.target_revision.engine,
-                source_schema_name=context.spec.source.table.schema_name,
-                source_table_name=context.spec.source.table.table_name,
-                target_schema_name=context.spec.target.table.schema_name,
-                target_table_name=context.spec.target.table.table_name,
-                mappings=mappings,
-                spool_directory=workspace / "oracle-verification",
-                oracle=self.oracle,
                 control_callback=lambda: self._poll_verification_control(
                     claim=claim,
                     lease=lease,
                 ),
-            )
+            ) as target_connection:
+                self._poll_verification_control(claim=claim, lease=lease)
+                source_peer = self.credentials.connector.connection_peer_ip(
+                    source_connection,
+                    engine=context.source_revision.engine,
+                )
+                target_peer = self.credentials.connector.connection_peer_ip(
+                    target_connection,
+                    engine=context.target_revision.engine,
+                )
+                source_observed_at = datetime.now(UTC)
+                target_observed_at = datetime.now(UTC)
+                self._persist_connection_evidence(
+                    claim=claim,
+                    operation_kind="ORACLE",
+                    revision_id=context.source_revision.id,
+                    resolved=source_resolved,
+                    peer_ip=source_peer,
+                    observed_at=source_observed_at,
+                )
+                self._persist_connection_evidence(
+                    claim=claim,
+                    operation_kind="ORACLE",
+                    revision_id=context.target_revision.id,
+                    resolved=target_resolved,
+                    peer_ip=target_peer,
+                    observed_at=target_observed_at,
+                )
+                self._poll_verification_control(claim=claim, lease=lease)
+                self.control.mark_claimed_oracle_started(claim=claim)
+                verification_run.oracle_started = True
+                self._poll_verification_control(claim=claim, lease=lease)
+                reads = verify_databases(
+                    source_connection,
+                    target_connection,
+                    source_engine=context.source_revision.engine,
+                    target_engine=context.target_revision.engine,
+                    source_schema_name=context.spec.source.table.schema_name,
+                    source_table_name=context.spec.source.table.table_name,
+                    target_schema_name=context.spec.target.table.schema_name,
+                    target_table_name=context.spec.target.table.table_name,
+                    mappings=mappings,
+                    spool_directory=workspace / "oracle-verification",
+                    oracle=self.oracle,
+                    control_callback=lambda: self._poll_verification_control(
+                        claim=claim,
+                        lease=lease,
+                    ),
+                )
         facts = self._verification_facts(claim)
         runtime_snapshot = ExecutionRuntimeSnapshot.model_validate(
             facts["execution"].runtime_snapshot
@@ -1031,8 +1183,21 @@ class ExecutionWorker:
     ) -> None:
         """Fail closed on every bounded oracle batch control boundary."""
 
+        self._poll_execution_control(claim=claim, lease=lease)
+        self.control.assert_claimed_verification_exclusivity(claim=claim)
+
+    def _poll_execution_control(
+        self,
+        *,
+        claim: ClaimedExecution,
+        lease: LeaseKeeper,
+    ) -> None:
+        """Check durable stop/cancel/fence facts outside oracle-only states."""
+
         lease.assert_owned()
         action = self.reconciler.poll_claim_action(claim)
+        if action == ProcessAction.TERMINATE:
+            raise VerificationTerminated
         if action == ProcessAction.CANCEL:
             raise VerificationCanceled
         if action == ProcessAction.FENCE_LOST:
@@ -1042,11 +1207,12 @@ class ExecutionWorker:
                 title="Execution 围栏已失效",
                 detail="旧 Worker 已停止推进当前 Execution。",
             )
-        self.control.assert_claimed_verification_exclusivity(claim=claim)
 
     def _assert_current_schemas(
         self,
         *,
+        claim: ClaimedExecution,
+        lease: LeaseKeeper,
         context: ExecutionContext,
         source_password: bytearray,
         target_password: bytearray,
@@ -1071,28 +1237,47 @@ class ExecutionWorker:
             schema_name=context.target_namespace.normalized_schema_name,
             table_name=context.target_namespace.normalized_table_name,
         )
+        self._poll_verification_control(claim=claim, lease=lease)
         with self.credentials.connector.connection(
             context.source_revision,
             password=source_password,
             resolved=source_resolved,
             read_only=True,
+            control_callback=lambda: self._poll_verification_control(
+                claim=claim,
+                lease=lease,
+            ),
         ) as connection:
             source_snapshot = probe_schema_snapshot(
                 connection,
                 engine=context.source_revision.engine,
                 identity=source_identity,
+                control_callback=lambda: self._poll_verification_control(
+                    claim=claim,
+                    lease=lease,
+                ),
             )
+        self._poll_verification_control(claim=claim, lease=lease)
         with self.credentials.connector.connection(
             context.target_revision,
             password=target_password,
             resolved=target_resolved,
             read_only=True,
+            control_callback=lambda: self._poll_verification_control(
+                claim=claim,
+                lease=lease,
+            ),
         ) as connection:
             target_snapshot = probe_schema_snapshot(
                 connection,
                 engine=context.target_revision.engine,
                 identity=target_identity,
+                control_callback=lambda: self._poll_verification_control(
+                    claim=claim,
+                    lease=lease,
+                ),
             )
+        self._poll_verification_control(claim=claim, lease=lease)
         assert_snapshot_matches_job(
             source_snapshot,
             expected_hash=context.version.source_schema_hash,
@@ -1329,6 +1514,15 @@ class ExecutionWorker:
                     claim=claim,
                     oracle_started=oracle_started,
                 )
+            elif exc.code in {
+                "WORK_TERMINATION_PENDING",
+                "TARGET_EXCLUSIVITY_NOT_ACTIVE",
+                "TARGET_EXCLUSIVITY_BROKEN",
+            }:
+                self.reconciler.complete_claimed_termination(
+                    claim=claim,
+                    oracle_started=oracle_started,
+                )
             return
         except ValueError:
             return
@@ -1341,7 +1535,14 @@ class ExecutionWorker:
     ) -> bool:
         """Acknowledge and atomically consume a cancel that won terminal ordering."""
 
-        if self.reconciler.poll_claim_action(claim) != ProcessAction.CANCEL:
+        action = self.reconciler.poll_claim_action(claim)
+        if action == ProcessAction.TERMINATE:
+            self.reconciler.complete_claimed_termination(
+                claim=claim,
+                oracle_started=oracle_started,
+            )
+            return True
+        if action != ProcessAction.CANCEL:
             return False
         self.reconciler.complete_claimed_cancel(
             claim=claim,

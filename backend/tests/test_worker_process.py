@@ -4,6 +4,8 @@ import stat
 import sys
 from pathlib import Path
 
+import pytest
+
 from datax_studio.worker.process import (
     BoundedRedactedLog,
     ProcessAction,
@@ -103,6 +105,59 @@ def test_managed_process_cancellation_terminates_the_process_group_and_redacts(
     assert result.end_reason == ProcessEndReason.CANCELED
     assert result.returncode != 0
     assert b"cancel-secret" not in result.log.path.read_bytes()
+
+
+def test_managed_process_security_termination_is_not_operator_cancellation(
+    tmp_path: Path,
+) -> None:
+    result = run_managed_process(
+        [sys.executable, "-c", "import time; time.sleep(30)"],
+        workspace=tmp_path / "workspace",
+        log_path=tmp_path / "logs" / "execution.log",
+        secrets=[],
+        timeout_seconds=10,
+        tick=lambda: ProcessAction.TERMINATE,
+        process_started=lambda _identity: None,
+        terminate_grace_seconds=0.05,
+        poll_seconds=0.01,
+        pid_start_time_reader=lambda _pid: 1,
+    )
+
+    assert result.end_reason == ProcessEndReason.TERMINATED
+    assert result.returncode != 0
+
+
+def test_pre_start_check_prevents_popen_after_a_late_safety_stop(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "popen-must-not-run"
+
+    class SafetyStop(RuntimeError):
+        pass
+
+    def stop_before_spawn() -> None:
+        raise SafetyStop
+
+    with pytest.raises(SafetyStop):
+        run_managed_process(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "from pathlib import Path;"
+                    f"Path({str(marker)!r}).write_text('spawned', encoding='utf-8')"
+                ),
+            ],
+            workspace=tmp_path / "workspace",
+            log_path=tmp_path / "logs" / "execution.log",
+            secrets=[],
+            timeout_seconds=10,
+            tick=lambda: ProcessAction.CONTINUE,
+            process_started=lambda _identity: None,
+            pre_start_check=stop_before_spawn,
+        )
+
+    assert not marker.exists()
 
 
 def test_managed_process_timeout_is_not_reported_as_normal_exit(

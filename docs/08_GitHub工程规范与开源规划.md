@@ -15,6 +15,13 @@
 > 仓库发布工作流仍生成 `gate_result=BLOCKED` 且需求项为 `NOT_RUN/E0` 的候选证据，
 > 不批准公开发布。
 
+> ADR-0011 已接受未来的两阶段插件/Runtime qualification 与发布晋级链：不可变 payload
+> 先在受保护 Windows harness 中取得 Phase A 私有 qualification（不是 E4 或 Plugin Manifest
+> 状态），独立签发 detached QR 后才构建私有最终候选；再在无 QH 的 Phase B 中验证精确
+> 安装包，才可派生 Windows E4 插件状态并交给 ADR-0010 hosted attestor/PR 公开晋级。
+> 当前 workflow 没有 payload root、QH/QR、candidate-root.v2、受信 reader 或真实
+> Windows/签名/OIDC 证据，仍只能生成显式 BLOCKED 候选。
+
 ## 1. 仓库目标
 
 仓库同时承载：
@@ -211,6 +218,25 @@ Windows release runner 或签名结果已经在线验证。Java 源码也没有�
 
 高风险 CI 所需密钥只使用受保护环境和最小权限短期凭据，不向 Fork PR 暴露。
 
+ADR-0011 要求把未来 release workflow 拆成以下不可互相替代的阶段：
+
+1. 先以精确 commit 构建不可变 payload P，并在不含 QH/QR/最终 Setup 的情况下计算
+   payload root；改变镜像、Runtime、插件、内置公钥或锁即产生新 P。
+2. 受保护 HQA 仅为指定 P、固定 harness、一次性 nonce 和短有效期签发 QH。QH 只能经
+   私有 override 给 Phase A harness，不能出现在标准 Compose、Setup、公开 artifact、
+   settings 或普通用户能力目录。
+3. 真实 E3/私有 Windows harness/payload qualification（不是 E4）的独立复核通过后，独立
+   RQA 才能签发 detached QR。HQA、RQA、Authenticode 证书和 GitHub OIDC 不是同一把密钥或
+   同一角色。
+4. QR 进入私有最终 F 后，Phase B 必须在无 QH 的标准 Launcher/Compose 上运行精确
+   Setup/Launcher 的 Windows E4；只有该证据才可派生 `WINDOWS_E4_CERTIFIED`，随后生成
+   同时绑定 P、QR、F 和最终证据的 candidate-root v2，由 hosted attestor 验证来源并由
+   发布 validator 形成 PR。E4 状态本身不等于公开晋级。
+
+任何阶段缺少真实外部 TCB、签名、场景/证据或负向验证时只生成 BLOCKED 候选。不得通过
+把 QR 写进 Worker 镜像、让 QR 绑定包含它的 Setup/manifest、使用环境变量放行，或把
+self-hosted runner 的自述 JSON 当作公开 release 证明。
+
 ## 7. Issue 规范
 
 功能 Issue 至少包含：
@@ -234,6 +260,12 @@ Bug Issue 应包含版本、环境、复现步骤、预期/实际、脱敏日志
 发布候选必须固定：
 
 - Git commit 和标签。
+- ADR-0011 的 payload root、私有 Phase A 非 E4 资格证据摘要和由独立 RQA 签发的 QR；
+  QH 只保留在受保护 harness 的短生命周期证据区，不进入公开候选或安装包。
+- 精确最终 F 与其 Phase B Windows E4 证据；它可派生插件 `WINDOWS_E4_CERTIFIED`，但普通
+  用户可执行性和公开分发还必须有同一 F 的有效 PR。最终 candidate-root.v2 必须绑定 P、QR、
+  F、acceptance/environment/scenario/SBOM/许可证和 hosted provenance。现有 v1 根只能表示
+  BLOCKED，不能代替该项。
 - 已签名 `DataX-Enterprise-Studio-Setup-<version>-x64.exe` 与其内
   `launcher.exe` 的 Authenticode 发布者、证书指纹、可信时间戳和 SHA-256。
 - PostgreSQL、API、egress-guard、Worker、Web 五个运行时镜像 digest；PostgreSQL 与

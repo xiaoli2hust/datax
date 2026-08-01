@@ -336,10 +336,20 @@ Windows E4 证据源，因此 Runtime 健康的四插件最多为 `PACKAGED`、
 没有 POST、上传、启用第三方插件或安装接口。
 
 `POST /jobs/{job_id}/executions` 在创建 `QUEUED+RESERVED` 之前校验发布版本
-绑定的 Reader/Writer E4 证据；`POST /executions/{execution_id}/rerun` 在创建
+绑定的 Reader/Writer Phase-B `WINDOWS_E4_CERTIFIED` 资格，以及两端一致的
+`evidence.release_promotion_ref`；`POST /executions/{execution_id}/rerun` 在创建
 新的恢复执行前做同一校验。Worker 在领取事务和建立工作区/解密凭据前各复检一次。
-这四个检查点遇到降级、哈希/候选不匹配、证据过期、依赖未盘点或许可未审查时，
-统一失败关闭为 `PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED`。
+E4 已具备但缺少该引用时，能力目录必须保持
+`ordinary_user_executable=false` 并给出 `RELEASE_PROMOTION_REQUIRED`。这四个检查点
+遇到降级、哈希/候选不匹配、证据过期、依赖未盘点、许可未审查、发布晋级引用缺失/格式
+无效或 Reader/Writer 引用不一致时，统一失败关闭为
+`PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED`。
+
+当前候选中的 `release_promotion_ref` 仍是**不透明引用**：实现只校验其存在性、格式和
+Reader/Writer 配对一致性，尚没有受信 reader，也没有带签名、可独立校验的候选根/最终
+`F` 绑定。因此该字段存在本身不能证明“同一最终 `F` 的有效公开发布晋级（PR）”。生产
+证据源仍默认 deny-all，未由此放开任何普通用户能力；后续受信发布纵向切片必须原子引入
+结构化、签名的发布晋级契约及其 reader，并同步加强四个检查点和负向验收。
 
 ### 8.6 Datasource
 
@@ -353,7 +363,7 @@ Windows E4 证据源，因此 Runtime 健康的四插件最多为 `PACKAGED`、
 | DELETE | `/datasources/{datasource_id}` | Admin | 软删除；有活动引用时 409 |
 | GET | `/datasources/{datasource_id}/revisions/{revision_id}` | Admin | 读取真实连接定位字段的不可变修订原始详情 |
 | GET | `/datasources/{datasource_id}/credential-secrets` | Admin | 只读 `ACTIVE/RETIRED/REVOKED/COMPROMISED` 生命周期与 Envelope 摘要 |
-| POST | `/datasources/{datasource_id}/credential-secrets/{version}/status` | Admin | 退役或紧急撤销版本；不可把历史版本重新激活 |
+| POST | `/datasources/{datasource_id}/credential-secrets/{version}/status` | Admin | 已先切换为另一枚 current secret 的历史 `ACTIVE→RETIRED/REVOKED/COMPROMISED`，`RETIRED→REVOKED/COMPROMISED`；直接退役 current secret 返回 `CREDENTIAL_STATUS_CONFLICT`。紧急终态同事务禁用 current 数据源并为受影响的已绑定与未领取工作建立持久终止事实；不可重新激活或降级 |
 | POST | `/datasources/{datasource_id}/test` | Admin | 复检 EndpointPolicy、DNS 与出口规则后受限连接测试 |
 | GET | `/datasources/{datasource_id}/schema/tables` | 有 `SOURCE_USE/TARGET_USE` | 游标读取表和列元数据 |
 
@@ -723,10 +733,12 @@ Idempotency-Key: 01J43MRF4Q3W8FNF4PMY90M4W5
 `reason` 仅允许 `OPERATOR_REVOKED`、`DBA_REVOKED`、
 `EXTERNAL_DML_DDL_REPORTED` 或 `CHANGE_FREEZE_BROKEN`。`responsible_party` 必须与原
 Execution 固化的确认责任类型一致，服务端以原值为准。API 原子保存
-`REVOKED`、`revoked_at/reason` 与
-`TARGET_EXCLUSIVITY_REVOKED` 审计，不直接写三组执行状态：未领取执行由 reconciler
-取消并释放 `RESERVED`；已领取执行由 Worker 终止并进入恢复门禁；`VERIFYING` 中的报告
-使 oracle 形成 `INCONCLUSIVE/TARGET_EXCLUSIVITY_BROKEN`。终态请求返回 409。
+`REVOKED`、`revoked_at/reason`、`TARGET_EXCLUSIVITY_REVOKED` 审计和独立
+`WorkTerminationRequest`，但不直接写三组执行状态：未领取执行由 reconciler 取消并释放
+`RESERVED`；已领取执行由 Worker 终止并进入恢复门禁；`VERIFYING` 中的报告使 oracle
+形成 `INCONCLUSIVE/TARGET_EXCLUSIVITY_BROKEN`。安全终止原因优先于并发人工取消。该 API
+不能把数据库提交与 OS `Popen` 或阻塞 JDBC 变成原子动作；Worker 只在有界控制点停止，无法
+及时返回时保守收敛为 `LOST`。终态请求返回 409。
 
 API 创建 Execution 的事务必须同时写 `QUEUED` 与
 `TargetCopyLock(state=RESERVED)`；`TargetNamespace` 部分唯一索引覆盖

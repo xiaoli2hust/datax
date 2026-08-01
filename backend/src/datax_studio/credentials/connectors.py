@@ -3,7 +3,7 @@ from __future__ import annotations
 import ipaddress
 import ssl
 import time
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Protocol
@@ -75,11 +75,22 @@ class DatabaseConnector:
         *,
         password: bytearray,
         resolved: ResolvedEndpoint,
+        control_callback: Callable[[], None] | None = None,
     ) -> ProbeResult:
         if revision.engine == "POSTGRESQL_15":
-            return self._probe_postgres(revision, password=password, resolved=resolved)
+            return self._probe_postgres(
+                revision,
+                password=password,
+                resolved=resolved,
+                control_callback=control_callback,
+            )
         if revision.engine == "MYSQL_8":
-            return self._probe_mysql(revision, password=password, resolved=resolved)
+            return self._probe_mysql(
+                revision,
+                password=password,
+                resolved=resolved,
+                control_callback=control_callback,
+            )
         raise ValueError("UNSUPPORTED_ENGINE")
 
     @contextmanager
@@ -91,6 +102,7 @@ class DatabaseConnector:
         resolved: ResolvedEndpoint,
         stream: bool = False,
         read_only: bool = False,
+        control_callback: Callable[[], None] | None = None,
     ) -> Iterator[psycopg.Connection | pymysql.Connection]:
         """Yield one pinned connection; callers never resolve the hostname again.
 
@@ -101,6 +113,7 @@ class DatabaseConnector:
 
         if revision.engine == "POSTGRESQL_15":
             with self.guard.lease(resolved) as lease:
+                self._run_control_callback(control_callback)
                 connection = self._connect_postgres(
                     revision,
                     password=password,
@@ -109,10 +122,13 @@ class DatabaseConnector:
                     autocommit=not (stream or read_only),
                 )
                 try:
+                    self._run_control_callback(control_callback)
                     if read_only:
+                        self._run_control_callback(control_callback)
                         connection.execute(
                             "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY"
                         )
+                        self._run_control_callback(control_callback)
                     yield connection
                     lease.assert_active()
                 finally:
@@ -123,6 +139,7 @@ class DatabaseConnector:
         if revision.engine == "MYSQL_8":
             cursor_class = pymysql.cursors.SSCursor if stream else pymysql.cursors.Cursor
             with self.guard.lease(resolved) as lease:
+                self._run_control_callback(control_callback)
                 connection = self._connect_mysql(
                     revision,
                     password=password,
@@ -131,10 +148,15 @@ class DatabaseConnector:
                     cursor_class=cursor_class,
                 )
                 try:
+                    self._run_control_callback(control_callback)
                     if read_only:
                         with connection.cursor() as cursor:
+                            self._run_control_callback(control_callback)
                             cursor.execute("SET SESSION TRANSACTION READ ONLY")
+                            self._run_control_callback(control_callback)
+                            self._run_control_callback(control_callback)
                             cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+                            self._run_control_callback(control_callback)
                     yield connection
                     lease.assert_active()
                 finally:
@@ -232,9 +254,11 @@ class DatabaseConnector:
         *,
         password: bytearray,
         resolved: ResolvedEndpoint,
+        control_callback: Callable[[], None] | None,
     ) -> ProbeResult:
         started = time.monotonic()
         with self.guard.lease(resolved) as lease:
+            self._run_control_callback(control_callback)
             connection = self._connect_postgres(
                 revision,
                 password=password,
@@ -242,11 +266,17 @@ class DatabaseConnector:
                 lease=lease,
             )
             try:
+                self._run_control_callback(control_callback)
                 with connection.cursor() as cursor:
+                    self._run_control_callback(control_callback)
                     cursor.execute("SHOW server_version")
+                    self._run_control_callback(control_callback)
                     server_version = str(cursor.fetchone()[0])
+                    self._run_control_callback(control_callback)
                     cursor.execute("SELECT system_identifier::text FROM pg_control_system()")
+                    self._run_control_callback(control_callback)
                     server_identity = str(cursor.fetchone()[0])
+                self._run_control_callback(control_callback)
                 peer_ip = ipaddress.ip_address(connection.info.hostaddr).compressed
                 if peer_ip != resolved.selected_ip:
                     raise ValueError("ENDPOINT_PEER_MISMATCH")
@@ -266,9 +296,11 @@ class DatabaseConnector:
         *,
         password: bytearray,
         resolved: ResolvedEndpoint,
+        control_callback: Callable[[], None] | None,
     ) -> ProbeResult:
         started = time.monotonic()
         with self.guard.lease(resolved) as lease:
+            self._run_control_callback(control_callback)
             connection = self._connect_mysql(
                 revision,
                 password=password,
@@ -276,9 +308,13 @@ class DatabaseConnector:
                 lease=lease,
             )
             try:
+                self._run_control_callback(control_callback)
                 with connection.cursor() as cursor:
+                    self._run_control_callback(control_callback)
                     cursor.execute("SELECT VERSION(), @@server_uuid")
+                    self._run_control_callback(control_callback)
                     server_version, server_identity = cursor.fetchone()
+                self._run_control_callback(control_callback)
                 peer_ip = ipaddress.ip_address(connection._sock.getpeername()[0]).compressed
                 if peer_ip != resolved.selected_ip:
                     raise ValueError("ENDPOINT_PEER_MISMATCH")
@@ -291,6 +327,13 @@ class DatabaseConnector:
                 )
             finally:
                 connection.close()
+
+    @staticmethod
+    def _run_control_callback(callback: Callable[[], None] | None) -> None:
+        """Consume a durable worker stop before the next probe operation."""
+
+        if callback is not None:
+            callback()
 
     def _postgres_columns(
         self,

@@ -33,6 +33,7 @@ from datax_studio.core.db import (
     Project,
     SystemControl,
     TargetCopyLock,
+    WorkTerminationRequest,
 )
 from datax_studio.credentials.db import EndpointConnectionEvidence
 from datax_studio.logs.db import ExecutionLogChunk, ExecutionLogGap
@@ -43,6 +44,7 @@ from datax_studio.settings import Settings, get_settings
 _TERMINAL_EXECUTION_STATES = frozenset({"SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELED", "LOST"})
 _OPEN_RECOVERY_GATE_STATES = frozenset({"OPEN", "REMEDIATION_SUBMITTED", "REJECTED"})
 _ACTIVE_CANCEL_REQUEST_STATES = frozenset({"PENDING", "ACKNOWLEDGED"})
+_ACTIVE_WORK_TERMINATION_REQUEST_STATES = frozenset({"PENDING", "ACKNOWLEDGED"})
 _REASON_PATTERN = re.compile(r"^[A-Z0-9_]{1,64}$")
 _AUDIT_DOMAIN = "DXAUDITv1"
 _QUARANTINE_DIRECTORY = ".retention-quarantine"
@@ -53,6 +55,13 @@ class RetentionMaintenanceError(RuntimeError):
         if _REASON_PATTERN.fullmatch(code) is None:
             raise ValueError("retention error code is invalid")
         super().__init__(code)
+        self.code = code
+
+
+class _RetentionItemBlocked(RuntimeError):
+    """Abort one nested purge without collapsing the full maintenance run."""
+
+    def __init__(self, code: str) -> None:
         self.code = code
 
 
@@ -142,26 +151,20 @@ class RetentionMaintenanceService:
             with self.sessions.begin() as session:
                 effective_now = checked_at or self._database_now(session)
                 self._lock_maintenance(session)
+                # Work-control writers take the parent Execution/RecoveryProbe
+                # row before their Organization audit lock.  Retention must not
+                # take every Organization lock before it later locks an
+                # Execution, or an emergency stop can deadlock with this run.
+                # The durable audit events are not visible until this enclosing
+                # transaction commits, so their Organization lock can safely be
+                # deferred until after the work-row purge phase.
                 organizations = list(
-                    session.scalars(
-                        select(Organization).order_by(Organization.id).with_for_update()
-                    )
+                    session.scalars(select(Organization).order_by(Organization.id))
                 )
                 if not organizations:
                     raise RetentionMaintenanceError("RETENTION_ORGANIZATION_MISSING")
                 organization_ids = [organization.id for organization in organizations]
                 self._verify_audit_chains(session, organization_ids)
-                for organization in organizations:
-                    self._append_audit(
-                        session,
-                        organization=organization,
-                        run_id=run_id,
-                        action="RETENTION_MAINTENANCE_STARTED",
-                        outcome="SUCCEEDED",
-                        reason_code=None,
-                        occurred_at=effective_now,
-                        metadata=self._policy_metadata(),
-                    )
 
                 reconciled, reconcile_reasons = self._reconcile_quarantine(
                     session,
@@ -200,6 +203,26 @@ class RetentionMaintenanceService:
                     counts=counts,
                     reasons=reasons,
                 )
+                # Lock Organizations only after all potentially destructive
+                # Execution work has acquired its parent-row locks.  Recheck
+                # the append-only chains under those locks so a concurrent
+                # domain audit cannot race the next sequence calculation.
+                organizations = self._lock_organizations_for_audit(
+                    session,
+                    organization_ids=organization_ids,
+                )
+                self._verify_audit_chains(session, organization_ids)
+                for organization in organizations:
+                    self._append_audit(
+                        session,
+                        organization=organization,
+                        run_id=run_id,
+                        action="RETENTION_MAINTENANCE_STARTED",
+                        outcome="SUCCEEDED",
+                        reason_code=None,
+                        occurred_at=effective_now,
+                        metadata=self._policy_metadata(),
+                    )
                 completed_outcome = "SUCCEEDED" if result.status != "BLOCKED" else "DENIED"
                 completed_reason = (
                     None if result.status == "SUCCEEDED" else "RETENTION_ITEMS_BLOCKED"
@@ -407,55 +430,103 @@ class RetentionMaintenanceService:
             )
         )
         for execution, organization_id in rows:
-            block_reason = self._execution_delete_block_reason(
-                session,
-                execution=execution,
-                organization_id=organization_id,
-                now=now,
-            )
-            if block_reason is not None:
-                counts.executions_blocked += 1
-                reasons.add(block_reason)
-                continue
             deleted_events = 0
             try:
                 with session.begin_nested():
+                    # All supported producers of WorkTerminationRequest lock the
+                    # parent work row first.  Take that same lock and refresh
+                    # before deciding whether this polymorphic descendant may be
+                    # removed, otherwise a late safety stop could survive with a
+                    # dangling work_id.
+                    locked_execution = session.scalar(
+                        select(Execution)
+                        .where(Execution.id == execution.id)
+                        .execution_options(populate_existing=True)
+                        .with_for_update()
+                    )
+                    if locked_execution is None:
+                        raise RetentionMaintenanceError("EXECUTION_DELETE_CONFLICT")
+                    block_reason = self._execution_delete_block_reason(
+                        session,
+                        execution=locked_execution,
+                        organization_id=organization_id,
+                        now=now,
+                    )
+                    if block_reason is not None:
+                        raise _RetentionItemBlocked(block_reason)
                     session.execute(
                         delete(EndpointConnectionEvidence).where(
-                            EndpointConnectionEvidence.execution_id == execution.id
+                            EndpointConnectionEvidence.execution_id == locked_execution.id
                         )
                     )
                     session.execute(
-                        delete(ExecutionLogGap).where(ExecutionLogGap.execution_id == execution.id)
+                        delete(ExecutionLogGap).where(
+                            ExecutionLogGap.execution_id == locked_execution.id
+                        )
                     )
                     session.execute(
                         delete(ExecutionLogChunk).where(
-                            ExecutionLogChunk.execution_id == execution.id
+                            ExecutionLogChunk.execution_id == locked_execution.id
                         )
                     )
                     event_result = session.execute(
-                        delete(ExecutionEvent).where(ExecutionEvent.execution_id == execution.id)
+                        delete(ExecutionEvent).where(
+                            ExecutionEvent.execution_id == locked_execution.id
+                        )
                     )
                     deleted_events = _rowcount(event_result.rowcount)
                     session.execute(
                         delete(ExecutionCancelRequest).where(
-                            ExecutionCancelRequest.execution_id == execution.id
+                            ExecutionCancelRequest.execution_id == locked_execution.id
                         )
                     )
                     session.execute(
-                        delete(TargetCopyLock).where(TargetCopyLock.execution_id == execution.id)
+                        delete(TargetCopyLock).where(
+                            TargetCopyLock.execution_id == locked_execution.id
+                        )
                     )
                     session.execute(
                         delete(ExecutionAttempt).where(
-                            ExecutionAttempt.execution_id == execution.id
+                            ExecutionAttempt.execution_id == locked_execution.id
                         )
                     )
+                    # A completed target-exclusivity request has no external
+                    # credential reference and is retained exactly with its
+                    # Execution group.  Completed secret-linked requests are
+                    # deliberately handled by the block predicate below until a
+                    # coordinated work+credential retention path exists.
+                    session.execute(
+                        delete(WorkTerminationRequest).where(
+                            WorkTerminationRequest.work_kind == "EXECUTION",
+                            WorkTerminationRequest.work_id == locked_execution.id,
+                            WorkTerminationRequest.status == "COMPLETED",
+                            WorkTerminationRequest.credential_secret_id.is_(None),
+                        )
+                    )
+                    # The predicate is redundant with the locked recheck above
+                    # for supported writers, but makes the destructive statement
+                    # itself fail closed if an unexpected WTR reference appears.
+                    any_termination_request = (
+                        select(WorkTerminationRequest.id)
+                        .where(
+                            WorkTerminationRequest.work_kind == "EXECUTION",
+                            WorkTerminationRequest.work_id == locked_execution.id,
+                        )
+                        .exists()
+                    )
                     deleted_execution = session.execute(
-                        delete(Execution).where(Execution.id == execution.id)
+                        delete(Execution).where(
+                            Execution.id == locked_execution.id,
+                            ~any_termination_request,
+                        )
                     )
                     if _rowcount(deleted_execution.rowcount) != 1:
                         raise RetentionMaintenanceError("EXECUTION_DELETE_CONFLICT")
                     session.flush()
+            except _RetentionItemBlocked as exc:
+                counts.executions_blocked += 1
+                reasons.add(exc.code)
+                continue
             except (IntegrityError, RetentionMaintenanceError):
                 counts.executions_blocked += 1
                 reasons.add("EXECUTION_REFERENCE_RESTRICTED")
@@ -517,6 +588,35 @@ class RetentionMaintenanceService:
             is not None
         ):
             return "EXECUTION_CANCEL_REQUEST_ACTIVE"
+        if (
+            session.scalar(
+                select(WorkTerminationRequest.id)
+                .where(
+                    WorkTerminationRequest.work_kind == "EXECUTION",
+                    WorkTerminationRequest.work_id == execution.id,
+                    WorkTerminationRequest.status.in_(
+                        _ACTIVE_WORK_TERMINATION_REQUEST_STATES
+                    ),
+                )
+                .limit(1)
+            )
+            is not None
+        ):
+            return "WORK_TERMINATION_REQUEST_ACTIVE"
+        if (
+            session.scalar(
+                select(WorkTerminationRequest.id)
+                .where(
+                    WorkTerminationRequest.work_kind == "EXECUTION",
+                    WorkTerminationRequest.work_id == execution.id,
+                    WorkTerminationRequest.status == "COMPLETED",
+                    WorkTerminationRequest.credential_secret_id.is_not(None),
+                )
+                .limit(1)
+            )
+            is not None
+        ):
+            return "WORK_TERMINATION_CREDENTIAL_RETENTION_PENDING"
         locks = list(
             session.scalars(
                 select(TargetCopyLock).where(TargetCopyLock.execution_id == execution.id)
@@ -799,6 +899,24 @@ class RetentionMaintenanceService:
         )
         if control is None:
             raise RetentionMaintenanceError("RETENTION_SYSTEM_CONTROL_MISSING")
+
+    @staticmethod
+    def _lock_organizations_for_audit(
+        session: Session,
+        *,
+        organization_ids: list[UUID],
+    ) -> list[Organization]:
+        organizations = list(
+            session.scalars(
+                select(Organization)
+                .where(Organization.id.in_(organization_ids))
+                .order_by(Organization.id)
+                .with_for_update()
+            )
+        )
+        if len(organizations) != len(organization_ids):
+            raise RetentionMaintenanceError("RETENTION_ORGANIZATION_MISSING")
+        return organizations
 
     @staticmethod
     def _database_now(session: Session) -> datetime:

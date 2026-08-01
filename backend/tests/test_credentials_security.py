@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,6 +36,7 @@ from datax_studio.credentials.crypto import (
 )
 from datax_studio.credentials.db import (
     CredentialSecret,
+    CredentialSecretEnvelope,
     EndpointConnectionEvidence,
 )
 from datax_studio.credentials.keyring import KekKeyring
@@ -99,6 +101,140 @@ def _guard(*answers: DnsResolution) -> EndpointPolicyGuard:
     )
 
 
+def test_postgres_probe_consumes_control_before_the_next_query(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A newly observed stop between PostgreSQL probe queries is fail-closed."""
+
+    events: list[str] = []
+    stop_requested = False
+
+    class _Guard:
+        @contextmanager
+        def lease(self, _resolved: object):
+            yield SimpleNamespace(assert_active=lambda: events.append("lease-active"))
+
+    class _Cursor:
+        def __enter__(self) -> _Cursor:
+            return self
+
+        def __exit__(
+            self,
+            _type: object,
+            _value: object,
+            _traceback: object,
+        ) -> None:
+            return None
+
+        def execute(self, statement: str) -> None:
+            nonlocal stop_requested
+            events.append(statement)
+            if statement == "SHOW server_version":
+                stop_requested = True
+
+        def fetchone(self) -> tuple[str]:
+            events.append("fetchone")
+            return ("15.1",)
+
+    class _Connection:
+        info = SimpleNamespace(hostaddr="127.0.0.1")
+
+        def cursor(self) -> _Cursor:
+            return _Cursor()
+
+        def close(self) -> None:
+            events.append("closed")
+
+    connector = DatabaseConnector(
+        guard=_Guard(),  # type: ignore[arg-type]
+        connect_timeout_seconds=1,
+        query_timeout_seconds=1,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_connect_postgres",
+        lambda *_args, **_kwargs: _Connection(),
+    )
+
+    def control_callback() -> None:
+        events.append("control")
+        if stop_requested:
+            raise RuntimeError("termination observed")
+
+    with pytest.raises(RuntimeError, match="termination observed"):
+        connector.probe(
+            SimpleNamespace(engine="POSTGRESQL_15"),
+            password=bytearray(b"secret"),
+            resolved=SimpleNamespace(selected_ip="127.0.0.1"),
+            control_callback=control_callback,
+        )
+
+    assert events.count("control") >= 4
+    assert "SHOW server_version" in events
+    assert "SELECT system_identifier::text FROM pg_control_system()" not in events
+
+
+def test_postgres_connection_consumes_control_before_read_only_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stop arriving during connect prevents read-only setup SQL."""
+
+    events: list[str] = []
+    stop_requested = False
+
+    class _Guard:
+        @contextmanager
+        def lease(self, _resolved: object):
+            yield SimpleNamespace(assert_active=lambda: events.append("lease-active"))
+
+    class _Connection:
+        autocommit = False
+
+        def execute(self, statement: str) -> None:
+            events.append(statement)
+
+        def rollback(self) -> None:
+            events.append("rollback")
+
+        def close(self) -> None:
+            events.append("closed")
+
+    connector = DatabaseConnector(
+        guard=_Guard(),  # type: ignore[arg-type]
+        connect_timeout_seconds=1,
+        query_timeout_seconds=1,
+    )
+
+    def connect(*_args: object, **_kwargs: object) -> _Connection:
+        nonlocal stop_requested
+        events.append("connect")
+        stop_requested = True
+        return _Connection()
+
+    monkeypatch.setattr(connector, "_connect_postgres", connect)
+
+    def control_callback() -> None:
+        events.append("control")
+        if stop_requested:
+            raise RuntimeError("termination observed")
+
+    with pytest.raises(
+        RuntimeError,
+        match="termination observed",
+    ), connector.connection(
+        SimpleNamespace(engine="POSTGRESQL_15"),
+        password=bytearray(b"secret"),
+        resolved=SimpleNamespace(selected_ip="127.0.0.1"),
+        read_only=True,
+        control_callback=control_callback,
+    ):
+        pytest.fail("the connection must not be yielded after a stop")
+
+    assert "connect" in events
+    assert "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY" not in events
+    assert "closed" in events
+
+
 def _service(
     sessions: sessionmaker,
     keyring: KekKeyring,
@@ -154,6 +290,89 @@ def _audit() -> AuditContext:
     )
 
 
+def _seed_worker_secret(
+    tmp_path: Path,
+) -> tuple[CredentialService, sessionmaker, UUID, UUID, UUID]:
+    sessions = _sqlite_sessions()
+    key_path = tmp_path / "credential-kek-v1.key"
+    key_path.write_bytes(b"w" * 32)
+    key_path.chmod(0o600)
+    service = _service(sessions, KekKeyring(tmp_path))
+    service.ensure_active_kek_registered()
+    now = datetime.now(UTC)
+    organization_id = uuid4()
+    user_id = uuid4()
+    project_id = uuid4()
+    datasource_id = uuid4()
+    with sessions.begin() as session:
+        session.add_all(
+            [
+                Organization(
+                    id=organization_id,
+                    name="Worker decrypt test",
+                    status="ACTIVE",
+                    created_at=now,
+                    updated_at=now,
+                    row_version=1,
+                ),
+                User(
+                    id=user_id,
+                    email=f"worker-{user_id}@example.com",
+                    display_name="Worker",
+                    password_hash="not-used",
+                    must_change_password=False,
+                    password_changed_at=now,
+                    status="ACTIVE",
+                    failed_login_count=0,
+                    created_at=now,
+                    updated_at=now,
+                    row_version=1,
+                ),
+                Project(
+                    id=project_id,
+                    organization_id=organization_id,
+                    name="Worker decrypt project",
+                    slug=f"worker-decrypt-{project_id}",
+                    status="ACTIVE",
+                    created_by=user_id,
+                    created_at=now,
+                    updated_at=now,
+                    row_version=1,
+                ),
+            ]
+        )
+        session.flush()
+        datasource = Datasource(
+            id=datasource_id,
+            project_id=project_id,
+            name="Worker datasource",
+            status="ACTIVE",
+            created_by=user_id,
+            created_at=now,
+            updated_at=now,
+            row_version=1,
+        )
+        session.add(datasource)
+        session.flush()
+        secret = service._install_secret(  # noqa: SLF001
+            session,
+            organization_id=organization_id,
+            project_id=project_id,
+            datasource=datasource,
+            password=bytearray(b"worker-password"),
+            actor_id=user_id,
+            now=now,
+        )
+        envelope_id = session.scalar(
+            select(CredentialSecretEnvelope.id).where(
+                CredentialSecretEnvelope.credential_secret_id == secret.id,
+                CredentialSecretEnvelope.status == "ACTIVE",
+            )
+        )
+        assert envelope_id is not None
+    return service, sessions, datasource_id, secret.id, envelope_id
+
+
 def test_password_request_fingerprint_is_deterministic_keyed_and_non_plaintext(
     tmp_path: Path,
 ) -> None:
@@ -169,6 +388,76 @@ def test_password_request_fingerprint_is_deterministic_keyed_and_non_plaintext(
     assert first != second
     assert first_password.hex() not in first
     assert second_password.hex() not in second
+
+
+@pytest.mark.parametrize("terminal_status", ["REVOKED", "COMPROMISED"])
+def test_worker_decrypt_freshly_rejects_terminal_secret_status(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    service, sessions, datasource_id, secret_id, envelope_id = _seed_worker_secret(
+        tmp_path
+    )
+    with sessions.begin() as session:
+        secret = session.get(CredentialSecret, secret_id)
+        assert secret is not None
+        changed_at = datetime.now(UTC)
+        secret.status = terminal_status
+        secret.status_reason_code = "SECURITY_INCIDENT"
+        secret.status_changed_at = changed_at
+        if terminal_status == "REVOKED":
+            secret.revoked_at = changed_at
+        else:
+            secret.compromised_at = changed_at
+
+    with pytest.raises(ProblemException) as blocked, service.decrypted_worker_password(
+        datasource_id=datasource_id,
+        secret_id=secret_id,
+        envelope_id=envelope_id,
+    ):
+        pytest.fail("terminal secret must never yield plaintext")
+    assert blocked.value.code == "CREDENTIAL_BINDING_NOT_ACTIVE"
+
+
+@pytest.mark.parametrize("terminal_status", ["REVOKED", "COMPROMISED"])
+def test_worker_decrypt_releases_transaction_and_next_call_observes_status_change(
+    tmp_path: Path,
+    terminal_status: str,
+) -> None:
+    service, sessions, datasource_id, secret_id, envelope_id = _seed_worker_secret(
+        tmp_path
+    )
+
+    with service.decrypted_worker_password(
+        datasource_id=datasource_id,
+        secret_id=secret_id,
+        envelope_id=envelope_id,
+    ) as plaintext:
+        assert bytes(plaintext) == b"worker-password"
+        # The worker-specific read transaction has already ended before yield,
+        # so an emergency status writer can commit without waiting for the
+        # lifetime of the plaintext consumer.
+        with sessions.begin() as session:
+            secret = session.get(CredentialSecret, secret_id)
+            assert secret is not None
+            changed_at = datetime.now(UTC)
+            secret.status = terminal_status
+            secret.status_reason_code = "SECURITY_INCIDENT"
+            secret.status_changed_at = changed_at
+            if terminal_status == "REVOKED":
+                secret.revoked_at = changed_at
+            else:
+                secret.compromised_at = changed_at
+        assert bytes(plaintext) == b"worker-password"
+
+    assert plaintext == bytearray(len(b"worker-password"))
+    with pytest.raises(ProblemException) as blocked, service.decrypted_worker_password(
+        datasource_id=datasource_id,
+        secret_id=secret_id,
+        envelope_id=envelope_id,
+    ):
+        pytest.fail("a new worker decrypt must observe the committed status")
+    assert blocked.value.code == "CREDENTIAL_BINDING_NOT_ACTIVE"
 
 
 def test_aad_is_exact_and_ciphertext_is_randomized_and_bound() -> None:

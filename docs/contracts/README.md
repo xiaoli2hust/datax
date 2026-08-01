@@ -5,7 +5,9 @@
 - `openapi.yaml`：HTTP API。
 - `job-spec.v1.schema.json`：平台任务契约。
 - `schema-snapshot.v1.schema.json`：MySQL/PostgreSQL 表结构的确定性、无秘密快照；发布校验与 Worker preflight 共同使用。
-- `plugin-manifest.v2.schema.json`：现行插件能力、分级认证、依赖/许可、证据与 UI 阻断契约。
+- `plugin-manifest.v2.schema.json`：现行插件能力、分级认证、依赖/许可、证据与 UI 阻断契约；
+  `WINDOWS_E4_CERTIFIED` 只描述精确最终候选的 Phase-B E4，普通用户执行还必须由同一最终
+  候选的 `release_promotion_ref` 证明有效公开发布晋级。
 - `plugin-manifest.v1.schema.json`：仅保留为历史契约，不再由当前 `/plugins` 返回。
 - `upstream-plugin-inventory.v1.schema.json`：从固定 Alibaba DataX 根 POM、模块 POM 与
   `plugin.json` 重建的 Reader/Writer 源码能力目录。对应规范化制品位于
@@ -51,6 +53,12 @@
 - `runtime-generation.v1.schema.json`：Launcher 原子选择 installation-id、secret 目录和
   三个 Docker named volume 的活动运行代际指针。
 - `system-backup.v1.md`：Windows Launcher 调用备份 helper 的停机、加密、恢复 journal 与失败关闭边界。
+
+ADR-0011 已规定未来需要独立的 release-payload、harness-qualification、
+release-qualification 与 candidate-root.v2 契约，但它们尚未创建或被任何运行时代码消费。
+现有 candidate-root.v1 继续只允许 BLOCKED/release_approved=false；不得用新增可选字段、
+宽松 schema、测试注入、环境变量或自签公钥伪造资格。实现这些新契约前，普通生产路径
+继续 deny-all。
 
 截至 2026-08-01，Datasource、Job、Execution、日志与恢复处置契约已有候选代码消费方，
 但真实四方向 DataX（E3）和 Windows 11 安装链路（E4）仍为 `NOT_RUN/BLOCKED`。

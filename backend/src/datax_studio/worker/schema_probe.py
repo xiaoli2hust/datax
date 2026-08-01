@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import re
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal, Protocol
 from uuid import UUID
@@ -160,36 +160,60 @@ def probe_schema_snapshot(
     *,
     engine: EngineName,
     identity: TableIdentity,
+    control_callback: Callable[[], None] | None = None,
 ) -> SchemaSnapshot:
     if engine == "MYSQL_8":
-        return _probe_mysql(connection, identity)
+        return _probe_mysql(
+            connection,
+            identity,
+            control_callback=control_callback,
+        )
     if engine == "POSTGRESQL_15":
-        return _probe_postgres(connection, identity)
+        return _probe_postgres(
+            connection,
+            identity,
+            control_callback=control_callback,
+        )
     raise SchemaProbeError("unsupported schema probe engine")
 
 
 def _probe_mysql(
     connection: Connection,
     identity: TableIdentity,
+    *,
+    control_callback: Callable[[], None] | None,
 ) -> SchemaSnapshot:
     with connection.cursor() as cursor:
-        cursor.execute("SELECT @@lower_case_table_names")
-        case_row = cursor.fetchone()
+        _controlled_execute(
+            cursor,
+            "SELECT @@lower_case_table_names",
+            control_callback=control_callback,
+        )
+        case_row = _controlled_fetchone(
+            cursor,
+            control_callback=control_callback,
+        )
         if case_row is None or int(case_row[0]) not in {0, 1, 2}:
             raise SchemaProbeError("MySQL identifier case mode is unavailable")
         case_mode = f"MYSQL_LOWER_CASE_TABLE_NAMES_{int(case_row[0])}"
-        cursor.execute(
+        _controlled_execute(
+            cursor,
             """
             SELECT TABLE_TYPE
             FROM information_schema.TABLES
             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
             """,
             (identity.catalog_name, identity.table_name),
+            control_callback=control_callback,
         )
-        table_row = cursor.fetchone()
+        table_row = _controlled_fetchone(
+            cursor,
+            control_callback=control_callback,
+        )
         if table_row is None or str(table_row[0]).upper() != "BASE TABLE":
             raise SchemaProbeError("MySQL source or target is not a base table")
-        cursor.execute(
+        _controlled_execute(
+            cursor,
             """
             SELECT
                 ORDINAL_POSITION,
@@ -210,9 +234,14 @@ def _probe_mysql(
             ORDER BY ORDINAL_POSITION
             """,
             (identity.catalog_name, identity.table_name),
+            control_callback=control_callback,
         )
-        raw_columns = cursor.fetchall()
-        cursor.execute(
+        raw_columns = _controlled_fetchall(
+            cursor,
+            control_callback=control_callback,
+        )
+        _controlled_execute(
+            cursor,
             """
             SELECT
                 tc.CONSTRAINT_NAME,
@@ -235,9 +264,14 @@ def _probe_mysql(
             ORDER BY tc.CONSTRAINT_NAME, kcu.ORDINAL_POSITION
             """,
             (identity.catalog_name, identity.table_name),
+            control_callback=control_callback,
         )
-        raw_constraints = cursor.fetchall()
-        cursor.execute(
+        raw_constraints = _controlled_fetchall(
+            cursor,
+            control_callback=control_callback,
+        )
+        _controlled_execute(
+            cursor,
             """
             SELECT
                 TRIGGER_NAME,
@@ -250,9 +284,14 @@ def _probe_mysql(
             ORDER BY TRIGGER_NAME, EVENT_MANIPULATION
             """,
             (identity.catalog_name, identity.table_name),
+            control_callback=control_callback,
         )
-        raw_triggers = cursor.fetchall()
-        cursor.execute(
+        raw_triggers = _controlled_fetchall(
+            cursor,
+            control_callback=control_callback,
+        )
+        _controlled_execute(
+            cursor,
             """
             SELECT COUNT(*)
             FROM information_schema.PARTITIONS
@@ -261,8 +300,12 @@ def _probe_mysql(
               AND PARTITION_NAME IS NOT NULL
             """,
             (identity.catalog_name, identity.table_name),
+            control_callback=control_callback,
         )
-        partition_row = cursor.fetchone()
+        partition_row = _controlled_fetchone(
+            cursor,
+            control_callback=control_callback,
+        )
 
     columns = [
         _mysql_column(row)
@@ -435,9 +478,12 @@ def _mysql_constraints(
 def _probe_postgres(
     connection: Connection,
     identity: TableIdentity,
+    *,
+    control_callback: Callable[[], None] | None,
 ) -> SchemaSnapshot:
     with connection.cursor() as cursor:
-        cursor.execute(
+        _controlled_execute(
+            cursor,
             """
             SELECT c.oid, c.relkind, c.relrowsecurity
             FROM pg_catalog.pg_class AS c
@@ -445,14 +491,19 @@ def _probe_postgres(
             WHERE n.nspname = %s AND c.relname = %s
             """,
             (identity.schema_name, identity.table_name),
+            control_callback=control_callback,
         )
-        table_row = cursor.fetchone()
+        table_row = _controlled_fetchone(
+            cursor,
+            control_callback=control_callback,
+        )
         if table_row is None or str(table_row[1]) not in {"r", "p"}:
             raise SchemaProbeError("PostgreSQL source or target is not a base table")
         table_oid = int(table_row[0])
         partitioned = str(table_row[1]) == "p"
         row_security = bool(table_row[2])
-        cursor.execute(
+        _controlled_execute(
+            cursor,
             """
             SELECT
                 a.attnum,
@@ -486,9 +537,14 @@ def _probe_postgres(
             ORDER BY a.attnum
             """,
             (table_oid,),
+            control_callback=control_callback,
         )
-        raw_columns = cursor.fetchall()
-        cursor.execute(
+        raw_columns = _controlled_fetchall(
+            cursor,
+            control_callback=control_callback,
+        )
+        _controlled_execute(
+            cursor,
             """
             SELECT
                 con.oid,
@@ -502,9 +558,14 @@ def _probe_postgres(
             ORDER BY con.oid
             """,
             (table_oid,),
+            control_callback=control_callback,
         )
-        raw_constraints = cursor.fetchall()
-        cursor.execute(
+        raw_constraints = _controlled_fetchall(
+            cursor,
+            control_callback=control_callback,
+        )
+        _controlled_execute(
+            cursor,
             """
             SELECT
                 t.tgname,
@@ -516,14 +577,19 @@ def _probe_postgres(
             ORDER BY t.tgname
             """,
             (table_oid,),
+            control_callback=control_callback,
         )
-        raw_triggers = cursor.fetchall()
+        raw_triggers = _controlled_fetchall(
+            cursor,
+            control_callback=control_callback,
+        )
         referenced_oids = sorted(
             {int(row[3]) for row in raw_constraints if int(row[3] or 0) != 0}
         )
         references: dict[int, tuple[str, str]] = {}
         if referenced_oids:
-            cursor.execute(
+            _controlled_execute(
+                cursor,
                 """
                 SELECT c.oid, n.nspname, c.relname
                 FROM pg_catalog.pg_class AS c
@@ -531,10 +597,14 @@ def _probe_postgres(
                 WHERE c.oid = ANY(%s)
                 """,
                 (referenced_oids,),
+                control_callback=control_callback,
             )
             references = {
                 int(row[0]): (str(row[1]), str(row[2]))
-                for row in cursor.fetchall()
+                for row in _controlled_fetchall(
+                    cursor,
+                    control_callback=control_callback,
+                )
             }
 
     columns = [_postgres_column(row) for row in raw_columns]
@@ -715,3 +785,43 @@ def _optional_nonnegative_int(value: Any) -> int | None:
         return None
     result = int(value)
     return result if result >= 0 else None
+
+
+def _controlled_execute(
+    cursor: Cursor,
+    query: str,
+    parameters: Sequence[object] | None = None,
+    *,
+    control_callback: Callable[[], None] | None,
+) -> object:
+    _check_control(control_callback)
+    result = cursor.execute(query) if parameters is None else cursor.execute(query, parameters)
+    _check_control(control_callback)
+    return result
+
+
+def _controlled_fetchone(
+    cursor: Cursor,
+    *,
+    control_callback: Callable[[], None] | None,
+) -> Sequence[Any] | None:
+    _check_control(control_callback)
+    result = cursor.fetchone()
+    _check_control(control_callback)
+    return result
+
+
+def _controlled_fetchall(
+    cursor: Cursor,
+    *,
+    control_callback: Callable[[], None] | None,
+) -> list[Sequence[Any]]:
+    _check_control(control_callback)
+    result = cursor.fetchall()
+    _check_control(control_callback)
+    return result
+
+
+def _check_control(control_callback: Callable[[], None] | None) -> None:
+    if control_callback is not None:
+        control_callback()

@@ -20,9 +20,9 @@ DataX Enterprise Studio 是面向企业内部数据工程团队的 DataX 可视�
 [第一性原理问题台账与开发修复计划](docs/14_第一性原理问题台账与开发修复计划.md)。
 
 仓库已按 [ADR-0009](docs/adr/0009-DataX完整上游与认证能力分级.md) 接受“完整上游
-随包、逐级可证明认证”的长期目标。当前 V1 仍只开放 MySQL/PostgreSQL 四插件；
-其他上游能力未达 `WINDOWS_E4_CERTIFIED` 前不得在普通用户 UI 中执行，也不得
-宣称稳定支持。
+随包、逐级可证明认证”的长期目标。V1 产品范围只定义 MySQL/PostgreSQL 四个候选
+Reader/Writer；当前生产证据源为 deny-all，普通用户实际开放能力为 **0 个**。任何候选
+未达到精确最终 Windows E4 与公开晋级前，都不得在普通用户 UI 中执行或宣称稳定支持。
 
 `GET /api/v1/plugins` 现按 `plugin-manifest.v2` 返回上游锁定、制品、
 依赖/许可、网络/文件边界、oracle、候选证据和阻断原因。
@@ -30,6 +30,13 @@ DataX Enterprise Studio 是面向企业内部数据工程团队的 DataX 可视�
 显示为 `PACKAGED` 且 `ordinary_user_executable=false`；普通 Execution 创建、
 恢复 `rerun`、Worker 领取和 Worker 启动四个检查点都会失败关闭。测试注入证据不属于公开契约，
 也不会被 `/plugins` 序列化为普通用户可执行事实。
+
+2026-08-02 已通过 [ADR-0011](docs/adr/0011-两阶段插件运行时资格认证与发布晋级链.md)
+接受未来的“两阶段资格认证 + 最终发布晋级”设计：先固定不可变 Runtime payload，在
+受保护 harness 中以短期签名资格取得真实取证，再以 detached 签名资格构建私有最终候选，
+最后对精确安装包完成 Windows E4、候选根与 hosted provenance。该 ADR 只解决安全自举和
+哈希循环的设计，不改变当前行为：QH/QR、受信 reader、payload root v1、candidate-root
+v2、真实 Windows/E3/签名/OIDC 证据都尚未实现，普通路径仍默认拒绝、发布仍为 BLOCKED。
 
 ## V1 一句话范围
 

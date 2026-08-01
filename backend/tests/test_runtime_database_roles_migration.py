@@ -120,7 +120,7 @@ def test_0013_creates_separate_non_ddl_runtime_roles(
         "NOREPLICATION",
     ):
         assert rendered.count(restriction) == 4
-    assert Settings().database_schema_revision == "20260731_0014"
+    assert Settings().database_schema_revision == "20260802_0015"
 
 
 def test_0013_rejects_reused_database_passwords(

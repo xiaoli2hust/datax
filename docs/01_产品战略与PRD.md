@@ -290,7 +290,12 @@ V1 为**单组织、多项目**。组织不提供切换入口；项目是资源�
   `EXPIRED`，Operator/DBA 知悉窗口被撤回或发生平台外 DML/DDL 时必须通过
   `POST /executions/{execution_id}/target-exclusivity/revoke` 报告，系统持久化
   `REVOKED`、`revoked_at` 和 `reason`。人工声明不是技术证明，平台无法检测全部未报告
-  或已经回滚的外部 DML/DDL。
+  或已经回滚的外部 DML/DDL。`REVOKED/EXPIRED` 必须同时形成独立于人工取消的持久
+  `WorkTerminationRequest`：未领取项由 reconciler 收敛为
+  `CANCELED/NONE/NOT_STARTED` 并释放 `RESERVED`，已领取项停止继续推进、终止受控
+  DataX 进程并按已知影响进入恢复门禁；安全原因优先于同时到达的人工取消。数据库终止事实
+  与 OS 进程创建、阻塞 JDBC 调用不是一个原子操作，未能在有界控制点返回时只能保守收敛为
+  `LOST`；在真实 DataX/Windows 取证前不得宣称即时止写。
 - 已领取执行进入 `FAILED / TIMED_OUT / CANCELED / LOST`：原执行不可变。Operator/DBA 在平台外完成必要处置后向恢复接口提交 `remediation_confirmation`；独立 RecoveryProbe 持目标锁生成空表证据并签发 `RecoveryGate=VERIFIED`。恢复后再次执行请求必须引用该 gate、重新确认源表静默，并提交带新 `confirmed_at/valid_until` 的目标外部独占声明，再创建关联原执行的新 Execution。尚未领取的 `QUEUED` 取消直接收敛为 `CANCELED/NONE/NOT_STARTED`，不创建 Attempt/fence/恢复门禁，并把已有 `RESERVED` 预留转为 `RELEASED`。
 
 ## 7. 业务规则
@@ -301,7 +306,7 @@ V1 为**单组织、多项目**。组织不提供切换入口；项目是资源�
 | PRD-BR-002 | Admin 可跨项目；其他角色只能访问明确授权项目。资源不存在与无权限的响应不得泄露跨项目资源信息。 |
 | PRD-BR-003 | 数据源仅允许 MySQL 8 或 PostgreSQL 15，且只有 Admin 可按 EndpointPolicy 创建、修改、测试和启停。成员必须分别获得 `SOURCE_USE` / `TARGET_USE`；源修订→目标修订必须有 `ACTIVE` TransferPolicy，`SENSITIVE` 策略需两个不同 Admin 批准。任何读取接口不返回密码原值。 |
 | PRD-BR-004 | 单任务只能选择一个 Reader、一个 Writer、一个源表和一个目标表；源与目标不能解析为同一物理数据库实例中的同一规范化表身份，切换 Datasource、revision、hostname 或 IP 别名不能绕过。V1 的源内容必须从运行前检查开始到独立 oracle 完成始终静默。 |
-| PRD-BR-005 | 发布只验证目标表存在、安全画像合格且具备可核验能力，不把发布时点的空表查询当作执行证据。目标表必须在每次运行前为空；平台不得创建、修改、清空或删除业务表，Worker 必须在启动 DataX 前服务端实测并保存本次 Execution 的 `target_empty_evidence`，不能信任客户端声明。 |
+| PRD-BR-005 | 发布只验证目标表存在、安全画像合格且具备可核验能力，不把发布时点的空表查询当作执行证据。目标表必须在每次运行前为空；平台不得创建、修改、清空或删除业务表，Worker 必须在启动 DataX 前服务端实测并保存本次 Execution 的 `target_empty_evidence`，不能信任客户端声明。每次 Execution 还必须有 `statement_version="1.0"`、`confirmed_at`、`valid_until`、`responsible_party` 的目标外部独占声明；只有 `ACTIVE`、未撤回且目标快照完成不晚于 `valid_until` 才能通过。撤回或到期必须原子持久化终止事实；未领取项释放 `RESERVED`，已领取项停止/进入恢复门禁，绝不能以人工取消或最终 oracle 拒绝替代止损。 |
 | PRD-BR-006 | 写入固定为 `INSERT_ONLY_ONCE`。非空目标拒绝执行；同一 TargetNamespace 在系统范围只允许一个未释放的 `RESERVED / ACTIVE / RECOVERY_REQUIRED` TargetCopyLock。API 创建 `QUEUED` Execution 时原子预留，Worker 领取时转换为 `ACTIVE`，未领取取消释放预留。该锁只串行平台内工作，不能阻止或证明不存在平台外 DML/DDL；V1 不承诺非空追加、周期或可重复同步。 |
 | PRD-BR-007 | 字段必须一对一映射；映射数为 1..2048；目标字段不能被重复映射；不允许常量、表达式、脚本或 SQL。 |
 | PRD-BR-008 | 目标类型必须在认证兼容矩阵内，并满足长度、精度、标度和空值约束；不安全的隐式缩窄必须阻断。 |
@@ -314,7 +319,7 @@ V1 为**单组织、多项目**。组织不提供切换入口；项目是资源�
 | PRD-BR-015 | V1 无自动重试。Execution 一旦被 Worker 领取，进入 `FAILED / TIMED_OUT / CANCELED / LOST` 后必须先提交 `remediation_confirmation`，由独立 RecoveryProbe 通过自身 Attempt/fence 复检空表并签发 `RecoveryGate=VERIFIED`；恢复后再次执行引用该 gate、重新确认源静默并提交有新 `confirmed_at/valid_until` 的目标外部独占声明，绑定原 JobVersion、创建新 Execution，并记录 `rerun_of_execution_id`。尚未领取的 `QUEUED` 取消由 reconciler 收敛为 `CANCELED/NONE/NOT_STARTED`，不创建 Attempt/fence/门禁并把 `RESERVED` 转为 `RELEASED`。领取事务提交前失败必须整体回滚且不产生 Attempt/fence、不把 `RESERVED` 转为 `ACTIVE`；提交后任何非唯一成功结果均不得自动回到 `QUEUED` 或复用 Attempt。 |
 | PRD-BR-016 | 同一运行请求的幂等键在 24 小时有效期内重复提交只能创建一个 Execution；新幂等键只能表达新意图，不能绕过目标空表、目标互斥、源静默或 RecoveryGate。 |
 | PRD-BR-017 | 每次 Execution 固化 JobVersion、源/目标 DatasourceRevision 与 EndpointPolicyRevision、PhysicalEndpointIdentity/TargetNamespace、方向授权与 TransferPolicy `scope_hash`、实际 CredentialSecretEnvelope、连接证据、规范化配置哈希、固定复制策略、Runtime/插件版本、触发人、静默确认、空表证据和触发时间。目标外部独占确认固定 `statement_version="1.0"`、`confirmed_at`、`valid_until`、`responsible_party`；Execution 另存 `ACTIVE / REVOKED / EXPIRED`、`revoked_at/reason`，RuntimeSnapshot 固定声明版本、有效期、接受 actor/时间和确认摘要。 |
-| PRD-BR-018 | DataX JSON 预览只读且脱敏。实际凭据仅在 Worker 运行时按需解密，临时文件最小权限并在结束后清理。 |
+| PRD-BR-018 | DataX JSON 预览只读且脱敏。实际凭据仅在 Worker 运行时按需解密，含密文件只可进入最小权限 tmpfs Attempt，并在结束后删除。只有已切换为新 current secret 的历史 `ACTIVE` 版本可退役为 `RETIRED`；直接退役 current secret 必须拒绝，避免排队工作永久等待失效凭据。`RETIRED` 可单向升级到紧急终态，不能重新激活或降级。`REVOKED/COMPROMISED` 必须同一事务禁用 current 指向它的数据源，并为已绑定非终态工作及尚未领取、将绑定该 current secret 的工作建立持久终止事实；Execution/RecoveryProbe 只能失败关闭，RecoveryGate 必须可重新提交而不能永久卡住。Worker 每一端凭据以全新短事务和 `FOR UPDATE` 状态锁决定是否解密，端间与每个有界外部 I/O 前后复检终止事实；状态先提交拒绝新解密，解密先完成也不得继续下一条外部连接。可控的 mutable 明文缓冲区在退出时尽力清零，但 Python/驱动/子进程可能产生不可逐一清零的内存副本，不能把该措施表述为完整内存擦除证明。 |
 | PRD-BR-019 | 发布、端点/数据源变更与测试、方向授权、TransferPolicy 审批、执行、取消、源静默确认、目标外部独占确认及撤回/破坏报告、处置确认、RecoveryProbe/RecoveryGate、恢复后再次执行和归档必须产生不可变审计事件。Operator/DBA 知悉目标窗口被撤回或破坏时负有立即报告义务；平台不声称能检测全部未报告或已经回滚的外部 DML/DDL。 |
 | PRD-BR-020 | 项目、数据源和任务优先软删除/归档；存在引用或历史执行时禁止物理删除。 |
 | PRD-BR-021 | 所有列表稳定排序并分页；所有写操作使用幂等控制或乐观锁，版本冲突不能静默覆盖。 |
@@ -394,7 +399,7 @@ V1 为**单组织、多项目**。组织不提供切换入口；项目是资源�
 | NFR-SCALE-001 | 单节点容量 | V1 单 Worker 默认最大并行 Execution 为 `1`；超过上限的执行必须保持 `QUEUED`。部署调高并发后仍必须保证同一规范化目标只有一个未释放的 `RESERVED/ACTIVE/RECOVERY_REQUIRED` 锁，并重新完成资源与稳定性验收。 |
 | NFR-REL-001 | 事实一致性 | PostgreSQL 是唯一业务事实源；Worker 使用 `FOR UPDATE SKIP LOCKED` 领取，`LISTEN/NOTIFY` 丢失时由轮询恢复，不得丢失 Execution 或产生伪成功。 |
 | NFR-REL-002 | 故障恢复 | API、Worker、Docker Desktop 或 Windows 重启，以及主机从睡眠恢复后必须对账在途执行；无法确认的状态进入 `LOST`。V1 不承诺睡眠/关机期间运行、不停机或自动故障转移。 |
-| NFR-SEC-001 | 凭据安全 | 凭据使用外部主密钥和 AEAD 加密；响应、日志、审计、预览、导出、异常和测试快照不得包含明文。 |
+| NFR-SEC-001 | 凭据安全 | 凭据使用外部主密钥和 AEAD 加密；响应、日志、审计、预览、导出、异常和测试快照不得包含明文。Worker 每端以 fresh short `FOR UPDATE` 状态锁解密；紧急 secret 撤销/折损与目标独占撤回/到期均须生成持久终止事实，Worker/reconciler 在 admission、每个有界外部 I/O、状态推进、Popen 紧前、tick、oracle 和 heartbeat 消费。已观察到终止后不得创建新连接或进程；数据库提交与 OS/JDBC 边界不可原子，阻塞调用只允许按超时/lease-LOST 保守收敛，真实 E2/E3 之前不得宣称即时停止或完整内存清零。 |
 | NFR-SEC-002 | 进程安全 | Worker 使用参数数组启动固定 Runtime，禁止 `shell=True`、命令字符串拼接和用户可控可执行路径；每次运行使用隔离工作目录。 |
 | NFR-SEC-003 | 访问控制 | 所有资源读写均校验组织、项目、角色和资源状态；越权、横向访问及对象枚举测试必须通过。 |
 | NFR-AUD-001 | 审计 | 凭据、EndpointPolicy、方向授权、TransferPolicy、发布、执行、取消、源静默确认、目标空表证据、处置确认、RecoveryProbe/RecoveryGate、恢复后再次执行和归档操作 100% 产生含主体、对象、结果、时间和 request_id 的审计事件。 |

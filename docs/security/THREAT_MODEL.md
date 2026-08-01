@@ -2,7 +2,7 @@
 
 > 状态：V1 发布门禁输入
 >
-> 更新日期：2026-08-01
+> 更新日期：2026-08-02
 > 适用范围：Windows 11 x64 本地工作站、单组织、多项目、单节点、安全的一次性离线全量复制
 
 > 实现口径：表中的“V1 强制控制”是发布前必须满足的控制集合，不等于当前全部已实现。
@@ -65,6 +65,11 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
 - Windows 11 宿主、当前登录用户、浏览器、`launcher.exe`、Docker Desktop/WSL2 与
   Linux 容器之间均是独立信任边界。Docker Desktop 管理权限等价于本机高权限，不授予
   Web/API/Worker 容器访问 Docker Socket、Windows 命名管道或宿主敏感目录。
+- 未来 ADR-0011 的 HQA、RQA、受保护 Windows qualification harness、Authenticode
+  签名服务与 hosted candidate-root attestor 是彼此分离的发布 TCB。QH 只能跨越至受保护
+  harness；QR 只能作为被安装包哈希约束的只读资源进入私有最终候选；GitHub OIDC
+  provenance 只跨越候选根来源边界，不能替代 Windows/数据库行为边界。当前这些角色和
+  资源均未实现，不得由普通用户设置或产品运行时网络调用替代。
 
 ## 4. 主要威胁与控制
 
@@ -80,7 +85,7 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
 | TM-08 | 伪成功 | DataX exit 0、存在脏记录，或目标行数与摘要跨快照读取，却被标为正确 | 固定 `dirty_data_limit=0/0`；exit 0 进入 VERIFYING；独立 oracle 在目标端同一一致性读事务计算行数和多重集摘要；PASSED 才 SUCCEEDED；三组状态分别保存 | 脏记录、跨快照竞态、oracle 故障注入与差异证据 |
 | TM-09 | 日志投毒/泄露/截断隐瞒 | ANSI/控制字符、超大日志、脱敏/存储故障被当作完整 | 先脱敏；raw/redacted/stored/dropped 四计数；所有缺口追加 LogGap；转义展示；Gap 后持续标不完整 | 控制字符、Secret、超长行/总量、读取/脱敏/存储故障 |
 | TM-10 | 审计篡改/换钥断链 | DB 管理员重写事件/锚点，或替换公钥后伪造 checkpoint | 当前：同库 `DXAUDITv1` 追加哈希链和连续性验证；发布缺口：`DXAUDITCHECKPOINTv1`、独立只读公钥 keyring、双签轮换、外部 WORM | 当前同库删除/重写测试；发布前补逐字节签名、轮换/妥协和外部重放演练 |
-| TM-11 | 密钥丢失、错误轮换或紧急撤销不生效 | 只保留最新 KEK；已泄露 secret 仍被新连接使用 | 版本化 KEK/Envelope、公钥/指纹；旧 key 保留到备份窗口；secret ACTIVE/RETIRED/REVOKED/COMPROMISED；紧急终止事实 | 新旧 Envelope、旧备份、紧急撤销竞态、灾难恢复 |
+| TM-11 | 密钥丢失、错误轮换或紧急撤销不生效 | 只保留最新 KEK；已泄露 secret 仍被新连接使用、撤销提交后终态覆盖终止事实，或 RecoveryProbe 在撤销后发布 EMPTY | 版本化 KEK/Envelope、公钥/指纹；旧 key 保留到备份窗口；只有已切换 current 的历史 secret 可 ACTIVE→RETIRED，直接退役 current secret 必须拒绝，RETIRED 仅可升级到 REVOKED/COMPROMISED；Worker 每端解密以新短事务的强制刷新 `FOR UPDATE` Secret 状态锁决定，锁不跨越外部 I/O；紧急状态与每个已绑定非终态 Execution/Probe 的持久终止事实同事务；若紧急 secret 仍是 current，还覆盖无 secret 绑定但不可变引用该 DatasourceRevision 的排队 Execution/Probe，并按 work row 与终态写序列化。Execution 的端间解密、预检每个有界 DNS/JDBC/schema/fingerprint/count I/O（含 connector probe 的查询间隙）、Popen 紧前/tick/oracle/heartbeat 与 Probe 的 heartbeat/DNS/连接/schema/count 边界消费；late EMPTY 必须失败关闭，Probe lease-LOST 重开 Gate=REJECTED。检查只阻止已观察到的终止；数据库提交与实际连接/Popen 之间没有同一原子提交，发布仍须 E3 测量并给出可接受的启动/egress 收敛边界。阻塞 JDBC 只可由超时/lease-LOST 收敛 | 新旧 Envelope、旧备份、撤销前/后/运行中/核验中 terminal-ordering、current secret 退役拒绝与无绑定队列、RETIRED 升级、双 secret、短事务解密顺序、probe 查询间隙/预检/Popen 终止边界、Probe late-EMPTY/lease-LOST、PostgreSQL 并发与真实数据库终止边界 |
 | TM-12 | 资源耗尽/队列饥饿 | 日志保留组合超 200 GiB；长任务、单项目或取消请求被唯一 Worker 饿死 | 分档组合公式、60 GiB 日志预算、绿黄红 admission、持久项目 service cursor、reconciler 独立取消、队列 SLO | 存储计算/水位故障、重启 cursor、取消 SLO、跨项目压测 |
 | TM-13 | 供应链漂移 | 镜像、JDK、DataX 或插件被替换 | 固定 digest/SHA-256、来源清单、只读挂载；PostgreSQL/egress-guard 固定 `15.18-alpine3.24`，API/Worker 最终层固定 Python 3.12.13 `slim-trixie`（Debian 13）。PR 配置 Gitleaks、hash-lock pip-audit、pnpm、Cargo OSV、四语言 CodeQL，以及真实 patched Worker 镜像 Syft+OSV 应用门禁；本地为 0 未处理项、6 个逐项 Logback 1.2.13 短期例外（到期 `2026-09-30`）。candidate release 从精确 commit archive 生成源码 SBOM，并为五镜像生成 SBOM/OSV/Grype 证据；Grype candidate 对可修复 High/Critical 阻断，无修复项进入 `review_required` 且候选仍 `BLOCKED`，promotion 默认阻断或仅接受逐项不超过 90 天例外。2026-08-01 线上快照：最新 PR 的 CI/安全/CodeQL 门禁通过，开放 CodeQL 告警为 0；`main` 经典分支保护严格要求 12 个检查、PR、分支最新、线性历史和会话解决，禁止强推/删除且管理员不可绕过；漏洞告警与 Dependabot security updates 已启用。单维护者阶段审批数仍为 0，且真实 release/OS/Windows 扫描未验证 | 工作流与本地 Worker policy 证据；源码 commit/SBOM 绑定；候选与 promotion 策略负例；线上必需检查、Grype DB/报告、Windows release 状态；启动自检、制品替换负例 |
 | TM-25 | 伪造插件认证或证据降级 | 将 Runtime 心跳、测试注入、过期 E4、其他 candidate/commit/image 或未审查依赖冒充为普通用户可执行 | 公开 `plugin-manifest.v2` 不包含测试证据类型；生产证据源默认 deny-all；只有受信发布证明绑定当前 candidate/commit/Worker image/Runtime/插件哈希、E3/E4 引用、有效期、完整依赖和已记录再分发许可时才进入 E4；普通创建、恢复 rerun、Worker 领取和启动四个检查点复检；UI 只消费目录并显示阻断原因 | v2 Schema 真实响应校验；测试证据不公开、降级、伪造、哈希/候选/镜像错配、过期、依赖路径穿越和许可未记录负例 |
@@ -95,6 +100,8 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
 | TM-22 | 睡眠/重启后旧事实继续写 | Windows 睡眠、WSL VM 暂停、Docker 重启造成 lease 时钟跳跃、孤儿容器或旧 fence 写入 | 恢复先标记未就绪并对账 boot/container identity、lease 与 fence；旧工作停止后才开放新执行；单节点中断明确可见 | 睡眠/恢复、Docker stop/start、WSL shutdown、Windows reboot 故障注入 |
 | TM-23 | 卸载、Docker 重置、首次初始化中断或磁盘故障导致数据丢失 | 卸载误删 named volumes/密钥/备份；先建卷后生成密钥时崩溃导致不可恢复；Docker 重置后静默创建空卷；卷部分丢失；磁盘不足时迁移或日志写入半完成 | 当前：程序/三卷分离；ACL 受控初始化日志；先完整 secret、后卷、提交旧 installation-id，再以不可覆盖的单一 `LEGACY` 指针整组绑定身份/secret/卷并清除日志；仅在无产品/数据卷容器且日志/secret/卷标签一致时补齐；既有卷缺密钥、指针篡改或状态矛盾 fail closed，绝不自动删卷；DATA/SECRETS 导出、双包认证 journal 与空 staging 已达到 E1。异机恢复、新空卷 `pg_restore`、证据重算、`RESTORE` 代际提交与覆盖升级仍是发布缺口 | 初始化各提交点断电/进程终止、容器存在、缺 secret、部分卷、错标签、Docker reset 负例；journal/staging/代际指针中断与篡改负例；发布前补安装→数据→卸载→重装、磁盘不足、真实 Windows 导出和异机恢复证据 |
 | TM-24 | 出口租约伪造、重放或守卫死亡后残留 | 客户端自报 lease ID、token 被记录/重放、API/Worker 不在守卫 netns、守卫死亡后旧 allow 无限存活 | lease ID 与 32-byte bearer 均由守卫生成；token 仅首次响应且内存只存域分离摘要；create/renew 重读 ACTIVE view；逻辑 30 秒、5 秒续租、nft 元素最多 15 秒；规则漂移锁存 base-deny；Launcher 实测三容器 netns 相等 | 请求未知字段/客户端 ID、错误 token、token 日志扫描、netns 不等、guard kill 15 秒、DB 失败、nft 漂移与撤策故障注入 |
+
+| TM-26 | 资格自举、签名替代或发布哈希循环 | 将测试注入/环境变量/自申报 JSON 作为生产资格；让 QH 进入普通包；让 QR 回写 Worker 镜像，或让 QR 与 Setup/manifest 互相绑定后仍宣称同一候选 | ADR-0011 固定 P → 受保护 QH → 独立 QR → 精确 F Phase B → hosted final root 的单向链。HQA 只能签短期 QH，RQA 才能签 QR；固定 keyring 不接受 envelope 公钥；标准 Compose 拒绝 QH；QR 为 detached 资源且不绑定包含自身的 F；普通 reader 对签名、purpose、有效期和 P/commit/image/runtime/JAR/依赖/许可证逐项失败关闭；公开发布还须 ADR-0010 provenance | QH/QR 篡改、未知 key/purpose、过期、nonce 重放、所有 payload 错配、标准 Compose 注入、资源替换、自引用、同版本不同候选、self-hosted provenance 混淆和真实 Phase A/B 证据；当前全部 BLOCKED |
 
 ## 5. 一次复制的强制安全序列
 
@@ -220,6 +227,10 @@ ACTIVE/SUPERSEDED，业务 ciphertext/nonce/AAD 不变。部署注入只读版�
 - LogGap 与 raw/redacted/stored/dropped 计数故障注入；
 - `DXAUDITCHECKPOINTv1` 前像、公钥 keyring/双签轮换、外部锚点和篡改恢复；
 - 200 GiB 组合容量公式、绿黄红 admission、队列 SLO及重启后跨项目公平性。
+
+- ADR-0011 的 P/QH/QR/F/PR 链真实可验证：QH 未泄露至普通路径且已清理、QR 由独立
+  RQA 为精确 P 签发、无 QH 的精确 F 已完成 Phase B、最终候选根来自 hosted attestor；
+  任何缺少 Windows/数据库/签名/OIDC 外部 TCB 的状态均为 BLOCKED。
 
 保留风险：源静默与目标外部独占都依赖系统所有者的外部变更冻结流程。平台无法仅靠 JDBC
 证明源扫描期间绝无写入，也无法靠 TargetCopyLock 阻止或完整发现第三方对目标执行的

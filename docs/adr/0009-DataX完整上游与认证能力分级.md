@@ -47,22 +47,32 @@ MySQL 8/PostgreSQL 15 的四个 Reader/Writer manifest 声明为认证能力。
 | `PACKAGED` | JAR、依赖、SBOM、许可证和 SHA-256 已进入固定 Worker 镜像 | 否 |
 | `CONTRACTED` | 参数、秘密、端点策略、JobSpec、日志、取消和结果语义已有机器契约 | 否 |
 | `E3_CERTIFIED` | 对受支持版本的真实外部系统完成成功/失败/取消和独立 oracle E3 | 否 |
-| `WINDOWS_E4_CERTIFIED` | 同一候选在干净 Windows 11 x64 安装、运行、恢复和卸载链路通过 | 是 |
+| `WINDOWS_E4_CERTIFIED` | 已绑定同一不可变 Runtime payload 的精确最终 F（Setup/Launcher）在无 QH 的正常模式通过 Phase B Windows E4；受信 reader 才可据此派生插件状态 | 仅当同一 F 另有有效 PR 时可；E4 状态本身不可 |
 | `BLOCKED` | 因许可、不可重现依赖、安全模型、外部环境或上游缺陷阻断 | 否，必须显示原因 |
 
 状态必须由发布制品摘要和证据包派生，不能由前端常量、文件名或人工勾选直接提升。任何
 插件版本、依赖、驱动、参数契约或安全策略变化都使受影响认证失效并要求重新取证。
 
+`WINDOWS_E4_CERTIFIED` 不是 Phase A payload 资格，也不是 QH/QR 的别名。它只能从
+ADR-0011 Phase B 对精确最终 F 的正常模式 Windows E4 证据派生，并必须同时绑定 F、P、
+Setup/Launcher、插件和候选身份。该插件状态也不等于公开发布批准：受信 reader 必须另行
+验证同一 F 的有效 PR（完整发布门禁和 hosted provenance）后，才可把
+`ordinary_user_executable` 暴露给普通用户。Phase A QH 只产生私有 harness/payload
+qualification，绝不写入 Plugin Manifest 或成为 E4 状态；在当前尚无受信 reader 时所有能力
+继续失败关闭。
+
 ### 3. V1 认证边界保持不变，完整覆盖作为后续纵向计划
 
 - V1 仍只认证 MySQL 8/PostgreSQL 15 四方向的一次性离线全量表复制。先修复当前 P0/P1、
   完成真实 E3 和 Windows E4，不能用横向增加插件掩盖核心链路不稳定。
-- 完整上游源码和插件清单可以随工程候选推进，但未达到 `WINDOWS_E4_CERTIFIED` 的能力
-  不得出现在可执行选择器中，也不得计入“稳定支持”。
+- 完整上游源码和插件清单可以随工程候选推进，但未达到 `WINDOWS_E4_CERTIFIED`、或没有
+  与其精确最终 F 绑定的有效 PR 的能力，不得出现在普通用户可执行选择器中，也不得计入
+  “稳定支持”。
 - 后续按插件族逐个纵向交付：关系数据库、文件/FTP、对象存储、数仓、NoSQL/搜索、云
   专有服务、Transformer。每个切片必须单独完成许可、安全、契约、真实依赖和回滚评审。
 - 只有目标清单中所有可合法再分发、仍受上游支持且能满足平台安全不变量的模块均达到
-  `WINDOWS_E4_CERTIFIED`，才允许声明“完整 DataX 功能稳定可用”。被永久阻断的模块必须
+  `WINDOWS_E4_CERTIFIED`，且精确最终包已完成 ADR-0011/0010 的公开晋级，才允许声明
+  “完整 DataX 功能稳定可用”。被永久阻断的模块必须
   从这一声明中显式列出，不能用“基本全部”隐藏。
 
 ### 4. 不允许用“全功能”绕过安全边界
@@ -85,6 +95,9 @@ MySQL 8/PostgreSQL 15 的四个 Reader/Writer manifest 声明为认证能力。
 - Worker 启动证明实际镜像内插件集合及摘要与 release manifest 完全一致；多出、缺少或
   摘要不符都必须 fail closed。
 - Setup/Launcher 只消费已经发布的固定镜像；不会因为本机存在额外 JAR 而扩展能力。
+- 资格证据不得回写进被认证的 Worker 镜像或与最终 Setup/manifest 形成自引用哈希。
+  受保护 harness 的短期资格、detached release qualification、最终安装包和公开发布
+  晋级必须按 ADR-0011 分离；测试注入和自申报 JSON 不是其中任一对象。
 
 ### 6. 已落地的第一安全切片：只证明源码存在
 
@@ -113,7 +126,9 @@ DataX 核心/配置以及任意 SQL、`preSql/postSql`、脚本转换等原生�
 UI 从目录渲染 Reader/Writer 并对非 E4 能力显示阻断原因。明确的内部测试
 依赖注入可验证门禁正路，但不能通过公开 Schema 或 `/plugins` 冒充发布事实。
 
-受信的生产发布证明读取器尚未实现，当前 `WINDOWS_E4_CERTIFIED=0`。
+受信的生产发布证明读取器尚未实现，当前 `WINDOWS_E4_CERTIFIED=0`。ADR-0011 已接受
+未来两阶段 qualification/晋级设计，但尚未提供 QH/QR schema、固定信任 keyring、
+production reader、protected harness 或最终 promotion validator。
 因此该切片只证明“不会把未取证能力当成已认证能力运行”，不证明四方向
 DataX E3、Windows E4 或全部 DataX 功能已完成。
 

@@ -7,9 +7,12 @@ from uuid import UUID, uuid4
 
 import pytest
 from jsonschema import Draft202012Validator, FormatChecker
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import func, select
+from sqlalchemy.orm import Session
 from test_core_control_plane import (
     CoreStack,
+    PublishedJob,
     _execution_request,
     _seed_published_job,
     core_stack,
@@ -21,7 +24,9 @@ from datax_studio.core.db import (
     Execution,
     ExecutionEvent,
     TargetCopyLock,
+    WorkTerminationRequest,
 )
+from datax_studio.credentials.db import CredentialSecret
 from datax_studio.logs.db import ExecutionLogChunk
 from datax_studio.maintenance.db import RetentionHold
 from datax_studio.maintenance.retention import (
@@ -52,6 +57,18 @@ def _create_canceled_execution(
     *,
     suffix: str,
 ) -> UUID:
+    execution_id, _published = _create_canceled_execution_with_published(
+        core_stack,
+        suffix=suffix,
+    )
+    return execution_id
+
+
+def _create_canceled_execution_with_published(
+    core_stack: CoreStack,
+    *,
+    suffix: str,
+) -> tuple[UUID, PublishedJob]:
     published = _seed_published_job(core_stack, suffix)
     created = core_stack.client.post(
         f"/api/v1/jobs/{published.job_id}/executions",
@@ -67,7 +84,36 @@ def _create_canceled_execution(
     )
     assert canceled.status_code == 202, canceled.text
     assert core_stack.service.reconcile_unclaimed_cancel(execution_id=execution_id)
-    return execution_id
+    return execution_id, published
+
+
+def _persist_work_termination_request(
+    core_stack: CoreStack,
+    *,
+    work_id: UUID,
+    status: str,
+    reason_code: str,
+    credential_secret_id: UUID | None = None,
+) -> UUID:
+    requested_at = datetime.now(UTC)
+    request_id = uuid4()
+    acknowledged_at = requested_at if status in {"ACKNOWLEDGED", "COMPLETED"} else None
+    completed_at = requested_at if status == "COMPLETED" else None
+    with core_stack.sessions.begin() as session:
+        session.add(
+            WorkTerminationRequest(
+                id=request_id,
+                work_kind="EXECUTION",
+                work_id=work_id,
+                credential_secret_id=credential_secret_id,
+                reason_code=reason_code,
+                status=status,
+                requested_at=requested_at,
+                acknowledged_at=acknowledged_at,
+                completed_at=completed_at,
+            )
+        )
+    return request_id
 
 
 def _validate_retention_audits(
@@ -146,6 +192,127 @@ def test_retention_deletes_expired_idempotency_and_safe_execution_group(
         "RETENTION_MAINTENANCE_COMPLETED",
     ]
     assert audits[-1].event_json["outcome"] == "SUCCEEDED"
+
+
+def test_retention_locks_execution_before_organization_audit_lock(
+    core_stack: CoreStack,
+    tmp_path: Path,
+) -> None:
+    """Record ORM lock intent; real PostgreSQL contention remains an E2 check."""
+
+    _create_canceled_execution(core_stack, suffix="lock-order")
+    lock_order: list[str] = []
+
+    def record_for_update(orm_execute_state: object) -> None:
+        statement = getattr(orm_execute_state, "statement", None)
+        if statement is None or getattr(statement, "_for_update_arg", None) is None:
+            return
+        from_names = {
+            name
+            for from_clause in statement.get_final_froms()
+            if isinstance((name := getattr(from_clause, "name", None)), str)
+        }
+        if "executions" in from_names:
+            lock_order.append("EXECUTION")
+        if "organizations" in from_names:
+            lock_order.append("ORGANIZATION")
+
+    sqlalchemy_event.listen(Session, "do_orm_execute", record_for_update)
+    try:
+        result = _service(core_stack, tmp_path).run(
+            now=datetime.now(UTC) + timedelta(days=366)
+        )
+    finally:
+        sqlalchemy_event.remove(Session, "do_orm_execute", record_for_update)
+
+    assert result.executions_deleted == 1
+    assert "EXECUTION" in lock_order
+    assert "ORGANIZATION" in lock_order
+    assert lock_order.index("EXECUTION") < lock_order.index("ORGANIZATION")
+
+
+def test_retention_deletes_completed_nonsecret_termination_with_execution_group(
+    core_stack: CoreStack,
+    tmp_path: Path,
+) -> None:
+    execution_id = _create_canceled_execution(
+        core_stack,
+        suffix="completed-nonsecret-termination",
+    )
+    termination_id = _persist_work_termination_request(
+        core_stack,
+        work_id=execution_id,
+        status="COMPLETED",
+        reason_code="TARGET_EXCLUSIVITY_REVOKED",
+    )
+
+    result = _service(core_stack, tmp_path).run(
+        now=datetime.now(UTC) + timedelta(days=366)
+    )
+
+    assert result.executions_deleted == 1
+    with core_stack.sessions() as session:
+        assert session.get(Execution, execution_id) is None
+        assert session.get(WorkTerminationRequest, termination_id) is None
+
+
+@pytest.mark.parametrize("status", ["PENDING", "ACKNOWLEDGED"])
+def test_retention_never_deletes_active_termination_request(
+    core_stack: CoreStack,
+    tmp_path: Path,
+    status: str,
+) -> None:
+    execution_id = _create_canceled_execution(
+        core_stack,
+        suffix=f"active-termination-{status.lower()}",
+    )
+    termination_id = _persist_work_termination_request(
+        core_stack,
+        work_id=execution_id,
+        status=status,
+        reason_code="TARGET_EXCLUSIVITY_REVOKED",
+    )
+
+    result = _service(core_stack, tmp_path).run(
+        now=datetime.now(UTC) + timedelta(days=366)
+    )
+
+    assert result.executions_deleted == 0
+    assert result.executions_blocked == 1
+    assert "WORK_TERMINATION_REQUEST_ACTIVE" in result.block_reasons
+    with core_stack.sessions() as session:
+        assert session.get(Execution, execution_id) is not None
+        request = session.get(WorkTerminationRequest, termination_id)
+        assert request is not None
+        assert request.status == status
+
+
+def test_retention_preserves_completed_secret_termination_until_coordinated_purge(
+    core_stack: CoreStack,
+    tmp_path: Path,
+) -> None:
+    execution_id, published = _create_canceled_execution_with_published(
+        core_stack,
+        suffix="completed-secret-termination",
+    )
+    now = datetime.now(UTC)
+    termination_id = _persist_work_termination_request(
+        core_stack,
+        work_id=execution_id,
+        status="COMPLETED",
+        reason_code="SECRET_REVOKED",
+        credential_secret_id=published.target_secret_id,
+    )
+
+    result = _service(core_stack, tmp_path).run(now=now + timedelta(days=366))
+
+    assert result.executions_deleted == 0
+    assert result.executions_blocked == 1
+    assert "WORK_TERMINATION_CREDENTIAL_RETENTION_PENDING" in result.block_reasons
+    with core_stack.sessions() as session:
+        assert session.get(Execution, execution_id) is not None
+        assert session.get(WorkTerminationRequest, termination_id) is not None
+        assert session.get(CredentialSecret, published.target_secret_id) is not None
 
 
 def test_active_hold_blocks_related_cleanup_until_explicit_release(

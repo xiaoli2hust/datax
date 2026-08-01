@@ -54,6 +54,7 @@ from datax_studio.core.db import (
     SyncJob,
     TargetNamespace,
     TransferPolicy,
+    WorkTerminationRequest,
 )
 from datax_studio.core.schemas import (
     ClaimedExecution,
@@ -62,6 +63,7 @@ from datax_studio.core.schemas import (
     EndpointPolicyRevisionResponse,
     JobSpecV1,
 )
+from datax_studio.core.service import ControlService
 from datax_studio.credentials.connectors import DatabaseConnector, ProbeResult
 from datax_studio.credentials.crypto import (
     AAD_SCHEMA_VERSION,
@@ -531,8 +533,69 @@ class CredentialService:
         secret_id: UUID,
         envelope_id: UUID,
     ) -> Iterator[bytearray]:
+        plaintext = bytearray()
+        try:
+            plaintext = self._decrypt_password_value(
+                session,
+                datasource_id=datasource_id,
+                secret_id=secret_id,
+                envelope_id=envelope_id,
+                lock_secret=False,
+            )
+            yield plaintext
+        finally:
+            zeroize(plaintext)
+
+    @contextmanager
+    def decrypted_worker_password(
+        self,
+        *,
+        datasource_id: UUID,
+        secret_id: UUID,
+        envelope_id: UUID,
+    ) -> Iterator[bytearray]:
+        """Decrypt one bound secret under a fresh, short status lock.
+
+        The transaction ends before plaintext is yielded.  Emergency status
+        changes therefore serialize with the decision to begin decryption,
+        without holding a database row lock for the lifetime of DataX or an
+        oracle read.
+        """
+
+        plaintext = bytearray()
+        try:
+            with self.sessions.begin() as session:
+                plaintext = self._decrypt_password_value(
+                    session,
+                    datasource_id=datasource_id,
+                    secret_id=secret_id,
+                    envelope_id=envelope_id,
+                    lock_secret=True,
+                )
+            yield plaintext
+        finally:
+            zeroize(plaintext)
+
+    def _decrypt_password_value(
+        self,
+        session: Session,
+        *,
+        datasource_id: UUID,
+        secret_id: UUID,
+        envelope_id: UUID,
+        lock_secret: bool,
+    ) -> bytearray:
         datasource = session.get(Datasource, datasource_id)
-        secret = session.get(CredentialSecret, secret_id)
+        secret = (
+            session.scalar(
+                select(CredentialSecret)
+                .where(CredentialSecret.id == secret_id)
+                .execution_options(populate_existing=True)
+                .with_for_update()
+            )
+            if lock_secret
+            else session.get(CredentialSecret, secret_id)
+        )
         envelope = session.get(CredentialSecretEnvelope, envelope_id)
         if (
             datasource is None
@@ -565,19 +628,14 @@ class CredentialService:
             credential_secret_id=secret.id,
             secret_version=secret.secret_version,
         )
-        plaintext = bytearray()
-        try:
-            with self.keyring.open_key(key.key_version) as kek:
-                plaintext = decrypt_credential(
-                    ciphertext=secret.ciphertext,
-                    nonce=secret.nonce,
-                    encrypted_dek=envelope.encrypted_dek,
-                    aad=aad,
-                    kek=kek,
-                )
-            yield plaintext
-        finally:
-            zeroize(plaintext)
+        with self.keyring.open_key(key.key_version) as kek:
+            return decrypt_credential(
+                ciphertext=secret.ciphertext,
+                nonce=secret.nonce,
+                encrypted_dek=envelope.encrypted_dek,
+                aad=aad,
+                kek=kek,
+            )
 
     # API-facing methods are below. Responses use dedicated schemas that never
     # include secret IDs, ciphertext, nonce, encrypted DEKs, or key bytes.
@@ -1638,13 +1696,52 @@ class CredentialService:
         audit: AuditContext,
     ) -> OperationResult[CredentialSecretSummary]:
         self._require_admin(principal)
-        now = utc_now()
         with self.sessions.begin() as session:
-            datasource, project, organization = self._locked_datasource_context(
+            # Read only enough to identify the immutable secret before taking
+            # work-row locks.  Emergency status changes use the deterministic
+            # Execution/Probe -> Organization -> Project -> Datasource ->
+            # Secret order; once the datasource lock is held we rescan, so a
+            # claim that won the datasource race cannot bind the secret after
+            # the scan.
+            candidate_secret_id = session.scalar(
+                select(CredentialSecret.id)
+                .join(Datasource, Datasource.id == CredentialSecret.datasource_id)
+                .join(Project, Project.id == Datasource.project_id)
+                .where(
+                    CredentialSecret.datasource_id == datasource_id,
+                    CredentialSecret.secret_version == secret_version,
+                    Project.organization_id == principal.organization_id,
+                )
+            )
+            if candidate_secret_id is None:
+                self._not_found()
+            emergency_stop = request.status in {"REVOKED", "COMPROMISED"}
+            locked_executions: list[Execution] = []
+            locked_probes: list[RecoveryProbe] = []
+            if emergency_stop:
+                # Queued work has not bound a secret yet.  Lock both its
+                # immutable datasource reference and already-bound work
+                # before taking the datasource gate, so a worker that wins a
+                # concurrent claim is observed by the second scan below.
+                # The final current-secret check is deliberately deferred
+                # until after the datasource row is locked: revoking an old
+                # retired secret must not cancel queued work that will bind a
+                # newer current secret.
+                locked_executions, locked_probes = self._lock_potential_work_for_secret_status(
+                    session,
+                    secret_id=candidate_secret_id,
+                    datasource_id=datasource_id,
+                )
+            datasource, project, organization = self._lock_admin_datasource_context(
                 session,
                 principal=principal,
                 datasource_id=datasource_id,
             )
+            # A status transition can wait behind a Worker or another control
+            # transaction.  Its durable termination/audit timestamps must be
+            # ordered by the database clock *after* that wait, rather than by
+            # the stale application time captured before the lock sequence.
+            now = self._database_now(session)
             replay = self._claim_idempotency(
                 session,
                 actor_id=principal.user_id,
@@ -1672,12 +1769,36 @@ class CredentialService:
             )
             if secret is None:
                 self._not_found()
-            if secret.status != "ACTIVE":
+            if secret.id != candidate_secret_id:
+                raise RuntimeError("credential secret identity changed during status update")
+            is_current_secret = datasource.current_secret_id == secret.id
+            # Retirement is a normal post-rotation lifecycle state.  Allowing
+            # it on the current secret would leave the datasource formally
+            # ACTIVE but make future Worker binding fail, stranding a queued
+            # Execution's RESERVED TargetCopyLock or a RecoveryGate probe.
+            # V1 has no atomic "install replacement + retire old" API, so
+            # require the replacement current secret to be selected first.
+            if request.status == "RETIRED" and is_current_secret:
+                raise ProblemException(
+                    status=409,
+                    code="CREDENTIAL_STATUS_CONFLICT",
+                    title="当前凭据不能直接退役",
+                    detail="请先完成凭据轮换并切换数据源 current secret，再退役历史版本。",
+                )
+            allowed_statuses = {
+                "ACTIVE": {"RETIRED", "REVOKED", "COMPROMISED"},
+                # Retirement is a normal rotation state, not evidence that
+                # the already-bound credential can never be discovered as
+                # leaked.  Escalation remains terminal and creates the same
+                # durable stop as a direct emergency revocation.
+                "RETIRED": {"REVOKED", "COMPROMISED"},
+            }
+            if request.status not in allowed_statuses.get(secret.status, set()):
                 raise ProblemException(
                     status=409,
                     code="CREDENTIAL_STATUS_CONFLICT",
                     title="凭据状态不能再次变更",
-                    detail="历史凭据不能重新激活或重复撤销。",
+                    detail="凭据不能重新激活、降级、重复撤销或从终态回退。",
                 )
             secret.status = request.status
             secret.status_reason_code = request.reason_code
@@ -1688,28 +1809,84 @@ class CredentialService:
                 secret.revoked_at = now
             else:
                 secret.compromised_at = now
-            if datasource.current_secret_id == secret.id:
+            if is_current_secret:
                 datasource.status = "DISABLED"
                 datasource.row_version += 1
                 datasource.updated_at = now
-            affected = list(
-                session.scalars(
-                    select(Execution)
-                    .where(
-                        Execution.process_state.not_in(_TERMINAL_EXECUTION_STATES),
-                        (
-                            (Execution.source_secret_id == secret.id)
-                            | (Execution.target_secret_id == secret.id)
-                        ),
-                    )
-                    .with_for_update()
+            # Re-scan after the datasource gate.  The initial scan follows
+            # the global Work -> Organization -> Project -> Datasource order;
+            # this second pass intentionally does *not* take Work row locks.
+            # Taking those locks after Datasource would invert the Worker
+            # claim order and can deadlock an emergency revocation.  New
+            # execution/probe producers now lock their Datasource before
+            # enqueueing, and claimers re-check the durable request after
+            # their Datasource/credential gate, so this non-locking read is
+            # enough to turn every interleaving into a durable stop.
+            affected_executions: list[Execution] = []
+            affected_probes: list[RecoveryProbe] = []
+            if emergency_stop:
+                affected_executions, affected_probes = self._find_bound_work_for_secret(
+                    session,
+                    secret_id=secret.id,
                 )
-            )
-            for execution in affected:
-                execution.queue_eligibility_state = "BLOCKED"
-                execution.queue_block_reason = f"CREDENTIAL_{request.status}"
-                execution.queue_state_changed_at = now
-                execution.state_version += 1
+                if is_current_secret:
+                    # The first lock pass covers the work that had not bound
+                    # a secret when the status change began.  A current
+                    # secret's emergency terminal status is also a durable
+                    # stop for those queued execution/probe intentions; they
+                    # cannot safely remain RESERVED/REMEDIATION_SUBMITTED and
+                    # wait for a secret that has just become unusable.
+                    late_queued_executions, late_queued_probes = (
+                        self._find_queued_work_for_current_secret_status(
+                            session,
+                            datasource_id=datasource.id,
+                        )
+                    )
+                    affected_executions = list(
+                        {
+                            execution.id: execution
+                            for execution in [
+                                *affected_executions,
+                                *locked_executions,
+                                *late_queued_executions,
+                            ]
+                        }.values()
+                    )
+                    affected_probes = list(
+                        {
+                            probe.id: probe
+                            for probe in [
+                                *affected_probes,
+                                *locked_probes,
+                                *late_queued_probes,
+                            ]
+                        }.values()
+                    )
+            termination_requests: list[WorkTerminationRequest] = []
+            if emergency_stop:
+                reason_code = f"SECRET_{request.status}"
+                for execution in affected_executions:
+                    termination_requests.append(
+                        ControlService._ensure_work_termination_request(  # noqa: SLF001
+                            session,
+                            work_kind="EXECUTION",
+                            work_id=execution.id,
+                            reason_code=reason_code,
+                            credential_secret_id=secret.id,
+                            now=now,
+                        )
+                    )
+                for probe in affected_probes:
+                    termination_requests.append(
+                        ControlService._ensure_work_termination_request(  # noqa: SLF001
+                            session,
+                            work_kind="RECOVERY_PROBE",
+                            work_id=probe.id,
+                            reason_code=reason_code,
+                            credential_secret_id=secret.id,
+                            now=now,
+                        )
+                    )
             self._append_audit(
                 session,
                 organization=organization,
@@ -1719,12 +1896,24 @@ class CredentialService:
                 target_type="DATASOURCE",
                 target_id=datasource.id,
                 target_name=datasource.name,
-                changed_fields=["credential_status", "datasource_status"],
+                changed_fields=[
+                    "credential_status",
+                    "datasource_status",
+                    *(
+                        ["work_termination_requests"]
+                        if termination_requests
+                        else []
+                    ),
+                ],
                 audit=audit,
                 metadata={
                     "secret_version": secret.secret_version,
                     "reason_code": request.reason_code,
-                    "affected_nonterminal_execution_count": len(affected),
+                    "affected_nonterminal_execution_count": len(affected_executions),
+                    "affected_nonterminal_recovery_probe_count": len(affected_probes),
+                    "termination_request_ids": [
+                        str(item.id) for item in termination_requests
+                    ],
                 },
             )
             response = self._secret_summary(session, secret)
@@ -3650,19 +3839,202 @@ class CredentialService:
         principal: Principal,
         datasource_id: UUID,
     ) -> tuple[Datasource, Project, Organization]:
+        # Every mutating datasource path follows Organization -> Project ->
+        # Datasource.  Worker claim takes its work row before Datasource; the
+        # emergency status path does the same.  Keeping all API control paths
+        # on this order avoids a status/rotation/delete deadlock that would
+        # make an emergency revocation randomly roll back.
+        project_id = session.scalar(
+            select(Datasource.project_id)
+            .join(Project, Project.id == Datasource.project_id)
+            .where(
+                Datasource.id == datasource_id,
+                Project.organization_id == principal.organization_id,
+            )
+        )
+        if project_id is None:
+            self._not_found()
+        if (
+            not principal.is_admin
+            and project_id not in self._visible_project_ids(principal)
+        ):
+            self._not_found()
+        organization = self._lock_organization(session, principal.organization_id)
+        project = session.scalar(
+            select(Project)
+            .where(
+                Project.id == project_id,
+                Project.organization_id == principal.organization_id,
+            )
+            .with_for_update()
+        )
+        if project is None:
+            self._not_found()
         datasource = session.scalar(
-            select(Datasource).where(Datasource.id == datasource_id).with_for_update()
+            select(Datasource)
+            .where(
+                Datasource.id == datasource_id,
+                Datasource.project_id == project.id,
+            )
+            .with_for_update()
         )
         if datasource is None:
             self._not_found()
-        project = self._visible_project(
-            session,
-            principal,
-            datasource.project_id,
-            lock=True,
-        )
-        organization = self._lock_organization(session, project.organization_id)
         return datasource, project, organization
+
+    @staticmethod
+    def _lock_potential_work_for_secret_status(
+        session: Session,
+        *,
+        secret_id: UUID,
+        datasource_id: UUID,
+    ) -> tuple[list[Execution], list[RecoveryProbe]]:
+        """Lock work affected by an emergency secret status change.
+
+        A queued work item deliberately has no CredentialSecret binding until
+        the Worker claims it.  Its immutable datasource revision is therefore
+        the only durable link to a *current* secret emergency.  Bound work is
+        still selected by exact secret ID so revoking a retired secret keeps
+        its existing active-work stop behavior without cancelling unrelated
+        queued work.
+
+        The caller always acquires Execution rows before RecoveryProbe rows,
+        both in UUID order, before it locks Organization/Project/Datasource.
+        That matches Worker claim writers and makes the current-secret
+        decision after the datasource lock safe to apply to the rows held by
+        this transaction.
+        """
+
+        revision_ids = select(DatasourceRevision.id).where(
+            DatasourceRevision.datasource_id == datasource_id
+        )
+        queued_execution_reference = and_(
+            Execution.process_state == "QUEUED",
+            Execution.active_attempt_id.is_(None),
+            or_(
+                Execution.source_datasource_revision_id.in_(revision_ids),
+                Execution.target_datasource_revision_id.in_(revision_ids),
+            ),
+        )
+        bound_execution_reference = and_(
+            Execution.process_state.not_in(_TERMINAL_EXECUTION_STATES),
+            or_(
+                Execution.source_secret_id == secret_id,
+                Execution.target_secret_id == secret_id,
+            ),
+        )
+        executions = list(
+            session.scalars(
+                select(Execution)
+                .where(or_(bound_execution_reference, queued_execution_reference))
+                .order_by(Execution.id)
+                .with_for_update()
+            )
+        )
+
+        queued_probe_reference = and_(
+            RecoveryProbe.process_state == "QUEUED",
+            RecoveryProbe.active_attempt_id.is_(None),
+            RecoveryProbe.target_datasource_revision_id.in_(revision_ids),
+        )
+        bound_probe_reference = and_(
+            RecoveryProbe.process_state.in_(_ACTIVE_RECOVERY_PROBE_STATES),
+            RecoveryProbe.target_secret_id == secret_id,
+        )
+        probes = list(
+            session.scalars(
+                select(RecoveryProbe)
+                .where(or_(bound_probe_reference, queued_probe_reference))
+                .order_by(RecoveryProbe.id)
+                .with_for_update()
+            )
+        )
+        return executions, probes
+
+    @staticmethod
+    def _find_bound_work_for_secret(
+        session: Session,
+        *,
+        secret_id: UUID,
+    ) -> tuple[list[Execution], list[RecoveryProbe]]:
+        """Read bound work after the datasource gate without reversing locks.
+
+        The emergency path already locked all work visible before it acquired
+        Organization/Project/Datasource.  This second read only discovers a
+        Worker that won that first Work-row race and committed a binding before
+        the datasource gate.  It must stay non-locking: Work -> Datasource is
+        the global ordering, and Datasource -> Work would deadlock a concurrent
+        claim.  The Worker re-checks the resulting durable request before it
+        can start or block the queue item.
+        """
+
+        executions = list(
+            session.scalars(
+                select(Execution)
+                .where(
+                    Execution.process_state.not_in(_TERMINAL_EXECUTION_STATES),
+                    (Execution.source_secret_id == secret_id)
+                    | (Execution.target_secret_id == secret_id),
+                )
+                .order_by(Execution.id)
+            )
+        )
+        probes = list(
+            session.scalars(
+                select(RecoveryProbe)
+                .where(
+                    RecoveryProbe.process_state.in_(_ACTIVE_RECOVERY_PROBE_STATES),
+                    RecoveryProbe.target_secret_id == secret_id,
+                )
+                .order_by(RecoveryProbe.id)
+            )
+        )
+        return executions, probes
+
+    @staticmethod
+    def _find_queued_work_for_current_secret_status(
+        session: Session,
+        *,
+        datasource_id: UUID,
+    ) -> tuple[list[Execution], list[RecoveryProbe]]:
+        """Find queued work created before the current datasource gate closed.
+
+        This is intentionally a non-locking read.  All execution/probe
+        producers serialize on the datasource row before enqueueing, so once
+        the emergency transition holds that row no later producer can commit
+        a new queue intention.  Locking Work rows here would invert the
+        Worker claim's Work -> Datasource order.
+        """
+
+        revision_ids = select(DatasourceRevision.id).where(
+            DatasourceRevision.datasource_id == datasource_id
+        )
+        executions = list(
+            session.scalars(
+                select(Execution)
+                .where(
+                    Execution.process_state == "QUEUED",
+                    Execution.active_attempt_id.is_(None),
+                    or_(
+                        Execution.source_datasource_revision_id.in_(revision_ids),
+                        Execution.target_datasource_revision_id.in_(revision_ids),
+                    ),
+                )
+                .order_by(Execution.id)
+            )
+        )
+        probes = list(
+            session.scalars(
+                select(RecoveryProbe)
+                .where(
+                    RecoveryProbe.process_state == "QUEUED",
+                    RecoveryProbe.active_attempt_id.is_(None),
+                    RecoveryProbe.target_datasource_revision_id.in_(revision_ids),
+                )
+                .order_by(RecoveryProbe.id)
+            )
+        )
+        return executions, probes
 
     def _lock_admin_datasource_context(
         self,
@@ -3706,6 +4078,17 @@ class CredentialService:
         if datasource is None:
             self._not_found()
         return datasource, project, organization
+
+    @staticmethod
+    def _database_now(session: Session) -> datetime:
+        """Return the transaction database clock as an aware UTC instant."""
+
+        value = session.scalar(select(func.current_timestamp()))
+        if not isinstance(value, datetime):
+            raise RuntimeError("database did not return current timestamp")
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=UTC)
+        return value.astimezone(UTC)
 
     def _datasource_active_reference(
         self,

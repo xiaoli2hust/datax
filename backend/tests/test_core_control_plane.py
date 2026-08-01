@@ -39,6 +39,7 @@ from datax_studio.core.db import (
     Execution,
     ExecutionAttempt,
     ExecutionCancelRequest,
+    ExecutionEvent,
     JobVersion,
     PhysicalEndpointIdentity,
     Project,
@@ -49,6 +50,7 @@ from datax_studio.core.db import (
     TargetCopyLock,
     TargetNamespace,
     TransferPolicy,
+    WorkTerminationRequest,
 )
 from datax_studio.core.schemas import (
     ClaimedExecution,
@@ -61,17 +63,19 @@ from datax_studio.core.service import (
     ValidationMaterial,
     _filtered_cursor_scope,
 )
+from datax_studio.credentials.db import CredentialSecret
 from datax_studio.credentials.routes import get_credential_service
 from datax_studio.plugin_certification import (
     CertifiedDependency,
     ExplicitTestPluginCertificationSource,
     PluginCertificationRecord,
+    ordinary_user_execution_block_reasons,
 )
 from datax_studio.recovery.db import RecoveryGate
 from datax_studio.schema_snapshot import schema_snapshot_hash
 from datax_studio.settings import Settings
 from datax_studio.worker.process import ProcessAction
-from datax_studio.worker.reconcile import WorkerReconciler
+from datax_studio.worker.reconcile import RuntimeIdentity, WorkerReconciler
 
 
 @dataclass(frozen=True)
@@ -96,6 +100,86 @@ class PublishedJob:
     target_datasource_revision_id: UUID
     target_endpoint_policy_revision_id: UUID
     target_table_identity_hash: str
+
+
+class _TrustedReleaseRecordTestSource:
+    """Test-only stand-in for a future trusted reader; never wired from settings."""
+
+    def __init__(
+        self,
+        *,
+        current_candidate_id: str,
+        current_candidate_commit: str,
+        current_worker_image_digest: str,
+        records: dict[str, PluginCertificationRecord],
+    ) -> None:
+        self.current_candidate_id = current_candidate_id
+        self.current_candidate_commit = current_candidate_commit
+        self.current_worker_image_digest = current_worker_image_digest
+        self._records = dict(records)
+
+    def get_record(self, plugin_name: str) -> PluginCertificationRecord | None:
+        return self._records.get(plugin_name)
+
+    def require_job_version(
+        self,
+        *,
+        version: JobVersion,
+        now: datetime,
+    ) -> tuple[PluginCertificationRecord, PluginCertificationRecord]:
+        reader = self.get_record(version.reader_plugin_name)
+        writer = self.get_record(version.writer_plugin_name)
+        reasons: list[str] = []
+        if version.datax_release != "datax_v202309":
+            reasons.append("DATAX_RELEASE_MISMATCH")
+        for record, expected_name, expected_hash, missing_reason in (
+            (
+                reader,
+                version.reader_plugin_name,
+                version.reader_plugin_sha256,
+                "READER_CERTIFICATION_MISSING",
+            ),
+            (
+                writer,
+                version.writer_plugin_name,
+                version.writer_plugin_sha256,
+                "WRITER_CERTIFICATION_MISSING",
+            ),
+        ):
+            if record is None:
+                reasons.append(missing_reason)
+            else:
+                reasons.extend(
+                    ordinary_user_execution_block_reasons(
+                        record,
+                        expected_plugin_name=expected_name,
+                        expected_plugin_sha256=expected_hash,
+                        expected_runtime_sha256=version.runtime_sha256,
+                        current_candidate_id=self.current_candidate_id,
+                        current_candidate_commit=self.current_candidate_commit,
+                        current_worker_image_digest=self.current_worker_image_digest,
+                        now=now,
+                    )
+                )
+        if reader is not None and writer is not None:
+            if reader.candidate_id != writer.candidate_id:
+                reasons.append("PAIR_CANDIDATE_ID_MISMATCH")
+            if reader.candidate_commit != writer.candidate_commit:
+                reasons.append("PAIR_CANDIDATE_COMMIT_MISMATCH")
+            if reader.worker_image_digest != writer.worker_image_digest:
+                reasons.append("PAIR_WORKER_IMAGE_MISMATCH")
+            if reader.release_promotion_ref != writer.release_promotion_ref:
+                reasons.append("PAIR_RELEASE_PROMOTION_MISMATCH")
+        if reasons:
+            raise ProblemException(
+                status=409,
+                code="PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED",
+                title="test-only trusted record is blocked",
+                detail="test-only trusted record is blocked",
+                details={"block_reasons": list(dict.fromkeys(reasons))},
+            )
+        assert reader is not None and writer is not None
+        return reader, writer
 
 
 _TEST_CANDIDATE_ID = "test-candidate-0001"
@@ -129,7 +213,6 @@ def _explicit_test_plugin_certification(
             name: PluginCertificationRecord(
                 plugin_name=name,  # type: ignore[arg-type]
                 certification_state="WINDOWS_E4_CERTIFIED",
-                ordinary_user_executable=True,
                 source="TEST_INJECTION",
                 candidate_id=_TEST_CANDIDATE_ID,
                 candidate_commit=_TEST_CANDIDATE_COMMIT,
@@ -138,6 +221,7 @@ def _explicit_test_plugin_certification(
                 plugin_sha256=plugin_sha256,
                 e3_evidence_ref=f"test/e3/{name}",
                 windows_e4_evidence_ref=f"test/windows-e4/{name}",
+                release_promotion_ref="test/release-promotion/test-candidate-0001",
                 dependency_inventory_ref=f"test/dependencies/{name}",
                 license_review_ref=f"test/licenses/{name}",
                 dependencies=(dependency,),
@@ -164,6 +248,112 @@ def _test_plugin_certification_with_override(
         current_worker_image_digest=_TEST_WORKER_IMAGE,
         records=records,
     )
+
+
+def _trusted_release_plugin_certification(
+    *,
+    release_promotion_ref: str | None,
+) -> _TrustedReleaseRecordTestSource:
+    """Create test data for a future reader without adding a production reader."""
+
+    base = _explicit_test_plugin_certification()
+    records: dict[str, PluginCertificationRecord] = {}
+    for name in _TEST_PLUGIN_HASHES:
+        record = base.get_record(name)
+        assert record is not None
+        records[name] = replace(
+            record,
+            source="TRUSTED_RELEASE_ATTESTATION",
+            release_promotion_ref=release_promotion_ref,
+        )
+    return _TrustedReleaseRecordTestSource(
+        current_candidate_id=_TEST_CANDIDATE_ID,
+        current_candidate_commit=_TEST_CANDIDATE_COMMIT,
+        current_worker_image_digest=_TEST_WORKER_IMAGE,
+        records=records,
+    )
+
+
+def _seed_ready_plugin_runtime(core_stack: CoreStack) -> None:
+    """Install the minimal current Worker attestation required by /plugins."""
+
+    now = datetime.now(UTC)
+    reconcile_epoch = uuid4()
+    with core_stack.sessions.begin() as session:
+        control = session.get(SystemControl, 1)
+        assert control is not None
+        control.host_boot_id = "boot-test"
+        control.reconcile_epoch = reconcile_epoch
+        control.reconciled_at = now
+        session.execute(
+            text(
+                """
+                CREATE TABLE worker_heartbeats (
+                    worker_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    runtime_code TEXT NOT NULL,
+                    oracle_code TEXT NOT NULL,
+                    datax_release TEXT,
+                    runtime_sha256 TEXT,
+                    mysqlreader_plugin_sha256 TEXT,
+                    postgresqlreader_plugin_sha256 TEXT,
+                    mysqlwriter_plugin_sha256 TEXT,
+                    postgresqlwriter_plugin_sha256 TEXT,
+                    host_boot_id TEXT,
+                    reconcile_epoch CHAR(32),
+                    reconciled_at DATETIME,
+                    updated_at DATETIME NOT NULL
+                )
+                """
+            )
+        )
+        session.execute(
+            text(
+                """
+                INSERT INTO worker_heartbeats (
+                    worker_id,
+                    status,
+                    runtime_code,
+                    oracle_code,
+                    datax_release,
+                    runtime_sha256,
+                    mysqlreader_plugin_sha256,
+                    postgresqlreader_plugin_sha256,
+                    mysqlwriter_plugin_sha256,
+                    postgresqlwriter_plugin_sha256,
+                    host_boot_id,
+                    reconcile_epoch,
+                    reconciled_at,
+                    updated_at
+                ) VALUES (
+                    'worker-1',
+                    'READY',
+                    'RUNTIME_OK',
+                    'ORACLE_OK',
+                    'datax_v202309',
+                    :runtime_sha256,
+                    :mysqlreader,
+                    :postgresqlreader,
+                    :mysqlwriter,
+                    :postgresqlwriter,
+                    'boot-test',
+                    :reconcile_epoch,
+                    :reconciled_at,
+                    :updated_at
+                )
+                """
+            ),
+            {
+                "runtime_sha256": _TEST_RUNTIME_SHA256,
+                "mysqlreader": _TEST_PLUGIN_HASHES["mysqlreader"],
+                "postgresqlreader": _TEST_PLUGIN_HASHES["postgresqlreader"],
+                "mysqlwriter": _TEST_PLUGIN_HASHES["mysqlwriter"],
+                "postgresqlwriter": _TEST_PLUGIN_HASHES["postgresqlwriter"],
+                "reconcile_epoch": reconcile_epoch.hex,
+                "reconciled_at": now,
+                "updated_at": now,
+            },
+        )
 
 
 @pytest.fixture
@@ -846,8 +1036,427 @@ def test_success_transition_refuses_accepted_cancel_and_worker_finishes_canceled
                 ExecutionCancelRequest.execution_id == execution_id
             )
         )
-        assert cancel_request is not None
-        assert cancel_request.status == "COMPLETED"
+    assert cancel_request is not None
+    assert cancel_request.status == "COMPLETED"
+
+
+def test_target_revoke_creates_durable_stop_and_wins_over_operator_cancel(
+    core_stack: CoreStack,
+) -> None:
+    published = _seed_published_job(core_stack, "termination-revoke")
+    created = core_stack.client.post(
+        f"/api/v1/jobs/{published.job_id}/executions",
+        headers={"Idempotency-Key": "termination-revoke-execution-001"},
+        json=_execution_request(published.job_version_id),
+    )
+    assert created.status_code == 202, created.text
+    execution_id = UUID(created.json()["id"])
+    claim = core_stack.service.claim_next_execution(
+        worker_id="worker-termination-revoke",
+        host_boot_id="boot-termination-revoke",
+        cgroup_identity="container:termination-revoke",
+        credential_selector=_credential_selector(
+            published,
+            CredentialBinding(
+                source_secret_id=published.source_secret_id,
+                target_secret_id=published.target_secret_id,
+                source_secret_envelope_id=uuid4(),
+                target_secret_envelope_id=uuid4(),
+                source_secret_version=1,
+                target_secret_version=1,
+            ),
+        ),
+    )
+    assert claim is not None
+    cancel = core_stack.client.post(
+        f"/api/v1/executions/{execution_id}/cancel",
+        headers={"Idempotency-Key": "termination-revoke-cancel-001"},
+        json={"reason": "operator cancellation races safety stop"},
+    )
+    assert cancel.status_code == 202, cancel.text
+    revoke = core_stack.client.post(
+        f"/api/v1/executions/{execution_id}/target-exclusivity/revoke",
+        headers={"Idempotency-Key": "termination-revoke-001"},
+        json={
+            "statement_version": "1.0",
+            "responsible_party": "DBA",
+            "reason": "EXTERNAL_DML_DDL_REPORTED",
+            "reported_at": datetime.now(UTC).isoformat(),
+            "note": "A reported external write invalidated the target window.",
+        },
+    )
+    assert revoke.status_code == 202, revoke.text
+
+    reconciler = WorkerReconciler(
+        control=core_stack.service,
+        sessions=core_stack.sessions,
+    )
+    assert reconciler.poll_claim_action(claim) == ProcessAction.TERMINATE
+    reconciler.complete_claimed_termination(claim=claim, oracle_started=False)
+
+    execution = core_stack.client.get(f"/api/v1/executions/{execution_id}").json()
+    assert execution["process_state"] == "FAILED"
+    assert execution["data_effect"] == "NONE"
+    assert execution["verification_state"] == "NOT_STARTED"
+    assert execution["failure_code"] == "TARGET_EXCLUSIVITY_BROKEN"
+    assert execution["target_copy_lock"]["state"] == "RECOVERY_REQUIRED"
+    with core_stack.sessions() as session:
+        termination = session.scalar(
+            select(WorkTerminationRequest).where(
+                WorkTerminationRequest.work_kind == "EXECUTION",
+                WorkTerminationRequest.work_id == execution_id,
+            )
+        )
+        cancel_request = session.scalar(
+            select(ExecutionCancelRequest).where(
+                ExecutionCancelRequest.execution_id == execution_id,
+            )
+        )
+        gate = session.scalar(
+            select(RecoveryGate).where(RecoveryGate.execution_id == execution_id)
+        )
+        assert termination is not None
+        assert termination.reason_code == "TARGET_EXCLUSIVITY_REVOKED"
+        assert termination.status == "COMPLETED"
+        assert cancel_request is not None and cancel_request.status == "REJECTED"
+        assert gate is not None and gate.status == "OPEN"
+
+
+def test_expired_target_window_terminates_claim_before_datax_starts(
+    core_stack: CoreStack,
+) -> None:
+    published = _seed_published_job(core_stack, "termination-expiry")
+    created = core_stack.client.post(
+        f"/api/v1/jobs/{published.job_id}/executions",
+        headers={"Idempotency-Key": "termination-expiry-execution-001"},
+        json=_execution_request(published.job_version_id),
+    )
+    assert created.status_code == 202, created.text
+    execution_id = UUID(created.json()["id"])
+    claim = core_stack.service.claim_next_execution(
+        worker_id="worker-termination-expiry",
+        host_boot_id="boot-termination-expiry",
+        cgroup_identity="container:termination-expiry",
+        credential_selector=_credential_selector(
+            published,
+            CredentialBinding(
+                source_secret_id=published.source_secret_id,
+                target_secret_id=published.target_secret_id,
+                source_secret_envelope_id=uuid4(),
+                target_secret_envelope_id=uuid4(),
+                source_secret_version=1,
+                target_secret_version=1,
+            ),
+        ),
+    )
+    assert claim is not None
+    with core_stack.sessions.begin() as session:
+        execution = session.get(Execution, execution_id)
+        assert execution is not None
+        confirmation = dict(execution.target_exclusivity_confirmation)
+        confirmation["valid_until"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+        execution.target_exclusivity_confirmation = confirmation
+
+    reconciler = WorkerReconciler(
+        control=core_stack.service,
+        sessions=core_stack.sessions,
+    )
+    assert reconciler.poll_claim_action(claim) == ProcessAction.TERMINATE
+    reconciler.complete_claimed_termination(claim=claim, oracle_started=False)
+
+    with core_stack.sessions() as session:
+        termination = session.scalar(
+            select(WorkTerminationRequest).where(
+                WorkTerminationRequest.work_kind == "EXECUTION",
+                WorkTerminationRequest.work_id == execution_id,
+            )
+        )
+        execution = session.get(Execution, execution_id)
+        assert termination is not None
+        assert termination.reason_code == "TARGET_EXCLUSIVITY_EXPIRED"
+        assert termination.status == "COMPLETED"
+        assert execution is not None
+        assert execution.target_exclusivity_status == "EXPIRED"
+        assert execution.process_state == "FAILED"
+
+
+@pytest.mark.parametrize(
+    ("boundary", "expected_code"),
+    [
+        ("PREFLIGHT", "TARGET_EXCLUSIVITY_NOT_ACTIVE"),
+        ("RUNNING", "TARGET_EXCLUSIVITY_NOT_ACTIVE"),
+        ("ORACLE", "WORK_TERMINATION_PENDING"),
+    ],
+)
+def test_elapsed_target_window_is_durable_at_every_admission_boundary(
+    core_stack: CoreStack,
+    boundary: str,
+    expected_code: str,
+) -> None:
+    published = _seed_published_job(core_stack, f"expiry-{boundary.lower()}")
+    created = core_stack.client.post(
+        f"/api/v1/jobs/{published.job_id}/executions",
+        headers={"Idempotency-Key": f"expiry-{boundary.lower()}-001"},
+        json=_execution_request(published.job_version_id),
+    )
+    assert created.status_code == 202, created.text
+    execution_id = UUID(created.json()["id"])
+    claim = core_stack.service.claim_next_execution(
+        worker_id=f"worker-expiry-{boundary.lower()}",
+        host_boot_id=f"boot-expiry-{boundary.lower()}",
+        cgroup_identity=f"container:expiry-{boundary.lower()}",
+        credential_selector=_credential_selector(
+            published,
+            CredentialBinding(
+                source_secret_id=published.source_secret_id,
+                target_secret_id=published.target_secret_id,
+                source_secret_envelope_id=uuid4(),
+                target_secret_envelope_id=uuid4(),
+                source_secret_version=1,
+                target_secret_version=1,
+            ),
+        ),
+    )
+    assert claim is not None
+    runtime_preflight = _runtime_preflight(published)
+    evidence_validator = _preflight_evidence_validator(
+        published,
+        claim,
+        runtime_preflight,
+    )
+    if boundary != "PREFLIGHT":
+        core_stack.service.record_claimed_preflight(
+            claim=claim,
+            runtime_preflight=runtime_preflight,
+            evidence_validator=evidence_validator,
+        )
+    if boundary == "ORACLE":
+        core_stack.service.transition_claimed_execution(
+            claim=claim,
+            expected_state="STARTING",
+            new_state="RUNNING",
+            data_effect="NONE",
+            verification_state="NOT_STARTED",
+        )
+        core_stack.service.transition_claimed_execution(
+            claim=claim,
+            expected_state="RUNNING",
+            new_state="VERIFYING",
+            data_effect="POSSIBLE",
+            verification_state="NOT_STARTED",
+            exit_code=0,
+            summary_parse_status="FAILED",
+        )
+    with core_stack.sessions.begin() as session:
+        execution = session.get(Execution, execution_id)
+        assert execution is not None
+        confirmation = dict(execution.target_exclusivity_confirmation)
+        confirmation["valid_until"] = (
+            datetime.now(UTC) - timedelta(seconds=1)
+        ).isoformat()
+        execution.target_exclusivity_confirmation = confirmation
+
+    with pytest.raises(ProblemException) as blocked:
+        if boundary == "PREFLIGHT":
+            core_stack.service.record_claimed_preflight(
+                claim=claim,
+                runtime_preflight=runtime_preflight,
+                evidence_validator=evidence_validator,
+            )
+        elif boundary == "RUNNING":
+            core_stack.service.transition_claimed_execution(
+                claim=claim,
+                expected_state="STARTING",
+                new_state="RUNNING",
+                data_effect="NONE",
+                verification_state="NOT_STARTED",
+            )
+        else:
+            core_stack.service.mark_claimed_oracle_started(claim=claim)
+    assert blocked.value.code == expected_code
+
+    with core_stack.sessions() as session:
+        termination = session.scalar(
+            select(WorkTerminationRequest).where(
+                WorkTerminationRequest.work_kind == "EXECUTION",
+                WorkTerminationRequest.work_id == execution_id,
+            )
+        )
+        execution = session.get(Execution, execution_id)
+        assert termination is not None and termination.status == "PENDING"
+        assert execution is not None
+        assert execution.target_exclusivity_status == "EXPIRED"
+
+    WorkerReconciler(
+        control=core_stack.service,
+        sessions=core_stack.sessions,
+    ).complete_claimed_termination(claim=claim, oracle_started=False)
+    terminal = core_stack.client.get(f"/api/v1/executions/{execution_id}").json()
+    assert terminal["process_state"] == "FAILED"
+    assert terminal["failure_code"] == "TARGET_EXCLUSIVITY_BROKEN"
+
+
+def test_idle_expired_target_window_is_reconciled_without_claim_attempt(
+    core_stack: CoreStack,
+) -> None:
+    published = _seed_published_job(core_stack, "idle-termination-expiry")
+    created = core_stack.client.post(
+        f"/api/v1/jobs/{published.job_id}/executions",
+        headers={"Idempotency-Key": "idle-termination-expiry-execution-001"},
+        json=_execution_request(published.job_version_id),
+    )
+    assert created.status_code == 202, created.text
+    execution_id = UUID(created.json()["id"])
+    with core_stack.sessions.begin() as session:
+        execution = session.get(Execution, execution_id)
+        assert execution is not None
+        confirmation = dict(execution.target_exclusivity_confirmation)
+        confirmation["valid_until"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
+        execution.target_exclusivity_confirmation = confirmation
+
+    reconciler = WorkerReconciler(
+        control=core_stack.service,
+        sessions=core_stack.sessions,
+    )
+    assert (
+        reconciler.reconcile_pending_work_terminations(
+            identity=RuntimeIdentity(
+                host_boot_id="idle-expiry-boot",
+                cgroup_identity="idle-expiry-cgroup",
+            )
+        )
+        == 1
+    )
+
+    with core_stack.sessions() as session:
+        execution = session.get(Execution, execution_id)
+        lock = session.scalar(
+            select(TargetCopyLock).where(TargetCopyLock.execution_id == execution_id)
+        )
+        termination = session.scalar(
+            select(WorkTerminationRequest).where(
+                WorkTerminationRequest.work_kind == "EXECUTION",
+                WorkTerminationRequest.work_id == execution_id,
+            )
+        )
+        assert execution is not None
+        assert execution.process_state == "CANCELED"
+        assert execution.target_exclusivity_status == "EXPIRED"
+        assert execution.failure_code == "TARGET_EXCLUSIVITY_BROKEN"
+        assert lock is not None and lock.state == "RELEASED"
+        assert termination is not None
+        assert termination.reason_code == "TARGET_EXCLUSIVITY_EXPIRED"
+        assert termination.status == "COMPLETED"
+
+
+def test_expired_worker_keeps_safety_stop_above_operator_cancel(
+    core_stack: CoreStack,
+) -> None:
+    published = _seed_published_job(core_stack, "termination-lease-fallback")
+    created = core_stack.client.post(
+        f"/api/v1/jobs/{published.job_id}/executions",
+        headers={"Idempotency-Key": "termination-lease-fallback-execution-001"},
+        json=_execution_request(published.job_version_id),
+    )
+    assert created.status_code == 202, created.text
+    execution_id = UUID(created.json()["id"])
+    claim = core_stack.service.claim_next_execution(
+        worker_id="worker-termination-lease-fallback",
+        host_boot_id="boot-termination-lease-fallback",
+        cgroup_identity="container:termination-lease-fallback",
+        credential_selector=_credential_selector(
+            published,
+            CredentialBinding(
+                source_secret_id=published.source_secret_id,
+                target_secret_id=published.target_secret_id,
+                source_secret_envelope_id=uuid4(),
+                target_secret_envelope_id=uuid4(),
+                source_secret_version=1,
+                target_secret_version=1,
+            ),
+        ),
+    )
+    assert claim is not None
+    with core_stack.sessions() as session:
+        initial_attempt = session.get(ExecutionAttempt, claim.attempt_id)
+        assert initial_attempt is not None
+        original_lease_expires_at = initial_attempt.lease_expires_at
+    cancel = core_stack.client.post(
+        f"/api/v1/executions/{execution_id}/cancel",
+        headers={"Idempotency-Key": "termination-lease-fallback-cancel-001"},
+        json={"reason": "operator cancellation races a safety stop"},
+    )
+    assert cancel.status_code == 202, cancel.text
+    revoke = core_stack.client.post(
+        f"/api/v1/executions/{execution_id}/target-exclusivity/revoke",
+        headers={"Idempotency-Key": "termination-lease-fallback-revoke-001"},
+        json={
+            "statement_version": "1.0",
+            "responsible_party": "DBA",
+            "reason": "EXTERNAL_DML_DDL_REPORTED",
+            "reported_at": datetime.now(UTC).isoformat(),
+            "note": "A reported external write invalidated the target window.",
+        },
+    )
+    assert revoke.status_code == 202, revoke.text
+    with pytest.raises(ProblemException) as termination_pending:
+        core_stack.service.heartbeat_execution(claim=claim)
+    assert termination_pending.value.code == "WORK_TERMINATION_PENDING"
+    with core_stack.sessions.begin() as session:
+        attempt = session.get(ExecutionAttempt, claim.attempt_id)
+        assert attempt is not None
+        assert attempt.lease_expires_at == original_lease_expires_at
+        attempt.lease_expires_at = datetime.now(UTC) - timedelta(seconds=1)
+
+    reconciler = WorkerReconciler(
+        control=core_stack.service,
+        sessions=core_stack.sessions,
+    )
+    assert (
+        reconciler.reconcile_pending_work_terminations(
+            identity=RuntimeIdentity(
+                host_boot_id="different-boot",
+                cgroup_identity="different-cgroup",
+            )
+        )
+        == 1
+    )
+
+    with core_stack.sessions() as session:
+        execution = session.get(Execution, execution_id)
+        attempt = session.get(ExecutionAttempt, claim.attempt_id)
+        termination = session.scalar(
+            select(WorkTerminationRequest).where(
+                WorkTerminationRequest.work_kind == "EXECUTION",
+                WorkTerminationRequest.work_id == execution_id,
+            )
+        )
+        gate = session.scalar(
+            select(RecoveryGate).where(RecoveryGate.execution_id == execution_id)
+        )
+        cancel_request = session.scalar(
+            select(ExecutionCancelRequest).where(
+                ExecutionCancelRequest.execution_id == execution_id,
+            )
+        )
+        lost_event = session.scalar(
+            select(ExecutionEvent)
+            .where(ExecutionEvent.execution_id == execution_id)
+            .order_by(ExecutionEvent.sequence_no.desc())
+        )
+        assert execution is not None and execution.process_state == "LOST"
+        assert execution.failure_code == "TARGET_EXCLUSIVITY_BROKEN"
+        assert attempt is not None and attempt.termination_reason == "TARGET_EXCLUSIVITY_REVOKED"
+        assert gate is not None and gate.reason_code == "TARGET_EXCLUSIVITY_BROKEN"
+        assert termination is not None and termination.status == "COMPLETED"
+        assert termination.acknowledged_at is not None
+        assert cancel_request is not None and cancel_request.status == "REJECTED"
+        assert lost_event is not None and lost_event.event_type == "EXECUTION_LOST"
+        assert lost_event.payload["primary_reason_code"] == "TARGET_EXCLUSIVITY_REVOKED"
+        assert (
+            lost_event.payload["lease_expiry_reason_code"]
+            == "SYSTEM_TERMINATION_LEASE_EXPIRED"
+        )
 
 
 @pytest.mark.parametrize(
@@ -944,20 +1553,20 @@ def test_verification_exclusivity_break_fails_closed_into_recovery_gate(
         assert boundary_broken.value.code == "TARGET_EXCLUSIVITY_BROKEN"
 
     # Even if revoke/expiry wins after the final callback, the SUCCEEDED row
-    # lock atomically commits the safe failed terminal result and returns the
-    # same stable code. EXPIRED_TERMINAL exercises expiry first observed here.
-    with pytest.raises(ProblemException) as terminal_broken:
-        core_stack.service.transition_claimed_execution(
-            claim=claim,
-            expected_state="VERIFYING",
-            new_state="SUCCEEDED",
-            data_effect="CONFIRMED",
-            verification_state="PASSED",
-            exit_code=0,
-            verification_report=oracle_report,
-            verification_evidence_hash=oracle_report["artifact_sha256"],
-        )
-    assert terminal_broken.value.code == "TARGET_EXCLUSIVITY_BROKEN"
+    # lock atomically commits the safe failed terminal result.  The control
+    # method returns normally because the fence and gate are already closed;
+    # callers must not retry the now-cleared claim as another termination.
+    # EXPIRED_TERMINAL exercises expiry first observed at this final point.
+    core_stack.service.transition_claimed_execution(
+        claim=claim,
+        expected_state="VERIFYING",
+        new_state="SUCCEEDED",
+        data_effect="CONFIRMED",
+        verification_state="PASSED",
+        exit_code=0,
+        verification_report=oracle_report,
+        verification_evidence_hash=oracle_report["artifact_sha256"],
+    )
     failed = core_stack.client.get(f"/api/v1/executions/{execution_id}").json()
     assert failed["process_state"] == "FAILED"
     assert failed["data_effect"] == "UNKNOWN"
@@ -973,10 +1582,31 @@ def test_verification_exclusivity_break_fails_closed_into_recovery_gate(
                 RecoveryGate.execution_id == execution_id,
             )
         )
+        attempt = session.get(ExecutionAttempt, claim.attempt_id)
+        termination = session.scalar(
+            select(WorkTerminationRequest).where(
+                WorkTerminationRequest.work_kind == "EXECUTION",
+                WorkTerminationRequest.work_id == execution_id,
+            )
+        )
+        terminal_event = session.scalar(
+            select(ExecutionEvent)
+            .where(ExecutionEvent.execution_id == execution_id)
+            .order_by(ExecutionEvent.sequence_no.desc())
+        )
         assert gate is not None
         assert gate.status == "OPEN"
         assert gate.data_effect_at_open == "UNKNOWN"
         assert gate.reason_code == "TARGET_EXCLUSIVITY_BROKEN"
+        assert attempt is not None
+        assert attempt.termination_reason == (
+            "TARGET_EXCLUSIVITY_REVOKED"
+            if broken_kind == "REVOKED"
+            else "TARGET_EXCLUSIVITY_EXPIRED"
+        )
+        assert termination is not None and termination.status == "COMPLETED"
+        assert terminal_event is not None
+        assert terminal_event.event_type == "EXECUTION_SYSTEM_TERMINATED"
 
 
 @pytest.mark.parametrize(
@@ -2094,6 +2724,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
         "runtime_sha256": _TEST_RUNTIME_SHA256,
         "e3_evidence_ref": "release/e3/mysqlreader.json",
         "windows_e4_evidence_ref": "release/e4/mysqlreader.json",
+        "release_promotion_ref": "release/promotions/test-candidate-0001.json",
         "valid_until": (datetime.now(UTC) + timedelta(days=1)).isoformat(),
     }
     schema_errors = list(validator.iter_errors(e4_contract_probe))
@@ -2145,6 +2776,46 @@ def test_plugins_are_derived_from_current_worker_attestation(
         for error in evidence_timestamp_error.value.errors()
     )
 
+    # Phase-B E4 is a meaningful, public catalog state before a public
+    # release promotion exists. It must remain visibly blocked instead of
+    # being silently downgraded to a pre-E4 state or made executable.
+    e4_contract_probe["evidence"]["valid_until"] = (
+        datetime.now(UTC) + timedelta(days=1)
+    ).isoformat()
+    e4_contract_probe["evidence"]["release_promotion_ref"] = None
+    e4_contract_probe["ordinary_user_executable"] = False
+    e4_contract_probe["block_reasons"] = ["RELEASE_PROMOTION_REQUIRED"]
+    assert list(validator.iter_errors(e4_contract_probe)) == []
+    pre_promotion_manifest = PluginManifest.model_validate_json(
+        json.dumps(e4_contract_probe)
+    )
+    assert pre_promotion_manifest.certification_state == "WINDOWS_E4_CERTIFIED"
+    assert pre_promotion_manifest.ordinary_user_executable is False
+
+    e4_contract_probe["ordinary_user_executable"] = True
+    e4_contract_probe["block_reasons"] = []
+    schema_errors = list(validator.iter_errors(e4_contract_probe))
+    assert any(
+        list(error.absolute_path) == ["evidence", "release_promotion_ref"]
+        and error.validator == "type"
+        for error in schema_errors
+    )
+    with pytest.raises(ValidationError) as promotion_error:
+        PluginManifest.model_validate_json(json.dumps(e4_contract_probe))
+    assert any(
+        error["loc"] == ()
+        and "requires a release promotion reference" in error["msg"]
+        for error in promotion_error.value.errors()
+    )
+
+    e4_contract_probe["evidence"]["release_promotion_ref"] = (
+        "release/promotions/test-candidate-0001.json"
+    )
+    assert list(validator.iter_errors(e4_contract_probe)) == []
+    assert PluginManifest.model_validate_json(
+        json.dumps(e4_contract_probe)
+    ).ordinary_user_executable
+
     production_service = ControlService(
         sessions=core_stack.sessions,
         integrity_hmac_key=b"production-deny-default-test-key",
@@ -2157,6 +2828,89 @@ def test_plugins_are_derived_from_current_worker_attestation(
     }
     assert not any(item.ordinary_user_executable for item in production_catalog.items)
     assert all(item.block_reasons for item in production_catalog.items)
+
+    pre_promotion_service = ControlService(
+        sessions=core_stack.sessions,
+        integrity_hmac_key=b"trusted-e4-pre-promotion-catalog-key",
+        plugin_certification_source=_trusted_release_plugin_certification(
+            release_promotion_ref=None,
+        ),
+    )
+    original_service = core_stack.client.app.state.control_service
+    core_stack.client.app.state.control_service = pre_promotion_service
+    try:
+        pre_promotion_response = core_stack.client.get("/api/v1/plugins")
+    finally:
+        core_stack.client.app.state.control_service = original_service
+    assert pre_promotion_response.status_code == 200, pre_promotion_response.text
+    pre_promotion_payload = pre_promotion_response.json()
+    for item in pre_promotion_payload["items"]:
+        assert item["certification_state"] == "WINDOWS_E4_CERTIFIED"
+        assert item["ordinary_user_executable"] is False
+        assert item["block_reasons"] == ["RELEASE_PROMOTION_REQUIRED"]
+        assert item["evidence"]["release_promotion_ref"] is None
+        assert list(validator.iter_errors(item)) == []
+
+    pre_promotion_job = _seed_published_job(
+        core_stack,
+        "e4-without-public-promotion",
+    )
+    with core_stack.sessions() as session:
+        version = session.get(JobVersion, pre_promotion_job.job_version_id)
+        assert version is not None
+        with pytest.raises(ProblemException) as promotion_blocked:
+            pre_promotion_service.require_job_version_plugin_certification(
+                version=version,
+            )
+    assert promotion_blocked.value.code == "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED"
+    assert promotion_blocked.value.details["block_reasons"] == [
+        "RELEASE_PROMOTION_REQUIRED"
+    ]
+
+    original_service = core_stack.client.app.state.control_service
+    core_stack.client.app.state.control_service = pre_promotion_service
+    try:
+        pre_promotion_create = core_stack.client.post(
+            f"/api/v1/jobs/{pre_promotion_job.job_id}/executions",
+            headers={"Idempotency-Key": "e4-prepromotion-api-gate-001"},
+            json=_execution_request(pre_promotion_job.job_version_id),
+        )
+    finally:
+        core_stack.client.app.state.control_service = original_service
+    assert pre_promotion_create.status_code == 409, pre_promotion_create.text
+    assert pre_promotion_create.json()["details"]["block_reasons"] == [
+        "RELEASE_PROMOTION_REQUIRED"
+    ]
+
+    queued = core_stack.client.post(
+        f"/api/v1/jobs/{pre_promotion_job.job_id}/executions",
+        headers={"Idempotency-Key": "e4-prepromotion-worker-gate-001"},
+        json=_execution_request(pre_promotion_job.job_version_id),
+    )
+    assert queued.status_code == 202, queued.text
+    queued_execution_id = UUID(queued.json()["id"])
+
+    def credential_selector_must_not_run(
+        *_args: object,
+        **_kwargs: object,
+    ) -> CredentialBinding:
+        raise AssertionError("credential selection must remain behind promotion")
+
+    assert (
+        pre_promotion_service.claim_next_execution(
+            worker_id="worker-e4-prepromotion",
+            host_boot_id="boot-e4-prepromotion",
+            cgroup_identity="container:e4-prepromotion",
+            credential_selector=credential_selector_must_not_run,
+        )
+        is None
+    )
+    with core_stack.sessions() as session:
+        queued_execution = session.get(Execution, queued_execution_id)
+        assert queued_execution is not None
+        assert queued_execution.process_state == "QUEUED"
+        assert queued_execution.queue_eligibility_state == "BLOCKED"
+        assert queued_execution.queue_block_reason == "PLUGIN_E4_CERTIFICATION_BLOCKED"
 
     base_source = _explicit_test_plugin_certification()
     damaged_records = {
@@ -2176,7 +2930,6 @@ def test_plugins_are_derived_from_current_worker_attestation(
         mysqlreader_record,
         plugin_name="mysqlwriter",  # type: ignore[arg-type]
         certification_state="PACKAGED",
-        ordinary_user_executable=False,
         candidate_id="bad",
         candidate_commit="bad",
         worker_image_digest="bad",
@@ -2184,6 +2937,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
         plugin_sha256="bad",
         e3_evidence_ref=None,
         windows_e4_evidence_ref=None,
+        release_promotion_ref=None,
         dependency_inventory_ref=None,
         license_review_ref=None,
         dependencies=(damaged_dependency, damaged_dependency),
@@ -2293,12 +3047,123 @@ def test_execution_api_rejects_production_default_without_windows_e4(
 
 
 @pytest.mark.parametrize(
+    "promotion_ref",
+    ["release promotions/not-opaque.json", 123],
+)
+def test_plugin_catalog_redacts_invalid_opaque_promotion_reference(
+    core_stack: CoreStack,
+    promotion_ref: object,
+) -> None:
+    """An untrusted record shape must not turn GET /plugins into a 500."""
+
+    base = _trusted_release_plugin_certification(
+        release_promotion_ref="release/promotions/test-candidate-0001.json",
+    )
+    records: dict[str, PluginCertificationRecord] = {}
+    for name in _TEST_PLUGIN_HASHES:
+        record = base.get_record(name)
+        assert record is not None
+        records[name] = replace(record, release_promotion_ref=promotion_ref)
+    source = _TrustedReleaseRecordTestSource(
+        current_candidate_id=_TEST_CANDIDATE_ID,
+        current_candidate_commit=_TEST_CANDIDATE_COMMIT,
+        current_worker_image_digest=_TEST_WORKER_IMAGE,
+        records=records,
+    )
+    service = ControlService(
+        sessions=core_stack.sessions,
+        integrity_hmac_key=b"invalid-promotion-reference-catalog-key",
+        plugin_certification_source=source,
+    )
+
+    _seed_ready_plugin_runtime(core_stack)
+    original_service = core_stack.client.app.state.control_service
+    core_stack.client.app.state.control_service = service
+    try:
+        response = core_stack.client.get("/api/v1/plugins")
+    finally:
+        core_stack.client.app.state.control_service = original_service
+    assert response.status_code == 200, response.text
+    for item in response.json()["items"]:
+        assert item["certification_state"] == "WINDOWS_E4_CERTIFIED"
+        assert item["ordinary_user_executable"] is False
+        assert item["evidence"]["release_promotion_ref"] is None
+        assert item["block_reasons"] == ["RELEASE_PROMOTION_REF_INVALID"]
+
+    published = _seed_published_job(core_stack, "invalid-promotion-reference")
+    with core_stack.sessions() as session:
+        version = session.get(JobVersion, published.job_version_id)
+        assert version is not None
+        with pytest.raises(ProblemException) as blocked:
+            service.require_job_version_plugin_certification(version=version)
+    assert blocked.value.code == "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED"
+    assert blocked.value.details["block_reasons"] == [
+        "RELEASE_PROMOTION_REF_INVALID"
+    ]
+
+
+def test_plugin_catalog_blocks_mismatched_candidate_promotion_references(
+    core_stack: CoreStack,
+) -> None:
+    base = _trusted_release_plugin_certification(
+        release_promotion_ref="release/promotions/test-candidate-0001-a.json",
+    )
+    records: dict[str, PluginCertificationRecord] = {}
+    for name in _TEST_PLUGIN_HASHES:
+        record = base.get_record(name)
+        assert record is not None
+        records[name] = replace(
+            record,
+            release_promotion_ref=(
+                "release/promotions/test-candidate-0001-b.json"
+                if name == "postgresqlwriter"
+                else record.release_promotion_ref
+            ),
+        )
+    source = _TrustedReleaseRecordTestSource(
+        current_candidate_id=_TEST_CANDIDATE_ID,
+        current_candidate_commit=_TEST_CANDIDATE_COMMIT,
+        current_worker_image_digest=_TEST_WORKER_IMAGE,
+        records=records,
+    )
+    service = ControlService(
+        sessions=core_stack.sessions,
+        integrity_hmac_key=b"mismatched-promotion-reference-catalog-key",
+        plugin_certification_source=source,
+    )
+
+    _seed_ready_plugin_runtime(core_stack)
+    original_service = core_stack.client.app.state.control_service
+    core_stack.client.app.state.control_service = service
+    try:
+        response = core_stack.client.get("/api/v1/plugins")
+    finally:
+        core_stack.client.app.state.control_service = original_service
+    assert response.status_code == 200, response.text
+    for item in response.json()["items"]:
+        assert item["certification_state"] == "WINDOWS_E4_CERTIFIED"
+        assert item["ordinary_user_executable"] is False
+        assert item["evidence"]["release_promotion_ref"] is None
+        assert item["block_reasons"] == ["PAIR_RELEASE_PROMOTION_MISMATCH"]
+
+    published = _seed_published_job(core_stack, "mismatched-promotion-reference")
+    with core_stack.sessions() as session:
+        version = session.get(JobVersion, published.job_version_id)
+        assert version is not None
+        with pytest.raises(ProblemException) as blocked:
+            service.require_job_version_plugin_certification(version=version)
+    assert blocked.value.code == "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED"
+    assert blocked.value.details["block_reasons"] == [
+        "PAIR_RELEASE_PROMOTION_MISMATCH"
+    ]
+
+
+@pytest.mark.parametrize(
     ("changes", "expected_reason"),
     [
         (
             {
                 "certification_state": "PACKAGED",
-                "ordinary_user_executable": False,
             },
             "NOT_WINDOWS_E4_CERTIFIED",
         ),
@@ -2642,6 +3507,34 @@ def _seed_published_job(core_stack: CoreStack, label: str) -> PublishedJob:
                     created_at=now,
                     updated_at=now,
                     row_version=1,
+                ),
+                CredentialSecret(
+                    id=source_secret_id,
+                    datasource_id=source_datasource_id,
+                    secret_version=1,
+                    ciphertext=b"core-control-source-secret",
+                    nonce=b"s" * 12,
+                    data_algorithm="AES-256-GCM",
+                    aad_schema_version="1.0",
+                    status="ACTIVE",
+                    status_reason_code=None,
+                    created_by=core_stack.principal.user_id,
+                    created_at=now,
+                    status_changed_at=now,
+                ),
+                CredentialSecret(
+                    id=target_secret_id,
+                    datasource_id=target_datasource_id,
+                    secret_version=1,
+                    ciphertext=b"core-control-target-secret",
+                    nonce=b"t" * 12,
+                    data_algorithm="AES-256-GCM",
+                    aad_schema_version="1.0",
+                    status="ACTIVE",
+                    status_reason_code=None,
+                    created_by=core_stack.principal.user_id,
+                    created_at=now,
+                    status_changed_at=now,
                 ),
                 DatasourceRevision(
                     id=source_revision_id,

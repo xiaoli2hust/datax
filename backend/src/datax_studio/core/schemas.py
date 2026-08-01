@@ -258,6 +258,12 @@ _PLUGIN_MANIFEST_IDENTITIES: dict[
     ),
 }
 
+_RELEASE_PROMOTION_BLOCK_REASONS = {
+    "RELEASE_PROMOTION_REQUIRED",
+    "RELEASE_PROMOTION_REF_INVALID",
+    "PAIR_RELEASE_PROMOTION_MISMATCH",
+}
+
 
 class HostKind(StrEnum):
     EXACT_FQDN = "EXACT_FQDN"
@@ -426,6 +432,10 @@ class PluginEvidence(StrictModel):
         default=None,
         pattern=r"^[A-Za-z0-9._/:-]{1,300}$",
     )
+    release_promotion_ref: str | None = Field(
+        default=None,
+        pattern=r"^[A-Za-z0-9._/:-]{1,300}$",
+    )
     valid_until: datetime | None = None
 
     @field_validator("valid_until")
@@ -543,10 +553,6 @@ class PluginManifest(StrictModel):
                 "plugin identity must match the locked engine/direction upstream mapping"
             )
         if self.certification_state == "WINDOWS_E4_CERTIFIED":
-            if not self.ordinary_user_executable or self.block_reasons:
-                raise ValueError(
-                    "Windows E4 capability must be executable and unblocked"
-                )
             if (
                 self.supply_chain.dependency_inventory_status != "COMPLETE"
                 or self.supply_chain.license_review_status != "CLEARED"
@@ -573,8 +579,34 @@ class PluginManifest(StrictModel):
                 raise ValueError(
                     "Windows E4 capability requires complete candidate evidence"
                 )
-        elif self.ordinary_user_executable or not self.block_reasons:
-            raise ValueError("non-E4 capability must be blocked for ordinary users")
+            if not self.ordinary_user_executable:
+                if self.evidence.release_promotion_ref is None:
+                    if (
+                        len(self.block_reasons) != 1
+                        or self.block_reasons[0]
+                        not in _RELEASE_PROMOTION_BLOCK_REASONS
+                    ):
+                        raise ValueError(
+                            "E4 without a usable public promotion must report "
+                            "one stable release-promotion block reason"
+                        )
+                else:
+                    raise ValueError(
+                        "E4 with a valid public promotion must be executable"
+                    )
+        elif self.ordinary_user_executable:
+            raise ValueError("non-E4 capability cannot be executable for ordinary users")
+        if self.ordinary_user_executable:
+            if self.block_reasons:
+                raise ValueError(
+                    "ordinary-user execution must not carry block reasons"
+                )
+            if self.evidence.release_promotion_ref is None:
+                raise ValueError(
+                    "ordinary-user execution requires a release promotion reference"
+                )
+        elif not self.block_reasons:
+            raise ValueError("non-executable capability must expose block reasons")
         if any(
             not re.fullmatch(r"[A-Z][A-Z0-9_]{2,127}", item)
             for item in self.block_reasons

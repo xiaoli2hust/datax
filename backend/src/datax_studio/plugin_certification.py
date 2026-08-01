@@ -53,7 +53,6 @@ class PluginCertificationRecord:
 
     plugin_name: PluginName
     certification_state: CertificationState
-    ordinary_user_executable: bool
     source: EvidenceSource
     candidate_id: str | None
     candidate_commit: str | None
@@ -62,6 +61,10 @@ class PluginCertificationRecord:
     plugin_sha256: str
     e3_evidence_ref: str | None
     windows_e4_evidence_ref: str | None
+    # This is deliberately separate from Phase B E4 evidence.  It identifies
+    # the valid public promotion (PR) for the *same* final candidate, which is
+    # an additional gate before ordinary users can execute a plugin.
+    release_promotion_ref: str | None
     dependency_inventory_ref: str | None
     license_review_ref: str | None
     dependencies: tuple[CertifiedDependency, ...]
@@ -149,7 +152,7 @@ class ExplicitTestPluginCertificationSource:
             reasons.append("READER_CERTIFICATION_MISSING")
         else:
             reasons.extend(
-                certification_block_reasons(
+                ordinary_user_execution_block_reasons(
                     reader,
                     expected_plugin_name=version.reader_plugin_name,
                     expected_plugin_sha256=version.reader_plugin_sha256,
@@ -164,7 +167,7 @@ class ExplicitTestPluginCertificationSource:
             reasons.append("WRITER_CERTIFICATION_MISSING")
         else:
             reasons.extend(
-                certification_block_reasons(
+                ordinary_user_execution_block_reasons(
                     writer,
                     expected_plugin_name=version.writer_plugin_name,
                     expected_plugin_sha256=version.writer_plugin_sha256,
@@ -182,13 +185,15 @@ class ExplicitTestPluginCertificationSource:
                 reasons.append("PAIR_CANDIDATE_COMMIT_MISMATCH")
             if reader.worker_image_digest != writer.worker_image_digest:
                 reasons.append("PAIR_WORKER_IMAGE_MISMATCH")
+            if reader.release_promotion_ref != writer.release_promotion_ref:
+                reasons.append("PAIR_RELEASE_PROMOTION_MISMATCH")
         if reasons:
             raise _certification_problem(reasons)
         assert reader is not None and writer is not None
         return reader, writer
 
 
-def certification_block_reasons(
+def e4_qualification_block_reasons(
     record: PluginCertificationRecord,
     *,
     expected_plugin_name: str,
@@ -199,11 +204,16 @@ def certification_block_reasons(
     current_worker_image_digest: str | None,
     now: datetime,
 ) -> list[str]:
+    """Return only facts required to call this exact candidate Phase-B E4.
+
+    This intentionally excludes the public release promotion.  A private
+    final candidate can be Windows E4 qualified before its candidate-root,
+    hosted provenance, and release validator form the public promotion record.
+    """
+
     reasons: list[str] = []
     if record.certification_state != "WINDOWS_E4_CERTIFIED":
         reasons.append("NOT_WINDOWS_E4_CERTIFIED")
-    if not record.ordinary_user_executable:
-        reasons.append("ORDINARY_USER_EXECUTION_NOT_APPROVED")
     if record.plugin_name != expected_plugin_name:
         reasons.append("PLUGIN_NAME_MISMATCH")
     if not _SHA256.fullmatch(record.plugin_sha256):
@@ -277,6 +287,139 @@ def certification_block_reasons(
     return list(dict.fromkeys(reasons))
 
 
+def ordinary_user_execution_block_reasons(
+    record: PluginCertificationRecord,
+    *,
+    expected_plugin_name: str,
+    expected_plugin_sha256: str,
+    expected_runtime_sha256: str,
+    current_candidate_id: str | None,
+    current_candidate_commit: str | None,
+    current_worker_image_digest: str | None,
+    now: datetime,
+) -> list[str]:
+    """Return the full gate for a normal user execution.
+
+    Ordinary execution needs both the Phase-B E4 qualification and the valid
+    public promotion of that same final candidate.  The promotion reference is
+    not optional merely because the E4 qualification itself is complete.
+    """
+
+    reasons = e4_qualification_block_reasons(
+        record,
+        expected_plugin_name=expected_plugin_name,
+        expected_plugin_sha256=expected_plugin_sha256,
+        expected_runtime_sha256=expected_runtime_sha256,
+        current_candidate_id=current_candidate_id,
+        current_candidate_commit=current_candidate_commit,
+        current_worker_image_digest=current_worker_image_digest,
+        now=now,
+    )
+    promotion_reason = release_promotion_ref_block_reason(
+        record.release_promotion_ref
+    )
+    if promotion_reason is not None:
+        reasons.append(promotion_reason)
+    return list(dict.fromkeys(reasons))
+
+
+def release_promotion_ref_block_reason(value: object) -> str | None:
+    """Classify an opaque public-promotion reference without raising.
+
+    The source is deliberately pluggable and its record dataclass does not
+    perform runtime validation.  Treat every malformed value as untrusted;
+    in particular, do not let a non-string value turn a capability listing or
+    an execution gate into a ``TypeError``/500 response.
+    """
+
+    if value is None:
+        return "RELEASE_PROMOTION_REQUIRED"
+    if not isinstance(value, str) or not _EVIDENCE_REF.fullmatch(value):
+        return "RELEASE_PROMOTION_REF_INVALID"
+    return None
+
+
+def require_ordinary_user_execution_pair(
+    *,
+    reader: PluginCertificationRecord,
+    writer: PluginCertificationRecord,
+    version: JobVersionBinding,
+    current_candidate_id: str | None,
+    current_candidate_commit: str | None,
+    current_worker_image_digest: str | None,
+    now: datetime,
+) -> None:
+    """Defence-in-depth check after a source returns an execution pair.
+
+    A future trusted reader remains responsible for signature and provenance
+    verification.  This common gate nevertheless prevents a buggy reader (or
+    a test double) from bypassing the non-secret candidate/ref consistency
+    checks before a Worker starts work.
+    """
+
+    reasons = ordinary_user_execution_block_reasons(
+        reader,
+        expected_plugin_name=version.reader_plugin_name,
+        expected_plugin_sha256=version.reader_plugin_sha256,
+        expected_runtime_sha256=version.runtime_sha256,
+        current_candidate_id=current_candidate_id,
+        current_candidate_commit=current_candidate_commit,
+        current_worker_image_digest=current_worker_image_digest,
+        now=now,
+    )
+    reasons.extend(
+        ordinary_user_execution_block_reasons(
+            writer,
+            expected_plugin_name=version.writer_plugin_name,
+            expected_plugin_sha256=version.writer_plugin_sha256,
+            expected_runtime_sha256=version.runtime_sha256,
+            current_candidate_id=current_candidate_id,
+            current_candidate_commit=current_candidate_commit,
+            current_worker_image_digest=current_worker_image_digest,
+            now=now,
+        )
+    )
+    if reader.candidate_id != writer.candidate_id:
+        reasons.append("PAIR_CANDIDATE_ID_MISMATCH")
+    if reader.candidate_commit != writer.candidate_commit:
+        reasons.append("PAIR_CANDIDATE_COMMIT_MISMATCH")
+    if reader.worker_image_digest != writer.worker_image_digest:
+        reasons.append("PAIR_WORKER_IMAGE_MISMATCH")
+    if reader.release_promotion_ref != writer.release_promotion_ref:
+        reasons.append("PAIR_RELEASE_PROMOTION_MISMATCH")
+    if reasons:
+        raise _certification_problem(list(dict.fromkeys(reasons)))
+
+
+def certification_block_reasons(
+    record: PluginCertificationRecord,
+    *,
+    expected_plugin_name: str,
+    expected_plugin_sha256: str,
+    expected_runtime_sha256: str,
+    current_candidate_id: str | None,
+    current_candidate_commit: str | None,
+    current_worker_image_digest: str | None,
+    now: datetime,
+) -> list[str]:
+    """Compatibility name for the ordinary-user execution gate.
+
+    Callers that need to display the narrower Phase-B E4 qualification must
+    use :func:`e4_qualification_block_reasons` instead.
+    """
+
+    return ordinary_user_execution_block_reasons(
+        record,
+        expected_plugin_name=expected_plugin_name,
+        expected_plugin_sha256=expected_plugin_sha256,
+        expected_runtime_sha256=expected_runtime_sha256,
+        current_candidate_id=current_candidate_id,
+        current_candidate_commit=current_candidate_commit,
+        current_worker_image_digest=current_worker_image_digest,
+        now=now,
+    )
+
+
 def _aware_utc(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("certification timestamps must be timezone-aware")
@@ -287,10 +430,11 @@ def _certification_problem(reasons: list[str]) -> ProblemException:
     return ProblemException(
         status=409,
         code="PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED",
-        title="DataX 执行能力尚未通过 Windows E4 认证",
+        title="DataX 执行能力尚未满足 Windows E4 与公开发布门禁",
         detail=(
-            "当前 JobVersion 的 Reader/Writer 没有与当前候选制品绑定的"
-            "、在有效期内的 Windows E4 证据，系统拒绝创建或启动执行。"
+            "当前 JobVersion 的 Reader/Writer 必须同时具备与当前最终候选制品绑定、"
+            "仍在有效期内的 Windows E4 资格，以及该候选的有效公开发布晋级记录；"
+            "系统拒绝创建或启动执行。"
         ),
         details={"block_reasons": list(dict.fromkeys(reasons))},
     )

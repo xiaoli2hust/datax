@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://datax-enterprise-studio.local/schemas/plugin-manifest.v2.schema.json",
   "title": "DataX Enterprise Studio Plugin Capability Manifest V2",
-  "description": "DataX 能力目录。源码、构建、打包、契约、E3 与 Windows E4 是不同状态；只有 WINDOWS_E4_CERTIFIED 且证据绑定当前候选的能力可供普通用户执行。",
+  "description": "DataX 能力目录。源码、构建、打包、契约、E3 与 Windows E4 是不同状态；WINDOWS_E4_CERTIFIED 只证明精确最终候选的 Phase-B E4。普通用户执行还必须有同一最终候选的有效公开发布晋级记录。",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -344,6 +344,7 @@
         "runtime_sha256",
         "e3_evidence_ref",
         "windows_e4_evidence_ref",
+        "release_promotion_ref",
         "valid_until"
       ],
       "properties": {
@@ -375,6 +376,11 @@
           "type": ["string", "null"],
           "pattern": "^[A-Za-z0-9._/:-]{1,300}$"
         },
+        "release_promotion_ref": {
+          "description": "同一最终候选的有效公开发布晋级（PR）记录。仅在服务端已验证为可用时返回字符串；缺失、格式无效或候选内不一致时返回 null，并以稳定 block_reasons 失败关闭。E4 资格本身可以尚未具备此记录。",
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9._/:-]{1,300}$"
+        },
         "valid_until": {
           "type": ["string", "null"],
           "format": "date-time"
@@ -392,8 +398,6 @@
       },
       "then": {
         "properties": {
-          "ordinary_user_executable": { "const": true },
-          "block_reasons": { "maxItems": 0 },
           "supply_chain": {
             "properties": {
               "dependency_inventory_status": { "const": "COMPLETE" },
@@ -428,6 +432,82 @@
       "else": {
         "properties": {
           "ordinary_user_executable": { "const": false },
+          "block_reasons": { "minItems": 1 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "certification_state": { "const": "WINDOWS_E4_CERTIFIED" },
+          "evidence": {
+            "properties": {
+              "release_promotion_ref": { "type": "string" }
+            },
+            "required": ["release_promotion_ref"]
+          }
+        },
+        "required": ["certification_state", "evidence"]
+      },
+      "then": {
+        "properties": {
+          "ordinary_user_executable": { "const": true },
+          "block_reasons": { "maxItems": 0 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "certification_state": { "const": "WINDOWS_E4_CERTIFIED" },
+          "ordinary_user_executable": { "const": false },
+          "evidence": {
+            "properties": {
+              "release_promotion_ref": { "type": "null" }
+            },
+            "required": ["release_promotion_ref"]
+          }
+        },
+        "required": [
+          "certification_state",
+          "ordinary_user_executable",
+          "evidence"
+        ]
+      },
+      "then": {
+        "properties": {
+          "block_reasons": {
+            "contains": {
+              "enum": [
+                "RELEASE_PROMOTION_REQUIRED",
+                "RELEASE_PROMOTION_REF_INVALID",
+                "PAIR_RELEASE_PROMOTION_MISMATCH"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ordinary_user_executable": { "const": true }
+        },
+        "required": ["ordinary_user_executable"]
+      },
+      "then": {
+        "properties": {
+          "certification_state": { "const": "WINDOWS_E4_CERTIFIED" },
+          "block_reasons": { "maxItems": 0 },
+          "evidence": {
+            "properties": {
+              "release_promotion_ref": { "type": "string" }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
           "block_reasons": { "minItems": 1 }
         }
       }

@@ -908,6 +908,98 @@ class ExecutionCancelRequest(Base):
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
+class WorkTerminationRequest(Base):
+    """Durable, Worker-consumed safety stop for one work item.
+
+    This is intentionally not an HTTP-command queue.  Privileged control-plane
+    facts (target-exclusivity withdrawal/expiry and emergency secret status)
+    create a request; an emergency current-secret transition may do so before
+    a queued work item binds its credential.  Only a fenced Worker or
+    reconciler may acknowledge it and advance the affected work item to its
+    safe terminal state.
+    """
+
+    __tablename__ = "work_termination_requests"
+    __table_args__ = (
+        CheckConstraint(
+            "work_kind IN ('EXECUTION','RECOVERY_PROBE')",
+            name="ck_work_termination_requests_work_kind",
+        ),
+        CheckConstraint(
+            "reason_code IN "
+            "('TARGET_EXCLUSIVITY_REVOKED','TARGET_EXCLUSIVITY_EXPIRED',"
+            "'SECRET_REVOKED','SECRET_COMPROMISED')",
+            name="ck_work_termination_requests_reason",
+        ),
+        CheckConstraint(
+            "status IN ('PENDING','ACKNOWLEDGED','COMPLETED')",
+            name="ck_work_termination_requests_status",
+        ),
+        CheckConstraint(
+            "(status = 'PENDING' AND acknowledged_at IS NULL AND completed_at IS NULL) "
+            "OR (status = 'ACKNOWLEDGED' AND acknowledged_at IS NOT NULL "
+            "AND completed_at IS NULL) "
+            "OR (status = 'COMPLETED' AND acknowledged_at IS NOT NULL "
+            "AND completed_at IS NOT NULL)",
+            name="ck_work_termination_requests_lifecycle",
+        ),
+        CheckConstraint(
+            "(reason_code IN ('SECRET_REVOKED','SECRET_COMPROMISED') "
+            "AND credential_secret_id IS NOT NULL) "
+            "OR (reason_code IN ('TARGET_EXCLUSIVITY_REVOKED',"
+            "'TARGET_EXCLUSIVITY_EXPIRED') AND credential_secret_id IS NULL "
+            "AND work_kind = 'EXECUTION')",
+            name="ck_work_termination_requests_secret_reason",
+        ),
+        Index(
+            "uq_work_termination_requests_active_target",
+            "work_kind",
+            "work_id",
+            "reason_code",
+            unique=True,
+            sqlite_where=text(
+                "status IN ('PENDING','ACKNOWLEDGED') AND credential_secret_id IS NULL"
+            ),
+            postgresql_where=text(
+                "status IN ('PENDING','ACKNOWLEDGED') AND credential_secret_id IS NULL"
+            ),
+        ),
+        Index(
+            "uq_work_termination_requests_active_secret",
+            "work_kind",
+            "work_id",
+            "reason_code",
+            "credential_secret_id",
+            unique=True,
+            sqlite_where=text(
+                "status IN ('PENDING','ACKNOWLEDGED') AND credential_secret_id IS NOT NULL"
+            ),
+            postgresql_where=text(
+                "status IN ('PENDING','ACKNOWLEDGED') AND credential_secret_id IS NOT NULL"
+            ),
+        ),
+        Index(
+            "ix_work_termination_requests_pending",
+            "status",
+            "requested_at",
+            "id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    work_kind: Mapped[str] = mapped_column(String(24), nullable=False)
+    work_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    credential_secret_id: Mapped[UUID | None] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("credential_secrets.id", ondelete="RESTRICT"),
+    )
+    reason_code: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    requested_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
 class ProjectQueueServiceCursor(Base):
     __tablename__ = "project_queue_service_cursors"
     __table_args__ = (

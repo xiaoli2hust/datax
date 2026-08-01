@@ -16,12 +16,18 @@ from datax_studio.core.db import (
     ExecutionCancelRequest,
     SystemControl,
     TargetCopyLock,
+    WorkTerminationRequest,
 )
 from datax_studio.core.schemas import ClaimedExecution
-from datax_studio.core.service import ControlService
+from datax_studio.core.service import (
+    _TERMINATION_FAILURE_CODES,
+    _TERMINATION_REASON_PRIORITY,
+    ControlService,
+)
 from datax_studio.logs.service import append_reconciler_fence_gap
-from datax_studio.recovery.db import RecoveryProbe, RecoveryProbeAttempt
+from datax_studio.recovery.db import RecoveryGate, RecoveryProbe, RecoveryProbeAttempt
 from datax_studio.recovery.gates import ensure_recovery_gate
+from datax_studio.recovery.service import RecoveryService
 from datax_studio.worker.process import (
     ProcessAction,
     ProcessIdentity,
@@ -81,6 +87,7 @@ class WorkerReconciler:
         """Drain, reconcile every prior active fact, then publish the epoch."""
 
         self._begin_epoch(identity=identity, reconcile_epoch=reconcile_epoch)
+        self.reconcile_pending_work_terminations(identity=identity)
         queued = self._reconcile_queued_cancellations()
         execution_ids = self._active_execution_ids()
         lost_executions = sum(
@@ -118,6 +125,7 @@ class WorkerReconciler:
         *,
         identity: RuntimeIdentity,
     ) -> ReconcileResult:
+        self.reconcile_pending_work_terminations(identity=identity)
         queued = self._reconcile_queued_cancellations()
         lost_executions = sum(
             self._mark_execution_lost(
@@ -143,6 +151,8 @@ class WorkerReconciler:
         )
 
     def poll_claim_action(self, claim: ClaimedExecution) -> ProcessAction:
+        if self.control.acknowledge_claimed_execution_termination(claim=claim):
+            return ProcessAction.TERMINATE
         with self.sessions.begin() as session:
             now = self.control._database_now(session)  # noqa: SLF001
             try:
@@ -193,6 +203,202 @@ class WorkerReconciler:
             )
             return ProcessAction.CANCEL
 
+    def complete_claimed_termination(
+        self,
+        *,
+        claim: ClaimedExecution,
+        oracle_started: bool,
+    ) -> None:
+        self.control.complete_claimed_execution_termination(
+            claim=claim,
+            oracle_started=oracle_started,
+        )
+
+    def reconcile_pending_work_terminations(
+        self,
+        *,
+        identity: RuntimeIdentity,
+    ) -> int:
+        """Converge queued stops and fail closed after an abandoned lease.
+
+        Active DataX processes normally consume the same durable request on
+        their sub-second control tick.  This loop is the independent recovery
+        path: it releases never-claimed Executions, rejects never-claimed
+        RecoveryProbe gates, attempts a local recorded-process stop where
+        identity proves ownership, and lets the existing expired-lease
+        reconciler publish LOST when it cannot prove a clean stop.
+        """
+
+        self._persist_elapsed_target_exclusivity_expiries()
+        with self.sessions() as session:
+            queued_execution_ids = list(
+                session.scalars(
+                    select(WorkTerminationRequest.work_id)
+                    .join(
+                        Execution,
+                        Execution.id == WorkTerminationRequest.work_id,
+                    )
+                    .where(
+                        WorkTerminationRequest.work_kind == "EXECUTION",
+                        WorkTerminationRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
+                        Execution.process_state == "QUEUED",
+                        Execution.active_attempt_id.is_(None),
+                    )
+                    .distinct()
+                    .order_by(WorkTerminationRequest.work_id)
+                )
+            )
+            active_execution_ids = list(
+                session.scalars(
+                    select(WorkTerminationRequest.work_id)
+                    .join(
+                        Execution,
+                        Execution.id == WorkTerminationRequest.work_id,
+                    )
+                    .where(
+                        WorkTerminationRequest.work_kind == "EXECUTION",
+                        WorkTerminationRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
+                        Execution.process_state.in_(_ACTIVE_EXECUTION_STATES),
+                        Execution.active_attempt_id.is_not(None),
+                    )
+                    .distinct()
+                    .order_by(WorkTerminationRequest.work_id)
+                )
+            )
+            queued_probe_ids = list(
+                session.scalars(
+                    select(WorkTerminationRequest.work_id)
+                    .join(
+                        RecoveryProbe,
+                        RecoveryProbe.id == WorkTerminationRequest.work_id,
+                    )
+                    .where(
+                        WorkTerminationRequest.work_kind == "RECOVERY_PROBE",
+                        WorkTerminationRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
+                        RecoveryProbe.process_state == "QUEUED",
+                        RecoveryProbe.active_attempt_id.is_(None),
+                    )
+                    .distinct()
+                    .order_by(WorkTerminationRequest.work_id)
+                )
+            )
+            active_probe_ids = list(
+                session.scalars(
+                    select(WorkTerminationRequest.work_id)
+                    .join(
+                        RecoveryProbe,
+                        RecoveryProbe.id == WorkTerminationRequest.work_id,
+                    )
+                    .where(
+                        WorkTerminationRequest.work_kind == "RECOVERY_PROBE",
+                        WorkTerminationRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
+                        RecoveryProbe.process_state.in_({"STARTING", "RUNNING"}),
+                        RecoveryProbe.active_attempt_id.is_not(None),
+                    )
+                    .distinct()
+                    .order_by(WorkTerminationRequest.work_id)
+                )
+            )
+        completed = sum(
+            self.control.reconcile_unclaimed_work_termination(execution_id=execution_id)
+            for execution_id in queued_execution_ids
+        )
+        recovery = RecoveryService(self.control)
+        completed += sum(
+            recovery.reconcile_unclaimed_probe_termination(recovery_probe_id=probe_id)
+            for probe_id in queued_probe_ids
+        )
+        for execution_id in active_execution_ids:
+            completed += self._nudge_or_fail_terminated_execution(
+                execution_id,
+                identity=identity,
+            )
+        for probe_id in active_probe_ids:
+            completed += self._fail_terminated_probe_if_expired(probe_id)
+        return completed
+
+    def _persist_elapsed_target_exclusivity_expiries(self) -> None:
+        """Turn elapsed declarations into durable stops without a claim race."""
+
+        with self.sessions() as session:
+            execution_ids = list(
+                session.scalars(
+                    select(Execution.id)
+                    .where(
+                        Execution.process_state.in_(_ACTIVE_EXECUTION_STATES | {"QUEUED"}),
+                        Execution.target_exclusivity_status == "ACTIVE",
+                        Execution.target_exclusivity_revoked_at.is_(None),
+                        Execution.target_exclusivity_revocation_reason.is_(None),
+                    )
+                    .order_by(Execution.id)
+                )
+            )
+        for execution_id in execution_ids:
+            self.control.reconcile_target_exclusivity_expiry(execution_id=execution_id)
+
+    def _nudge_or_fail_terminated_execution(
+        self,
+        execution_id: UUID,
+        *,
+        identity: RuntimeIdentity,
+    ) -> int:
+        expired = False
+        with self.sessions() as session:
+            now = self.control._database_now(session)  # noqa: SLF001
+            execution = session.get(Execution, execution_id)
+            attempt = (
+                session.get(ExecutionAttempt, execution.active_attempt_id)
+                if execution is not None and execution.active_attempt_id is not None
+                else None
+            )
+            if execution is None or attempt is None:
+                return 0
+            expired = ensure_aware(attempt.lease_expires_at) <= now
+            if (
+                not expired
+                and attempt.host_boot_id == identity.host_boot_id
+                and attempt.cgroup_identity == identity.cgroup_identity
+                and attempt.pid is not None
+                and attempt.pid_start_time is not None
+                and attempt.process_group_id is not None
+            ):
+                terminate_recorded_process_group(
+                    ProcessIdentity(
+                        pid=attempt.pid,
+                        pid_start_time=attempt.pid_start_time,
+                        process_group_id=attempt.process_group_id,
+                    )
+                )
+        if not expired:
+            return 0
+        return int(
+            self._mark_execution_lost(
+                execution_id,
+                identity=identity,
+                require_expired=True,
+                reason_code="SYSTEM_TERMINATION_LEASE_EXPIRED",
+            )
+        )
+
+    def _fail_terminated_probe_if_expired(self, probe_id: UUID) -> int:
+        with self.sessions() as session:
+            now = self.control._database_now(session)  # noqa: SLF001
+            probe = session.get(RecoveryProbe, probe_id)
+            attempt = (
+                session.get(RecoveryProbeAttempt, probe.active_attempt_id)
+                if probe is not None and probe.active_attempt_id is not None
+                else None
+            )
+            if probe is None or attempt is None or ensure_aware(attempt.lease_expires_at) > now:
+                return 0
+        return int(
+            self._mark_probe_lost(
+                probe_id,
+                require_expired=True,
+                reason_code="SYSTEM_TERMINATION_LEASE_EXPIRED",
+            )
+        )
+
     def complete_claimed_cancel(
         self,
         *,
@@ -200,15 +406,31 @@ class WorkerReconciler:
         oracle_started: bool,
     ) -> None:
         verification_state = "INCONCLUSIVE" if oracle_started else "NOT_STARTED"
-        self.control.transition_claimed_execution(
-            claim=claim,
-            expected_state="CANCEL_REQUESTED",
-            new_state="CANCELED",
-            data_effect="UNKNOWN",
-            verification_state=verification_state,
-            failure_code="OPERATOR_CANCELED",
-            failure_message="Execution was canceled after Worker acknowledgement.",
-        )
+        try:
+            self.control.transition_claimed_execution(
+                claim=claim,
+                expected_state="CANCEL_REQUESTED",
+                new_state="CANCELED",
+                data_effect="UNKNOWN",
+                verification_state=verification_state,
+                failure_code="OPERATOR_CANCELED",
+                failure_message="Execution was canceled after Worker acknowledgement.",
+            )
+        except ProblemException as exc:
+            # A durable safety termination can win after this Worker accepted
+            # an operator cancel but before the CANCELED write obtains the
+            # fenced row lock.  Its system outcome must take precedence over
+            # the operator outcome, and the same claim must consume it.
+            if exc.code not in {
+                "WORK_TERMINATION_PENDING",
+                "TARGET_EXCLUSIVITY_NOT_ACTIVE",
+                "TARGET_EXCLUSIVITY_BROKEN",
+            }:
+                raise
+            self.complete_claimed_termination(
+                claim=claim,
+                oracle_started=oracle_started,
+            )
 
     def ensure_terminal_gate(self, execution_id: UUID) -> bool:
         with self.sessions.begin() as session:
@@ -336,6 +558,30 @@ class WorkerReconciler:
                         process_group_id=attempt.process_group_id,
                     )
                 )
+            terminations = list(
+                session.scalars(
+                    select(WorkTerminationRequest)
+                    .where(
+                        WorkTerminationRequest.work_kind == "EXECUTION",
+                        WorkTerminationRequest.work_id == execution.id,
+                        WorkTerminationRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
+                    )
+                    .with_for_update()
+                )
+            )
+            primary_termination = (
+                min(
+                    terminations,
+                    key=lambda item: _TERMINATION_REASON_PRIORITY[item.reason_code],
+                )
+                if terminations
+                else None
+            )
+            failure_code = (
+                _TERMINATION_FAILURE_CODES[primary_termination.reason_code]
+                if primary_termination is not None
+                else reason_code
+            )
             from_state = execution.process_state
             oracle_started = (
                 from_state == "VERIFYING" or execution.verification_state == "VERIFYING"
@@ -343,9 +589,12 @@ class WorkerReconciler:
             execution.process_state = "LOST"
             execution.data_effect = "UNKNOWN"
             execution.verification_state = "INCONCLUSIVE" if oracle_started else "NOT_STARTED"
-            execution.failure_code = reason_code
+            execution.failure_code = failure_code
             execution.failure_message = (
-                "Worker ownership could not be safely retained; manual recovery is required."
+                "A safety termination request remained active after Worker ownership "
+                "could not be safely retained; manual recovery is required."
+                if primary_termination is not None
+                else "Worker ownership could not be safely retained; manual recovery is required."
             )
             append_reconciler_fence_gap(
                 session,
@@ -357,7 +606,11 @@ class WorkerReconciler:
             execution.active_attempt_id = None
             execution.state_version += 1
             attempt.finished_at = now
-            attempt.termination_reason = "LOST"
+            attempt.termination_reason = (
+                primary_termination.reason_code
+                if primary_termination is not None
+                else "LOST"
+            )
             lock.state = "RECOVERY_REQUIRED"
             cancel = session.scalar(
                 select(ExecutionCancelRequest)
@@ -368,9 +621,17 @@ class WorkerReconciler:
                 .with_for_update()
             )
             if cancel is not None:
-                cancel.status = "COMPLETED"
+                # A durable safety stop remains the authoritative cause even
+                # when lease expiry makes clean local termination impossible.
+                # Do not let a simultaneous operator cancellation relabel the
+                # incident as a normal cancellation.
+                cancel.status = "REJECTED" if terminations else "COMPLETED"
                 cancel.acknowledged_at = cancel.acknowledged_at or now
                 cancel.completed_at = now
+            for termination in terminations:
+                termination.status = "COMPLETED"
+                termination.acknowledged_at = termination.acknowledged_at or now
+                termination.completed_at = now
             self.control._append_execution_event(  # noqa: SLF001
                 session,
                 execution,
@@ -381,7 +642,25 @@ class WorkerReconciler:
                 payload={
                     "data_effect": "UNKNOWN",
                     "verification_state": execution.verification_state,
+                    # Preserve the legacy reconciliation reason for existing
+                    # event readers; primary_reason_code is the terminal
+                    # safety cause when a durable stop was active.
                     "reason_code": reason_code,
+                    "failure_code": failure_code,
+                    "primary_reason_code": (
+                        primary_termination.reason_code
+                        if primary_termination is not None
+                        else None
+                    ),
+                    # A terminal safety reason must remain operator-visible,
+                    # but the lease-expiry path is also material evidence for
+                    # why reconciliation, rather than the active Worker,
+                    # closed the work item.
+                    "reconciliation_reason_code": reason_code,
+                    "lease_expiry_reason_code": reason_code
+                    if require_expired
+                    else None,
+                    "termination_request_ids": [str(item.id) for item in terminations],
                 },
                 now=now,
             )
@@ -421,13 +700,60 @@ class WorkerReconciler:
                 raise RuntimeError("active recovery probe attempt is missing")
             if require_expired and ensure_aware(attempt.lease_expires_at) > now:
                 return False
+            gate = session.scalar(
+                select(RecoveryGate)
+                .where(RecoveryGate.id == probe.recovery_gate_id)
+                .with_for_update()
+            )
+            if gate is None or gate.latest_recovery_probe_id != probe.id:
+                raise RuntimeError("active recovery probe gate is missing or stale")
+            terminations = list(
+                session.scalars(
+                    select(WorkTerminationRequest)
+                    .where(
+                        WorkTerminationRequest.work_kind == "RECOVERY_PROBE",
+                        WorkTerminationRequest.work_id == probe.id,
+                        WorkTerminationRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
+                    )
+                    .with_for_update()
+                )
+            )
+            primary_termination = (
+                min(
+                    terminations,
+                    key=lambda item: _TERMINATION_REASON_PRIORITY[item.reason_code],
+                )
+                if terminations
+                else None
+            )
+            failure_code = (
+                _TERMINATION_FAILURE_CODES[primary_termination.reason_code]
+                if primary_termination is not None
+                else reason_code
+            )
             probe.process_state = "LOST"
             probe.result = "INCONCLUSIVE"
-            probe.failure_code = reason_code
+            probe.target_empty_evidence = None
+            probe.failure_code = failure_code
             probe.finished_at = now
             probe.active_attempt_id = None
             attempt.finished_at = now
-            attempt.termination_reason = "LOST"
+            attempt.termination_reason = (
+                primary_termination.reason_code
+                if primary_termination is not None
+                else "LOST"
+            )
+            # A lost or safety-terminated probe cannot leave its gate in
+            # REMEDIATION_SUBMITTED: that state forbids the operator from
+            # submitting the next independently fenced probe.
+            gate.status = "REJECTED"
+            gate.target_empty_evidence = None
+            gate.verified_at = None
+            gate.reason_code = failure_code
+            for termination in terminations:
+                termination.status = "COMPLETED"
+                termination.acknowledged_at = termination.acknowledged_at or now
+                termination.completed_at = now
             return True
 
     def _begin_epoch(

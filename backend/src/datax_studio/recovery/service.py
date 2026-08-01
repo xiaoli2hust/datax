@@ -29,6 +29,7 @@ from datax_studio.core.db import (
     TargetCopyLock,
     TargetNamespace,
     TransferPolicy,
+    WorkTerminationRequest,
 )
 from datax_studio.core.schemas import (
     CredentialBinding,
@@ -38,7 +39,7 @@ from datax_studio.core.schemas import (
     TargetEmptyEvidence,
 )
 from datax_studio.core.service import ControlService
-from datax_studio.credentials.db import EndpointConnectionEvidence
+from datax_studio.credentials.db import CredentialSecret, EndpointConnectionEvidence
 from datax_studio.recovery.db import (
     RecoveryGate,
     RecoveryProbe,
@@ -71,6 +72,21 @@ class CredentialBindingSelector(Protocol):
         source_datasource_id: UUID,
         target_datasource_id: UUID,
     ) -> CredentialBinding: ...
+
+
+_ACTIVE_WORK_TERMINATION_STATUSES = ("PENDING", "ACKNOWLEDGED")
+_TERMINATION_REASON_PRIORITY = {
+    "SECRET_COMPROMISED": 0,
+    "SECRET_REVOKED": 1,
+    "TARGET_EXCLUSIVITY_REVOKED": 2,
+    "TARGET_EXCLUSIVITY_EXPIRED": 3,
+}
+_TERMINATION_FAILURE_CODES = {
+    "SECRET_COMPROMISED": "CREDENTIAL_SECRET_COMPROMISED",
+    "SECRET_REVOKED": "CREDENTIAL_SECRET_REVOKED",
+    "TARGET_EXCLUSIVITY_REVOKED": "TARGET_EXCLUSIVITY_BROKEN",
+    "TARGET_EXCLUSIVITY_EXPIRED": "TARGET_EXCLUSIVITY_BROKEN",
+}
 
 
 class RecoveryService:
@@ -168,6 +184,58 @@ class RecoveryService:
                     code="VALIDATION_ERROR",
                     title="处置确认时间无效",
                     detail="confirmed_at 不能显著晚于服务端当前时间。",
+                )
+            # Serialize with current-secret emergency status transitions
+            # before writing a new queue intention.  If revocation wins, the
+            # datasource is DISABLED and no RecoveryProbe/Gate transition is
+            # persisted.  If this submission wins, it commits while holding
+            # the datasource row and the revocation's non-locking post-gate
+            # scan records a durable WorkTerminationRequest for the probe.
+            target_revision = session.get(
+                DatasourceRevision,
+                execution.target_datasource_revision_id,
+            )
+            target_datasource = (
+                session.scalar(
+                    select(Datasource)
+                    .where(
+                        Datasource.id == target_revision.datasource_id,
+                        Datasource.project_id == execution.project_id,
+                    )
+                    .execution_options(populate_existing=True)
+                    .with_for_update()
+                )
+                if target_revision is not None
+                else None
+            )
+            target_secret = (
+                session.scalar(
+                    select(CredentialSecret)
+                    .where(
+                        CredentialSecret.id == target_datasource.current_secret_id,
+                        CredentialSecret.datasource_id == target_datasource.id,
+                    )
+                    .execution_options(populate_existing=True)
+                    .with_for_update()
+                )
+                if (
+                    target_datasource is not None
+                    and target_datasource.current_secret_id is not None
+                )
+                else None
+            )
+            if (
+                target_revision is None
+                or target_datasource is None
+                or target_datasource.status != "ACTIVE"
+                or target_secret is None
+                or target_secret.status != "ACTIVE"
+            ):
+                raise ProblemException(
+                    status=409,
+                    code="CREDENTIAL_BINDING_NOT_ACTIVE",
+                    title="目标数据源当前凭据不可用",
+                    detail="恢复空表复检只会为 ACTIVE 数据源及其当前凭据创建队列。",
                 )
             active_probe = session.scalar(
                 select(RecoveryProbe.id).where(
@@ -371,6 +439,7 @@ class RecoveryService:
                 session,
                 job.project_id,
                 spec,
+                lock_datasources=True,
             )
             policy = session.get(TransferPolicy, version.transfer_policy_id)
             if (
@@ -502,12 +571,22 @@ class RecoveryService:
                     retryable=True,
                 )
             now = self.control._database_now(session)  # noqa: SLF001
+            pending_termination = (
+                select(WorkTerminationRequest.id)
+                .where(
+                    WorkTerminationRequest.work_kind == "RECOVERY_PROBE",
+                    WorkTerminationRequest.work_id == RecoveryProbe.id,
+                    WorkTerminationRequest.status.in_(_ACTIVE_WORK_TERMINATION_STATUSES),
+                )
+                .exists()
+            )
             probe = session.scalar(
                 select(RecoveryProbe)
                 .where(
                     RecoveryProbe.process_state == "QUEUED",
                     RecoveryProbe.active_attempt_id.is_(None),
                     RecoveryProbe.queue_eligibility_state == "ELIGIBLE",
+                    ~pending_termination,
                 )
                 .order_by(RecoveryProbe.queued_at, RecoveryProbe.id)
                 .limit(1)
@@ -539,13 +618,31 @@ class RecoveryService:
                 probe.target_endpoint_policy_revision_id,
             )
             datasource = (
-                session.get(Datasource, revision.datasource_id) if revision is not None else None
+                session.scalar(
+                    select(Datasource)
+                    .where(Datasource.id == revision.datasource_id)
+                    .execution_options(populate_existing=True)
+                    .with_for_update()
+                )
+                if revision is not None
+                else None
             )
             policy = (
                 session.get(EndpointPolicy, policy_revision.endpoint_policy_id)
                 if policy_revision is not None
                 else None
             )
+            # The initial selection happened before this transaction waited
+            # for the datasource/credential gate.  A current-secret emergency
+            # may have committed a durable stop during that wait.  Preserve
+            # the request for the reconciler instead of converting the probe
+            # into a generic blocked queue row and stranding its gate.
+            if self._active_probe_termination_requests(
+                session,
+                recovery_probe_id=probe.id,
+                lock=False,
+            ):
+                return None
             if (
                 gate is None
                 or gate.status != "REMEDIATION_SUBMITTED"
@@ -574,9 +671,21 @@ class RecoveryService:
             except ProblemException as exc:
                 if exc.code != "CREDENTIAL_BINDING_NOT_ACTIVE":
                     raise
+                if self._active_probe_termination_requests(
+                    session,
+                    recovery_probe_id=probe.id,
+                    lock=False,
+                ):
+                    return None
                 probe.queue_eligibility_state = "BLOCKED"
                 probe.queue_block_reason = exc.code
                 probe.queue_state_changed_at = now
+                return None
+            if self._active_probe_termination_requests(
+                session,
+                recovery_probe_id=probe.id,
+                lock=False,
+            ):
                 return None
             token = secrets.token_urlsafe(32)
             next_fence = probe.fence_epoch + 1
@@ -613,6 +722,7 @@ class RecoveryService:
             )
 
     def start_claimed_probe(self, claim: ClaimedRecoveryProbe) -> None:
+        termination_pending = False
         with self.control.sessions.begin() as session:
             now = self.control._database_now(session)  # noqa: SLF001
             probe, _attempt = self._current_probe_attempt(
@@ -622,7 +732,22 @@ class RecoveryService:
             )
             if probe.process_state != "STARTING":
                 self._probe_fence_lost()
-            probe.process_state = "RUNNING"
+            termination_pending = bool(
+                self._acknowledge_probe_termination_requests(
+                    session,
+                    recovery_probe_id=probe.id,
+                    now=now,
+                )
+            )
+            if not termination_pending:
+                probe.process_state = "RUNNING"
+        if termination_pending:
+            raise ProblemException(
+                status=409,
+                code="RECOVERY_PROBE_TERMINATION_PENDING",
+                title="恢复探针收到安全终止请求",
+                detail="Worker 必须停止探针，不能发布空表核验结论。",
+            )
 
     def heartbeat_probe(
         self,
@@ -630,12 +755,109 @@ class RecoveryService:
         *,
         lease_seconds: int = 30,
     ) -> datetime:
+        termination_pending = False
         with self.control.sessions.begin() as session:
             now = self.control._database_now(session)  # noqa: SLF001
-            _probe, attempt = self._current_probe_attempt(session, claim, now)
-            attempt.heartbeat_at = now
-            attempt.lease_expires_at = now + timedelta(seconds=lease_seconds)
-            return ensure_aware(attempt.lease_expires_at)
+            probe, attempt = self._current_probe_attempt(session, claim, now)
+            termination_pending = bool(
+                self._acknowledge_probe_termination_requests(
+                    session,
+                    recovery_probe_id=probe.id,
+                    now=now,
+                )
+            )
+            if not termination_pending:
+                attempt.heartbeat_at = now
+                attempt.lease_expires_at = now + timedelta(seconds=lease_seconds)
+                lease_expires_at = ensure_aware(attempt.lease_expires_at)
+            else:
+                lease_expires_at = ensure_aware(attempt.lease_expires_at)
+        if termination_pending:
+            raise ProblemException(
+                status=409,
+                code="RECOVERY_PROBE_TERMINATION_PENDING",
+                title="恢复探针收到安全终止请求",
+                detail="Worker 必须停止探针，不能发布空表核验结论。",
+            )
+        return lease_expires_at
+
+    def poll_claimed_probe_termination(self, claim: ClaimedRecoveryProbe) -> bool:
+        """Acknowledge an emergency stop at a bounded probe control point."""
+
+        with self.control.sessions.begin() as session:
+            now = self.control._database_now(session)  # noqa: SLF001
+            probe, _attempt = self._current_probe_attempt(session, claim, now)
+            return bool(
+                self._acknowledge_probe_termination_requests(
+                    session,
+                    recovery_probe_id=probe.id,
+                    now=now,
+                )
+            )
+
+    def complete_claimed_probe_termination(self, claim: ClaimedRecoveryProbe) -> bool:
+        """Fail a fenced probe closed so it cannot verify a recovery gate."""
+
+        with self.control.sessions.begin() as session:
+            now = self.control._database_now(session)  # noqa: SLF001
+            probe, attempt = self._current_probe_attempt(session, claim, now)
+            requests = self._acknowledge_probe_termination_requests(
+                session,
+                recovery_probe_id=probe.id,
+                now=now,
+            )
+            if not requests:
+                return False
+            self._complete_probe_termination(
+                session,
+                probe=probe,
+                attempt=attempt,
+                requests=requests,
+                now=now,
+            )
+            return True
+
+    def reconcile_unclaimed_probe_termination(
+        self,
+        *,
+        recovery_probe_id: UUID,
+    ) -> bool:
+        """Worker-only convergence for a queued RecoveryProbe safety stop.
+
+        Unlike a claimed probe, a queued probe has no attempt or secret
+        binding.  A durable WorkTerminationRequest created when its current
+        datasource secret becomes terminal must still reject the gate, so an
+        Operator can submit a fresh independently fenced remediation probe.
+        """
+
+        with self.control.sessions.begin() as session:
+            now = self.control._database_now(session)  # noqa: SLF001
+            probe = session.scalar(
+                select(RecoveryProbe)
+                .where(RecoveryProbe.id == recovery_probe_id)
+                .with_for_update()
+            )
+            if (
+                probe is None
+                or probe.process_state != "QUEUED"
+                or probe.active_attempt_id is not None
+            ):
+                return False
+            requests = self._acknowledge_probe_termination_requests(
+                session,
+                recovery_probe_id=probe.id,
+                now=now,
+            )
+            if not requests:
+                return False
+            self._complete_probe_termination(
+                session,
+                probe=probe,
+                attempt=None,
+                requests=requests,
+                now=now,
+            )
+            return True
 
     def complete_probe(
         self,
@@ -653,6 +875,20 @@ class RecoveryService:
             probe, attempt = self._current_probe_attempt(session, claim, now)
             if probe.process_state not in {"STARTING", "RUNNING"}:
                 self._probe_fence_lost()
+            requests = self._acknowledge_probe_termination_requests(
+                session,
+                recovery_probe_id=probe.id,
+                now=now,
+            )
+            if requests:
+                self._complete_probe_termination(
+                    session,
+                    probe=probe,
+                    attempt=attempt,
+                    requests=requests,
+                    now=now,
+                )
+                return
             gate = session.scalar(
                 select(RecoveryGate)
                 .where(RecoveryGate.id == probe.recovery_gate_id)
@@ -741,6 +977,87 @@ class RecoveryService:
             probe.active_attempt_id = None
             attempt.finished_at = now
             attempt.termination_reason = process_state
+
+    @staticmethod
+    def _active_probe_termination_requests(
+        session: Session,
+        *,
+        recovery_probe_id: UUID,
+        lock: bool,
+    ) -> list[WorkTerminationRequest]:
+        statement = (
+            select(WorkTerminationRequest)
+            .where(
+                WorkTerminationRequest.work_kind == "RECOVERY_PROBE",
+                WorkTerminationRequest.work_id == recovery_probe_id,
+                WorkTerminationRequest.status.in_(_ACTIVE_WORK_TERMINATION_STATUSES),
+            )
+            .order_by(WorkTerminationRequest.requested_at, WorkTerminationRequest.id)
+        )
+        if lock:
+            statement = statement.with_for_update()
+        return list(session.scalars(statement))
+
+    def _acknowledge_probe_termination_requests(
+        self,
+        session: Session,
+        *,
+        recovery_probe_id: UUID,
+        now: datetime,
+    ) -> list[WorkTerminationRequest]:
+        requests = self._active_probe_termination_requests(
+            session,
+            recovery_probe_id=recovery_probe_id,
+            lock=True,
+        )
+        for request in requests:
+            if request.status == "PENDING":
+                request.status = "ACKNOWLEDGED"
+                request.acknowledged_at = now
+        return requests
+
+    def _complete_probe_termination(
+        self,
+        session: Session,
+        *,
+        probe: RecoveryProbe,
+        attempt: RecoveryProbeAttempt | None,
+        requests: list[WorkTerminationRequest],
+        now: datetime,
+    ) -> None:
+        gate = session.scalar(
+            select(RecoveryGate)
+            .where(RecoveryGate.id == probe.recovery_gate_id)
+            .with_for_update()
+        )
+        if gate is None or gate.latest_recovery_probe_id != probe.id:
+            self._probe_fence_lost()
+        primary = min(
+            requests,
+            key=lambda item: _TERMINATION_REASON_PRIORITY[item.reason_code],
+        )
+        failure_code = _TERMINATION_FAILURE_CODES[primary.reason_code]
+        probe.process_state = "FAILED"
+        probe.result = "INCONCLUSIVE"
+        probe.target_empty_evidence = None
+        probe.failure_code = failure_code
+        probe.finished_at = now
+        probe.active_attempt_id = None
+        if attempt is not None:
+            attempt.finished_at = now
+            attempt.termination_reason = primary.reason_code
+        else:
+            probe.queue_eligibility_state = "BLOCKED"
+            probe.queue_block_reason = failure_code
+            probe.queue_state_changed_at = now
+        gate.status = "REJECTED"
+        gate.target_empty_evidence = None
+        gate.verified_at = None
+        gate.reason_code = failure_code
+        for request in requests:
+            request.status = "COMPLETED"
+            request.acknowledged_at = request.acknowledged_at or now
+            request.completed_at = now
 
     @staticmethod
     def ensure_gate(

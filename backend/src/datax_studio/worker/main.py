@@ -533,6 +533,10 @@ def main() -> None:
 
     while not STOP.is_set():
         try:
+            # Safety stops are intentionally independent from admission and
+            # runtime-attestation gates: a degraded Worker must still release
+            # queued work and terminate any locally provable active process.
+            reconciler.reconcile_pending_work_terminations(identity=identity)
             dynamic_attestation = collect_dynamic_worker_attestation(
                 egress_verifier=egress_verifier,
                 storage_verifier=storage_verifier,

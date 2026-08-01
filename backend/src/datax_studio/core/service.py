@@ -66,6 +66,7 @@ from datax_studio.core.db import (
     TargetCopyLock,
     TargetNamespace,
     TransferPolicy,
+    WorkTerminationRequest,
 )
 from datax_studio.core.schemas import (
     AuditPage,
@@ -136,7 +137,10 @@ from datax_studio.egress_attestation import (
 from datax_studio.plugin_certification import (
     DenyAllPluginCertificationSource,
     PluginCertificationSource,
-    certification_block_reasons,
+    e4_qualification_block_reasons,
+    ordinary_user_execution_block_reasons,
+    release_promotion_ref_block_reason,
+    require_ordinary_user_execution_pair,
 )
 from datax_studio.recovery.gates import ensure_recovery_gate
 from datax_studio.schema_snapshot import (
@@ -159,6 +163,19 @@ _HOSTNAME_PATTERN = re.compile(
 )
 _TERMINAL_STATES = {"SUCCEEDED", "FAILED", "TIMED_OUT", "CANCELED", "LOST"}
 _ACTIVE_LOCK_STATES = {"RESERVED", "ACTIVE", "RECOVERY_REQUIRED"}
+_ACTIVE_WORK_TERMINATION_STATUSES = ("PENDING", "ACKNOWLEDGED")
+_TERMINATION_REASON_PRIORITY = {
+    "SECRET_COMPROMISED": 0,
+    "SECRET_REVOKED": 1,
+    "TARGET_EXCLUSIVITY_REVOKED": 2,
+    "TARGET_EXCLUSIVITY_EXPIRED": 3,
+}
+_TERMINATION_FAILURE_CODES = {
+    "SECRET_COMPROMISED": "CREDENTIAL_SECRET_COMPROMISED",
+    "SECRET_REVOKED": "CREDENTIAL_SECRET_REVOKED",
+    "TARGET_EXCLUSIVITY_REVOKED": "TARGET_EXCLUSIVITY_BROKEN",
+    "TARGET_EXCLUSIVITY_EXPIRED": "TARGET_EXCLUSIVITY_BROKEN",
+}
 _PROCESS_STATES = (
     "QUEUED",
     "STARTING",
@@ -1050,21 +1067,29 @@ class ControlService:
                 "1ea3e7ef4deebb90b36e4c7b1cb1e91852abbe9d6db0d52eee7a42fa037589f6",
             ),
         )
-        manifests: list[PluginManifest] = []
         now = utc_now()
         runtime_sha256 = str(row["runtime_sha256"])
+        # Read the candidate evidence only once.  Besides providing a
+        # deterministic catalog snapshot, this keeps a pluggable source from
+        # returning mutually inconsistent records within one response.
+        records = {
+            name: self._plugin_certification_source.get_record(name)
+            for name, *_unused in definitions
+        }
+        qualification_block_reasons_by_name: dict[str, list[str]] = {}
+        e4_certified_by_name: dict[str, bool] = {}
         for (
             name,
-            display_name,
-            engine,
-            direction,
-            path,
-            module_pom_sha256,
-            plugin_json_sha256,
+            _display_name,
+            _engine,
+            _direction,
+            _path,
+            _module_pom_sha256,
+            _plugin_json_sha256,
         ) in definitions:
-            record = self._plugin_certification_source.get_record(name)
-            record_block_reasons = (
-                certification_block_reasons(
+            record = records[name]
+            qualification_block_reasons = (
+                e4_qualification_block_reasons(
                     record,
                     expected_plugin_name=name,
                     expected_plugin_sha256=plugin_hashes[name],
@@ -1088,16 +1113,88 @@ class ControlService:
                     "WINDOWS_E4_EVIDENCE_MISSING",
                 ]
             )
-            if record is not None and record.source == "TEST_INJECTION":
-                record_block_reasons = [
-                    *record_block_reasons,
-                    "NON_RELEASE_TEST_EVIDENCE",
-                ]
-            e4_certified = (
+            qualification_block_reasons_by_name[name] = qualification_block_reasons
+            e4_certified_by_name[name] = (
                 record is not None
                 and record.source == "TRUSTED_RELEASE_ATTESTATION"
-                and not record_block_reasons
+                and not qualification_block_reasons
             )
+
+        # A release promotion is candidate-level evidence.  If trusted E4
+        # records disagree about it, no plugin may be advertised as ordinarily
+        # executable.  The raw values are not returned in that state: a
+        # syntactically valid but mismatched opaque reference is not a usable
+        # public promotion.
+        trusted_e4_promotion_refs = [
+            records[name].release_promotion_ref
+            for name, certified in e4_certified_by_name.items()
+            if certified and records[name] is not None
+        ]
+        promotion_refs_coherent = True
+        first_promotion_ref: str | None = None
+        for promotion_ref in trusted_e4_promotion_refs:
+            if release_promotion_ref_block_reason(promotion_ref) is not None:
+                promotion_refs_coherent = False
+                break
+            assert isinstance(promotion_ref, str)
+            if first_promotion_ref is None:
+                first_promotion_ref = promotion_ref
+            elif promotion_ref != first_promotion_ref:
+                promotion_refs_coherent = False
+                break
+
+        manifests: list[PluginManifest] = []
+        for (
+            name,
+            display_name,
+            engine,
+            direction,
+            path,
+            module_pom_sha256,
+            plugin_json_sha256,
+        ) in definitions:
+            record = records[name]
+            qualification_block_reasons = qualification_block_reasons_by_name[name]
+            execution_block_reasons = (
+                ordinary_user_execution_block_reasons(
+                    record,
+                    expected_plugin_name=name,
+                    expected_plugin_sha256=plugin_hashes[name],
+                    expected_runtime_sha256=runtime_sha256,
+                    current_candidate_id=(
+                        self._plugin_certification_source.current_candidate_id
+                    ),
+                    current_candidate_commit=(
+                        self._plugin_certification_source.current_candidate_commit
+                    ),
+                    current_worker_image_digest=(
+                        self._plugin_certification_source.current_worker_image_digest
+                    ),
+                    now=now,
+                )
+                if record is not None
+                else qualification_block_reasons
+            )
+            e4_certified = e4_certified_by_name[name]
+            if (
+                e4_certified
+                and release_promotion_ref_block_reason(
+                    record.release_promotion_ref if record is not None else None
+                )
+                is None
+                and not promotion_refs_coherent
+            ):
+                execution_block_reasons = [
+                    *execution_block_reasons,
+                    "PAIR_RELEASE_PROMOTION_MISMATCH",
+                ]
+            public_block_reasons = list(dict.fromkeys(execution_block_reasons))
+            if record is not None and record.source == "TEST_INJECTION":
+                public_block_reasons = [
+                    *public_block_reasons,
+                    "NON_RELEASE_TEST_EVIDENCE",
+                ]
+            ordinary_user_executable = e4_certified and not execution_block_reasons
             manifests.append(
                 PluginManifest(
                     schema_version="2.0",
@@ -1183,7 +1280,7 @@ class ControlService:
                         if e4_certified
                         else ("BLOCKED" if record is not None else "PACKAGED")
                     ),
-                    ordinary_user_executable=e4_certified,
+                    ordinary_user_executable=ordinary_user_executable,
                     evidence=PluginEvidence(
                         source=(
                             "TRUSTED_RELEASE_ATTESTATION"
@@ -1204,9 +1301,16 @@ class ControlService:
                         windows_e4_evidence_ref=(
                             record.windows_e4_evidence_ref if e4_certified else None
                         ),
+                        release_promotion_ref=(
+                            record.release_promotion_ref
+                            if ordinary_user_executable
+                            else None
+                        ),
                         valid_until=(record.valid_until if e4_certified else None),
                     ),
-                    block_reasons=([] if e4_certified else record_block_reasons),
+                    block_reasons=(
+                        [] if ordinary_user_executable else public_block_reasons
+                    ),
                 )
             )
         return PluginPage(items=manifests)
@@ -1217,9 +1321,23 @@ class ControlService:
         version: JobVersion,
         now: datetime | None = None,
     ) -> None:
-        self._plugin_certification_source.require_job_version(
+        check_time = now or utc_now()
+        reader, writer = self._plugin_certification_source.require_job_version(
             version=version,
-            now=now or utc_now(),
+            now=check_time,
+        )
+        require_ordinary_user_execution_pair(
+            reader=reader,
+            writer=writer,
+            version=version,
+            current_candidate_id=self._plugin_certification_source.current_candidate_id,
+            current_candidate_commit=(
+                self._plugin_certification_source.current_candidate_commit
+            ),
+            current_worker_image_digest=(
+                self._plugin_certification_source.current_worker_image_digest
+            ),
+            now=check_time,
         )
 
     # ------------------------------------------------------------------
@@ -2542,7 +2660,12 @@ class ControlService:
                     now=now,
                 )
                 spec = JobSpecV1.model_validate(version.spec_json)
-                self._check_job_spec_resources(session, job.project_id, spec)
+                self._check_job_spec_resources(
+                    session,
+                    job.project_id,
+                    spec,
+                    lock_datasources=True,
+                )
                 policy = session.get(TransferPolicy, version.transfer_policy_id)
                 if (
                     policy is None
@@ -3066,6 +3189,14 @@ class ControlService:
             execution.target_exclusivity_revoked_at = now
             execution.target_exclusivity_revocation_reason = request.reason
             execution.state_version += 1
+            termination = self._ensure_target_exclusivity_termination(
+                session,
+                execution=execution,
+                now=now,
+                attempt_id=execution.active_attempt_id,
+            )
+            if termination is None:
+                raise RuntimeError("revoked target exclusivity must create a termination request")
             self._append_execution_event(
                 session,
                 execution,
@@ -3074,6 +3205,7 @@ class ControlService:
                     "reason": request.reason,
                     "responsible_party": request.responsible_party,
                     "reported_at": _rfc3339(request.reported_at),
+                    "termination_request_id": str(termination.id),
                 },
                 now=now,
             )
@@ -3170,12 +3302,22 @@ class ControlService:
                 )
                 .exists()
             )
+            pending_termination = (
+                select(WorkTerminationRequest.id)
+                .where(
+                    WorkTerminationRequest.work_kind == "EXECUTION",
+                    WorkTerminationRequest.work_id == Execution.id,
+                    WorkTerminationRequest.status.in_(_ACTIVE_WORK_TERMINATION_STATUSES),
+                )
+                .exists()
+            )
             claimable = (
                 Execution.process_state == "QUEUED",
                 Execution.active_attempt_id.is_(None),
                 Execution.queue_eligibility_state == "ELIGIBLE",
                 Execution.target_exclusivity_status == "ACTIVE",
                 ~pending_cancel,
+                ~pending_termination,
             )
             project_has_claimable = (
                 select(Execution.id)
@@ -3234,14 +3376,15 @@ class ControlService:
                     execution.target_exclusivity_status == "ACTIVE"
                     and valid_until <= now
                 ):
-                    execution.target_exclusivity_status = "EXPIRED"
-                    execution.target_exclusivity_revocation_reason = (
-                        "VALIDITY_WINDOW_EXPIRED"
+                    self._ensure_target_exclusivity_termination(
+                        session,
+                        execution=execution,
+                        now=now,
+                        attempt_id=None,
                     )
                     execution.queue_eligibility_state = "BLOCKED"
                     execution.queue_block_reason = "TARGET_EXCLUSIVITY_EXPIRED"
                     execution.queue_state_changed_at = now
-                    execution.state_version += 1
                 return None
             target_lock = session.scalar(
                 select(TargetCopyLock)
@@ -3368,6 +3511,21 @@ class ControlService:
             }
             source_datasource = datasources.get(source_revision.datasource_id)
             target_datasource = datasources.get(target_revision.datasource_id)
+            # The SQL eligibility predicate was evaluated before this
+            # transaction acquired datasource/credential gates.  An emergency
+            # current-secret transition may have held the datasource row,
+            # durably recorded a WorkTerminationRequest for this queued item,
+            # and then committed while we waited.  Do not mark the queue item
+            # generically BLOCKED in that case: leave the durable request for
+            # the reconciler so it can release TargetCopyLock with its exact
+            # safety reason.
+            if self._active_work_termination_requests(
+                session,
+                work_kind="EXECUTION",
+                work_id=execution.id,
+                lock=False,
+            ):
+                return None
             if source_datasource is None or target_datasource is None:
                 execution.queue_eligibility_state = "BLOCKED"
                 execution.queue_block_reason = "CREDENTIAL_BINDING_NOT_ACTIVE"
@@ -3383,10 +3541,24 @@ class ControlService:
             except ProblemException as exc:
                 if exc.code != "CREDENTIAL_BINDING_NOT_ACTIVE":
                     raise
+                if self._active_work_termination_requests(
+                    session,
+                    work_kind="EXECUTION",
+                    work_id=execution.id,
+                    lock=False,
+                ):
+                    return None
                 execution.queue_eligibility_state = "BLOCKED"
                 execution.queue_block_reason = exc.code
                 execution.queue_state_changed_at = now
                 execution.state_version += 1
+                return None
+            if self._active_work_termination_requests(
+                session,
+                work_kind="EXECUTION",
+                work_id=execution.id,
+                lock=False,
+            ):
                 return None
             if (
                 source_datasource.status != "ACTIVE"
@@ -3486,6 +3658,33 @@ class ControlService:
         runtime_preflight: RuntimePreflight | dict[str, Any],
         evidence_validator: PreflightEvidenceValidator,
     ) -> ExecutionRuntimeSnapshot:
+        result = self._record_claimed_preflight_transaction(
+            claim=claim,
+            runtime_preflight=runtime_preflight,
+            evidence_validator=evidence_validator,
+        )
+        if isinstance(result, str):
+            if result == "WORK_TERMINATION_PENDING":
+                title = "Execution 已收到安全终止请求"
+                detail = "Worker 不得继续写入运行前检查事实。"
+            else:
+                title = "目标独占声明已失效"
+                detail = "Worker 必须终止当前 Attempt 并进入恢复门禁。"
+            raise ProblemException(
+                status=409,
+                code=result,
+                title=title,
+                detail=detail,
+            )
+        return result
+
+    def _record_claimed_preflight_transaction(
+        self,
+        *,
+        claim: ClaimedExecution,
+        runtime_preflight: RuntimePreflight | dict[str, Any],
+        evidence_validator: PreflightEvidenceValidator,
+    ) -> ExecutionRuntimeSnapshot | str:
         """Persist real post-claim connection and empty-target evidence.
 
         The Worker must call this only after claim_execution commits and before
@@ -3514,21 +3713,22 @@ class ControlService:
                     title="Execution 已不在运行前检查阶段",
                     detail="只有当前 fenced STARTING Attempt 可以写入 preflight 证据。",
                 )
-            valid_until = _parse_timestamp(
-                execution.target_exclusivity_confirmation["valid_until"]
+            active_terminations = self._active_work_termination_requests(
+                session,
+                work_kind="EXECUTION",
+                work_id=execution.id,
+                lock=True,
             )
-            if (
-                execution.target_exclusivity_status != "ACTIVE"
-                or execution.target_exclusivity_revoked_at is not None
-                or execution.target_exclusivity_revocation_reason is not None
-                or valid_until <= now
-            ):
-                raise ProblemException(
-                    status=409,
-                    code="TARGET_EXCLUSIVITY_NOT_ACTIVE",
-                    title="目标独占声明已失效",
-                    detail="Worker 必须终止当前 Attempt 并进入恢复门禁。",
-                )
+            if active_terminations:
+                return "WORK_TERMINATION_PENDING"
+            termination = self._ensure_target_exclusivity_termination(
+                session,
+                execution=execution,
+                now=now,
+                attempt_id=attempt.id,
+            )
+            if termination is not None:
+                return "TARGET_EXCLUSIVITY_NOT_ACTIVE"
             if execution.runtime_snapshot is not None:
                 raise ProblemException(
                     status=409,
@@ -3639,6 +3839,7 @@ class ControlService:
     ) -> datetime:
         if not 5 <= lease_seconds <= 300:
             raise ValueError("lease_seconds must be between 5 and 300")
+        termination_pending = False
         with self.sessions.begin() as session:
             now = self._database_now(session)
             execution, attempt = self._current_fenced_attempt(
@@ -3647,12 +3848,233 @@ class ControlService:
                 now=now,
                 lock=True,
             )
-            attempt.heartbeat_at = now
-            attempt.lease_expires_at = now + timedelta(seconds=lease_seconds)
-            # Touch the execution CAS version so stale state writers cannot ignore
-            # a concurrent lifecycle mutation.
+            self._ensure_target_exclusivity_termination(
+                session,
+                execution=execution,
+                now=now,
+                attempt_id=attempt.id,
+            )
+            requests = self._active_work_termination_requests(
+                session,
+                work_kind="EXECUTION",
+                work_id=execution.id,
+                lock=True,
+            )
+            if requests:
+                termination_pending = True
+                for request in requests:
+                    if request.status == "PENDING":
+                        request.status = "ACKNOWLEDGED"
+                        request.acknowledged_at = now
+                self._append_execution_event(
+                    session,
+                    execution,
+                    event_type="EXECUTION_SYSTEM_TERMINATION_ACKNOWLEDGED",
+                    from_state=execution.process_state,
+                    to_state=execution.process_state,
+                    attempt_id=attempt.id,
+                    payload={
+                        "termination_request_ids": [str(item.id) for item in requests],
+                        "reason_codes": [item.reason_code for item in requests],
+                        "acknowledged_via": "HEARTBEAT",
+                    },
+                    now=now,
+                )
+            else:
+                attempt.heartbeat_at = now
+                attempt.lease_expires_at = now + timedelta(seconds=lease_seconds)
+                # Touch the execution CAS version so stale state writers cannot ignore
+                # a concurrent lifecycle mutation.
+                execution.state_version += 1
+                lease_expires_at = ensure_aware(attempt.lease_expires_at)
+        if termination_pending:
+            raise ProblemException(
+                status=409,
+                code="WORK_TERMINATION_PENDING",
+                title="Execution 已收到安全终止请求",
+                detail="Worker 不得继续续租，必须停止当前工作并收敛安全终态。",
+            )
+        return lease_expires_at
+
+    def acknowledge_claimed_execution_termination(
+        self,
+        *,
+        claim: ClaimedExecution,
+    ) -> bool:
+        """Acknowledge a durable safety stop without advancing business state.
+
+        A managed process may still be alive when this returns.  The caller
+        must terminate it and then call :meth:`complete_claimed_execution_termination`
+        under the same fence.  Keeping acknowledgement separate makes a
+        crash between those steps visible to the reconciler instead of silently
+        converting it to a successful or operator-cancelled execution.
+        """
+
+        with self.sessions.begin() as session:
+            now = self._database_now(session)
+            execution, attempt = self._current_fenced_attempt(
+                session,
+                claim=claim,
+                now=now,
+                lock=True,
+            )
+            self._ensure_target_exclusivity_termination(
+                session,
+                execution=execution,
+                now=now,
+                attempt_id=attempt.id,
+            )
+            requests = self._active_work_termination_requests(
+                session,
+                work_kind="EXECUTION",
+                work_id=execution.id,
+                lock=True,
+            )
+            if not requests:
+                return False
+            for request in requests:
+                if request.status == "PENDING":
+                    request.status = "ACKNOWLEDGED"
+                    request.acknowledged_at = now
+            self._append_execution_event(
+                session,
+                execution,
+                event_type="EXECUTION_SYSTEM_TERMINATION_ACKNOWLEDGED",
+                from_state=execution.process_state,
+                to_state=execution.process_state,
+                attempt_id=attempt.id,
+                payload={
+                    "termination_request_ids": [str(item.id) for item in requests],
+                    "reason_codes": [item.reason_code for item in requests],
+                },
+                now=now,
+            )
+            return True
+
+    def complete_claimed_execution_termination(
+        self,
+        *,
+        claim: ClaimedExecution,
+        oracle_started: bool,
+    ) -> bool:
+        """Finish a safety stop as FAILED and atomically open recovery.
+
+        System termination intentionally outranks a user cancellation request:
+        it records a security/precondition failure rather than misclassifying
+        the incident as an operator initiated cancellation.
+        """
+
+        with self.sessions.begin() as session:
+            now = self._database_now(session)
+            execution, attempt = self._current_fenced_attempt(
+                session,
+                claim=claim,
+                now=now,
+                lock=True,
+            )
+            requests = self._active_work_termination_requests(
+                session,
+                work_kind="EXECUTION",
+                work_id=execution.id,
+                lock=True,
+            )
+            if not requests:
+                return False
+            if execution.process_state not in {
+                "STARTING",
+                "RUNNING",
+                "VERIFYING",
+                "CANCEL_REQUESTED",
+            }:
+                self._fence_lost()
+            target_lock = self._execution_lock(session, execution.id, lock=True)
+            if (
+                target_lock.state != "ACTIVE"
+                or target_lock.attempt_id != attempt.id
+                or target_lock.fence_epoch != claim.fence_epoch
+            ):
+                self._fence_lost()
+            for request in requests:
+                if request.status == "PENDING":
+                    request.status = "ACKNOWLEDGED"
+                    request.acknowledged_at = now
+            primary = min(
+                requests,
+                key=lambda item: _TERMINATION_REASON_PRIORITY[item.reason_code],
+            )
+            failure_code = _TERMINATION_FAILURE_CODES[primary.reason_code]
+            from_state = execution.process_state
+            verification_inconclusive = (
+                oracle_started
+                or from_state == "VERIFYING"
+                or execution.verification_state == "VERIFYING"
+            )
+            active_cancel = session.scalar(
+                select(ExecutionCancelRequest)
+                .where(
+                    ExecutionCancelRequest.execution_id == execution.id,
+                    ExecutionCancelRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
+                )
+                .with_for_update()
+            )
+            if active_cancel is not None:
+                active_cancel.status = "REJECTED"
+                active_cancel.completed_at = now
+            execution.process_state = "FAILED"
+            execution.data_effect = "NONE" if from_state == "STARTING" else "UNKNOWN"
+            execution.verification_state = (
+                "INCONCLUSIVE" if verification_inconclusive else "NOT_STARTED"
+            )
+            execution.exit_code = (
+                attempt.exit_code
+                if attempt.exit_code is not None
+                else execution.exit_code
+            )
+            execution.failure_code = failure_code
+            execution.failure_message = (
+                "A safety termination request stopped this execution; "
+                "manual recovery is required."
+            )
+            if from_state != "STARTING":
+                execution.summary_parse_status = "FAILED"
+                execution.run_summary = None
+            execution.finished_at = now
+            execution.active_attempt_id = None
             execution.state_version += 1
-            return ensure_aware(attempt.lease_expires_at)
+            attempt.finished_at = now
+            attempt.termination_reason = primary.reason_code
+            target_lock.state = "RECOVERY_REQUIRED"
+            for request in requests:
+                request.status = "COMPLETED"
+                request.acknowledged_at = request.acknowledged_at or now
+                request.completed_at = now
+            self._append_execution_event(
+                session,
+                execution,
+                event_type="EXECUTION_SYSTEM_TERMINATED",
+                from_state=from_state,
+                to_state="FAILED",
+                attempt_id=attempt.id,
+                payload={
+                    "data_effect": execution.data_effect,
+                    "verification_state": execution.verification_state,
+                    "failure_code": failure_code,
+                    "primary_reason_code": primary.reason_code,
+                    "termination_request_ids": [str(item.id) for item in requests],
+                    "rejected_cancel_request_id": (
+                        str(active_cancel.id) if active_cancel is not None else None
+                    ),
+                },
+                now=now,
+            )
+            gate = ensure_recovery_gate(
+                session,
+                execution=execution,
+                now=now,
+            )
+            if gate is None:
+                raise RuntimeError("system terminated execution must create a recovery gate")
+            return True
 
     def transition_claimed_execution(
         self,
@@ -3670,6 +4092,47 @@ class ControlService:
         summary_parse_status: str | None = None,
         run_summary: dict[str, Any] | None = None,
     ) -> None:
+        outcome = self._transition_claimed_execution_transaction(
+            claim=claim,
+            expected_state=expected_state,
+            new_state=new_state,
+            data_effect=data_effect,
+            verification_state=verification_state,
+            exit_code=exit_code,
+            verification_report=verification_report,
+            verification_evidence_hash=verification_evidence_hash,
+            failure_code=failure_code,
+            failure_message=failure_message,
+            summary_parse_status=summary_parse_status,
+            run_summary=run_summary,
+        )
+        if outcome == "TERMINATION_PENDING":
+            raise ProblemException(
+                status=409,
+                code="TARGET_EXCLUSIVITY_NOT_ACTIVE",
+                title="目标独占声明已失效",
+                detail="Worker 必须终止当前 Attempt 并进入恢复门禁。",
+            )
+        # TERMINATION_CONVERGED means the final terminal transaction itself
+        # safely changed a would-be success into FAILED and opened the gate.
+        # It is intentionally not retried through the now-cleared fence.
+
+    def _transition_claimed_execution_transaction(
+        self,
+        *,
+        claim: ClaimedExecution,
+        expected_state: str,
+        new_state: str,
+        data_effect: str,
+        verification_state: str,
+        exit_code: int | None = None,
+        verification_report: dict[str, Any] | None = None,
+        verification_evidence_hash: str | None = None,
+        failure_code: str | None = None,
+        failure_message: str | None = None,
+        summary_parse_status: str | None = None,
+        run_summary: dict[str, Any] | None = None,
+    ) -> str | None:
         allowed = {
             "STARTING": {"RUNNING", "FAILED", "CANCEL_REQUESTED"},
             "RUNNING": {"VERIFYING", "FAILED", "TIMED_OUT", "CANCEL_REQUESTED"},
@@ -3679,6 +4142,8 @@ class ControlService:
         if new_state not in allowed.get(expected_state, set()):
             raise ValueError("illegal execution transition")
         target_exclusivity_broken = False
+        termination_primary_reason: str | None = None
+        termination_request_ids: list[str] = []
         with self.sessions.begin() as session:
             now = self._database_now(session)
             execution, attempt = self._current_fenced_attempt(
@@ -3694,6 +4159,26 @@ class ControlService:
                     title="Execution 状态已变化",
                     detail="旧 Worker 不得覆盖当前状态。",
                 )
+            active_terminations = self._active_work_termination_requests(
+                session,
+                work_kind="EXECUTION",
+                work_id=execution.id,
+                lock=True,
+            )
+            if active_terminations and not (
+                new_state == "SUCCEEDED"
+                and all(
+                    item.reason_code
+                    in {"TARGET_EXCLUSIVITY_REVOKED", "TARGET_EXCLUSIVITY_EXPIRED"}
+                    for item in active_terminations
+                )
+            ):
+                raise ProblemException(
+                    status=409,
+                    code="WORK_TERMINATION_PENDING",
+                    title="Execution 已收到安全终止请求",
+                    detail="Worker 必须先收敛安全终止，不能推进状态。",
+                )
             target_lock = self._execution_lock(session, execution.id, lock=True)
             if (
                 target_lock.state != "ACTIVE"
@@ -3704,6 +4189,18 @@ class ControlService:
             confirmation_valid_until = _parse_timestamp(
                 execution.target_exclusivity_confirmation["valid_until"]
             )
+            # This is the final wall-clock check for every non-success state
+            # transition.  Returning from inside the transaction commits the
+            # newly durable stop; the public wrapper raises only after that
+            # commit so the Worker can converge it under the same fence.
+            expiration_termination = self._ensure_target_exclusivity_termination(
+                session,
+                execution=execution,
+                now=now,
+                attempt_id=attempt.id,
+            )
+            if expiration_termination is not None and new_state != "SUCCEEDED":
+                return "TERMINATION_PENDING"
             parsed_run_summary = (
                 RunSummary.model_validate(run_summary)
                 if run_summary is not None
@@ -3788,31 +4285,12 @@ class ControlService:
                     or confirmation_valid_until <= now
                 ):
                     target_exclusivity_broken = True
-                    if (
-                        execution.target_exclusivity_status == "ACTIVE"
-                        and execution.target_exclusivity_revoked_at is None
-                        and execution.target_exclusivity_revocation_reason is None
-                        and confirmation_valid_until <= now
-                    ):
-                        execution.target_exclusivity_status = "EXPIRED"
-                        execution.target_exclusivity_revocation_reason = (
-                            "VALIDITY_WINDOW_EXPIRED"
-                        )
-                        execution.state_version += 1
-                        self._append_execution_event(
-                            session,
-                            execution,
-                            event_type="TARGET_EXCLUSIVITY_EXPIRED",
-                            from_state="VERIFYING",
-                            to_state="VERIFYING",
-                            attempt_id=attempt.id,
-                            payload={
-                                "valid_until": _rfc3339(
-                                    confirmation_valid_until
-                                )
-                            },
-                            now=now,
-                        )
+                    self._ensure_target_exclusivity_termination(
+                        session,
+                        execution=execution,
+                        now=now,
+                        attempt_id=attempt.id,
+                    )
                     # The terminal row lock is the final ordering point with a
                     # concurrent revoke or wall-clock expiry. Persist the safe
                     # terminal result in this transaction, then raise the
@@ -3889,12 +4367,37 @@ class ControlService:
                 execution.finished_at = now
                 attempt.finished_at = now
                 attempt.exit_code = exit_code
-                attempt.termination_reason = new_state
                 execution.active_attempt_id = None
+                if target_exclusivity_broken:
+                    terminations = self._active_work_termination_requests(
+                        session,
+                        work_kind="EXECUTION",
+                        work_id=execution.id,
+                        lock=True,
+                    )
+                    if not terminations:
+                        raise RuntimeError(
+                            "target exclusivity failure must retain a termination request"
+                        )
+                    primary = min(
+                        terminations,
+                        key=lambda item: _TERMINATION_REASON_PRIORITY[item.reason_code],
+                    )
+                    termination_primary_reason = primary.reason_code
+                    termination_request_ids = [str(item.id) for item in terminations]
+                    for termination in terminations:
+                        termination.status = "COMPLETED"
+                        termination.acknowledged_at = termination.acknowledged_at or now
+                        termination.completed_at = now
+                attempt.termination_reason = termination_primary_reason or new_state
             self._append_execution_event(
                 session,
                 execution,
-                event_type=f"EXECUTION_{new_state}",
+                event_type=(
+                    "EXECUTION_SYSTEM_TERMINATED"
+                    if target_exclusivity_broken
+                    else f"EXECUTION_{new_state}"
+                ),
                 from_state=expected_state,
                 to_state=new_state,
                 attempt_id=attempt.id,
@@ -3902,6 +4405,8 @@ class ControlService:
                     "data_effect": data_effect,
                     "verification_state": verification_state,
                     "failure_code": failure_code,
+                    "primary_reason_code": termination_primary_reason,
+                    "termination_request_ids": termination_request_ids,
                 },
                 now=now,
             )
@@ -3916,12 +4421,8 @@ class ControlService:
                         "claimed recovery-required terminal state must create a gate"
                     )
         if target_exclusivity_broken:
-            raise ProblemException(
-                status=409,
-                code="TARGET_EXCLUSIVITY_BROKEN",
-                title="目标独占声明已失效",
-                detail="Oracle 结论已拒绝；当前 Execution 已进入恢复门禁。",
-            )
+            return "TERMINATION_CONVERGED"
+        return None
 
     def assert_claimed_verification_exclusivity(
         self,
@@ -3952,6 +4453,18 @@ class ControlService:
                     title="Execution 状态已变化",
                     detail="旧 Worker 不得继续当前核验。",
                 )
+            if self._active_work_termination_requests(
+                session,
+                work_kind="EXECUTION",
+                work_id=execution.id,
+                lock=True,
+            ):
+                raise ProblemException(
+                    status=409,
+                    code="WORK_TERMINATION_PENDING",
+                    title="Execution 已收到安全终止请求",
+                    detail="Oracle 不得在安全终止待处理时启动。",
+                )
             target_lock = self._execution_lock(session, execution.id, lock=True)
             if (
                 target_lock.state != "ACTIVE"
@@ -3959,36 +4472,13 @@ class ControlService:
                 or target_lock.fence_epoch != claim.fence_epoch
             ):
                 self._fence_lost()
-            valid_until = _parse_timestamp(
-                execution.target_exclusivity_confirmation["valid_until"]
+            termination = self._ensure_target_exclusivity_termination(
+                session,
+                execution=execution,
+                now=now,
+                attempt_id=attempt.id,
             )
-            if (
-                execution.target_exclusivity_status == "ACTIVE"
-                and execution.target_exclusivity_revoked_at is None
-                and execution.target_exclusivity_revocation_reason is None
-                and valid_until <= now
-            ):
-                execution.target_exclusivity_status = "EXPIRED"
-                execution.target_exclusivity_revocation_reason = (
-                    "VALIDITY_WINDOW_EXPIRED"
-                )
-                execution.state_version += 1
-                self._append_execution_event(
-                    session,
-                    execution,
-                    event_type="TARGET_EXCLUSIVITY_EXPIRED",
-                    from_state="VERIFYING",
-                    to_state="VERIFYING",
-                    attempt_id=attempt.id,
-                    payload={"valid_until": _rfc3339(valid_until)},
-                    now=now,
-                )
-            broken = (
-                execution.target_exclusivity_status != "ACTIVE"
-                or execution.target_exclusivity_revoked_at is not None
-                or execution.target_exclusivity_revocation_reason is not None
-                or valid_until <= now
-            )
+            broken = termination is not None
         if broken:
             raise ProblemException(
                 status=409,
@@ -4002,6 +4492,19 @@ class ControlService:
         *,
         claim: ClaimedExecution,
     ) -> None:
+        if self._mark_claimed_oracle_started_transaction(claim=claim):
+            raise ProblemException(
+                status=409,
+                code="WORK_TERMINATION_PENDING",
+                title="Execution 已收到安全终止请求",
+                detail="Oracle 不得在安全终止待处理时启动。",
+            )
+
+    def _mark_claimed_oracle_started_transaction(
+        self,
+        *,
+        claim: ClaimedExecution,
+    ) -> bool:
         """Record the exact boundary where independent database reads may begin."""
 
         with self.sessions.begin() as session:
@@ -4023,6 +4526,13 @@ class ControlService:
                     title="Oracle 启动状态冲突",
                     detail="只有 DataX 正常退出且尚未启动核验的 Execution 才能启动 Oracle。",
                 )
+            if self._active_work_termination_requests(
+                session,
+                work_kind="EXECUTION",
+                work_id=execution.id,
+                lock=True,
+            ):
+                return True
             target_lock = self._execution_lock(session, execution.id, lock=True)
             if (
                 target_lock.state != "ACTIVE"
@@ -4030,6 +4540,13 @@ class ControlService:
                 or target_lock.fence_epoch != claim.fence_epoch
             ):
                 self._fence_lost()
+            if self._ensure_target_exclusivity_termination(
+                session,
+                execution=execution,
+                now=now,
+                attempt_id=attempt.id,
+            ) is not None:
+                return True
             execution.verification_state = "VERIFYING"
             execution.state_version += 1
             self._append_execution_event(
@@ -4045,6 +4562,7 @@ class ControlService:
                 },
                 now=now,
             )
+        return False
 
     def reconcile_unclaimed_cancel(self, *, execution_id: UUID) -> bool:
         """Reconciler-only path for QUEUED cancellation.
@@ -4062,6 +4580,16 @@ class ControlService:
                 or execution.process_state != "QUEUED"
                 or execution.active_attempt_id is not None
             ):
+                return False
+            if self._active_work_termination_requests(
+                session,
+                work_kind="EXECUTION",
+                work_id=execution.id,
+                lock=True,
+            ):
+                # A durable safety stop wins over a user cancel.  The
+                # reconciler will preserve its exact cause and release the
+                # reservation through reconcile_unclaimed_work_termination.
                 return False
             cancel = session.scalar(
                 select(ExecutionCancelRequest)
@@ -4127,27 +4655,13 @@ class ControlService:
             target_lock = self._execution_lock(session, execution.id, lock=True)
             if target_lock.state != "RESERVED" or target_lock.attempt_id is not None:
                 return False
-            valid_until = _parse_timestamp(
-                execution.target_exclusivity_confirmation["valid_until"]
+            termination = self._ensure_target_exclusivity_termination(
+                session,
+                execution=execution,
+                now=now,
+                attempt_id=None,
             )
-            if (
-                execution.target_exclusivity_status == "ACTIVE"
-                and execution.target_exclusivity_revoked_at is None
-                and execution.target_exclusivity_revocation_reason is None
-                and valid_until <= now
-            ):
-                execution.target_exclusivity_status = "EXPIRED"
-                execution.target_exclusivity_revocation_reason = (
-                    "VALIDITY_WINDOW_EXPIRED"
-                )
-                self._append_execution_event(
-                    session,
-                    execution,
-                    event_type="TARGET_EXCLUSIVITY_EXPIRED",
-                    payload={"valid_until": _rfc3339(valid_until)},
-                    now=now,
-                )
-            if execution.target_exclusivity_status not in {"REVOKED", "EXPIRED"}:
+            if termination is None:
                 return False
             self._append_execution_event(
                 session,
@@ -4176,6 +4690,121 @@ class ControlService:
             execution.state_version += 1
             target_lock.state = "RELEASED"
             target_lock.released_at = now
+            requests = self._active_work_termination_requests(
+                session,
+                work_kind="EXECUTION",
+                work_id=execution.id,
+                lock=True,
+            )
+            for request in requests:
+                request.status = "COMPLETED"
+                request.acknowledged_at = request.acknowledged_at or now
+                request.completed_at = now
+            return True
+
+    def reconcile_target_exclusivity_expiry(self, *, execution_id: UUID) -> bool:
+        """Persist an elapsed target window even when no claim is attempted.
+
+        Expiry is wall-clock state, not a side effect of queue selection.  The
+        Worker heartbeat scanner calls this so an idle queue cannot continue
+        displaying an expired declaration as ACTIVE indefinitely.
+        """
+
+        with self.sessions.begin() as session:
+            now = self._database_now(session)
+            execution = session.scalar(
+                select(Execution).where(Execution.id == execution_id).with_for_update()
+            )
+            if execution is None or execution.process_state in _TERMINAL_STATES:
+                return False
+            return (
+                self._ensure_target_exclusivity_termination(
+                    session,
+                    execution=execution,
+                    now=now,
+                    attempt_id=execution.active_attempt_id,
+                )
+                is not None
+            )
+
+    def reconcile_unclaimed_work_termination(self, *, execution_id: UUID) -> bool:
+        """Worker-only convergence for a queued safety termination request.
+
+        No Attempt has existed, so this releases the reservation without
+        manufacturing a recovery gate.  The authoritative reason is retained
+        in both the Execution failure code and the completed request rows.
+        """
+
+        with self.sessions.begin() as session:
+            now = self._database_now(session)
+            execution = session.scalar(
+                select(Execution).where(Execution.id == execution_id).with_for_update()
+            )
+            if (
+                execution is None
+                or execution.process_state != "QUEUED"
+                or execution.active_attempt_id is not None
+            ):
+                return False
+            requests = self._active_work_termination_requests(
+                session,
+                work_kind="EXECUTION",
+                work_id=execution.id,
+                lock=True,
+            )
+            if not requests:
+                return False
+            target_lock = self._execution_lock(session, execution.id, lock=True)
+            if target_lock.state != "RESERVED" or target_lock.attempt_id is not None:
+                return False
+            primary = min(
+                requests,
+                key=lambda item: _TERMINATION_REASON_PRIORITY[item.reason_code],
+            )
+            active_cancel = session.scalar(
+                select(ExecutionCancelRequest)
+                .where(
+                    ExecutionCancelRequest.execution_id == execution.id,
+                    ExecutionCancelRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
+                )
+                .with_for_update()
+            )
+            if active_cancel is not None:
+                active_cancel.status = "REJECTED"
+                active_cancel.completed_at = now
+            execution.process_state = "CANCELED"
+            execution.data_effect = "NONE"
+            execution.verification_state = "NOT_STARTED"
+            execution.queue_eligibility_state = "BLOCKED"
+            execution.queue_block_reason = _TERMINATION_FAILURE_CODES[primary.reason_code]
+            execution.queue_state_changed_at = now
+            execution.failure_code = _TERMINATION_FAILURE_CODES[primary.reason_code]
+            execution.failure_message = "A safety termination request prevented execution."
+            execution.finished_at = now
+            execution.state_version += 1
+            target_lock.state = "RELEASED"
+            target_lock.released_at = now
+            for request in requests:
+                request.status = "COMPLETED"
+                request.acknowledged_at = request.acknowledged_at or now
+                request.completed_at = now
+            self._append_execution_event(
+                session,
+                execution,
+                event_type="EXECUTION_SYSTEM_TERMINATED_UNCLAIMED",
+                from_state="QUEUED",
+                to_state="CANCELED",
+                payload={
+                    "failure_code": execution.failure_code,
+                    "primary_reason_code": primary.reason_code,
+                    "termination_request_ids": [str(item.id) for item in requests],
+                    "target_lock_state": "RELEASED",
+                    "rejected_cancel_request_id": (
+                        str(active_cancel.id) if active_cancel is not None else None
+                    ),
+                },
+                now=now,
+            )
             return True
 
     # ------------------------------------------------------------------
@@ -4780,6 +5409,8 @@ class ControlService:
         session: Session,
         project_id: UUID,
         spec: JobSpecV1,
+        *,
+        lock_datasources: bool = False,
     ) -> None:
         source_revision = session.get(
             DatasourceRevision,
@@ -4789,20 +5420,30 @@ class ControlService:
             DatasourceRevision,
             spec.target.datasource_revision_id,
         )
-        source = (
-            session.get(Datasource, source_revision.datasource_id)
-            if source_revision
-            else None
-        )
-        target = (
-            session.get(Datasource, target_revision.datasource_id)
-            if target_revision
-            else None
-        )
+        if source_revision is None or target_revision is None:
+            self._not_found()
+        if lock_datasources:
+            datasource_ids = {
+                source_revision.datasource_id,
+                target_revision.datasource_id,
+            }
+            datasources = {
+                datasource.id: datasource
+                for datasource in session.scalars(
+                    select(Datasource)
+                    .where(Datasource.id.in_(datasource_ids))
+                    .order_by(Datasource.id)
+                    .execution_options(populate_existing=True)
+                    .with_for_update()
+                )
+            }
+            source = datasources.get(source_revision.datasource_id)
+            target = datasources.get(target_revision.datasource_id)
+        else:
+            source = session.get(Datasource, source_revision.datasource_id)
+            target = session.get(Datasource, target_revision.datasource_id)
         if (
-            source_revision is None
-            or target_revision is None
-            or source is None
+            source is None
             or target is None
             or source.id != spec.source.datasource_id
             or target.id != spec.target.datasource_id
@@ -5421,6 +6062,122 @@ class ControlService:
             target_multiset_sha256=target_multiset_hash,
             artifact_sha256=computed_artifact_hash,
             finished_at=report_finished_at,
+        )
+
+    def _active_work_termination_requests(
+        self,
+        session: Session,
+        *,
+        work_kind: str,
+        work_id: UUID,
+        lock: bool,
+    ) -> list[WorkTerminationRequest]:
+        statement = (
+            select(WorkTerminationRequest)
+            .where(
+                WorkTerminationRequest.work_kind == work_kind,
+                WorkTerminationRequest.work_id == work_id,
+                WorkTerminationRequest.status.in_(_ACTIVE_WORK_TERMINATION_STATUSES),
+            )
+            .order_by(WorkTerminationRequest.requested_at, WorkTerminationRequest.id)
+        )
+        if lock:
+            statement = statement.with_for_update()
+        return list(session.scalars(statement))
+
+    @staticmethod
+    def _ensure_work_termination_request(
+        session: Session,
+        *,
+        work_kind: str,
+        work_id: UUID,
+        reason_code: str,
+        credential_secret_id: UUID | None,
+        now: datetime,
+    ) -> WorkTerminationRequest:
+        if work_kind not in {"EXECUTION", "RECOVERY_PROBE"}:
+            raise ValueError("invalid work termination kind")
+        if reason_code not in _TERMINATION_REASON_PRIORITY:
+            raise ValueError("invalid work termination reason")
+        is_secret_reason = reason_code in {"SECRET_REVOKED", "SECRET_COMPROMISED"}
+        if is_secret_reason != (credential_secret_id is not None):
+            raise ValueError("termination credential reference does not match reason")
+        secret_match = (
+            WorkTerminationRequest.credential_secret_id.is_(None)
+            if credential_secret_id is None
+            else WorkTerminationRequest.credential_secret_id == credential_secret_id
+        )
+        existing = session.scalar(
+            select(WorkTerminationRequest)
+            .where(
+                WorkTerminationRequest.work_kind == work_kind,
+                WorkTerminationRequest.work_id == work_id,
+                WorkTerminationRequest.reason_code == reason_code,
+                secret_match,
+                WorkTerminationRequest.status.in_(_ACTIVE_WORK_TERMINATION_STATUSES),
+            )
+            .order_by(WorkTerminationRequest.requested_at, WorkTerminationRequest.id)
+            .with_for_update()
+        )
+        if existing is not None:
+            return existing
+        request = WorkTerminationRequest(
+            id=uuid4(),
+            work_kind=work_kind,
+            work_id=work_id,
+            credential_secret_id=credential_secret_id,
+            reason_code=reason_code,
+            status="PENDING",
+            requested_at=now,
+        )
+        session.add(request)
+        return request
+
+    def _ensure_target_exclusivity_termination(
+        self,
+        session: Session,
+        *,
+        execution: Execution,
+        now: datetime,
+        attempt_id: UUID | None,
+    ) -> WorkTerminationRequest | None:
+        """Persist expiry/revocation before a Worker acts on the safety stop."""
+
+        valid_until = _parse_timestamp(
+            execution.target_exclusivity_confirmation["valid_until"]
+        )
+        if (
+            execution.target_exclusivity_status == "ACTIVE"
+            and execution.target_exclusivity_revoked_at is None
+            and execution.target_exclusivity_revocation_reason is None
+            and valid_until <= now
+        ):
+            execution.target_exclusivity_status = "EXPIRED"
+            execution.target_exclusivity_revocation_reason = "VALIDITY_WINDOW_EXPIRED"
+            execution.state_version += 1
+            self._append_execution_event(
+                session,
+                execution,
+                event_type="TARGET_EXCLUSIVITY_EXPIRED",
+                from_state=execution.process_state,
+                to_state=execution.process_state,
+                attempt_id=attempt_id,
+                payload={"valid_until": _rfc3339(valid_until)},
+                now=now,
+            )
+        if execution.target_exclusivity_status == "REVOKED":
+            reason_code = "TARGET_EXCLUSIVITY_REVOKED"
+        elif execution.target_exclusivity_status == "EXPIRED":
+            reason_code = "TARGET_EXCLUSIVITY_EXPIRED"
+        else:
+            return None
+        return self._ensure_work_termination_request(
+            session,
+            work_kind="EXECUTION",
+            work_id=execution.id,
+            reason_code=reason_code,
+            credential_secret_id=None,
+            now=now,
         )
 
     def _execution_lock(

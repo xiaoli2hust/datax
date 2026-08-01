@@ -87,6 +87,21 @@ GitHub artifact attestation 能证明候选根由指定 workflow/commit 产生�
 `http://127.0.0.1:17860` 使用产品；不需要自建 Linux 服务器，也不需要把目标 Windows
 电脑长期注册为 GitHub runner。
 
+### 6. 与 ADR-0011 的衔接
+
+ADR-0011 将插件/Runtime 的不可变 payload、受保护 harness 的短期资格、detached
+release qualification、最终安装包和公开晋级拆开。这里的双重信任根不被 QR 替代：
+
+- 自托管 Windows harness 可在 Phase A 对 payload 进行真实 E3/私有 Windows harness/payload
+  qualification（明确不是 E4 或 Plugin Manifest 状态），并在 Phase B 对精确最终
+  Setup/Launcher 做无 harness override 的正常模式 E4；只有后者才可派生
+  `WINDOWS_E4_CERTIFIED`，且它仍不能自行签发公开候选根。
+- hosted attestor 必须在 Phase B 之后重新验证 final candidate root，且 root 必须同时
+  绑定 payload root、QR、最终 Setup/Launcher/manifest、最终场景和验收证据。OIDC
+  provenance 只能证明来源和不可替换性，不能将 QR 或 Windows JSON 变成物理行为证明。
+- 现有 candidate-root.v1 的 BLOCKED 语义保持不变。未来需要独立的 v2 契约表达最终
+  promotion；不得放宽 v1，或让 QH/QR/manifest 自身声称 release_approved=true。
+
 ## 实施门禁
 
 1. 先固化机器场景 profile 和 candidate-root Schema/生成器/验证器及负向测试。
@@ -140,6 +155,10 @@ attestation 服务上运行，因而没有真实 bundle/反向验证证据；机
 以及 attestation 后的完整 acceptance/oracle/E4/P0-P1 聚合门禁也均未完成。本切片没有放开
 `validate_acceptance_manifest.py --require-pass`；正式发布仍稳定返回
 `TRUSTED_RELEASE_ATTESTATION_NOT_IMPLEMENTED`。
+
+ADR-0011 在 2026-08-02 只接受了两阶段资格/晋级的架构，不代表其中的 payload root、
+QH/QR、candidate-root.v2、受信 runtime reader、受保护 override 或 Phase A/Phase B
+workflow 已存在；这些项目及真实 Windows/签名/OIDC 证据继续为 BLOCKED。
 
 ## 后果
 

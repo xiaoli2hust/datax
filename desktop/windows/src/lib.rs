@@ -35,7 +35,7 @@ const COMPOSE_TIMEOUT: Duration = Duration::from_secs(180);
 const SYSTEM_BACKUP_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
-const SUPPORTED_MIGRATION_REVISION: &str = "20260731_0014";
+const SUPPORTED_MIGRATION_REVISION: &str = "20260802_0015";
 const IMAGE_ENV_FILE_NAME: &str = "images.release.env";
 const EXPECTED_SERVICES: [&str; 6] = [
     "api",

@@ -19,6 +19,7 @@ from typing import BinaryIO
 class ProcessAction(StrEnum):
     CONTINUE = "CONTINUE"
     CANCEL = "CANCEL"
+    TERMINATE = "TERMINATE"
     FENCE_LOST = "FENCE_LOST"
     EGRESS_LOST = "EGRESS_LOST"
 
@@ -27,6 +28,7 @@ class ProcessEndReason(StrEnum):
     EXITED = "EXITED"
     TIMED_OUT = "TIMED_OUT"
     CANCELED = "CANCELED"
+    TERMINATED = "TERMINATED"
     FENCE_LOST = "FENCE_LOST"
     EGRESS_LOST = "EGRESS_LOST"
 
@@ -359,6 +361,7 @@ def run_managed_process(
     terminate_grace_seconds: float = 10.0,
     poll_seconds: float = 0.2,
     pid_start_time_reader: Callable[[int], int] | None = None,
+    pre_start_check: Callable[[], None] | None = None,
 ) -> ManagedProcessResult:
     if not command or any(not isinstance(item, str) or "\0" in item for item in command):
         raise ValueError("command must be a non-empty NUL-free argument vector")
@@ -374,21 +377,32 @@ def run_managed_process(
         maximum_bytes=maximum_log_bytes,
         maximum_line_bytes=maximum_line_bytes,
     )
-    process = subprocess.Popen(
-        list(command),
-        cwd=resolved_workspace,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env={
-            "HOME": "/tmp",
-            "LANG": "C.UTF-8",
-            "LC_ALL": "C.UTF-8",
-            "PATH": "/opt/java/openjdk/bin:/usr/local/bin:/usr/bin:/bin",
-        },
-        start_new_session=True,
-        umask=0o077,
-    )
+    try:
+        # This callback runs in the same helper immediately before Popen.
+        # It cannot make process creation transactional with a database
+        # revocation, but removes the caller-to-launcher scheduling gap and
+        # guarantees an observed stop prevents a new process group.
+        if pre_start_check is not None:
+            pre_start_check()
+        process = subprocess.Popen(
+            list(command),
+            cwd=resolved_workspace,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env={
+                "HOME": "/tmp",
+                "LANG": "C.UTF-8",
+                "LC_ALL": "C.UTF-8",
+                "PATH": "/opt/java/openjdk/bin:/usr/local/bin:/usr/bin:/bin",
+            },
+            start_new_session=True,
+            umask=0o077,
+        )
+    except BaseException:
+        with suppress(ValueError):
+            log.close()
+        raise
     assert process.stdout is not None and process.stderr is not None
     try:
         identity = ProcessIdentity(
@@ -426,6 +440,10 @@ def run_managed_process(
             action = tick()
             if action == ProcessAction.CANCEL:
                 reason = ProcessEndReason.CANCELED
+                _terminate_group(process, terminate_grace_seconds)
+                break
+            if action == ProcessAction.TERMINATE:
+                reason = ProcessEndReason.TERMINATED
                 _terminate_group(process, terminate_grace_seconds)
                 break
             if action == ProcessAction.FENCE_LOST:

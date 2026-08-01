@@ -95,6 +95,7 @@ def capture_source_preflight(
     spool_directory: Path,
     oracle: ModuleType,
     fetch_size: int = 1000,
+    control_callback: Callable[[], None] | None = None,
 ) -> SideRead:
     with oracle.DigestSpool(spool_directory) as spool:
         result = _read_side(
@@ -108,6 +109,7 @@ def capture_source_preflight(
             side="source",
             target_snapshot=False,
             fetch_size=fetch_size,
+            control_callback=control_callback,
         )
     return result
 
@@ -172,26 +174,39 @@ def count_target_rows(
     engine: EngineName,
     schema_name: str,
     table_name: str,
+    control_callback: Callable[[], None] | None = None,
 ) -> tuple[int, datetime]:
-    _begin_consistent_read(connection, engine)
-    cursor = connection.cursor()
+    _invoke_control_callback(control_callback)
+    cursor: Cursor | None = None
     try:
+        _begin_consistent_read(
+            connection,
+            engine,
+            control_callback=control_callback,
+        )
+        _invoke_control_callback(control_callback)
+        cursor = connection.cursor()
+        _invoke_control_callback(control_callback)
         cursor.execute(
             f"SELECT COUNT(*) FROM "
             f"{qualified_table(engine, schema_name=schema_name, table_name=table_name)}"
         )
+        _invoke_control_callback(control_callback)
         row = cursor.fetchone()
+        _invoke_control_callback(control_callback)
         if row is None:
             raise OracleDatabaseError("target count query returned no row")
         count = int(row[0])
         checked_at = datetime.now(UTC)
         connection.commit()
+        _invoke_control_callback(control_callback)
         return count, checked_at
     except BaseException:
         _safe_rollback(connection)
         raise
     finally:
-        cursor.close()
+        if cursor is not None:
+            cursor.close()
 
 
 def _read_side(
@@ -212,23 +227,31 @@ def _read_side(
         raise OracleDatabaseError("oracle mapping is empty or inconsistent")
     if not 1 <= fetch_size <= 100_000:
         raise ValueError("fetch_size must be between 1 and 100000")
-    _invoke_control_callback(control_callback)
-    snapshot_started_at = datetime.now(UTC)
-    marker = _begin_consistent_read(connection, engine)
-    query = (
-        "SELECT "
-        + ", ".join(quote_identifier(engine, name) for name in column_names)
-        + " FROM "
-        + qualified_table(
-            engine,
-            schema_name=schema_name,
-            table_name=table_name,
-        )
-    )
-    cursor = _streaming_cursor(connection, engine)
-    read_started_at = datetime.now(UTC)
+    cursor: Cursor | None = None
     try:
+        _invoke_control_callback(control_callback)
+        snapshot_started_at = datetime.now(UTC)
+        marker = _begin_consistent_read(
+            connection,
+            engine,
+            control_callback=control_callback,
+        )
+        query = (
+            "SELECT "
+            + ", ".join(quote_identifier(engine, name) for name in column_names)
+            + " FROM "
+            + qualified_table(
+                engine,
+                schema_name=schema_name,
+                table_name=table_name,
+            )
+        )
+        _invoke_control_callback(control_callback)
+        cursor = _streaming_cursor(connection, engine)
+        read_started_at = datetime.now(UTC)
+        _invoke_control_callback(control_callback)
         cursor.execute(query)
+        _invoke_control_callback(control_callback)
         while True:
             batch = cursor.fetchmany(fetch_size)
             # Each database read is bounded by fetch_size. Check Worker
@@ -264,7 +287,8 @@ def _read_side(
         _safe_rollback(connection)
         raise
     finally:
-        cursor.close()
+        if cursor is not None:
+            cursor.close()
 
 
 def _invoke_control_callback(callback: Callable[[], None] | None) -> None:
@@ -272,23 +296,38 @@ def _invoke_control_callback(callback: Callable[[], None] | None) -> None:
         callback()
 
 
-def _begin_consistent_read(connection: Connection, engine: EngineName) -> str:
+def _begin_consistent_read(
+    connection: Connection,
+    engine: EngineName,
+    *,
+    control_callback: Callable[[], None] | None = None,
+) -> str:
     _set_autocommit(connection, False)
+    _invoke_control_callback(control_callback)
     cursor = connection.cursor()
     try:
         if engine == "POSTGRESQL_15":
+            _invoke_control_callback(control_callback)
             cursor.execute("BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            _invoke_control_callback(control_callback)
             cursor.execute("SELECT pg_catalog.txid_current_snapshot()::text")
+            _invoke_control_callback(control_callback)
             row = cursor.fetchone()
+            _invoke_control_callback(control_callback)
             if row is None:
                 raise OracleDatabaseError("PostgreSQL snapshot marker is unavailable")
             raw_marker = str(row[0])
             prefix = "postgresql"
         elif engine == "MYSQL_8":
+            _invoke_control_callback(control_callback)
             cursor.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+            _invoke_control_callback(control_callback)
             cursor.execute("START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY")
+            _invoke_control_callback(control_callback)
             cursor.execute("SELECT @@server_uuid, @@GLOBAL.gtid_executed, CONNECTION_ID()")
+            _invoke_control_callback(control_callback)
             row = cursor.fetchone()
+            _invoke_control_callback(control_callback)
             if row is None:
                 raise OracleDatabaseError("MySQL snapshot marker is unavailable")
             raw_marker = "\n".join(str(value) for value in row)

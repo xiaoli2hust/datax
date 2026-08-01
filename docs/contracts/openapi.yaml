@@ -557,9 +557,17 @@ paths:
       description: |
         返回当前 Runtime 中四个 V1 候选 Reader/Writer 的制品、上游、
         依赖/许可审查、访问边界、oracle 和证据状态。源码存在、
-        构建成功或已打包均不等于普通用户可执行；只有
-        certification_state=WINDOWS_E4_CERTIFIED 且 ordinary_user_executable=true
-        、证据仍在有效期并绑定当前候选时才能创建和启动 Execution。
+        构建成功或已打包均不等于普通用户可执行。`WINDOWS_E4_CERTIFIED`
+        只表示精确最终候选已完成 Phase-B Windows E4；只有该状态、同一最终候选
+        的有效 `evidence.release_promotion_ref`、`ordinary_user_executable=true`，且
+        证据仍在有效期并绑定当前候选时才能创建和启动 Execution。E4 已通过但尚无
+        公开发布晋级时，接口必须返回 `WINDOWS_E4_CERTIFIED`、
+        `ordinary_user_executable=false` 及 `RELEASE_PROMOTION_REQUIRED`。该引用是
+        opaque identifier，不是客户端可自行信任的证明；服务端只会在其认证源已确认
+        可用时返回字符串。缺失、格式无效或同一候选内不一致时返回 null，并以
+        `RELEASE_PROMOTION_REQUIRED`、`RELEASE_PROMOTION_REF_INVALID` 或
+        `PAIR_RELEASE_PROMOTION_MISMATCH` 失败关闭。当前 production 仍没有受信 reader，
+        默认 deny-all；测试注入不会被序列化为公开可信的普通用户能力。
       responses:
         '200':
           description: 插件能力与证据状态列表
@@ -1021,8 +1029,11 @@ paths:
       operationId: changeDatasourceCredentialSecretStatus
       summary: Admin 退役或紧急撤销凭据版本
       description: |
-        ACTIVE 可转为 RETIRED、REVOKED 或 COMPROMISED；REVOKED/COMPROMISED
-        必须 fail closed，并为引用该版本的非终态 Execution/RecoveryProbe 建立紧急终止事实。
+        已先切换为另一枚 current secret 的历史 ACTIVE 版本可转为 RETIRED、REVOKED 或
+        COMPROMISED；直接退役 current secret 返回 CREDENTIAL_STATUS_CONFLICT，避免新队列
+        等待不能领取的凭据。已 RETIRED 的历史版本仅可进一步升级为 REVOKED 或 COMPROMISED，
+        以处理轮换后才发现的泄露。REVOKED/COMPROMISED 均为终态，必须 fail closed，并为
+        引用该版本的非终态 Execution/RecoveryProbe 建立紧急终止事实。
         该接口不能把任何历史版本重新变为 ACTIVE；配置新密码应走数据源更新接口并创建新版本。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
