@@ -77,3 +77,23 @@ def test_database_owner_secret_is_not_mounted_into_runtime_services() -> None:
     assert "worker_database_password" in sources("worker")
     assert "api_database_password" not in sources("worker")
     assert "worker_database_password" not in sources("api")
+
+
+def test_worker_has_the_complete_minimum_secret_closure() -> None:
+    compose = yaml.safe_load(
+        (REPOSITORY_ROOT / "deploy/windows/compose.yaml").read_text(encoding="utf-8")
+    )
+    worker_sources = {
+        entry if isinstance(entry, str) else entry["source"]
+        for entry in compose["services"]["worker"]["secrets"]
+    }
+
+    # Worker bootstrap constructs ControlService and CredentialService before
+    # it can reconcile or claim work. Keep the exact set explicit so a future
+    # Compose edit cannot silently reintroduce a crash loop or overmount API
+    # authentication keys.
+    assert worker_sources == {
+        "worker_database_password",
+        "idempotency_hmac_key",
+        "credential_kek_v1",
+    }

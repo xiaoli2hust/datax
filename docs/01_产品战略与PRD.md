@@ -167,14 +167,16 @@ V1 为**单组织、多项目**。组织不提供切换入口；项目是资源�
 
 ### 4.2 Reader/Writer 认证矩阵
 
-| Reader | Writer | V1 承诺 |
+| Reader | Writer | 目标承诺与当前证据 |
 |---|---|---|
-| MySQL 8 | MySQL 8 | 支持并通过真实 E2E |
-| MySQL 8 | PostgreSQL 15 | 支持并作为主验收链路 |
-| PostgreSQL 15 | MySQL 8 | 支持并通过真实 E2E |
-| PostgreSQL 15 | PostgreSQL 15 | 支持并通过真实 E2E |
+| MySQL 8 | MySQL 8 | V1 目标支持；当前真实 E3 `NOT_RUN/BLOCKED` |
+| MySQL 8 | PostgreSQL 15 | V1 主验收目标；当前真实 E3 `NOT_RUN/BLOCKED` |
+| PostgreSQL 15 | MySQL 8 | V1 目标支持；当前真实 E3 `NOT_RUN/BLOCKED` |
+| PostgreSQL 15 | PostgreSQL 15 | V1 目标支持；当前真实 E3 `NOT_RUN/BLOCKED` |
 
-认证矩阵只表示两类数据源均可作为 Reader 或 Writer，不表示支持数据库之间的任意类型转换。平台维护单独的类型兼容矩阵；无法无损直连或安全扩宽的映射必须在发布前阻断。
+认证矩阵只表示 V1 的目标产品边界，不代表当前已通过真实 DataX E3 或 Windows E4；
+具体证据状态以决策基线与验收 manifest 为准。两类数据源均可作为 Reader 或 Writer，
+不表示支持数据库之间的任意类型转换。平台维护单独的类型兼容矩阵；无法无损直连或安全扩宽的映射必须在发布前阻断。
 
 ### 4.3 固定技术边界
 

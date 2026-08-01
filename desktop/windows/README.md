@@ -49,7 +49,7 @@
    获得 `NET_ADMIN`，API/Worker 均 `cap_drop=ALL` 并精确使用
    `network_mode: service:egress-guard`；启动后读取三者实际 `/proc/self/ns/net`，不一致
    立即停止。API live 后会在容器内只检查自己的数据库密码、JWT/HMAC 与 KEK 固定
-   target，Worker 只检查自己的数据库密码与凭据 KEK，守卫只检查独立只读数据库密码；
+   target，Worker 只检查自己的数据库密码、idempotency HMAC 与凭据 KEK，守卫只检查独立只读数据库密码；
    都只核验普通文件类型和长度，
    不读取或输出 secret 内容。`0.0.0.0`、`::`、`::1` 或其他地址会触发停止并失败。所有外部命令输出
    都有界读取；读失败或超过上限时整体失败关闭，不允许用部分输出完成端口、签名、
@@ -74,7 +74,7 @@
 | `jwt_private_key.pem` | Ed25519 PKCS#8 PEM | `/run/secrets/jwt_private_key.pem` |
 | `jwt_public_key.pem` | 对应 Ed25519 SPKI PEM | `/run/secrets/jwt_public_key.pem` |
 | `refresh_token_hmac_key` | 独立 32-byte 随机原始二进制 | `/run/secrets/refresh_token_hmac_key` |
-| `idempotency_hmac_key` | 另一把独立 32-byte 随机原始二进制 | `/run/secrets/idempotency_hmac_key` |
+| `idempotency_hmac_key` | 另一把独立 32-byte 随机原始二进制 | API 与 Worker `/run/secrets/idempotency_hmac_key`；Worker 仅用于控制面完整性，不获得 JWT 或 refresh-token key |
 | `credential-kek-v1.key` | 与两把 HMAC key 独立的 32-byte 随机原始二进制 | `/run/secrets/credential-kek-v1.key`（API 与 Worker） |
 
 停止：

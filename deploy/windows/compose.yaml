@@ -151,6 +151,10 @@ services:
     secrets:
       - source: worker_database_password
         target: database_password
+      # The Worker builds ControlService and CredentialService before it can
+      # heartbeat or claim work. Both use this domain-separated key to verify
+      # persisted control-plane facts, so omitting it crash-loops the Worker.
+      - idempotency_hmac_key
       - source: credential_kek_v1
         target: credential-kek-v1.key
     volumes:

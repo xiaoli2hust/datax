@@ -71,6 +71,7 @@ const VERIFY_CONTAINER_SECRETS_SCRIPT: &str = concat!(
 const VERIFY_WORKER_SECRETS_SCRIPT: &str = concat!(
     "import os,stat\n",
     "spec={'/run/secrets/database_password':(64,64),",
+    "'/run/secrets/idempotency_hmac_key':(32,32),",
     "'/run/secrets/credential-kek-v1.key':(32,32)}\n",
     "try:\n",
     " ok=all(stat.S_ISREG(os.lstat(p).st_mode) and lo<=os.lstat(p).st_size<=hi ",
@@ -4723,6 +4724,7 @@ fn validate_rendered_service_secrets(
         ],
         "worker" => &[
             ("worker_database_password", "database_password"),
+            ("idempotency_hmac_key", "idempotency_hmac_key"),
             ("credential_kek_v1", "credential-kek-v1.key"),
         ],
         "postgres" => &[("postgres_password", "postgres_password")],
@@ -6375,6 +6377,7 @@ mod tests {
                     "image": lock.worker,
                     "secrets": [
                         {"source": "worker_database_password", "target": "database_password"},
+                        "idempotency_hmac_key",
                         {"source": "credential_kek_v1", "target": "/run/secrets/credential-kek-v1.key"}
                     ],
                     "cap_drop": ["ALL"],
