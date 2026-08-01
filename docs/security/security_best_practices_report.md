@@ -5,7 +5,7 @@
 | 审查日期 | 2026-08-02 |
 | 审查范围 | Windows Launcher/Setup、Compose/egress-guard、API/Worker 租约客户端、GitHub Windows 签名链，以及其权威契约与验收追踪 |
 | 方法 | 从攻击者可控制的环境变量、同 netns 调用、同名容器、安装器参数、Runner 工具路径和工作区污染出发；每项都要求失败关闭或明确外部阻塞 |
-| 当前结论 | 源码层已修复 4 项可利用问题并补齐 1 项追踪闭包；Windows 实机、真实签名和发布仍 `BLOCKED` |
+| 当前结论 | 源码层已修复 5 项可利用问题并补齐 1 项追踪闭包；Windows 实机、真实签名和发布仍 `BLOCKED` |
 
 ## 证据等级
 
@@ -58,14 +58,44 @@
 
 验证：完整后端测试、48 个 acceptance 回归和 requirements catalog canonical check 通过，catalog SHA-256 为 `5c5e50bc98fb02a4cda9a7d066c7bb36e8150975db05d589d88ba90a8d072350`。
 
+### ASR-006 — High — Environment 保护检查发生在 signing job 已引用名称之后
+
+攻击路径：GitHub 会在 workflow job 首次引用不存在的 `environment` 名称时隐式创建无保护
+Environment。旧流程虽在导入 PFX 前 GET 并检查 reviewer，但同一个 signing job 已先声明
+`environment: windows-candidate-signing`，所以它不能证明此 Environment 在引用前已经存在；删除/重建
+或审批策略在检查后变化也没有身份绑定。
+
+修复：新增 GitHub-hosted `signing-environment-preflight`，它没有 job-level `environment`、不读取
+signing secrets/发布 variables，只 GET 并严格验证既有 Environment。它只将 immutable Environment ID
+与 canonical protection SHA-256 传给 downstream，不输出 reviewer login/name/numeric ID/token。signing
+job 必须 `needs` 该成功快照，仍声明固定 Environment，但在导入 PFX 前二次 GET 并要求 ID/hash 精确
+相同；缺失、隐式创建、删除/重建、未知/畸形策略、自审、API 错误或变更均失败关闭。两次响应都不
+输出到日志，Windows job 的完整 REST response 在成功或失败后清理。
+
+兼容性修复：GitHub REST 的正常分支/标签限制会同时给出 `type=branch_policy` 与非空
+`deployment_branch_policy`。verifier 现只接受一个 `branch_policy`，并要求
+`protected_branches`/`custom_branch_policies` 恰有一个为 `true`；规则与 selector 均进入
+canonical hash。重复、缺配对、双真/双假、畸形或其他未知 rule 仍失败关闭，避免把真实受限
+Environment 错误拒绝或静默放宽。
+
+验证：Environment verifier 的快照/身份/策略变更负向测试与 release workflow 静态拓扑测试通过（16
+个定向测试）；仅为 E1。残余风险：远端当前仍为 0 个 Environment、没有在线 workflow/审批记录，且
+`datax-release-signing` custom runner group 在当前 User-owned public repo 上需要所有权/ADR 决策；因此
+本修复不能声明真实签名或 E4。补充对抗发现：GitHub 默认允许管理员 bypass protection rules；官方
+REST Get Environment schema 和当前 GraphQL `Environment` 类型不公开 `can_admins_bypass`，所以
+verifier/ID-hash 快照不能证明它已禁用。Release Owner 必须保存 Settings UI 中关闭该开关的记录；
+迁入 Organization 后，还须保存 `environment.update_protection_rule` audit event 的
+`can_admins_bypass=false` 与签名窗口无反向修改查询。没有这组外部证据，reviewer gate 不可视为独立。
+
 ## 未关闭的发布阻塞
 
-1. GitHub 当前 `environments` 数为 **0**，尚不存在受保护的 `windows-candidate-signing` Environment。
-2. GitHub 当前 repository self-hosted runner 数为 **0**，不存在可承载 `datax-release-signing` group/labels 的 Windows 11 x64 Runner。
-3. 本机没有 `pwsh`、NSIS 或 Windows 11 x64 + Docker Desktop/WSL2，无法执行 PowerShell runtime、真实 PFX 签名、Setup 安装/卸载、宿主端口或 Docker helper 清理验收。
-4. 真实 MySQL 8/PostgreSQL 15 四方向 DataX、独立 oracle、恢复、睡眠/重启和 LAN 负例仍未达到 E3/E4。
+1. GitHub 当前 `environments` 数为 **0**，尚不存在受保护的 `windows-candidate-signing` Environment；源码的双阶段 ID/hash 流程只证明 E1 失败关闭，尚无在线运行或审批记录。即使未来 reviewer 规则可见，管理员 bypass 默认允许，且 REST/GraphQL verifier 无法读取 `can_admins_bypass`；UI/audit-log 禁用证据仍是独立阻塞项。
+2. 当前 public repo owner type 为 **User**；GitHub custom runner group 是 Organization/Enterprise 管理边界，强制的 `datax-release-signing` group 因此是 `BLOCKED_DECISION`。首选迁入/转让到 Organization；否则必须先接受新的 ADR，不能删除 group 回退到任意 runner。
+3. GitHub 当前 repository self-hosted runner 数为 **0**，不存在可承载 `datax-release-signing` group/labels 的 Windows 11 x64 Runner。
+4. 本机没有 `pwsh`、NSIS 或 Windows 11 x64 + Docker Desktop/WSL2，无法执行 PowerShell runtime、真实 PFX 签名、Setup 安装/卸载、宿主端口或 Docker helper 清理验收。
+5. 真实 MySQL 8/PostgreSQL 15 四方向 DataX、独立 oracle、恢复、睡眠/重启和 LAN 负例仍未达到 E3/E4。
 
-因此不得发布 `Setup.exe`、不得声称“Windows 已稳定运行”或“企业级已完成”。下一次外部验收必须先由仓库所有者配置受保护 Environment、独立 reviewer、受控干净 Windows Runner、工具 hash/ACL 取证与不可导出签名能力，再运行同一精确候选的 E3/E4。
+因此不得发布 `Setup.exe`、不得声称“Windows 已稳定运行”或“企业级已完成”。下一次外部验收必须先由仓库所有者作出 Organization 迁移或新 ADR 的签名信任决策，再配置受保护 Environment、独立 reviewer、受控干净 Windows Runner、工具 hash/ACL 取证与不可导出签名能力，并运行同一精确候选的 E3/E4。
 
 ## 本轮已执行的检查
 

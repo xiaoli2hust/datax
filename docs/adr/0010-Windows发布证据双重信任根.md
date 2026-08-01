@@ -29,6 +29,11 @@
    `runs-on.group=datax-release-signing` 加
    `self-hosted/windows/x64/datax-release-windows11` labels 路由到该隔离组；缺组或缺 runner
    必须阻断，不能因任意同标签 runner 可用而回退。
+   当前远端 `xiaoli2hust/datax` 的 owner type 为 `User` 且为 public；GitHub 的 custom runner
+   group 是 Organization/Enterprise 管理边界，`/repos/.../actions/runner-groups` 与
+   `/orgs/xiaoli2hust/...` 当前均不能提供该组。因此这是 `BLOCKED_DECISION`：首选把发布仓库
+   迁入/转让给 Organization 后再配置该组；若所有者不接受迁移，必须先用新的 Accepted ADR
+   选择等价但不同的签名信任架构。不得把现有 group 要求静默降级成任意 self-hosted runner。
 2. **候选根 attestor**：后续 GitHub 托管 runner 重新下载 Windows 证据，验证候选根和
    全部哈希，再使用 GitHub Actions OIDC/Sigstore artifact attestation 对候选根签发构建
    来源证明。发布 validator 必须要求该证明来自固定仓库、固定 release workflow、受保护
@@ -71,14 +76,38 @@ candidate-root 和 attestation bundle 做密码学验证，并同时固定：
 
 ### 4. 签名 Environment 必须在导入证书前失败关闭
 
-签名 job 使用 `windows-candidate-signing` 之前，必须通过 GitHub REST API 读取已存在的
-同名 Environment；YAML 名称或 workflow 首次引用均不构成保护存在。预检要求：
+签名 job 使用 `windows-candidate-signing` 之前，必须由一个 GitHub-hosted、无
+`environment` 声明的 `signing-environment-preflight` job 通过 GitHub REST API 读取已存在的
+同名 Environment；YAML 名称或 workflow 首次引用均不构成保护存在。该 preflight 不读取签名
+secrets 或发布环境 variables，因而不会先通过 job-level Environment 引用触发 GitHub 的隐式创建。
+它只输出 `ready`、不可变 `environment_id` 与 canonical `protection_sha256`，绝不输出 reviewer
+姓名、登录名、数值身份或 token。预检要求：
 
 - 恰好一个非空 `required_reviewers` protection rule；
 - reviewer 总数为 1–6，且 User/Team 身份唯一；
 - `prevent_self_review=true`；
-- Environment 缺失、规则为空/重复/畸形、允许自审或 API 读取失败时，均在导入证书、设置
+- canonical hash 必须涵盖 reviewer 集合、`prevent_self_review`、受支持的 `wait_timer` 和
+  deployment branch policy。GitHub REST 会把正常的分支/标签限制表示为一个 `branch_policy`
+  protection rule：只允许恰好一个，且仅当可读 `deployment_branch_policy` 的
+  `protected_branches` 与 `custom_branch_policies` 恰有一个为 `true` 时接受；其规则与 selector
+  均进入 hash。缺 rule、重复 rule、空/双真/双假的 selector、畸形 policy、未知保护规则、
+  Environment 缺失、规则为空/重复/畸形、允许自审或 API 读取失败时，均在导入证书、设置
   signing 变量或调用签名工具前终止。
+
+GitHub 默认允许管理员绕过 Environment protection rules。Release Owner 必须在 GitHub Settings UI
+显式取消 **Allow administrators to bypass configured protection rules**，并保存含 Environment 名称、
+时间、设置值与操作者的 UI 配置证据；仓库迁入 Organization 后，还必须保存
+`environment.update_protection_rule` 审计事件中 `environment_id`、`environment_name` 与
+`can_admins_bypass=false` 的证据，并证明签名窗口内无把该值改回 `true` 的事件。GitHub 的
+[REST Get environment](https://docs.github.com/en/rest/deployments/environments#get-an-environment)
+响应和当前 GraphQL `Environment` 类型均不公开这个开关；`verify_signing_environment.py` 只能验证
+其可见规则/身份/hash，**不得**声称校验了管理员绕过禁用状态。
+
+签名 job 必须 `needs` 该 preflight，只有 `ready=true` 才能进入执行并在运行时引用该 Environment。即使 preflight
+与签名 job 之间发生删除、重建或策略修改，签名 job 也必须在导入 PFX 前再次 GET，并要求当前
+`environment_id` 与 `protection_sha256` 精确等于 preflight 输出；任一不匹配、空输出或 API 错误
+均失败关闭。这样既阻止“先引用而后检查”的隐式创建时序漏洞，也不把两次读取之间的远端变更
+包装成已审批事实。
 
 `cargo.exe`、`makensis.exe`、`rustc.exe` 与 `signtool.exe` 必须由发布环境显式提供本机
 绝对路径；workflow 和 release scripts 不得从 PATH 自动发现。导入 PFX 前必须拒绝 dirty/
@@ -91,9 +120,9 @@ target/home 等环境覆盖。Cargo 调用必须把 `RUSTC` 固定为显式 rust
 替代工具 hash/签名、父目录 ACL、受保护且可还原的一次性 runner，或不可导出 HSM/远程签名；这些
 仍是 E3/E4 门禁。
 
-该预检只确认所读取的 Environment 形状；它不替代 owner 对 secrets 作用域、`main` 与精确
-release tag 部署限制、真实审批记录或受控 Windows runner 的独立取证。后者仍必须以 E4
-release evidence 单独证明。
+该双阶段预检只确认两次所读取的 Environment 身份和形状；它不替代 owner 对管理员绕过禁用、
+secrets 作用域、`main` 与精确 release tag 部署限制、真实审批记录、Organization runner group
+或受控 Windows runner 的独立取证。后者仍必须以 E4 release evidence 单独证明。
 
 ### 5. 明确信任声明的上限
 
@@ -137,8 +166,11 @@ release qualification、最终安装包和公开晋级拆开。这里的双重�
 2. 再把受保护 Windows E4 harness 输出接入候选根，保持未执行项为 `BLOCKED`。
 3. 在 GitHub 托管 job 中使用完整 commit SHA 锁定 attestation action，签发并立即反向验证
    bundle；发布 job 不接受浮动 action tag。
-4. 在导入证书前，以 API 快照证明签名 Environment 已存在、只有一个 1–6 人的 required-reviewers
-   规则且禁止 self-review；任何读取/形状失败均不得触及证书。
+4. 在任何 signing job 进入执行并在运行时引用 Environment 前，以无 Environment/secrets 的 hosted preflight 取得
+   API 身份与 canonical protection hash；signing job 依赖该输出并在导入证书前二次读取、精确
+   比对。只有一个 1–6 人的 required-reviewers 规则且禁止 self-review；任何读取/形状/快照
+   比对失败均不得触及证书。另须有 GitHub UI 和（Organization 后）audit-log 证据证明
+   `can_admins_bypass=false`；API verifier 不能替代该证据。
 5. 只有真实 PASS manifest、完整场景结果、可信 attestation 和 P0/P1=0 同时满足时，
    `--require-pass` 才可返回 `release_approved=true`。
 6. 在 protected environment、一次性 Windows runner、证书、真实数据库和外部复核均未
@@ -185,10 +217,13 @@ release qualification、最终安装包和公开晋级拆开。这里的双重�
   完整候选及证明制品；该接线不会批准发布。
 - Windows signing job 现在还固定选择 `datax-release-signing` runner group 与四个精确标签，
   并要求发布环境给出 `CARGO_PATH`、`MAKENSIS_PATH`、`RUSTC_PATH`、`SIGNTOOL_PATH`；它在
-  导入 PFX 前检查 checkout 和工具路径，工具执行后重查 tracked source。当前远端没有该组的
-  runner 或 signing Environment，因此这只是静态 E1 fail-closed 控制。绝对路径不等于工具
-  身份或不可替换性，仍不是受控 runner、工具 hash/ACL、TOCTOU 防护、不可导出证书或 Windows
-  E4 证据。
+  导入 PFX 前检查 checkout 和工具路径，工具执行后重查 tracked source。新增的 hosted
+  `signing-environment-preflight` 不声明 Environment、不读取 signing secrets，只输出预先存在的
+  Environment immutable ID 与 canonical protection SHA-256；Windows signing job 在 PFX 前再读
+  REST 并精确比对。当前远端没有该 Environment、runner，也因 User-owned repo 没有可配置该
+  custom runner group 的 Organization 边界，因此这只是静态 E1 fail-closed 控制和
+  `BLOCKED_DECISION/BLOCKED_EXTERNAL` 记录。绝对路径不等于工具身份或不可替换性，仍不是受控
+  runner、工具 hash/ACL、TOCTOU 防护、不可导出证书或 Windows E4 证据。
 
 尚未完成：上述 workflow 尚未在受保护 Windows runner、真实签名 secrets 和 GitHub
 attestation 服务上运行，因而没有真实 bundle/反向验证证据；机器场景 profile/result 契约、

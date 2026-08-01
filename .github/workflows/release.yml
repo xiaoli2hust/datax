@@ -223,9 +223,105 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
+  signing-environment-preflight:
+    name: Verify the pre-existing signing gate before a signing job can reference it
+    needs: linux-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      ready: ${{ steps.verify.outputs.ready }}
+      environment_id: ${{ steps.verify.outputs.environment_id }}
+      protection_sha256: ${{ steps.verify.outputs.protection_sha256 }}
+    steps:
+      - name: Check out the exact candidate verifier without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the signing-environment verifier Python runtime
+        id: signing-environment-python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.13"
+
+      - name: Read and strictly validate the pre-existing signing environment
+        id: verify
+        shell: bash
+        env:
+          EXPECTED_ENVIRONMENT: windows-candidate-signing
+          GITHUB_TOKEN: ${{ github.token }}
+          VERIFIER_PYTHON: ${{ steps.signing-environment-python.outputs.python-path }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${GITHUB_TOKEN}" || -z "${VERIFIER_PYTHON}" ]]; then
+            echo "Signing-environment preflight has no GitHub token or verifier Python." >&2
+            exit 1
+          fi
+          environment_name="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${EXPECTED_ENVIRONMENT}")"
+          environment_uri="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/environments/${environment_name}"
+          environment_path="${RUNNER_TEMP}/signing-environment-preflight-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          if [[ -e "${environment_path}" ]]; then
+            echo "Signing-environment response path already exists." >&2
+            exit 1
+          fi
+          trap 'rm -f -- "${environment_path:-}"' EXIT
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --tlsv1.2 \
+            --max-time 20 \
+            --request GET \
+            --header "Accept: application/vnd.github+json" \
+            --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            --output "${environment_path}" \
+            "${environment_uri}"
+          verification_json="$("${VERIFIER_PYTHON}" \
+            scripts/release/verify_signing_environment.py \
+            --environment-json "${environment_path}" \
+            --expected-environment "${EXPECTED_ENVIRONMENT}")"
+          VERIFICATION_JSON="${verification_json}" \
+            "${VERIFIER_PYTHON}" - "${GITHUB_OUTPUT}" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+          from pathlib import Path
+
+          result = json.loads(os.environ["VERIFICATION_JSON"])
+          environment_id = result.get("environment_id")
+          protection_sha256 = result.get("protection_sha256")
+          if (
+              result.get("ready") is not True
+              or result.get("code") != "WINDOWS_SIGNING_ENVIRONMENT_PROTECTION_VALID"
+              or result.get("environment") != "windows-candidate-signing"
+              or isinstance(environment_id, bool)
+              or not isinstance(environment_id, int)
+              or environment_id < 1
+              or not isinstance(protection_sha256, str)
+              or re.fullmatch(r"[0-9a-f]{64}", protection_sha256) is None
+          ):
+              raise SystemExit("Signing-environment verifier returned an invalid snapshot.")
+          with Path(sys.argv[1]).open("a", encoding="utf-8") as output:
+              output.write("ready=true\n")
+              output.write(f"environment_id={environment_id}\n")
+              output.write(f"protection_sha256={protection_sha256}\n")
+          PY
+
   windows-signed-candidate:
     name: Sign and verify the Windows candidate
-    needs: linux-images
+    needs:
+      - linux-images
+      - signing-environment-preflight
+    if: needs.signing-environment-preflight.outputs.ready == 'true'
     runs-on:
       group: datax-release-signing
       labels:
@@ -252,18 +348,22 @@ jobs:
         with:
           python-version: "3.12.13"
 
-      - name: Require a preconfigured approval-gated signing environment
+      - name: Revalidate the pre-existing approval-gated signing environment before secrets
         shell: pwsh
         env:
           EXPECTED_ENVIRONMENT: windows-candidate-signing
+          EXPECTED_ENVIRONMENT_ID: ${{ needs.signing-environment-preflight.outputs.environment_id }}
+          EXPECTED_PROTECTION_SHA256: ${{ needs.signing-environment-preflight.outputs.protection_sha256 }}
           GITHUB_TOKEN: ${{ github.token }}
           VERIFIER_PYTHON: ${{ steps.signing-environment-python.outputs.python-path }}
         run: |
           $ErrorActionPreference = "Stop"
           Set-StrictMode -Version Latest
           if ([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN) -or
-              [string]::IsNullOrWhiteSpace($env:VERIFIER_PYTHON)) {
-              throw "Signing-environment protection preflight has no GitHub token or verifier Python."
+              [string]::IsNullOrWhiteSpace($env:VERIFIER_PYTHON) -or
+              $env:EXPECTED_ENVIRONMENT_ID -notmatch '^[1-9][0-9]*$' -or
+              $env:EXPECTED_PROTECTION_SHA256 -cnotmatch '^[0-9a-f]{64}$') {
+              throw "Signing-environment revalidation has no valid preflight identity, hash, token, or verifier Python."
           }
           $environmentName = [Uri]::EscapeDataString($env:EXPECTED_ENVIRONMENT)
           $environmentUri = (
@@ -280,21 +380,30 @@ jobs:
               Authorization = "Bearer $env:GITHUB_TOKEN"
               "X-GitHub-Api-Version" = "2022-11-28"
           }
-          $response = Invoke-WebRequest `
-              -Uri $environmentUri `
-              -Headers $headers `
-              -UseBasicParsing
-          [IO.File]::WriteAllText(
-              $environmentPath,
-              $response.Content,
-              [Text.UTF8Encoding]::new($false)
-          )
-          & $env:VERIFIER_PYTHON `
-              scripts/release/verify_signing_environment.py `
-              --environment-json $environmentPath `
-              --expected-environment $env:EXPECTED_ENVIRONMENT
-          if ($LASTEXITCODE -ne 0) {
-              throw "GitHub signing environment protection preflight failed."
+          try {
+              $response = Invoke-WebRequest `
+                  -Uri $environmentUri `
+                  -Headers $headers `
+                  -UseBasicParsing
+              [IO.File]::WriteAllText(
+                  $environmentPath,
+                  $response.Content,
+                  [Text.UTF8Encoding]::new($false)
+              )
+              & $env:VERIFIER_PYTHON `
+                  scripts/release/verify_signing_environment.py `
+                  --environment-json $environmentPath `
+                  --expected-environment $env:EXPECTED_ENVIRONMENT `
+                  --expected-environment-id $env:EXPECTED_ENVIRONMENT_ID `
+                  --expected-protection-sha256 $env:EXPECTED_PROTECTION_SHA256
+              if ($LASTEXITCODE -ne 0) {
+                  throw "GitHub signing environment protection preflight failed."
+              }
+          }
+          finally {
+              if (Test-Path -LiteralPath $environmentPath) {
+                  Remove-Item -LiteralPath $environmentPath -Force -ErrorAction Stop
+              }
           }
 
       - name: Download immutable Linux evidence

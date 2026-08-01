@@ -50,6 +50,12 @@
   最终候选不得保留一个未覆盖
   candidate root 的旧 `SHA256SUMS` 并把它声称为完整清单，完整库存职责由 canonical
   candidate root 承担。
+- `windows-e4-preflight.v1.schema.json`：未来受保护 Windows E4 harness 的本机前置观察
+  记录；对应 `scripts/acceptance/windows_e4_preflight.ps1` 和
+  `validate_windows_e4_preflight.py` 只能检查 Windows/WSL2/Docker、候选哈希/签名与
+  固定产品残留，并固定 `e4_result=NOT_RUN`、`release_approved=false`。当前仓库只对该
+  脚本与契约做 E1 静态/结构测试；即使未来本机记录为 `READY`，也不是 E4、不是 golden-image
+  或 runner 信任证明，不能写入 `candidate-root.v1` 或用于发布晋级。
 - `egress-guard-attestation.v1.schema.json`：共享网络命名空间内出口守卫的实时证明。
 - `egress-guard-lease.v1.schema.json`：精确 selected-IP `/32|/128 + TCP port` 短租约请求与响应。
 - `egress-guard.v1.md`：守卫只读数据库视图、loopback HTTP、nftables 和 fail-closed 边界。

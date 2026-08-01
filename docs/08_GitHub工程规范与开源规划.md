@@ -13,12 +13,25 @@
 > 同样受约束。当前仓库只有一名维护者，为避免自提交 PR 永久不可合并，审批数暂为 0，
 > 因而不能把该设置表述为独立人工复核。漏洞告警与 Dependabot security updates 已启用。
 > `windows-candidate-signing` GitHub Environment 当前尚未配置（2026-08-02 API 返回 0 个
-> environment）；引用不存在的名称会被 GitHub 自动创建为无保护环境。发布工作流因此在导入
-> 签名证书前查询 Environment，要求至少一名 required reviewer 且 `prevent_self_review=true`，
-> 否则失败关闭。该本地预检不替代实际在 GitHub 配置审批人、分支/标签策略和环境专属 secrets。
-> 当前也没有可用 self-hosted runner；签名 job 只能路由到专用
-> `datax-release-signing` runner group 中同时带有 `self-hosted/windows/x64/datax-release-windows11`
-> labels 的机器。缺组或缺 runner 应保持排队/阻断，不能回退到任意同标签 runner。
+> environment）；引用不存在的名称会被 GitHub 自动创建为无保护环境。发布工作流先由一个
+> 不声明 `environment`、不读取 signing secrets/发布 variables 的 GitHub-hosted preflight GET
+> 该 Environment，并只输出 immutable ID 与 canonical protection SHA-256；签名 job `needs` 此
+> 输出，再在导入 PFX 前二次 GET 并精确比对。这样不能由签名 job 自己的首次 Environment 引用
+> 伪造“已预先配置”事实；缺失、策略/API 读取失败、删除/重建或 hash 不符均失败关闭。该 E1
+> 接线不替代实际在 GitHub 配置审批人、分支/标签策略、环境专属 secrets 或管理员绕过禁用，
+> 也尚无在线运行证据。GitHub 默认允许管理员 bypass protection rules，而 REST Get Environment
+> 与当前 GraphQL `Environment` 类型不返回 `can_admins_bypass`；verifier 不得声称验证它。
+> Release Owner 必须在 Settings UI 取消 **Allow administrators to bypass configured protection rules**
+> 并保存带时间/Environment/操作者的截图或等价配置记录；迁入 Organization 后还需保存
+> `environment.update_protection_rule` audit 记录的 `can_admins_bypass=false`，以及签名窗口无反向
+> 修改的审计查询。
+> 当前也没有可用 self-hosted runner。更根本的是该 public repo owner type 为 `User`，而
+> `datax-release-signing` custom runner group 是 GitHub Organization/Enterprise 管理边界；当前
+> repository/org runner-group API 均无法提供该组。这是 `BLOCKED_DECISION`：首选迁入或转让到
+> Organization 后配置专用 group；否则必须先新增 Accepted ADR 决定等价的新签名信任架构。
+> 在决策前，签名 job 保持只路由到该 group 与
+> `self-hosted/windows/x64/datax-release-windows11` labels 的交集，缺组或缺 runner 保持阻断，
+> 不能回退到任意同标签 runner。
 > 仓库发布工作流仍生成 `gate_result=BLOCKED` 且需求项为 `NOT_RUN/E0` 的候选证据，不批准公开发布。
 
 > ADR-0011 已接受未来的两阶段插件/Runtime qualification 与发布晋级链：不可变 payload
@@ -206,11 +219,21 @@ Windows release runner 或签名结果已经在线验证。Java 源码也没有�
 - 签名只在受保护发布环境执行，使用不可导出的代码签名凭据和可信时间戳。Fork PR、
   普通分支与日志不得获得证书私钥或签名服务权限。
 - 签名 job 使用前，`windows-candidate-signing` 必须已在 GitHub 管理面预先创建，并至少配置
-  一名 required reviewer 且禁止发起人自审；工作流会读取 REST Environment 描述并失败关闭。
-  空/隐式创建的 Environment、缺审批、允许 self-review 或 API 不可读均不得触及证书导入。
+  一名 required reviewer 且禁止发起人自审。必须先由 GitHub-hosted preflight（无 job-level
+  `environment`、无 signing secret/发布 variable）读取 REST Environment，验证后只输出 immutable
+  ID 与不含 reviewer identity 的 canonical protection SHA-256；签名 job 必须 `needs` 此输出，且在
+  导入 PFX 前再次读取并精确比对。空/隐式创建的 Environment、缺审批、允许 self-review、未知
+  policy、API 不可读、identity/hash 变化或空输出均不得触及证书导入。
+  GitHub 默认允许管理员绕过环境规则，且可读 REST/GraphQL Environment 表示不提供
+  `can_admins_bypass`；因此 verifier 不能宣称这项通过。Release Owner 必须在 UI 显式禁用 bypass
+  并保存证据；迁入 Organization 后还要保留 `environment.update_protection_rule` 审计记录中
+  `can_admins_bypass=false` 与签名窗口无反向修改的查询结果。
   签名 job 还固定要求 `datax-release-signing` runner group 与
   `self-hosted/windows/x64/datax-release-windows11` 标签交集；该 group 只能向本仓库暴露可还原、
   一次性 Windows Release runner，不能把宽泛的默认组或单一标签当作等价隔离。
+  因当前 repo 为 User-owned，custom group 的创建/绑定是外部 `BLOCKED_DECISION`：Release Owner
+  必须优先把仓库迁入 Organization，或在新增 Accepted ADR 后才能采用不同的信任边界；不得仅为
+  让 workflow 排队消失而放宽该 group。
   `CARGO_PATH`、`MAKENSIS_PATH`、`RUSTC_PATH` 与 `SIGNTOOL_PATH` 必须作为发布环境配置的
   显式本机绝对路径提供；工作流在导入 PFX 前拒绝空路径、网络/相对路径、重解析点、错误文件名
   或 dirty/untracked checkout，还拒绝 `RUSTC_WRAPPER`、`RUSTFLAGS`、

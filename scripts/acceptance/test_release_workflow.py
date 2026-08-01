@@ -95,18 +95,60 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("--require-pass", hosted_text)
         self.assertNotIn("release_approved=true", hosted_text)
 
-    def test_windows_signing_requires_an_existing_reviewer_gate_before_secrets(self) -> None:
+    def test_environment_preflight_precedes_any_signing_job_environment_reference(self) -> None:
+        preflight = self.workflow["jobs"]["signing-environment-preflight"]
+        self.assertEqual(preflight["runs-on"], "ubuntu-24.04")
+        self.assertEqual(preflight["needs"], "linux-images")
+        self.assertEqual(
+            preflight["permissions"],
+            {"actions": "read", "contents": "read"},
+        )
+        self.assertNotIn("environment", preflight)
+        self.assertNotIn("secrets.", str(preflight))
+        self.assertNotIn("vars.", str(preflight))
+        self.assertEqual(
+            set(preflight["outputs"]),
+            {"ready", "environment_id", "protection_sha256"},
+        )
+        preflight_script = next(
+            step
+            for step in preflight["steps"]
+            if step["name"]
+            == "Read and strictly validate the pre-existing signing environment"
+        )["run"]
+        self.assertIn("/environments/${environment_name}", preflight_script)
+        self.assertIn("verify_signing_environment.py", preflight_script)
+        self.assertIn("environment_id", preflight_script)
+        self.assertIn("protection_sha256", preflight_script)
+        self.assertNotIn("reviewers", preflight_script)
+
         job = self.workflow["jobs"]["windows-signed-candidate"]
+        self.assertEqual(
+            job["needs"],
+            ["linux-images", "signing-environment-preflight"],
+        )
+        self.assertEqual(
+            job["if"],
+            "needs.signing-environment-preflight.outputs.ready == 'true'",
+        )
+        self.assertEqual(job["environment"], "windows-candidate-signing")
         self.assertEqual(job["permissions"], {"actions": "read", "contents": "read"})
         names = [step["name"] for step in job["steps"]]
         verifier_index = names.index(
-            "Require a preconfigured approval-gated signing environment"
+            "Revalidate the pre-existing approval-gated signing environment before secrets"
         )
         certificate_index = names.index("Require and import the protected signing certificate")
         self.assertLess(verifier_index, certificate_index)
         script = job["steps"][verifier_index]["run"]
         self.assertIn("/environments/$environmentName", script)
         self.assertIn("verify_signing_environment.py", script)
+        self.assertIn("--expected-environment-id", script)
+        self.assertIn("--expected-protection-sha256", script)
+        self.assertIn("EXPECTED_ENVIRONMENT_ID", script)
+        self.assertIn("EXPECTED_PROTECTION_SHA256", script)
+        self.assertIn("finally", script)
+        self.assertIn("Remove-Item -LiteralPath $environmentPath -Force", script)
+        self.assertNotIn("Write-Output $response.Content", script)
         self.assertIn("prevent", (REPOSITORY_ROOT / "scripts/release/verify_signing_environment.py").read_text(encoding="utf-8"))
 
     def test_windows_signing_uses_the_dedicated_runner_group(self) -> None:

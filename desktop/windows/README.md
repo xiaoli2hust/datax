@@ -42,7 +42,9 @@
    角色密码与 Worker 数据库角色密码、
    Ed25519 PKCS#8/SPKI JWT 密钥对、32-byte
    refresh-token HMAC key、独立的 32-byte idempotency HMAC key，以及独立的 32-byte
-   数据源凭据 KEK。三把对称密钥使用各自的 OS CSPRNG 取样和文件，不能复用。DACL
+   数据源凭据 KEK；还生成与四个数据库角色密码值域分离的 32-byte 出口租约创建能力，
+   其文件内容为 64 个小写十六进制字符。三把对称密钥使用各自的 OS CSPRNG 取样和文件，
+   不能复用。DACL
    会被重建并回读验证，只允许当前用户和 `SYSTEM`，拒绝 UNC/reparse point；已有数据卷
    缺失密钥、部分密钥束、公私钥不匹配、对称密钥相同或异常长度均 fail closed，不生成
    替代密钥。
@@ -74,6 +76,7 @@
 |---|---|---|
 | `postgres_password.txt` | 32-byte 随机数的小写 hex，共 64 bytes、无换行 | `/run/secrets/postgres_password` |
 | `egress_guard_database_password.txt` | 与 PostgreSQL 管理密码独立的 32-byte 随机数小写 hex，共 64 bytes、无换行 | `/run/secrets/egress_guard_database_password`（仅迁移与守卫） |
+| `egress_lease_creation_capability` | 与四个数据库角色密码独立的 32-byte 随机数小写 hex，共 64 bytes、无换行；不是租约 bearer token | guard、API、Worker 的 `/run/secrets/egress_lease_creation_capability`；只用于 guard `POST /v1/leases` 的创建者认证，绝不传给 DataX |
 | `api_database_password.txt` | 与其他数据库角色独立的 32-byte 随机数小写 hex，共 64 bytes、无换行 | API `/run/secrets/database_password`；迁移容器读取固定原名 |
 | `worker_database_password.txt` | 与其他数据库角色独立的 32-byte 随机数小写 hex，共 64 bytes、无换行 | Worker `/run/secrets/database_password`；迁移容器读取固定原名 |
 | `jwt_private_key.pem` | Ed25519 PKCS#8 PEM | `/run/secrets/jwt_private_key.pem` |
@@ -116,8 +119,9 @@ launcher.exe backup ^
 - `.dxdata` 只含一致性逻辑 dump、`des-log-data` 脱敏日志和三个固定发布元数据；
   `des-workspace-data`、任何 `job.json` 与物理 PostgreSQL volume 永不挂载到 helper。
   helper 会用全部私密运行 secret 做精确泄露扫描，并对日志做结构化二次脱敏检查。
-- `.dxkeys` 单独保存九个固定运行 secret 与受支持 KEK，并通过
-  `related_data_backup_id` 绑定 DATA 包。任一分包失败会失败关闭；临时明文 dump 位于
+- `.dxkeys` 单独保存九个固定非 KEK secret（含出口租约创建能力）与至少一个受支持 KEK；
+  默认新安装因此有十个运行 secret 文件。它通过 `related_data_backup_id` 绑定 DATA 包。
+  任一分包失败会失败关闭；临时明文 dump 位于
   受控随机 staging，成功或失败后均必须清理，否则返回高优先级阻断错误。
 - 内部 helper 已能对双包做完整认证、配对与版本/发布摘要校验，使用双恢复秘密认证的
   journal 解包到全新空 staging，并在成功 staging 后返回

@@ -74,6 +74,8 @@ jobs:
           python -m unittest scripts.acceptance.test_candidate_root -v
           python -m unittest scripts.acceptance.test_trusted_gh_cli -v
           python -m unittest scripts.acceptance.test_release_workflow -v
+          python -m unittest scripts.acceptance.test_windows_hosted_preflight -v
+          python -m unittest scripts.acceptance.test_validate_windows_e4_preflight -v
 
       - name: Verify the committed upstream DataX source and plugin inventory
         run: |
@@ -228,7 +230,8 @@ jobs:
           $paths = @(
             "scripts/windows/build-installer.ps1",
             "scripts/windows/validate-release.ps1",
-            "desktop/windows/resources/secure-acl.ps1"
+            "desktop/windows/resources/secure-acl.ps1",
+            "scripts/acceptance/windows_e4_preflight.ps1"
           )
           foreach ($path in $paths) {
             $tokens = $null

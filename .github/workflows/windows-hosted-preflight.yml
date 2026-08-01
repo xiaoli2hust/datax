@@ -1,0 +1,215 @@
+name: Non-release Windows hosted installer preflight (E1 only)
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/windows-hosted-preflight.yml"
+      - ".github/workflows/ci.yml"
+      - "desktop/windows/**"
+      - "installer/windows/**"
+      - "scripts/acceptance/test_windows_hosted_preflight.py"
+  push:
+    branches:
+      - main
+      - "agent/**"
+    paths:
+      - ".github/workflows/windows-hosted-preflight.yml"
+      - ".github/workflows/ci.yml"
+      - "desktop/windows/**"
+      - "installer/windows/**"
+      - "scripts/acceptance/test_windows_hosted_preflight.py"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-hosted-preflight-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  native-installer-preflight:
+    name: Native Windows Server source and installer syntax preflight (E1)
+    if: github.ref_type != 'tag'
+    runs-on: windows-2025
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the candidate source without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up the static-check Python runtime
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.13"
+
+      - name: Install hash-locked static-check dependencies
+        shell: pwsh
+        run: >-
+          python -m pip install --disable-pip-version-check
+          --require-hashes -r backend/requirements-dev.lock
+
+      - name: Enforce the non-release hosted-preflight boundary
+        shell: pwsh
+        run: |
+          python -m unittest scripts.acceptance.test_windows_hosted_preflight -v
+          python -m unittest scripts.acceptance.test_windows_installer_source -v
+
+      - name: Create an ephemeral non-release workspace
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+          $preflightRoot = Join-Path `
+            $env:RUNNER_TEMP `
+            "datax-hosted-installer-preflight"
+          if (Test-Path -LiteralPath $preflightRoot) {
+            throw "Hosted preflight workspace already exists."
+          }
+          [IO.Directory]::CreateDirectory($preflightRoot) | Out-Null
+          "DATAX_HOSTED_PREFLIGHT_ROOT=$preflightRoot" >> $env:GITHUB_ENV
+
+      - name: Install the pinned Rust toolchain for the native build
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+          rustup toolchain install 1.97.0 --profile minimal --component clippy
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned Rust toolchain installation failed."
+          }
+          rustup default 1.97.0
+          if ($LASTEXITCODE -ne 0) {
+            throw "Pinned Rust toolchain activation failed."
+          }
+
+      - name: Build and test the native Launcher without a release binding
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+          $overrideNames = @(
+            "DES_RELEASE_MANIFEST_SHA256",
+            "RUSTC",
+            "RUSTC_WRAPPER",
+            "RUSTC_WORKSPACE_WRAPPER",
+            "RUSTFLAGS",
+            "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_BUILD_RUSTFLAGS",
+            "CARGO_HOME"
+          )
+          foreach ($name in $overrideNames) {
+            Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue
+          }
+          $env:CARGO_TARGET_DIR = Join-Path `
+            $env:DATAX_HOSTED_PREFLIGHT_ROOT `
+            "cargo-target"
+          cargo test --locked --manifest-path desktop/windows/Cargo.toml --lib
+          if ($LASTEXITCODE -ne 0) {
+            throw "Native Launcher unit tests failed."
+          }
+          cargo build --locked --release --manifest-path desktop/windows/Cargo.toml --bin launcher
+          if ($LASTEXITCODE -ne 0) {
+            throw "Native Launcher build failed."
+          }
+          $launcher = Join-Path $env:CARGO_TARGET_DIR "release\launcher.exe"
+          if (-not (Test-Path -LiteralPath $launcher -PathType Leaf)) {
+            throw "Native Launcher build did not produce launcher.exe."
+          }
+
+      - name: Download and verify the fixed NSIS compiler
+        shell: pwsh
+        env:
+          NSIS_ARCHIVE_URL: https://sourceforge.net/projects/nsis/files/NSIS%203/3.11/nsis-3.11.zip/download
+          NSIS_ARCHIVE_SHA256: c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+          $archive = Join-Path $env:DATAX_HOSTED_PREFLIGHT_ROOT "nsis-3.11.zip"
+          Invoke-WebRequest `
+            -Uri $env:NSIS_ARCHIVE_URL `
+            -OutFile $archive `
+            -MaximumRedirection 5
+          $actualHash = (
+            Get-FileHash -LiteralPath $archive -Algorithm SHA256
+          ).Hash.ToLowerInvariant()
+          if ($actualHash -cne $env:NSIS_ARCHIVE_SHA256) {
+            throw "Pinned NSIS archive SHA-256 did not match."
+          }
+          Expand-Archive `
+            -LiteralPath $archive `
+            -DestinationPath $env:DATAX_HOSTED_PREFLIGHT_ROOT `
+            -Force
+          $makensis = Join-Path `
+            $env:DATAX_HOSTED_PREFLIGHT_ROOT `
+            "nsis-3.11\makensis.exe"
+          if (-not (Test-Path -LiteralPath $makensis -PathType Leaf)) {
+            throw "Pinned NSIS archive did not contain makensis.exe."
+          }
+          "DATAX_HOSTED_PREFLIGHT_MAKENSIS=$makensis" >> $env:GITHUB_ENV
+
+      - name: Compile and discard a deliberately non-release installer
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+          $resources = Join-Path $env:DATAX_HOSTED_PREFLIGHT_ROOT "resources"
+          [IO.Directory]::CreateDirectory($resources) | Out-Null
+          $utf8WithoutBom = [Text.UTF8Encoding]::new($false)
+          $imageLock = Join-Path $resources "images.release.env"
+          $manifest = Join-Path $resources "release-manifest.json"
+          [IO.File]::WriteAllText(
+            $imageLock,
+            "# deliberately non-release preflight input`n",
+            $utf8WithoutBom
+          )
+          [IO.File]::WriteAllText($manifest, "{}", $utf8WithoutBom)
+          $launcher = Join-Path `
+            $env:DATAX_HOSTED_PREFLIGHT_ROOT `
+            "cargo-target\release\launcher.exe"
+          $compose = Join-Path $env:GITHUB_WORKSPACE "deploy\windows\compose.yaml"
+          $aclScript = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "desktop\windows\resources\secure-acl.ps1"
+          $installer = Join-Path `
+            $env:GITHUB_WORKSPACE `
+            "installer\windows\DataXEnterpriseStudio.nsi"
+          $output = Join-Path `
+            $env:DATAX_HOSTED_PREFLIGHT_ROOT `
+            "nonrelease-installer-preflight.exe"
+          $arguments = @(
+            "/DPRODUCT_VERSION=0.1.0",
+            "/DFILE_VERSION=0.1.0.0",
+            "/DLAUNCHER_EXE=$launcher",
+            "/DCOMPOSE_FILE=$compose",
+            "/DIMAGE_ENV_FILE=$imageLock",
+            "/DACL_SCRIPT=$aclScript",
+            "/DRELEASE_MANIFEST=$manifest",
+            "/DOUTPUT_FILE=$output",
+            $installer
+          )
+          & $env:DATAX_HOSTED_PREFLIGHT_MAKENSIS @arguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "NSIS source compilation failed."
+          }
+          if (-not (Test-Path -LiteralPath $output -PathType Leaf) -or
+              (Get-Item -LiteralPath $output).Length -le 0) {
+            throw "NSIS source compilation did not create a non-release installer."
+          }
+
+      - name: Remove all generated non-release inputs and output
+        if: always()
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Set-StrictMode -Version Latest
+          $preflightRoot = Join-Path `
+            $env:RUNNER_TEMP `
+            "datax-hosted-installer-preflight"
+          if (Test-Path -LiteralPath $preflightRoot) {
+            Remove-Item -LiteralPath $preflightRoot -Recurse -Force -ErrorAction Stop
+          }
