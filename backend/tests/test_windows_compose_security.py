@@ -32,6 +32,22 @@ def test_persistent_workspace_is_not_the_secret_runtime_root() -> None:
     assert worker["environment"]["DES_WORKSPACE_VOLUME_PATH"] == ("/var/lib/datax-studio/runs")
 
 
+def test_runtime_volume_names_have_launcher_controlled_generation_hooks() -> None:
+    compose = yaml.safe_load(
+        (REPOSITORY_ROOT / "deploy/windows/compose.yaml").read_text(encoding="utf-8")
+    )
+
+    assert compose["volumes"]["postgres-data"]["name"] == (
+        "${DES_POSTGRES_VOLUME_NAME:-des-postgres-data}"
+    )
+    assert compose["volumes"]["log-data"]["name"] == (
+        "${DES_LOG_VOLUME_NAME:-des-log-data}"
+    )
+    assert compose["volumes"]["workspace-data"]["name"] == (
+        "${DES_WORKSPACE_VOLUME_NAME:-des-workspace-data}"
+    )
+
+
 def test_database_owner_secret_is_not_mounted_into_runtime_services() -> None:
     compose = yaml.safe_load(
         (REPOSITORY_ROOT / "deploy/windows/compose.yaml").read_text(encoding="utf-8")

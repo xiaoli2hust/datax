@@ -16,6 +16,8 @@
 - `system-backup-manifest.v1.schema.json`：系统 DATA/SECRETS 分包、版本、数据树摘要与配对清单。
 - `system-restore-journal.v1.schema.json`：双恢复秘密认证的 staging journal、包证据、
   状态和事件结构；不包含最终卷提交成功状态。
+- `runtime-generation.v1.schema.json`：Launcher 原子选择 installation-id、secret 目录和
+  三个 Docker named volume 的活动运行代际指针。
 - `system-backup.v1.md`：Windows Launcher 调用备份 helper 的停机、加密、恢复 journal 与失败关闭边界。
 
 截至 2026-07-31，Datasource、Job、Execution、日志与恢复处置契约已有候选代码消费方，

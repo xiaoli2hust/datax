@@ -1,4 +1,5 @@
 mod platform;
+pub mod runtime_generation;
 
 use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
@@ -653,6 +654,18 @@ impl Installation {
             (
                 OsString::from("DES_INSTALLATION_ID"),
                 OsString::from(installation_id),
+            ),
+            (
+                OsString::from("DES_POSTGRES_VOLUME_NAME"),
+                OsString::from(RUNTIME_VOLUMES[0].0),
+            ),
+            (
+                OsString::from("DES_LOG_VOLUME_NAME"),
+                OsString::from(RUNTIME_VOLUMES[1].0),
+            ),
+            (
+                OsString::from("DES_WORKSPACE_VOLUME_NAME"),
+                OsString::from(RUNTIME_VOLUMES[2].0),
             ),
         ])
     }

@@ -14,9 +14,10 @@ ADR 记录已接受或被替代的关键决策，避免 Issue、代码和文档�
 V1.2 终端交付宿主固定为 Windows 11 x64 本地工作站。`Setup.exe` 只安装产品文件和
 `launcher.exe`，Docker Desktop、WSL2 与虚拟化由用户/组织预先提供并自行接受许可；
 固定 Linux 容器承载全部服务。默认入口仅为 `http://127.0.0.1:17860`，只映射 Web
-容器，API/Worker/PostgreSQL 不映射宿主端口。业务数据使用
-`des-postgres-data`、`des-log-data`、`des-workspace-data` named volumes，不用
-Windows bind mount，卸载默认保留。该交付边界是下列 ADR 的共同部署前提，不改变
+容器，API/Worker/PostgreSQL 不映射宿主端口。业务数据使用由原子运行代际指针选择的三个
+Docker named volumes；旧式首次安装仍可引用 `des-postgres-data`、`des-log-data`、
+`des-workspace-data`，恢复代际使用随机名称。数据卷不用 Windows bind mount，卸载默认
+保留。该交付边界是下列 ADR 的共同部署前提，不改变
 一次性复制、不可变版本、传输授权和执行围栏语义。
 
 当前决策：
@@ -28,3 +29,4 @@ Windows bind mount，卸载默认保留。该交付边界是下列 ADR 的共同
 - [ADR-0005：不可变数据源修订与传输授权](0005-不可变数据源修订与传输授权.md)
 - [ADR-0006：PostgreSQL 事实队列与执行围栏](0006-PostgreSQL事实队列与执行围栏.md)
 - [ADR-0007：Discovery Gate 与工程实施分离](0007-Discovery-Gate与工程实施分离.md)
+- [ADR-0008：干净目标恢复与原子运行代际](0008-干净目标恢复与原子运行代际.md)

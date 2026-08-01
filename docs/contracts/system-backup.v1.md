@@ -9,9 +9,11 @@ RecoveryGate 与这里的系统灾难恢复不是同一概念。
 仓库已有 DATA/SECRETS 分包、加密包格式、归档 allowlist、二次秘密扫描和单元测试。
 内部 helper 现在还能把经过认证且严格配对的双包解到一个全新的空 staging，并创建由
 两把恢复秘密共同认证的 restore journal；该能力只达到 E1
-`IMPLEMENTED_STAGING_ONLY`。新空 PostgreSQL named volume、`pg_restore`、数据库/审计链
-证据重算、日志与 secrets 的原子提交、签名安装包集成、实际 Docker named volume 演练、
-异机 Windows 11 x64 恢复与 RPO/RTO 仍为 `NOT_RUN/BLOCKED`。
+`IMPLEMENTED_STAGING_ONLY`。ADR-0008、运行代际机器契约、严格 Rust 解析/摘要/对象集合
+校验以及 Compose 的受控 volume-name 注入已落地，但尚未接入活动指针提交。新空
+PostgreSQL named volume、`pg_restore`、数据库/审计链证据重算、日志与 secrets 的原子
+提交、签名安装包集成、实际 Docker named volume 演练、异机 Windows 11 x64 恢复与
+RPO/RTO 仍为 `NOT_RUN/BLOCKED`。
 
 因此普通单包 `restore_package` 固定返回 `RESTORE_PAIR_REQUIRED`。内部
 `stage-restore-pair` 成功完成认证与解包后也必须返回非成功状态
@@ -149,18 +151,18 @@ datax-studio-system-backup stage-restore-pair \
 - 完成双包 staging 后 journal 状态为 `STAGED_COMMIT_BLOCKED`。结果明确要求下一门禁
   `PG_RESTORE_NEW_EMPTY_VOLUME_AND_ATOMIC_COMMIT`，helper 不返回“恢复成功”。
 
-### 6.2 尚未实现且继续阻断的提交边界
+### 6.2 已接受但尚未完整接入的提交边界
 
-当前 Compose 把三个运行卷固定命名为
-`des-postgres-data/des-log-data/des-workspace-data`，也没有一个经 journal 认证、可原子
-切换的 active-volume pointer。Docker named volume 本身不提供安全 rename/compare-and-swap。
-在没有先设计并验收该提交协议前，Launcher 不能把 staging 数据复制进固定活跃卷，也不能
-删除、改名或重建这些卷。
+ADR-0008 已决定用受 ACL 保护并原子创建的 `runtime-generation.json` 同时选择
+installation-id、独立 secret 目录和三个随机 named volume；Compose 的逻辑 volume key
+不变，实际名称由 Launcher 明确注入。Docker named volume 本身仍不提供安全
+rename/compare-and-swap，因此 V1 restore 只允许无旧 installation-id、无活动代际、无
+产品容器和产品卷的干净目标，不覆盖已有安装。
 
-此外，现有首次 `start` 流程会生成新 installation-id、运行 secrets 和固定卷；异机恢复
-必须新增一个在首次初始化提交前执行、且不会生成替代 KEK/密码或固定卷的 clean-restore
-模式。当前失败关闭的 `restore` 分支特意位于 secrets/volume 初始化之前，但尚未拥有下面
-的 staging-volume 提交能力。
+当前代码已有运行代际 JSON Schema、域分离摘要、严格来源/路径/卷集合/UTC 时间校验和
+Compose 变量边界，但 `Installation`、首次初始化、restore journal 与 Docker staging 尚未
+消费和提交该指针。现有失败关闭的 `restore` 分支仍位于 secrets/volume 初始化之前，
+不会生成替代 KEK/密码或固定卷。
 
 后续实现至少必须在产品服务和出站网络完全停止的隔离阶段：
 
@@ -170,11 +172,11 @@ datax-studio-system-backup stage-restore-pair \
    执行 `pg_restore --exit-on-error --single-transaction --no-owner --no-privileges`；
 3. 在 staging 数据库上执行迁移版本、约束、行数、审计链、JobVersion/Execution、日志、
    Envelope/KEK 解密探针和发布制品证据重算；
-4. 以崩溃可恢复的单一提交点切换 installation-id、secret 目录和三个 active volume
-   引用；提交前任何失败只清理 journal 记录的新对象，提交后失败可明确回滚到完整旧集合；
+4. 以崩溃可恢复的单一提交点创建 installation-id、secret 目录和三个 active volume
+   引用；提交前任何失败只清理 journal 记录的新对象；V1 没有旧活动集合，也不执行覆盖；
 5. 在干净 Windows 11 x64 上覆盖掉电、Docker/WSL2 中断、错包/错密码/错版本、空间不足、
    `pg_restore` 失败、证据失败、提交中断和旧卷保留的 E4 演练。
 
-上述协议未完成前，`launcher.exe restore ...` 必须稳定返回
+上述接入和真实演练未完成前，`launcher.exe restore ...` 必须稳定返回
 `RESTORE_ATOMIC_VOLUME_COMMIT_UNAVAILABLE` 且不读取恢复 key、不停止服务、不创建 staging
 对象、不修改运行卷。

@@ -219,17 +219,17 @@ secrets:
 
 volumes:
   postgres-data:
-    name: des-postgres-data
+    name: ${DES_POSTGRES_VOLUME_NAME:-des-postgres-data}
     labels:
       com.xiaoli.datax.installation-id: ${DES_INSTALLATION_ID:-UNINITIALIZED}
       com.xiaoli.datax.volume-role: postgres-data
   log-data:
-    name: des-log-data
+    name: ${DES_LOG_VOLUME_NAME:-des-log-data}
     labels:
       com.xiaoli.datax.installation-id: ${DES_INSTALLATION_ID:-UNINITIALIZED}
       com.xiaoli.datax.volume-role: log-data
   workspace-data:
-    name: des-workspace-data
+    name: ${DES_WORKSPACE_VOLUME_NAME:-des-workspace-data}
     labels:
       com.xiaoli.datax.installation-id: ${DES_INSTALLATION_ID:-UNINITIALIZED}
       com.xiaoli.datax.volume-role: workspace-data
