@@ -675,8 +675,207 @@ jobs:
       - name: Upload signed candidate artifact and evidence
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: windows-signed-candidate-${{ needs.linux-images.outputs.artifact_suffix }}
+          name: blocked-windows-handoff-candidate-${{ needs.linux-images.outputs.artifact_suffix }}
           path: ${{ steps.candidate.outputs.directory }}
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  hosted-candidate-attestor:
+    name: Attest the blocked candidate root on a GitHub-hosted runner
+    needs:
+      - linux-images
+      - windows-signed-candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - name: Check out the exact candidate commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          clean: true
+
+      - name: Set up the candidate-root validator runtime
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: backend/requirements-dev.lock
+
+      - name: Install hash-locked acceptance validator dependencies
+        shell: bash
+        run: >-
+          python -m pip install --disable-pip-version-check
+          --require-hashes -r backend/requirements-dev.lock
+
+      - name: Download the complete blocked Windows handoff candidate
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: blocked-windows-handoff-candidate-${{ needs.linux-images.outputs.artifact_suffix }}
+          path: ${{ runner.temp }}/blocked-windows-handoff-candidate
+
+      - name: Verify the handoff manifest and establish the canonical blocked root
+        id: candidate-root
+        shell: bash
+        env:
+          CANDIDATE_DIRECTORY: ${{ runner.temp }}/blocked-windows-handoff-candidate
+          VERSION: ${{ needs.linux-images.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
+          test ! -e "${CANDIDATE_DIRECTORY}/candidate-root.v1.json"
+          python scripts/release/hash_manifest.py \
+            verify \
+            --root "${CANDIDATE_DIRECTORY}"
+          unlink "${CANDIDATE_DIRECTORY}/SHA256SUMS"
+          test ! -e "${CANDIDATE_DIRECTORY}/SHA256SUMS"
+          release_candidate="${VERSION}-${GITHUB_SHA:0:12}"
+          python scripts/acceptance/candidate_root.py \
+            generate \
+            --candidate-directory "${CANDIDATE_DIRECTORY}" \
+            --schema "${GITHUB_WORKSPACE}/docs/contracts/candidate-root.v1.schema.json" \
+            --workflow-run-id "${GITHUB_RUN_ID}" \
+            --workflow-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --source-ref "${GITHUB_REF}" \
+            --commit "${GITHUB_SHA}" \
+            --product-version "${VERSION}" \
+            --release-candidate "${release_candidate}" \
+            --scenario-blocked-reason \
+              "Machine-readable scenario profile and result catalogs are absent." \
+            --scenario-blocked-reason \
+              "Protected Windows E4 harness evidence is absent."
+          python scripts/acceptance/candidate_root.py \
+            validate \
+            --candidate-directory "${CANDIDATE_DIRECTORY}" \
+            --schema "${GITHUB_WORKSPACE}/docs/contracts/candidate-root.v1.schema.json" \
+            --workflow-run-id "${GITHUB_RUN_ID}" \
+            --workflow-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --source-ref "${GITHUB_REF}" \
+            --commit "${GITHUB_SHA}" \
+            --product-version "${VERSION}" \
+            --release-candidate "${release_candidate}"
+          root_sha256="$(sha256sum "${CANDIDATE_DIRECTORY}/candidate-root.v1.json" | cut -d ' ' -f 1)"
+          echo "path=${CANDIDATE_DIRECTORY}/candidate-root.v1.json" >> "${GITHUB_OUTPUT}"
+          echo "sha256=${root_sha256}" >> "${GITHUB_OUTPUT}"
+
+      - name: Attest the canonical blocked candidate root
+        id: attest
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: ${{ steps.candidate-root.outputs.path }}
+          show-summary: false
+
+      - name: Install the hash-locked GitHub CLI verifier
+        id: trusted-gh
+        shell: bash
+        env:
+          TRUSTED_GH_DIRECTORY: ${{ runner.temp }}/trusted-gh-cli
+        run: |
+          set -euo pipefail
+          archive_url="$(python scripts/acceptance/trusted_gh_cli.py metadata --field archive_url)"
+          archive_path="${RUNNER_TEMP}/gh_2.97.0_linux_amd64.tar.gz"
+          test ! -e "${archive_path}"
+          mkdir -p "${TRUSTED_GH_DIRECTORY}"
+          curl \
+            --fail \
+            --location \
+            --proto '=https' \
+            --proto-redir '=https' \
+            --show-error \
+            --silent \
+            --tlsv1.2 \
+            --output "${archive_path}" \
+            "${archive_url}"
+          python scripts/acceptance/trusted_gh_cli.py \
+            install \
+            --archive "${archive_path}" \
+            --output "${TRUSTED_GH_DIRECTORY}/gh"
+          python scripts/acceptance/trusted_gh_cli.py \
+            verify \
+            --executable "${TRUSTED_GH_DIRECTORY}/gh"
+          echo "path=${TRUSTED_GH_DIRECTORY}/gh" >> "${GITHUB_OUTPUT}"
+
+      - name: Re-verify provenance and require the stable TCB blocker
+        id: verify-attestation
+        shell: bash
+        env:
+          ATTESTATION_BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+          CANDIDATE_DIRECTORY: ${{ runner.temp }}/blocked-windows-handoff-candidate
+          TRUSTED_GH_PATH: ${{ steps.trusted-gh.outputs.path }}
+          VERSION: ${{ needs.linux-images.outputs.version }}
+        run: |
+          set -euo pipefail
+          release_candidate="${VERSION}-${GITHUB_SHA:0:12}"
+          evidence_directory="${RUNNER_TEMP}/blocked-candidate-root-attestation"
+          test ! -e "${evidence_directory}"
+          mkdir "${evidence_directory}"
+          policy_result="${evidence_directory}/attestation-policy-result.json"
+          set +e
+          python scripts/acceptance/verify_candidate_attestation.py \
+            --candidate-root "${CANDIDATE_DIRECTORY}/candidate-root.v1.json" \
+            --bundle "${ATTESTATION_BUNDLE}" \
+            --trusted-gh-path "${TRUSTED_GH_PATH}" \
+            --schema "${GITHUB_WORKSPACE}/docs/contracts/candidate-root.v1.schema.json" \
+            --workflow-run-id "${GITHUB_RUN_ID}" \
+            --workflow-run-attempt "${GITHUB_RUN_ATTEMPT}" \
+            --source-ref "${GITHUB_REF}" \
+            --commit "${GITHUB_SHA}" \
+            --product-version "${VERSION}" \
+            --release-candidate "${release_candidate}" \
+            > "${evidence_directory}/unexpected-success.json" \
+            2> "${policy_result}"
+          verifier_status=$?
+          set -e
+          if [[ "${verifier_status}" -ne 1 ]]; then
+            echo "The blocked attestation verifier returned an unexpected status." >&2
+            exit 1
+          fi
+          POLICY_RESULT="${policy_result}" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result = json.loads(Path(os.environ["POLICY_RESULT"]).read_text(encoding="utf-8"))
+          if result != {
+              "code": "TRUSTED_ATTESTATION_VERIFIER_TCB_NOT_IMPLEMENTED",
+              "detail": result.get("detail"),
+              "ready": False,
+              "release_approved": False,
+          } or not str(result["detail"]).startswith(
+              "TRUSTED_ATTESTATION_VERIFIER_TCB_NOT_IMPLEMENTED:"
+          ):
+              raise SystemExit("attestation verifier did not fail with the fixed TCB blocker")
+          PY
+          test ! -s "${evidence_directory}/unexpected-success.json"
+          unlink "${evidence_directory}/unexpected-success.json"
+          cp \
+            "${CANDIDATE_DIRECTORY}/candidate-root.v1.json" \
+            "${evidence_directory}/candidate-root.v1.json"
+          cp "${ATTESTATION_BUNDLE}" "${evidence_directory}/candidate-root.attestation.json"
+          python scripts/acceptance/trusted_gh_cli.py metadata \
+            > "${evidence_directory}/trusted-gh-cli-lock.json"
+          echo "evidence_directory=${evidence_directory}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload the canonical blocked candidate
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: blocked-attested-windows-candidate-${{ needs.linux-images.outputs.artifact_suffix }}
+          path: ${{ runner.temp }}/blocked-windows-handoff-candidate
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+      - name: Upload the blocked candidate-root attestation evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: blocked-candidate-root-attestation-${{ needs.linux-images.outputs.artifact_suffix }}
+          path: ${{ steps.verify-attestation.outputs.evidence_directory }}
           if-no-files-found: error
           retention-days: 30
           compression-level: 0

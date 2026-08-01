@@ -72,6 +72,8 @@ jobs:
             --check
           python -m unittest scripts.acceptance.test_acceptance_manifest -v
           python -m unittest scripts.acceptance.test_candidate_root -v
+          python -m unittest scripts.acceptance.test_trusted_gh_cli -v
+          python -m unittest scripts.acceptance.test_release_workflow -v
 
       - name: Verify the committed upstream DataX source and plugin inventory
         run: |
