@@ -86,6 +86,46 @@ def test_all_json_schemas_are_valid_draft_2020_12_schemas() -> None:
         Draft202012Validator.check_schema(schema)
 
 
+def test_runtime_generation_schema_separates_legacy_and_generation_objects() -> None:
+    schema = json.loads(
+        (CONTRACT_ROOT / "runtime-generation.v1.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    validator = Draft202012Validator(schema)
+    generation_id = "a" * 32
+    base = {
+        "schema_version": "1.0",
+        "generation_id": generation_id,
+        "installation_id": "b" * 64,
+        "source": "FRESH",
+        "restore_journal_id": None,
+        "secret_directory": f"generations/{generation_id}/secrets",
+        "volumes": {
+            "postgres": f"des-postgres-{generation_id}",
+            "logs": f"des-log-{generation_id}",
+            "workspace": f"des-workspace-{generation_id}",
+        },
+        "committed_at": "2026-08-01T09:30:00Z",
+        "state_sha256": "c" * 64,
+    }
+    assert validator.is_valid(base)
+
+    fresh_with_legacy_objects = {
+        **base,
+        "secret_directory": "secrets",
+        "volumes": {
+            "postgres": "des-postgres-data",
+            "logs": "des-log-data",
+            "workspace": "des-workspace-data",
+        },
+    }
+    assert not validator.is_valid(fresh_with_legacy_objects)
+
+    legacy_with_generation_objects = {**base, "source": "LEGACY"}
+    assert not validator.is_valid(legacy_with_generation_objects)
+
+
 def test_literal_audit_actions_are_declared_by_the_machine_contract() -> None:
     schema = json.loads(
         (CONTRACT_ROOT / "audit-event.v1.schema.json").read_text(encoding="utf-8")

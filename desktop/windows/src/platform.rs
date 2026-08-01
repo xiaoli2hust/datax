@@ -42,6 +42,7 @@ mod imp {
     const MB_DEFBUTTON2: u32 = 0x0000_0100;
     const MB_OK: u32 = 0x0000_0000;
     const MB_YESNO: u32 = 0x0000_0004;
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x0000_0008;
     const IDYES: i32 = 6;
     const IDOK: usize = 1;
     const IDCANCEL: usize = 2;
@@ -282,6 +283,11 @@ mod imp {
             process: Handle,
             process_machine: *mut u16,
             native_machine: *mut u16,
+        ) -> i32;
+        fn MoveFileExW(
+            existing_file_name: *const u16,
+            new_file_name: *const u16,
+            flags: u32,
         ) -> i32;
     }
 
@@ -840,6 +846,54 @@ mod imp {
                     "所需文件不是普通文件或包含 reparse point：{}",
                     path.display()
                 ),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn move_new_write_through(source: &Path, destination: &Path) -> Result<(), LauncherError> {
+        if source.parent().is_none()
+            || source.parent() != destination.parent()
+            || source.file_name().is_none()
+            || destination.file_name().is_none()
+        {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_COMMIT_PATH_INVALID",
+                "运行代际 pending 文件与活动指针必须位于同一受控目录。",
+            ));
+        }
+        ensure_regular_file(source)?;
+        match fs::symlink_metadata(destination) {
+            Ok(_) => {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_ALREADY_EXISTS",
+                    "活动运行代际指针已存在；Launcher 不会覆盖它。",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_COMMIT_CHECK_FAILED",
+                    "无法证明活动运行代际指针目标不存在。",
+                ));
+            }
+        }
+
+        let source = wide(source.as_os_str());
+        let destination = wide(destination.as_os_str());
+        // SAFETY: both paths are NUL-terminated. REPLACE_EXISTING is deliberately absent, so
+        // another destination entry can never be overwritten; WRITE_THROUGH flushes the move.
+        if unsafe {
+            MoveFileExW(
+                source.as_ptr(),
+                destination.as_ptr(),
+                MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_COMMIT_FAILED",
+                "无法以不覆盖、写穿方式提交活动运行代际指针。",
             ));
         }
         Ok(())
@@ -1840,6 +1894,7 @@ mod imp {
 #[cfg(not(target_os = "windows"))]
 mod imp {
     use super::{BootstrapInput, LauncherError, Path, PathBuf};
+    use std::fs;
 
     pub struct InstanceGuard;
 
@@ -1902,7 +1957,9 @@ mod imp {
     }
 
     pub fn ensure_directory(path: &Path) -> Result<(), LauncherError> {
-        if path.is_dir() {
+        if fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        {
             Ok(())
         } else {
             Err(LauncherError::new(
@@ -1913,7 +1970,9 @@ mod imp {
     }
 
     pub fn ensure_regular_file(path: &Path) -> Result<(), LauncherError> {
-        if path.is_file() {
+        if fs::symlink_metadata(path)
+            .is_ok_and(|metadata| metadata.is_file() && !metadata.file_type().is_symlink())
+        {
             Ok(())
         } else {
             Err(LauncherError::new(
@@ -1921,6 +1980,52 @@ mod imp {
                 format!("文件不可用：{}", path.display()),
             ))
         }
+    }
+
+    pub fn move_new_write_through(source: &Path, destination: &Path) -> Result<(), LauncherError> {
+        if source.parent().is_none()
+            || source.parent() != destination.parent()
+            || source.file_name().is_none()
+            || destination.file_name().is_none()
+        {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_COMMIT_PATH_INVALID",
+                "运行代际 pending 文件与活动指针必须位于同一受控目录。",
+            ));
+        }
+        ensure_regular_file(source)?;
+        match fs::symlink_metadata(destination) {
+            Ok(_) => {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_ALREADY_EXISTS",
+                    "活动运行代际指针已存在；Launcher 不会覆盖它。",
+                ));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_COMMIT_CHECK_FAILED",
+                    "无法证明活动运行代际指针目标不存在。",
+                ));
+            }
+        }
+        fs::rename(source, destination).map_err(|_| {
+            LauncherError::new(
+                "RUNTIME_GENERATION_COMMIT_FAILED",
+                "当前非 Windows 测试主机无法提交活动运行代际指针。",
+            )
+        })?;
+        if let Some(parent) = destination.parent() {
+            fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
+                .map_err(|_| {
+                    LauncherError::new(
+                        "RUNTIME_GENERATION_COMMIT_FAILED",
+                        "当前非 Windows 测试主机无法刷盘活动运行代际目录。",
+                    )
+                })?;
+        }
+        Ok(())
     }
 
     pub fn ensure_authenticode_trusted(_path: &Path) -> Result<(), LauncherError> {

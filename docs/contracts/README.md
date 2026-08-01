@@ -20,10 +20,10 @@
   三个 Docker named volume 的活动运行代际指针。
 - `system-backup.v1.md`：Windows Launcher 调用备份 helper 的停机、加密、恢复 journal 与失败关闭边界。
 
-截至 2026-07-31，Datasource、Job、Execution、日志与恢复处置契约已有候选代码消费方，
+截至 2026-08-01，Datasource、Job、Execution、日志与恢复处置契约已有候选代码消费方，
 但真实四方向 DataX（E3）和 Windows 11 安装链路（E4）仍为 `NOT_RUN/BLOCKED`。
 系统备份契约已有 DATA/SECRETS 分包导出，以及双包认证、配对、受认证 journal 和空目录
-staging 的 E1 候选实现；新空 PostgreSQL volume、`pg_restore`、证据重算、原子还原提交
+staging 的 E1 候选实现；`LEGACY` 指针原子提交与 Compose 消费也已有候选实现。新空 PostgreSQL volume、`pg_restore`、证据重算、`RESTORE` 原子还原提交
 与升级路径仍未实现并保持失败关闭，不能把导出包、journal 或 staging 文件存在当作恢复
 验收。
 

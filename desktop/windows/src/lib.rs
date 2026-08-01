@@ -5,6 +5,7 @@ use ed25519_dalek::pkcs8::spki::der::pem::LineEnding;
 use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use getrandom::fill as fill_random;
+use runtime_generation::RuntimeGeneration;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,7 +18,7 @@ use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use wait_timeout::ChildExt;
 use zeroize::{Zeroize, Zeroizing};
 
@@ -44,7 +45,6 @@ const EXPECTED_SERVICES: [&str; 6] = [
     "web",
     "worker",
 ];
-const INSTALLATION_ID_UNINITIALIZED: &str = "UNINITIALIZED";
 const VOLUME_IDENTITY_LABEL: &str = "com.xiaoli.datax.installation-id";
 const VOLUME_ROLE_LABEL: &str = "com.xiaoli.datax.volume-role";
 const RUNTIME_VOLUMES: [(&str, &str); 3] = [
@@ -196,6 +196,7 @@ struct Installation {
     app_data_root: PathBuf,
     initialization_state: PathBuf,
     installation_id: PathBuf,
+    runtime_generation: PathBuf,
     secret_dir: PathBuf,
     postgres_secret: PathBuf,
     egress_guard_database_secret: PathBuf,
@@ -398,13 +399,9 @@ where
             let mut tools = Tools::discover(&installation.install_dir)?;
             platform::ensure_hardware_prerequisites(&installation.local_app_data)?;
             let start_tools = StartTools::discover()?;
-            verify_prerequisites(
-                &mut tools,
-                &start_tools,
-                &installation,
-                &verified_release.image_lock,
-            )?;
+            verify_prerequisites(&mut tools, &start_tools, &installation)?;
             ensure_runtime_secrets(&tools, &start_tools, &installation)?;
+            verify_compose_config(&tools, &installation, &verified_release.image_lock)?;
             if start(&tools, &start_tools, &installation)? {
                 Ok(RunOutcome::Started)
             } else {
@@ -426,12 +423,7 @@ where
             let mut tools = Tools::discover(&installation.install_dir)?;
             platform::ensure_hardware_prerequisites(&installation.local_app_data)?;
             let start_tools = StartTools::discover()?;
-            verify_prerequisites(
-                &mut tools,
-                &start_tools,
-                &installation,
-                &verified_release.image_lock,
-            )?;
+            verify_prerequisites(&mut tools, &start_tools, &installation)?;
             let (data_package, secrets_package) = create_system_backup(
                 &tools,
                 &start_tools,
@@ -605,6 +597,7 @@ impl Installation {
         let app_data_root = local_app_data.join("DataXEnterpriseStudio");
         let initialization_state = app_data_root.join("initialization-incomplete");
         let installation_id = app_data_root.join("installation-id");
+        let runtime_generation = app_data_root.join("runtime-generation.json");
         let secret_dir = app_data_root.join("secrets");
         let postgres_secret = secret_dir.join("postgres_password.txt");
         let egress_guard_database_secret = secret_dir.join("egress_guard_database_password.txt");
@@ -627,6 +620,7 @@ impl Installation {
             app_data_root,
             initialization_state,
             installation_id,
+            runtime_generation,
             secret_dir,
             postgres_secret,
             egress_guard_database_secret,
@@ -641,33 +635,17 @@ impl Installation {
     }
 
     fn compose_environment(&self) -> Result<Vec<(OsString, OsString)>, LauncherError> {
-        let installation_id = if self.installation_id.exists() {
-            read_installation_id(&self.installation_id)?
-        } else {
-            String::from(INSTALLATION_ID_UNINITIALIZED)
-        };
-        Ok(vec![
-            (
-                OsString::from("DES_SECRET_DIR"),
-                self.secret_dir.as_os_str().to_os_string(),
-            ),
-            (
-                OsString::from("DES_INSTALLATION_ID"),
-                OsString::from(installation_id),
-            ),
-            (
-                OsString::from("DES_POSTGRES_VOLUME_NAME"),
-                OsString::from(RUNTIME_VOLUMES[0].0),
-            ),
-            (
-                OsString::from("DES_LOG_VOLUME_NAME"),
-                OsString::from(RUNTIME_VOLUMES[1].0),
-            ),
-            (
-                OsString::from("DES_WORKSPACE_VOLUME_NAME"),
-                OsString::from(RUNTIME_VOLUMES[2].0),
-            ),
-        ])
+        let generation = read_runtime_generation(&self.runtime_generation)?;
+        if generation.source == "LEGACY" {
+            let legacy_installation_id = read_installation_id(&self.installation_id)?;
+            if !constant_time_ascii_equal(&generation.installation_id, &legacy_installation_id) {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_IDENTITY_MISMATCH",
+                    "活动运行代际与旧式 installation-id 不一致；Launcher 已安全阻断。",
+                ));
+            }
+        }
+        Ok(generation.compose_environment(&self.app_data_root))
     }
 }
 
@@ -865,7 +843,6 @@ fn verify_prerequisites(
     tools: &mut Tools,
     start_tools: &StartTools,
     installation: &Installation,
-    image_lock: &ImageLock,
 ) -> Result<(), LauncherError> {
     let current_version_key = r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion";
     let installation_type = query_registry_string(
@@ -993,6 +970,14 @@ fn verify_prerequisites(
         ));
     }
 
+    Ok(())
+}
+
+fn verify_compose_config(
+    tools: &Tools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+) -> Result<(), LauncherError> {
     let config = compose(
         tools,
         installation,
@@ -1085,7 +1070,9 @@ fn ensure_runtime_secrets(
     }
 
     let storage_was_existing = ensure_storage_identity(tools, start_tools, installation, &sid)?;
-    ensure_existing_runtime_secrets(start_tools, installation, &sid, storage_was_existing)
+    ensure_existing_runtime_secrets(start_tools, installation, &sid, storage_was_existing)?;
+    let installation_id = read_installation_id(&installation.installation_id)?;
+    ensure_legacy_runtime_generation(start_tools, installation, &sid, &installation_id)
 }
 
 fn ensure_existing_runtime_secrets(
@@ -1243,6 +1230,8 @@ fn resume_runtime_initialization(
     } else {
         commit_installation_id(start_tools, installation, sid, &initialization_id)?;
     }
+
+    ensure_legacy_runtime_generation(start_tools, installation, sid, &initialization_id)?;
 
     fs::remove_file(&installation.initialization_state).map_err(|_| {
         LauncherError::new(
@@ -1705,6 +1694,171 @@ fn write_new_secret_file(path: &Path, value: &[u8], error_code: &str) -> Result<
         ));
     }
     Ok(())
+}
+
+fn read_runtime_generation(path: &Path) -> Result<RuntimeGeneration, LauncherError> {
+    match fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_MISSING",
+                "活动运行代际指针不存在；请先用 Launcher 完成安全迁移。",
+            ));
+        }
+        Err(_) => {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_INVALID",
+                "无法安全检查活动运行代际指针。",
+            ));
+        }
+        Ok(_) => platform::ensure_regular_file(path).map_err(|_| {
+            LauncherError::new(
+                "RUNTIME_GENERATION_INVALID",
+                "活动运行代际指针不是受控普通文件。",
+            )
+        })?,
+    }
+    let bytes = read_bounded_file(path, 16 * 1024, "RUNTIME_GENERATION_INVALID")?;
+    RuntimeGeneration::parse(&bytes)
+}
+
+fn ensure_legacy_runtime_generation(
+    start_tools: &StartTools,
+    installation: &Installation,
+    sid: &str,
+    installation_id: &str,
+) -> Result<(), LauncherError> {
+    if !is_secret_bytes(installation_id.as_bytes()) {
+        return Err(LauncherError::new(
+            "INSTALLATION_ID_INVALID",
+            "无法用格式无效的 installation-id 提交运行代际。",
+        ));
+    }
+    if installation.runtime_generation.exists() {
+        platform::ensure_regular_file(&installation.runtime_generation)?;
+        let generation = read_runtime_generation(&installation.runtime_generation)?;
+        if generation.source != "LEGACY"
+            || !constant_time_ascii_equal(&generation.installation_id, installation_id)
+        {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_IDENTITY_MISMATCH",
+                "活动运行代际不是当前完整旧式对象集合；Launcher 不会拼接或覆盖它。",
+            ));
+        }
+        restrict_file_acl(
+            start_tools,
+            installation,
+            &installation.runtime_generation,
+            sid,
+        )?;
+        let rechecked = read_runtime_generation(&installation.runtime_generation)?;
+        if rechecked != generation {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_CHANGED_DURING_CHECK",
+                "活动运行代际在 ACL 核验期间发生变化；Launcher 已安全阻断。",
+            ));
+        }
+        return Ok(());
+    }
+
+    let generation_id = random_runtime_generation_id()?;
+    let generation = RuntimeGeneration::legacy(
+        generation_id.clone(),
+        installation_id.to_owned(),
+        current_utc_timestamp(SystemTime::now())?,
+    )?;
+    let encoded = generation.to_bytes()?;
+    let pending = installation
+        .app_data_root
+        .join(format!(".runtime-generation-{generation_id}.pending"));
+    write_new_secret_file(
+        &pending,
+        &encoded,
+        "RUNTIME_GENERATION_PENDING_CREATE_FAILED",
+    )?;
+
+    let prepared = (|| {
+        restrict_file_acl(start_tools, installation, &pending, sid)?;
+        let parsed = read_runtime_generation(&pending)?;
+        if parsed != generation {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_PENDING_INVALID",
+                "运行代际 pending 文件回读不一致；未提交活动指针。",
+            ));
+        }
+        platform::move_new_write_through(&pending, &installation.runtime_generation)?;
+        let committed = read_runtime_generation(&installation.runtime_generation)?;
+        if committed != generation {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_COMMIT_INVALID",
+                "活动运行代际指针提交后回读不一致；服务未启动。",
+            ));
+        }
+        Ok(())
+    })();
+    if prepared.is_err() && pending.exists() {
+        let _ = fs::remove_file(&pending);
+    }
+    prepared
+}
+
+fn random_runtime_generation_id() -> Result<String, LauncherError> {
+    let mut random = Zeroizing::new([0_u8; 16]);
+    fill_random(&mut *random).map_err(|_| {
+        LauncherError::new(
+            "RUNTIME_GENERATION_RANDOM_FAILED",
+            "Windows 安全随机数生成失败，未创建运行代际。",
+        )
+    })?;
+    Ok(hex_lower(&*random))
+}
+
+fn current_utc_timestamp(now: SystemTime) -> Result<String, LauncherError> {
+    let elapsed = now.duration_since(UNIX_EPOCH).map_err(|_| {
+        LauncherError::new(
+            "RUNTIME_GENERATION_TIME_INVALID",
+            "系统 UTC 时间早于 Unix epoch，未创建运行代际。",
+        )
+    })?;
+    let seconds = i64::try_from(elapsed.as_secs()).map_err(|_| {
+        LauncherError::new(
+            "RUNTIME_GENERATION_TIME_INVALID",
+            "系统 UTC 时间超出支持范围，未创建运行代际。",
+        )
+    })?;
+    let days = seconds / 86_400;
+    let seconds_of_day = seconds % 86_400;
+    let (year, month, day) = civil_date_from_unix_days(days);
+    if !(2000..=9999).contains(&year) {
+        return Err(LauncherError::new(
+            "RUNTIME_GENERATION_TIME_INVALID",
+            "系统 UTC 年份超出运行代际契约范围。",
+        ));
+    }
+    let hour = seconds_of_day / 3_600;
+    let minute = (seconds_of_day % 3_600) / 60;
+    let second = seconds_of_day % 60;
+    Ok(format!(
+        "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{second:02}Z"
+    ))
+}
+
+fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
+    let shifted = days + 719_468;
+    let era = if shifted >= 0 {
+        shifted
+    } else {
+        shifted - 146_096
+    } / 146_097;
+    let day_of_era = shifted - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
 }
 
 fn validate_existing_auth_secret_bundle(installation: &Installation) -> Result<(), LauncherError> {
@@ -2635,14 +2789,6 @@ fn create_system_backup(
     image_lock: &ImageLock,
     request: BackupRequestPaths<'_>,
 ) -> Result<(PathBuf, PathBuf), LauncherError> {
-    if !compose_project_exists(tools, installation)?
-        || !compose_web_is_running(tools, installation)?
-    {
-        return Err(LauncherError::new(
-            "BACKUP_RUNNING_SERVICE_REQUIRED",
-            "系统备份必须从已正常运行的本机服务发起，以便先进入 draining 并证明没有活动任务。",
-        ));
-    }
     let prepared = prepare_system_backup(
         tools,
         start_tools,
@@ -2652,6 +2798,15 @@ fn create_system_backup(
         request.data_key,
         request.secrets_key,
     )?;
+    verify_compose_config(tools, installation, image_lock)?;
+    if !compose_project_exists(tools, installation)?
+        || !compose_web_is_running(tools, installation)?
+    {
+        return Err(LauncherError::new(
+            "BACKUP_RUNNING_SERVICE_REQUIRED",
+            "系统备份必须从已正常运行的本机服务发起，以便先进入 draining 并证明没有活动任务。",
+        ));
+    }
     let staging = prepare_backup_staging(start_tools, installation, &prepared.current_user_sid)?;
 
     let preflight = match lifecycle(tools, installation, "preflight-stop") {
@@ -2768,6 +2923,12 @@ fn prepare_system_backup(
     ensure_storage_identity(tools, start_tools, installation, &current_user_sid)?;
     ensure_existing_runtime_secrets(start_tools, installation, &current_user_sid, true)?;
     let installation_id = read_installation_id(&installation.installation_id)?;
+    ensure_legacy_runtime_generation(
+        start_tools,
+        installation,
+        &current_user_sid,
+        &installation_id,
+    )?;
 
     let data_output =
         prepare_backup_output_directory(start_tools, installation, data_output, &current_user_sid)?;
@@ -4668,7 +4829,10 @@ fn run_process_to_new_file(
         .env_remove("DES_WORKER_IMAGE")
         .env_remove("DES_WEB_IMAGE")
         .env_remove("DES_SECRET_DIR")
-        .env_remove("DES_INSTALLATION_ID");
+        .env_remove("DES_INSTALLATION_ID")
+        .env_remove("DES_POSTGRES_VOLUME_NAME")
+        .env_remove("DES_LOG_VOLUME_NAME")
+        .env_remove("DES_WORKSPACE_VOLUME_NAME");
     for (name, value) in environment {
         command.env(name, value);
     }
@@ -4768,7 +4932,10 @@ fn run_process_internal(
         .env_remove("DES_WORKER_IMAGE")
         .env_remove("DES_WEB_IMAGE")
         .env_remove("DES_SECRET_DIR")
-        .env_remove("DES_INSTALLATION_ID");
+        .env_remove("DES_INSTALLATION_ID")
+        .env_remove("DES_POSTGRES_VOLUME_NAME")
+        .env_remove("DES_LOG_VOLUME_NAME")
+        .env_remove("DES_WORKSPACE_VOLUME_NAME");
     for (name, value) in environment {
         command.env(name, value);
     }
@@ -5825,6 +5992,92 @@ mod tests {
             hex_lower_32(&[0xab; 32]),
             *b"abababababababababababababababababababababababababababababababab"
         );
+    }
+
+    #[test]
+    fn runtime_generation_timestamp_uses_strict_utc_calendar_time() {
+        assert_eq!(
+            current_utc_timestamp(UNIX_EPOCH + Duration::from_secs(946_684_800)).unwrap(),
+            "2000-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            current_utc_timestamp(UNIX_EPOCH + Duration::from_secs(1_775_203_199)).unwrap(),
+            "2026-04-03T07:59:59Z"
+        );
+        assert_eq!(
+            current_utc_timestamp(UNIX_EPOCH).unwrap_err().code(),
+            "RUNTIME_GENERATION_TIME_INVALID"
+        );
+    }
+
+    #[test]
+    fn runtime_generation_commit_never_overwrites_existing_pointer() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "datax-runtime-generation-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let pending = root.join("first.pending");
+        let pointer = root.join("runtime-generation.json");
+        fs::write(&pending, b"first").unwrap();
+        platform::move_new_write_through(&pending, &pointer).unwrap();
+        assert_eq!(fs::read(&pointer).unwrap(), b"first");
+        assert!(!pending.exists());
+
+        let second = root.join("second.pending");
+        fs::write(&second, b"second").unwrap();
+        assert_eq!(
+            platform::move_new_write_through(&second, &pointer)
+                .unwrap_err()
+                .code(),
+            "RUNTIME_GENERATION_ALREADY_EXISTS"
+        );
+        assert_eq!(fs::read(&pointer).unwrap(), b"first");
+        assert_eq!(fs::read(&second).unwrap(), b"second");
+
+        fs::remove_file(second).unwrap();
+        fs::remove_file(pointer).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn runtime_generation_reader_rejects_symlink_pointer() {
+        use std::os::unix::fs::symlink;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "datax-runtime-generation-symlink-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let target = root.join("attacker.json");
+        let pointer = root.join("runtime-generation.json");
+        let generation = RuntimeGeneration::legacy(
+            "a".repeat(32),
+            "b".repeat(64),
+            "2026-08-01T09:30:00Z".to_owned(),
+        )
+        .unwrap();
+        fs::write(&target, generation.to_bytes().unwrap()).unwrap();
+        assert_eq!(read_runtime_generation(&target).unwrap(), generation);
+        symlink(&target, &pointer).unwrap();
+
+        assert_eq!(
+            read_runtime_generation(&pointer).unwrap_err().code(),
+            "RUNTIME_GENERATION_INVALID"
+        );
+
+        fs::remove_file(pointer).unwrap();
+        fs::remove_file(target).unwrap();
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]

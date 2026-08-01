@@ -6,8 +6,9 @@ DataX Enterprise Studio 是面向企业内部数据工程团队的 DataX 可视�
 > 构建、后端/Worker、数据源/任务/执行 Vue 页面与正式 API 适配、Windows Compose、
 > Launcher/Setup 骨架、API/Worker 独立数据库登录、敏感 tmpfs/资源上限、DATA/SECRETS
 > 分离加密导出、双包认证 journal/空 staging 及 GitHub 安全工作流；这些仍是工程候选，
-> 不是已发布产品。恢复只达到 E1 staging，真实 `pg_restore`、证据重算、卷/secret 原子
-> 提交和覆盖升级保持失败关闭。Discovery Gate、真实四方向 DataX E3、发布镜像 digest、
+> 不是已发布产品。旧式完整对象集合到 `LEGACY` 运行代际的不可覆盖原子指针、以及 Compose
+> 对该指针的整组消费已有工程候选；恢复仍只达到 E1 staging，真实 `pg_restore`、证据重算、
+> `RESTORE` 卷/secret 原子提交和覆盖升级保持失败关闭。Discovery Gate、真实四方向 DataX E3、发布镜像 digest、
 > 主机/容器级
 > 默认拒绝 egress 的 Windows 实测、数据库外审计锚定/WORM、代码签名和干净 Windows 11
 > x64 E4 均为 `NOT_RUN/BLOCKED`，因此不声明生产能力。

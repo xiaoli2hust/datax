@@ -10,7 +10,8 @@ RecoveryGate 与这里的系统灾难恢复不是同一概念。
 内部 helper 现在还能把经过认证且严格配对的双包解到一个全新的空 staging，并创建由
 两把恢复秘密共同认证的 restore journal；该能力只达到 E1
 `IMPLEMENTED_STAGING_ONLY`。ADR-0008、运行代际机器契约、严格 Rust 解析/摘要/对象集合
-校验以及 Compose 的受控 volume-name 注入已落地，但尚未接入活动指针提交。新空
+校验、旧式完整集合到 `LEGACY` 活动指针的不覆盖原子提交，以及 Compose 从单一指针整组
+注入 secret/installation-id/三个 volume name 已落地为工程候选。新空
 PostgreSQL named volume、`pg_restore`、数据库/审计链证据重算、日志与 secrets 的原子
 提交、签名安装包集成、实际 Docker named volume 演练、异机 Windows 11 x64 恢复与
 RPO/RTO 仍为 `NOT_RUN/BLOCKED`。
@@ -151,7 +152,7 @@ datax-studio-system-backup stage-restore-pair \
 - 完成双包 staging 后 journal 状态为 `STAGED_COMMIT_BLOCKED`。结果明确要求下一门禁
   `PG_RESTORE_NEW_EMPTY_VOLUME_AND_ATOMIC_COMMIT`，helper 不返回“恢复成功”。
 
-### 6.2 已接受但尚未完整接入的提交边界
+### 6.2 已部分接入、但恢复仍关闭的提交边界
 
 ADR-0008 已决定用受 ACL 保护并原子创建的 `runtime-generation.json` 同时选择
 installation-id、独立 secret 目录和三个随机 named volume；Compose 的逻辑 volume key
@@ -159,10 +160,16 @@ installation-id、独立 secret 目录和三个随机 named volume；Compose 的
 rename/compare-and-swap，因此 V1 restore 只允许无旧 installation-id、无活动代际、无
 产品容器和产品卷的干净目标，不覆盖已有安装。
 
-当前代码已有运行代际 JSON Schema、域分离摘要、严格来源/路径/卷集合/UTC 时间校验和
-Compose 变量边界，但 `Installation`、首次初始化、restore journal 与 Docker staging 尚未
-消费和提交该指针。现有失败关闭的 `restore` 分支仍位于 secrets/volume 初始化之前，
-不会生成替代 KEK/密码或固定卷。
+当前代码已有运行代际 JSON Schema、域分离摘要、严格来源/路径/卷集合/UTC 时间校验；
+Launcher 只在固定卷、固定 secret 集和旧 installation-id 全部通过原有身份检查后，才为
+首次初始化或既有工程候选安装创建 `LEGACY` 指针。pending 文件先刷盘并限制 ACL，再以同
+目录、`MOVEFILE_WRITE_THROUGH` 且不含 replace flag 的 rename 提交；目标已存在、链接、摘要
+篡改、身份或对象集合不一致时均拒绝覆盖。所有 Compose 子进程先移除宿主同名环境变量，
+再从已验证指针整组注入五个值。
+
+restore journal、新随机 volume、代际 secret 目录和 Docker staging 尚未消费或提交
+`RESTORE` 指针。现有失败关闭的 `restore` 分支仍位于 secrets/volume 初始化之前，不会
+读取恢复 key、生成替代 KEK/密码或创建固定卷。
 
 后续实现至少必须在产品服务和出站网络完全停止的隔离阶段：
 

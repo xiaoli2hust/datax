@@ -33,6 +33,36 @@ pub struct RuntimeGeneration {
 }
 
 impl RuntimeGeneration {
+    pub fn legacy(
+        generation_id: String,
+        installation_id: String,
+        committed_at: String,
+    ) -> Result<Self, LauncherError> {
+        let mut value = Self {
+            schema_version: "1.0".to_owned(),
+            generation_id,
+            installation_id,
+            source: "LEGACY".to_owned(),
+            restore_journal_id: None,
+            secret_directory: LEGACY_SECRET_DIRECTORY.to_owned(),
+            volumes: RuntimeVolumes {
+                postgres: LEGACY_POSTGRES_VOLUME.to_owned(),
+                logs: LEGACY_LOG_VOLUME.to_owned(),
+                workspace: LEGACY_WORKSPACE_VOLUME.to_owned(),
+            },
+            committed_at,
+            state_sha256: String::new(),
+        };
+        value.state_sha256 = value.calculated_state_sha256()?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, LauncherError> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|_| invalid("无法编码运行代际指针。"))
+    }
+
     pub fn parse(bytes: &[u8]) -> Result<Self, LauncherError> {
         if bytes.is_empty() || bytes.len() > 16 * 1024 {
             return Err(invalid("运行代际指针大小无效。"));
@@ -280,15 +310,16 @@ mod tests {
 
     #[test]
     fn legacy_generation_requires_the_complete_fixed_set() {
-        let mut value = generation("FRESH");
-        value.source = "LEGACY".to_owned();
-        value.secret_directory = "secrets".to_owned();
-        value.volumes = RuntimeVolumes {
-            postgres: LEGACY_POSTGRES_VOLUME.to_owned(),
-            logs: LEGACY_LOG_VOLUME.to_owned(),
-            workspace: LEGACY_WORKSPACE_VOLUME.to_owned(),
-        };
-        value.state_sha256 = value.calculated_state_sha256().unwrap();
+        let mut value = RuntimeGeneration::legacy(
+            "a".repeat(32),
+            "b".repeat(64),
+            "2026-08-01T09:30:00Z".to_owned(),
+        )
+        .unwrap();
+        assert_eq!(
+            RuntimeGeneration::parse(&value.to_bytes().unwrap()).unwrap(),
+            value
+        );
         assert!(value.validate().is_ok());
 
         value.volumes.logs = format!("des-log-{}", value.generation_id);

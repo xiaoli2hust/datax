@@ -17,7 +17,7 @@
 | 数据源、任务、执行/日志/恢复 UI 与正式 API 适配 | 候选代码已存在 | 浏览器真实闭环、可访问性或 E3/E4 已通过 |
 | 数据库运行角色 | 迁移 owner、API、Worker 独立登录/密码且运行角色无 DDL/TEMP；两类运行角色当前仍有相同全表 DML | 数据库已强制 API/Worker 的细粒度状态写入边界 |
 | Worker 敏感运行区 | 含密 Job、未脱敏日志和进程工作目录进入 256 MiB tmpfs；Compose 已设资源上限 | Windows Docker/WSL2 的残留、SIGKILL 与资源故障 E4 已通过 |
-| 系统备份 | DATA/SECRETS 分离加密导出、双包认证 journal 与全新空 staging 已实现并测到 E1 | 新空 PostgreSQL volume、真实 `pg_restore`、证据重算、卷/secret 原子提交、覆盖升级、异机演练或 RPO/RTO 已通过 |
+| 系统备份 | DATA/SECRETS 分离加密导出、双包认证 journal、全新空 staging、`LEGACY` 指针提交与 Compose 消费已实现并测到 E1 | 新空 PostgreSQL volume、真实 `pg_restore`、证据重算、`RESTORE` 卷/secret 原子提交、覆盖升级、异机演练或 RPO/RTO 已通过 |
 | GitHub 安全工作流 | PR 已配置 Gitleaks、hash-lock pip-audit、pnpm、Cargo OSV、CodeQL 与真实 patched Worker 镜像 Syft+OSV 应用门禁；候选发布配置六份 SPDX SBOM、OSV 应用和 Grype distro 策略 | 线上 CI/真实 release 已通过、主分支已强制保护，或当前 OS 扫描已有线上证据 |
 | 外部发布门禁 | release 候选显式生成 `BLOCKED` manifest | 四方向真实 DataX、签名 Setup、干净 Windows E4、外部 WORM 或恢复完成 |
 

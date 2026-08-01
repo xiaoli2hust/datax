@@ -87,6 +87,37 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "source": { "enum": ["FRESH", "RESTORE"] }
+        }
+      },
+      "then": {
+        "properties": {
+          "secret_directory": {
+            "type": "string",
+            "pattern": "^generations/[0-9a-f]{32}/secrets$"
+          },
+          "volumes": {
+            "properties": {
+              "postgres": {
+                "type": "string",
+                "pattern": "^des-postgres-[0-9a-f]{32}$"
+              },
+              "logs": {
+                "type": "string",
+                "pattern": "^des-log-[0-9a-f]{32}$"
+              },
+              "workspace": {
+                "type": "string",
+                "pattern": "^des-workspace-[0-9a-f]{32}$"
+              }
+            }
+          }
+        }
+      }
     }
   ],
   "$defs": {
