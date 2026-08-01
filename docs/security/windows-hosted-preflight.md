@@ -33,7 +33,11 @@ NSIS、签名或候选产物之前。本文所述最小 Windows wheel lock 修�
 `Command::get_envs()` 把 `HTTP_PROXY` 与 `http_proxy` 表示为两条独立移除记录。Windows 环境变量
 名是大小写不敏感的，实际受控子进程仍在启动前移除二者的同一有效变量。测试现只在 Windows 对
 该观察结果作大小写无关匹配，在其他平台仍逐项精确断言；修复后的真实 run 尚待记录，不能预先
-表述为 E1 通过。
+表述为 E1 通过。第四次 [run 30724102606](https://github.com/xiaoli2hust/datax/actions/runs/30724102606)
+已经通过 Launcher 原生测试与 release 构建，却发现 PowerShell `Invoke-WebRequest` 返回内容的
+SHA-256 不等于固定 NSIS archive；工作流在解压前停止且 finally 清理临时目录。下载器现改为
+显式 `%SystemRoot%\System32\curl.exe`，禁用用户 curl 配置、仅允许 HTTPS 及 HTTPS 重定向，并在
+相同 SHA-256 校验后才解压；修复后的真实 run 仍待记录。
 
 它不创建、上传或保留任何候选安装包；临时 `nonrelease-installer-preflight.exe`、其非发布资源、
 NSIS 和 Cargo 输出都只存在于 GitHub-hosted runner 的临时目录，并在作业结束前删除。
@@ -46,7 +50,9 @@ secrets、OIDC `id-token`、attestation、发布、签名、Docker/WSL2 调用�
 
 NSIS 只从官方 SourceForge 下载固定的 `nsis-3.11.zip`，并要求 SHA-256
 `c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1`；下载、哈希、解压或
-`makensis.exe` 定位失败即失败，不回退到 PATH、Chocolatey 或任意预装 NSIS。
+`makensis.exe` 定位失败即失败。下载只调用明确的 `%SystemRoot%\System32\curl.exe`，使用
+`--disable --fail --location --proto =https --proto-redir =https --tlsv1.2`，不读取用户 curl 配置，
+不回退到 PATH、Chocolatey 或任意预装 NSIS。
 这只限制开发工具输入，不能证明最终发布工具链、工具目录 ACL、TOCTOU、签名私钥或候选二进制的
 来源可信。NSIS 在本预检中只是构建时工具，不随产品分发；其官方许可证为 zlib/libpng。
 替代路径是正式 self-hosted 签名 runner 上由受控发布环境显式提供的 `MAKENSIS_PATH`，不能把

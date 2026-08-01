@@ -88,6 +88,19 @@ class WindowsHostedPreflightTests(unittest.TestCase):
         self.assertIn('Remove-Item -LiteralPath "Env:$name"', self.raw)
         self.assertIn(NSIS_ARCHIVE_URL, self.raw)
         self.assertIn(NSIS_ARCHIVE_SHA256, self.raw)
+        self.assertNotIn("Invoke-WebRequest", self.raw)
+        self.assertIn('Join-Path $env:SystemRoot "System32\\curl.exe"', self.raw)
+        for required_curl_option in (
+            '"--disable"',
+            '"--fail"',
+            '"--location"',
+            '"--proto-redir"',
+            '"=https"',
+            '"--tlsv1.2"',
+            '"--output"',
+        ):
+            with self.subTest(required_curl_option=required_curl_option):
+                self.assertIn(required_curl_option, self.raw)
         self.assertIn("Get-FileHash -LiteralPath $archive -Algorithm SHA256", self.raw)
         self.assertIn("Expand-Archive", self.raw)
         self.assertIn("nsis-3.11\\makensis.exe", self.raw)

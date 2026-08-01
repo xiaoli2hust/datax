@@ -135,10 +135,34 @@ jobs:
           $ErrorActionPreference = "Stop"
           Set-StrictMode -Version Latest
           $archive = Join-Path $env:DATAX_HOSTED_PREFLIGHT_ROOT "nsis-3.11.zip"
-          Invoke-WebRequest `
-            -Uri $env:NSIS_ARCHIVE_URL `
-            -OutFile $archive `
-            -MaximumRedirection 5
+          if ([string]::IsNullOrWhiteSpace($env:SystemRoot)) {
+            throw "Windows system root is unavailable for the fixed downloader."
+          }
+          $curl = Join-Path $env:SystemRoot "System32\curl.exe"
+          if (-not (Test-Path -LiteralPath $curl -PathType Leaf)) {
+            throw "Fixed Windows downloader curl.exe is unavailable."
+          }
+          $curlArguments = @(
+            "--disable",
+            "--fail",
+            "--location",
+            "--max-redirs",
+            "5",
+            "--proto",
+            "=https",
+            "--proto-redir",
+            "=https",
+            "--tlsv1.2",
+            "--silent",
+            "--show-error",
+            "--output",
+            $archive,
+            $env:NSIS_ARCHIVE_URL
+          )
+          & $curl @curlArguments
+          if ($LASTEXITCODE -ne 0) {
+            throw "Fixed Windows downloader failed to retrieve the NSIS archive."
+          }
           $actualHash = (
             Get-FileHash -LiteralPath $archive -Algorithm SHA256
           ).Hash.ToLowerInvariant()
