@@ -32,6 +32,8 @@ datax-runtime/
 runtime-artifacts/
 work/
 logs/
+!backend/src/datax_studio/logs/
+!backend/src/datax_studio/logs/**
 backups/
 .local/
 .runtime/
