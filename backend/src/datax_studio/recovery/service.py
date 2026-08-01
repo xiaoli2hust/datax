@@ -44,6 +44,7 @@ from datax_studio.recovery.db import (
     RecoveryProbe,
     RecoveryProbeAttempt,
 )
+from datax_studio.recovery.gates import ensure_recovery_gate
 from datax_studio.recovery.schemas import (
     ExecutionRerunCreate,
     RecoveryGateResponse,
@@ -744,35 +745,7 @@ class RecoveryService:
         execution: Execution,
         now: datetime,
     ) -> RecoveryGate | None:
-        if execution.attempt_count < 1 or execution.process_state not in {
-            "FAILED",
-            "TIMED_OUT",
-            "CANCELED",
-            "LOST",
-        }:
-            return None
-        gate = session.scalar(
-            select(RecoveryGate).where(RecoveryGate.execution_id == execution.id).with_for_update()
-        )
-        if gate is None:
-            gate = RecoveryGate(
-                id=uuid4(),
-                execution_id=execution.id,
-                project_id=execution.project_id,
-                target_namespace_id=execution.target_namespace_id,
-                status="OPEN",
-                data_effect_at_open=execution.data_effect,
-                remediation_confirmation=None,
-                target_empty_evidence=None,
-                latest_recovery_probe_id=None,
-                submitted_at=None,
-                verified_at=None,
-                reason_code=execution.failure_code,
-                created_at=now,
-            )
-            session.add(gate)
-            session.flush()
-        return gate
+        return ensure_recovery_gate(session, execution=execution, now=now)
 
     def _current_probe_attempt(
         self,

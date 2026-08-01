@@ -221,37 +221,32 @@ def test_log_body_is_deleted_after_30_days_but_summary_and_gate_survive(
         failure_code="TEST_PRE_DATA_FAILURE",
     )
     now = datetime.now(UTC)
-    gate_id = uuid4()
     with core_stack.sessions.begin() as session:
         execution = session.get(Execution, claim.execution_id)
         lock = session.scalar(
             select(TargetCopyLock).where(TargetCopyLock.execution_id == claim.execution_id)
         )
-        assert execution is not None
-        assert lock is not None
-        lock.state = "RELEASED"
-        lock.released_at = now
-        session.add(
-            RecoveryGate(
-                id=gate_id,
-                execution_id=claim.execution_id,
-                project_id=execution.project_id,
-                target_namespace_id=execution.target_namespace_id,
-                status="VERIFIED",
-                data_effect_at_open="NONE",
-                remediation_confirmation={
-                    "action": "NO_CLEANUP_REQUIRED",
-                    "target_was_mutated": False,
-                    "reason": "pre-data failure",
-                },
-                target_empty_evidence={"result": "EMPTY"},
-                latest_recovery_probe_id=None,
-                submitted_at=now,
-                verified_at=now,
-                reason_code=None,
-                created_at=now,
+        gate = session.scalar(
+            select(RecoveryGate).where(
+                RecoveryGate.execution_id == claim.execution_id
             )
         )
+        assert execution is not None
+        assert lock is not None
+        assert gate is not None
+        gate_id = gate.id
+        lock.state = "RELEASED"
+        lock.released_at = now
+        gate.status = "VERIFIED"
+        gate.remediation_confirmation = {
+            "action": "NO_CLEANUP_REQUIRED",
+            "target_was_mutated": False,
+            "reason": "pre-data failure",
+        }
+        gate.target_empty_evidence = {"result": "EMPTY"}
+        gate.submitted_at = now
+        gate.verified_at = now
+        gate.reason_code = None
 
     result = _service(core_stack, tmp_path).run(now=now + timedelta(days=31))
 

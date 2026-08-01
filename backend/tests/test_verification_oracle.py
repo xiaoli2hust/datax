@@ -151,6 +151,70 @@ def test_disk_spool_reports_exact_missing_and_unexpected_counts(
     assert len(difference.sample_digest_pairs) == 3
 
 
+def test_disk_spool_summary_interrupts_after_fixed_bounded_digest_scan(
+    tmp_path: Path,
+) -> None:
+    class OracleInterrupted(RuntimeError):
+        pass
+
+    checks = 0
+
+    def check_control() -> None:
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            raise OracleInterrupted
+
+    with oracle.DigestSpool(tmp_path) as spool:
+        spool.add_rows(
+            "source",
+            ([value] for value in range(oracle.CONTROL_POLL_DIGEST_ROWS + 1)),
+            ["INTEGER"],
+        )
+
+        with pytest.raises(OracleInterrupted):
+            spool.summary("source", control_callback=check_control)
+
+    # One check before the scan and one exactly at the fixed row boundary.
+    assert checks == 2
+
+
+def test_disk_spool_difference_interrupts_during_bounded_difference_scan(
+    tmp_path: Path,
+) -> None:
+    class OracleInterrupted(RuntimeError):
+        pass
+
+    checks = 0
+
+    def check_control() -> None:
+        nonlocal checks
+        checks += 1
+        # For N+1 distinct rows, each summary checks before, at N and after.
+        # The seventh check starts the difference scan and the eighth is the
+        # first fixed N-row comparison boundary.
+        if checks == 8:
+            raise OracleInterrupted
+
+    row_count = oracle.CONTROL_POLL_DIGEST_ROWS + 1
+    with oracle.DigestSpool(tmp_path) as spool:
+        spool.add_rows(
+            "source",
+            ([value] for value in range(row_count)),
+            ["INTEGER"],
+        )
+        spool.add_rows(
+            "target",
+            ([value] for value in range(row_count)),
+            ["INTEGER"],
+        )
+
+        with pytest.raises(OracleInterrupted):
+            spool.difference(control_callback=check_control)
+
+    assert checks == 8
+
+
 def test_report_builder_produces_schema_valid_rfc8785_artifact() -> None:
     schema = json.loads(
         (

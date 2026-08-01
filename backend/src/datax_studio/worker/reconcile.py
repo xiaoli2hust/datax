@@ -21,7 +21,7 @@ from datax_studio.core.schemas import ClaimedExecution
 from datax_studio.core.service import ControlService
 from datax_studio.logs.service import append_reconciler_fence_gap
 from datax_studio.recovery.db import RecoveryProbe, RecoveryProbeAttempt
-from datax_studio.recovery.service import RecoveryService
+from datax_studio.recovery.gates import ensure_recovery_gate
 from datax_studio.worker.process import (
     ProcessAction,
     ProcessIdentity,
@@ -158,13 +158,19 @@ class WorkerReconciler:
                 select(ExecutionCancelRequest)
                 .where(
                     ExecutionCancelRequest.execution_id == execution.id,
-                    ExecutionCancelRequest.status == "PENDING",
+                    ExecutionCancelRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
                 )
                 .with_for_update()
             )
             if cancel is None:
                 return ProcessAction.CONTINUE
             from_state = execution.process_state
+            if cancel.status == "ACKNOWLEDGED":
+                return (
+                    ProcessAction.CANCEL
+                    if from_state == "CANCEL_REQUESTED"
+                    else ProcessAction.FENCE_LOST
+                )
             if from_state not in {"STARTING", "RUNNING", "VERIFYING"}:
                 return (
                     ProcessAction.CANCEL
@@ -203,29 +209,6 @@ class WorkerReconciler:
             failure_code="OPERATOR_CANCELED",
             failure_message="Execution was canceled after Worker acknowledgement.",
         )
-        with self.sessions.begin() as session:
-            now = self.control._database_now(session)  # noqa: SLF001
-            execution = session.scalar(
-                select(Execution).where(Execution.id == claim.execution_id).with_for_update()
-            )
-            cancel = session.scalar(
-                select(ExecutionCancelRequest)
-                .where(
-                    ExecutionCancelRequest.execution_id == claim.execution_id,
-                    ExecutionCancelRequest.status == "ACKNOWLEDGED",
-                )
-                .with_for_update()
-            )
-            if execution is None or execution.process_state != "CANCELED":
-                return
-            if cancel is not None:
-                cancel.status = "COMPLETED"
-                cancel.completed_at = now
-            RecoveryService.ensure_gate(
-                session,
-                execution=execution,
-                now=now,
-            )
 
     def ensure_terminal_gate(self, execution_id: UUID) -> bool:
         with self.sessions.begin() as session:
@@ -236,7 +219,7 @@ class WorkerReconciler:
             if execution is None:
                 return False
             return (
-                RecoveryService.ensure_gate(
+                ensure_recovery_gate(
                     session,
                     execution=execution,
                     now=now,
@@ -402,11 +385,13 @@ class WorkerReconciler:
                 },
                 now=now,
             )
-            RecoveryService.ensure_gate(
+            gate = ensure_recovery_gate(
                 session,
                 execution=execution,
                 now=now,
             )
+            if gate is None:
+                raise RuntimeError("lost claimed execution must create a recovery gate")
             return True
 
     def _mark_probe_lost(

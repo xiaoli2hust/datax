@@ -17,10 +17,11 @@ from test_core_control_plane import (
 )
 
 from datax_studio.auth.db import AuditEvent
-from datax_studio.core.db import ExecutionAttempt
+from datax_studio.core.db import Execution, ExecutionAttempt, TargetCopyLock
 from datax_studio.core.schemas import ClaimedExecution, CredentialBinding
 from datax_studio.logs.db import ExecutionLogChunk, ExecutionLogGap
 from datax_studio.logs.service import ExecutionLogService
+from datax_studio.recovery.db import RecoveryGate
 from datax_studio.worker.process import BoundedRedactedLog
 from datax_studio.worker.reconcile import RuntimeIdentity, WorkerReconciler
 
@@ -310,12 +311,27 @@ def test_reconciler_records_fence_lost_gap_without_stale_worker_write(
     )
     assert result.lost_executions == 1
     with core_stack.sessions() as session:
+        execution = session.get(Execution, claim.execution_id)
+        target_lock = session.scalar(
+            select(TargetCopyLock).where(
+                TargetCopyLock.execution_id == claim.execution_id
+            )
+        )
+        gate = session.scalar(
+            select(RecoveryGate).where(
+                RecoveryGate.execution_id == claim.execution_id
+            )
+        )
         gap = session.scalar(
             select(ExecutionLogGap).where(
                 ExecutionLogGap.execution_id == claim.execution_id,
                 ExecutionLogGap.reason == "FENCE_LOST",
             )
         )
+        assert execution is not None and execution.process_state == "LOST"
+        assert target_lock is not None and target_lock.state == "RECOVERY_REQUIRED"
+        assert gate is not None and gate.status == "OPEN"
+        assert gate.reason_code == "EXECUTION_LEASE_EXPIRED"
         assert gap is not None
         assert gap.raw_received_bytes == 0
         assert gap.redacted_received_bytes == 0

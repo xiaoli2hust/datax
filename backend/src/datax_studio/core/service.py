@@ -127,6 +127,7 @@ from datax_studio.egress_attestation import (
     POLICY_ENGINE_VERSION,
     RESOLVER_POLICY_VERSION,
 )
+from datax_studio.recovery.gates import ensure_recovery_gate
 from datax_studio.schema_snapshot import (
     schema_snapshot_hash,
     validate_schema_snapshot,
@@ -3499,6 +3500,7 @@ class ControlService:
         }
         if new_state not in allowed.get(expected_state, set()):
             raise ValueError("illegal execution transition")
+        target_exclusivity_broken = False
         with self.sessions.begin() as session:
             now = self._database_now(session)
             execution, attempt = self._current_fenced_attempt(
@@ -3529,6 +3531,34 @@ class ControlService:
                 if run_summary is not None
                 else None
             )
+            active_cancel = None
+            if new_state in _TERMINAL_STATES:
+                active_cancel = session.scalar(
+                    select(ExecutionCancelRequest)
+                    .where(
+                        ExecutionCancelRequest.execution_id == execution.id,
+                        ExecutionCancelRequest.status.in_(
+                            ("PENDING", "ACKNOWLEDGED")
+                        ),
+                    )
+                    .with_for_update()
+                )
+                if active_cancel is not None and new_state not in {
+                    "CANCELED",
+                    "LOST",
+                }:
+                    # request_cancel locks the same Execution row before it
+                    # persists the request. Worker-authored terminal outcomes
+                    # therefore have one database ordering with cancellation:
+                    # either the terminal state commits first and the API
+                    # rejects cancellation, or the accepted cancel is visible
+                    # here and the Worker must converge through CANCELED.
+                    raise ProblemException(
+                        status=409,
+                        code="EXECUTION_CANCEL_PENDING",
+                        title="Execution 已有待处理取消请求",
+                        detail="Worker 必须先完成取消，不能提交其他终态。",
+                    )
             if summary_parse_status is not None:
                 if summary_parse_status not in {"PENDING", "SUCCEEDED", "FAILED"}:
                     raise ValueError("invalid summary_parse_status")
@@ -3574,41 +3604,98 @@ class ControlService:
                 execution.datax_finished_at = now
             elif new_state == "SUCCEEDED":
                 if (
-                    data_effect != "CONFIRMED"
-                    or verification_state != "PASSED"
-                    or exit_code != 0
-                    or not verification_report
-                    or verification_evidence_hash is None
-                    or execution.target_exclusivity_status != "ACTIVE"
+                    execution.target_exclusivity_status != "ACTIVE"
                     or execution.target_exclusivity_revoked_at is not None
                     or execution.target_exclusivity_revocation_reason is not None
-                    or execution.summary_parse_status not in {"SUCCEEDED", "FAILED"}
+                    or confirmation_valid_until <= now
                 ):
-                    raise ValueError("SUCCEEDED requires confirmed independent verification")
-                summary = self._validate_successful_verification(
-                    execution=execution,
-                    target_lock=target_lock,
-                    version=self._required_job_version(
-                        session,
-                        execution.job_version_id,
-                    ),
-                    report=verification_report,
-                    verification_evidence_hash=verification_evidence_hash,
-                )
-                if (
-                    summary.target_snapshot_finished_at is None
-                    or summary.target_snapshot_finished_at > confirmation_valid_until
-                ):
-                    raise ValueError(
-                        "target snapshot must finish within exclusivity window"
+                    target_exclusivity_broken = True
+                    if (
+                        execution.target_exclusivity_status == "ACTIVE"
+                        and execution.target_exclusivity_revoked_at is None
+                        and execution.target_exclusivity_revocation_reason is None
+                        and confirmation_valid_until <= now
+                    ):
+                        execution.target_exclusivity_status = "EXPIRED"
+                        execution.target_exclusivity_revocation_reason = (
+                            "VALIDITY_WINDOW_EXPIRED"
+                        )
+                        execution.state_version += 1
+                        self._append_execution_event(
+                            session,
+                            execution,
+                            event_type="TARGET_EXCLUSIVITY_EXPIRED",
+                            from_state="VERIFYING",
+                            to_state="VERIFYING",
+                            attempt_id=attempt.id,
+                            payload={
+                                "valid_until": _rfc3339(
+                                    confirmation_valid_until
+                                )
+                            },
+                            now=now,
+                        )
+                    # The terminal row lock is the final ordering point with a
+                    # concurrent revoke or wall-clock expiry. Persist the safe
+                    # terminal result in this transaction, then raise the
+                    # stable code after commit so the Worker opens the gate.
+                    new_state = "FAILED"
+                    data_effect = "UNKNOWN"
+                    verification_state = "INCONCLUSIVE"
+                    verification_report = None
+                    verification_evidence_hash = None
+                    failure_code = "TARGET_EXCLUSIVITY_BROKEN"
+                    failure_message = (
+                        "Target exclusivity was revoked or expired during verification."
                     )
-                target_lock.state = "RELEASED"
-                target_lock.released_at = now
+                    target_lock.state = "RECOVERY_REQUIRED"
+                else:
+                    if (
+                        data_effect != "CONFIRMED"
+                        or verification_state != "PASSED"
+                        or exit_code != 0
+                        or not verification_report
+                        or verification_evidence_hash is None
+                        or execution.summary_parse_status
+                        not in {"SUCCEEDED", "FAILED"}
+                    ):
+                        raise ValueError(
+                            "SUCCEEDED requires confirmed independent verification"
+                        )
+                    summary = self._validate_successful_verification(
+                        execution=execution,
+                        target_lock=target_lock,
+                        version=self._required_job_version(
+                            session,
+                            execution.job_version_id,
+                        ),
+                        report=verification_report,
+                        verification_evidence_hash=verification_evidence_hash,
+                    )
+                    if (
+                        summary.target_snapshot_finished_at is None
+                        or summary.target_snapshot_finished_at
+                        > confirmation_valid_until
+                    ):
+                        raise ValueError(
+                            "target snapshot must finish within exclusivity window"
+                        )
+                    target_lock.state = "RELEASED"
+                    target_lock.released_at = now
             elif new_state in _TERMINAL_STATES:
                 if expected_state == "RUNNING" and data_effect == "NONE":
                     raise ValueError("a started DataX process cannot finish with NONE")
                 if new_state in {"FAILED", "TIMED_OUT", "CANCELED", "LOST"}:
                     target_lock.state = "RECOVERY_REQUIRED"
+                if new_state == "CANCELED" and active_cancel is None:
+                    raise ValueError("CANCELED requires an accepted cancel request")
+                if active_cancel is not None and new_state in {"CANCELED", "LOST"}:
+                    # CANCELED consumes its request in this same transaction;
+                    # LOST is the reconciler safety outcome and also closes an
+                    # accepted request so no active request can be orphaned.
+                    active_cancel.status = "COMPLETED"
+                    active_cancel.acknowledged_at = active_cancel.acknowledged_at or now
+                    active_cancel.completed_at = now
             execution.process_state = new_state
             execution.data_effect = data_effect
             execution.verification_state = verification_state
@@ -3639,6 +3726,97 @@ class ControlService:
                     "failure_code": failure_code,
                 },
                 now=now,
+            )
+            if new_state in {"FAILED", "TIMED_OUT", "CANCELED", "LOST"}:
+                gate = ensure_recovery_gate(
+                    session,
+                    execution=execution,
+                    now=now,
+                )
+                if gate is None:
+                    raise RuntimeError(
+                        "claimed recovery-required terminal state must create a gate"
+                    )
+        if target_exclusivity_broken:
+            raise ProblemException(
+                status=409,
+                code="TARGET_EXCLUSIVITY_BROKEN",
+                title="目标独占声明已失效",
+                detail="Oracle 结论已拒绝；当前 Execution 已进入恢复门禁。",
+            )
+
+    def assert_claimed_verification_exclusivity(
+        self,
+        *,
+        claim: ClaimedExecution,
+    ) -> None:
+        """Check the external target exclusivity promise at an oracle boundary.
+
+        The oracle invokes this after every bounded database or digest-spool
+        batch. Expiry is persisted using database time before the stable error
+        is raised, so the Worker can converge the active Attempt through the
+        normal FAILED/UNKNOWN/INCONCLUSIVE recovery-gated path.
+        """
+
+        broken = False
+        with self.sessions.begin() as session:
+            now = self._database_now(session)
+            execution, attempt = self._current_fenced_attempt(
+                session,
+                claim=claim,
+                now=now,
+                lock=True,
+            )
+            if execution.process_state != "VERIFYING":
+                raise ProblemException(
+                    status=409,
+                    code="FENCE_STATE_CONFLICT",
+                    title="Execution 状态已变化",
+                    detail="旧 Worker 不得继续当前核验。",
+                )
+            target_lock = self._execution_lock(session, execution.id, lock=True)
+            if (
+                target_lock.state != "ACTIVE"
+                or target_lock.attempt_id != attempt.id
+                or target_lock.fence_epoch != claim.fence_epoch
+            ):
+                self._fence_lost()
+            valid_until = _parse_timestamp(
+                execution.target_exclusivity_confirmation["valid_until"]
+            )
+            if (
+                execution.target_exclusivity_status == "ACTIVE"
+                and execution.target_exclusivity_revoked_at is None
+                and execution.target_exclusivity_revocation_reason is None
+                and valid_until <= now
+            ):
+                execution.target_exclusivity_status = "EXPIRED"
+                execution.target_exclusivity_revocation_reason = (
+                    "VALIDITY_WINDOW_EXPIRED"
+                )
+                execution.state_version += 1
+                self._append_execution_event(
+                    session,
+                    execution,
+                    event_type="TARGET_EXCLUSIVITY_EXPIRED",
+                    from_state="VERIFYING",
+                    to_state="VERIFYING",
+                    attempt_id=attempt.id,
+                    payload={"valid_until": _rfc3339(valid_until)},
+                    now=now,
+                )
+            broken = (
+                execution.target_exclusivity_status != "ACTIVE"
+                or execution.target_exclusivity_revoked_at is not None
+                or execution.target_exclusivity_revocation_reason is not None
+                or valid_until <= now
+            )
+        if broken:
+            raise ProblemException(
+                status=409,
+                code="TARGET_EXCLUSIVITY_BROKEN",
+                title="目标独占声明已失效",
+                detail="Oracle 已中断；当前 Execution 必须进入恢复门禁。",
             )
 
     def mark_claimed_oracle_started(

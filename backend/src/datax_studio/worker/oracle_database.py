@@ -3,7 +3,7 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import sys
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -126,6 +126,7 @@ def verify_databases(
     spool_directory: Path,
     oracle: ModuleType,
     fetch_size: int = 1000,
+    control_callback: Callable[[], None] | None = None,
 ) -> VerificationReads:
     """Read both databases independently and compare exact row multisets.
 
@@ -146,6 +147,7 @@ def verify_databases(
             side="source",
             target_snapshot=False,
             fetch_size=fetch_size,
+            control_callback=control_callback,
         )
         target = _read_side(
             target_connection,
@@ -158,8 +160,9 @@ def verify_databases(
             side="target",
             target_snapshot=True,
             fetch_size=fetch_size,
+            control_callback=control_callback,
         )
-        difference = spool.difference()
+        difference = spool.difference(control_callback=control_callback)
     return VerificationReads(source=source, target=target, difference=difference)
 
 
@@ -203,11 +206,13 @@ def _read_side(
     side: Literal["source", "target"],
     target_snapshot: bool,
     fetch_size: int,
+    control_callback: Callable[[], None] | None = None,
 ) -> SideRead:
     if not column_names or len(column_names) != len(logical_types):
         raise OracleDatabaseError("oracle mapping is empty or inconsistent")
     if not 1 <= fetch_size <= 100_000:
         raise ValueError("fetch_size must be between 1 and 100000")
+    _invoke_control_callback(control_callback)
     snapshot_started_at = datetime.now(UTC)
     marker = _begin_consistent_read(connection, engine)
     query = (
@@ -226,6 +231,11 @@ def _read_side(
         cursor.execute(query)
         while True:
             batch = cursor.fetchmany(fetch_size)
+            # Each database read is bounded by fetch_size. Check Worker
+            # control facts after every bounded fetch, including the final
+            # empty fetch, so cancellation/fence loss cannot be hidden by a
+            # long-running oracle scan or an empty table.
+            _invoke_control_callback(control_callback)
             if not batch:
                 break
             spool.add_rows(
@@ -234,8 +244,12 @@ def _read_side(
                 logical_types,
                 batch_size=fetch_size,
             )
+            _invoke_control_callback(control_callback)
         read_finished_at = datetime.now(UTC)
-        summary = spool.summary(side)
+        summary = spool.summary(
+            side,
+            control_callback=control_callback,
+        )
         snapshot_finished_at = datetime.now(UTC)
         connection.commit()
         return SideRead(
@@ -251,6 +265,11 @@ def _read_side(
         raise
     finally:
         cursor.close()
+
+
+def _invoke_control_callback(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        callback()
 
 
 def _begin_consistent_read(connection: Connection, engine: EngineName) -> str:

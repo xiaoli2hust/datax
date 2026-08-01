@@ -13,8 +13,8 @@ from datax_studio.api.problems import ProblemException
 from datax_studio.core.schemas import ClaimedExecution
 from datax_studio.credentials.network import ResolvedEndpoint
 from datax_studio.worker import executor as executor_module
-from datax_studio.worker.executor import ExecutionWorker
-from datax_studio.worker.process import ProcessEndReason
+from datax_studio.worker.executor import ExecutionWorker, VerificationCanceled
+from datax_studio.worker.process import ProcessAction, ProcessEndReason
 
 
 def _resolved(
@@ -221,3 +221,144 @@ def test_worker_failure_uses_actual_oracle_start_boundary(
     )
 
     assert transitions[0]["verification_state"] == expected
+
+
+def test_verification_control_acknowledges_cancel_and_interrupts_oracle() -> None:
+    lease_checks = 0
+
+    class _Lease:
+        def assert_owned(self) -> None:
+            nonlocal lease_checks
+            lease_checks += 1
+
+    worker = object.__new__(ExecutionWorker)
+    worker.reconciler = SimpleNamespace(
+        poll_claim_action=lambda _claim: ProcessAction.CANCEL,
+    )
+    claim = ClaimedExecution(
+        execution_id=uuid4(),
+        attempt_id=uuid4(),
+        fence_epoch=1,
+        lease_token="x" * 32,
+    )
+
+    with pytest.raises(VerificationCanceled):
+        worker._poll_verification_control(  # noqa: SLF001
+            claim=claim,
+            lease=_Lease(),  # type: ignore[arg-type]
+        )
+
+    assert lease_checks == 1
+
+
+@pytest.mark.parametrize("oracle_started", [False, True])
+def test_worker_failure_converges_cancel_that_won_terminal_ordering(
+    oracle_started: bool,
+) -> None:
+    completed: list[dict[str, object]] = []
+
+    def reject_terminal(**_kwargs: object) -> None:
+        raise ProblemException(
+            status=409,
+            code="EXECUTION_CANCEL_PENDING",
+            title="cancel pending",
+            detail="cancel won terminal ordering",
+        )
+
+    worker = object.__new__(ExecutionWorker)
+    worker.control = SimpleNamespace(
+        transition_claimed_execution=reject_terminal,
+    )
+    worker.reconciler = SimpleNamespace(
+        poll_claim_action=lambda _claim: ProcessAction.CANCEL,
+        complete_claimed_cancel=lambda **kwargs: completed.append(kwargs),
+        ensure_terminal_gate=lambda _id: None,
+    )
+    claim = ClaimedExecution(
+        execution_id=uuid4(),
+        attempt_id=uuid4(),
+        fence_epoch=1,
+        lease_token="x" * 32,
+    )
+
+    worker._fail_current_state(  # noqa: SLF001
+        claim=claim,
+        state="VERIFYING" if oracle_started else "RUNNING",
+        code="WORKER_INTERNAL_FAILURE",
+        oracle_started=oracle_started,
+    )
+
+    assert completed == [
+        {
+            "claim": claim,
+            "oracle_started": oracle_started,
+        }
+    ]
+
+
+def test_verification_control_checks_target_exclusivity_at_every_boundary() -> None:
+    exclusivity_checks: list[ClaimedExecution] = []
+
+    class _Lease:
+        def assert_owned(self) -> None:
+            return None
+
+    worker = object.__new__(ExecutionWorker)
+    worker.reconciler = SimpleNamespace(
+        poll_claim_action=lambda _claim: ProcessAction.CONTINUE,
+    )
+    worker.control = SimpleNamespace(
+        assert_claimed_verification_exclusivity=(
+            lambda *, claim: exclusivity_checks.append(claim)
+        )
+    )
+    claim = ClaimedExecution(
+        execution_id=uuid4(),
+        attempt_id=uuid4(),
+        fence_epoch=1,
+        lease_token="x" * 32,
+    )
+
+    worker._poll_verification_control(  # noqa: SLF001
+        claim=claim,
+        lease=_Lease(),  # type: ignore[arg-type]
+    )
+
+    assert exclusivity_checks == [claim]
+
+
+def test_verification_control_preserves_target_exclusivity_failure_code() -> None:
+    class _Lease:
+        def assert_owned(self) -> None:
+            return None
+
+    def fail_exclusivity(*, claim: ClaimedExecution) -> None:
+        del claim
+        raise ProblemException(
+            status=409,
+            code="TARGET_EXCLUSIVITY_BROKEN",
+            title="目标独占声明已失效",
+            detail="Oracle 必须中断。",
+        )
+
+    worker = object.__new__(ExecutionWorker)
+    worker.reconciler = SimpleNamespace(
+        poll_claim_action=lambda _claim: ProcessAction.CONTINUE,
+    )
+    worker.control = SimpleNamespace(
+        assert_claimed_verification_exclusivity=fail_exclusivity,
+    )
+    claim = ClaimedExecution(
+        execution_id=uuid4(),
+        attempt_id=uuid4(),
+        fence_epoch=1,
+        lease_token="x" * 32,
+    )
+
+    with pytest.raises(ProblemException) as broken:
+        worker._poll_verification_control(  # noqa: SLF001
+            claim=claim,
+            lease=_Lease(),  # type: ignore[arg-type]
+        )
+
+    assert broken.value.code == "TARGET_EXCLUSIVITY_BROKEN"

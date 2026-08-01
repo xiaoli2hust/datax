@@ -148,6 +148,89 @@ def test_target_count_is_read_in_a_consistent_read_transaction() -> None:
     assert connection.queries[-1] == 'SELECT COUNT(*) FROM "public"."orders"'
 
 
+def test_oracle_control_callback_interrupts_between_bounded_batches(
+    tmp_path: Path,
+) -> None:
+    oracle = load_oracle_module(ORACLE_PATH)
+    source = FakeConnection([[1, "a"], [2, "b"], [3, "c"]])
+    target = FakeConnection(list(source.data_rows))
+    control_checks = 0
+
+    class OracleInterrupted(RuntimeError):
+        pass
+
+    def check_control() -> None:
+        nonlocal control_checks
+        control_checks += 1
+        if control_checks == 3:
+            raise OracleInterrupted
+
+    with pytest.raises(OracleInterrupted):
+        verify_databases(
+            source,
+            target,
+            source_engine="POSTGRESQL_15",
+            target_engine="POSTGRESQL_15",
+            source_schema_name="public",
+            source_table_name="source table",
+            target_schema_name="public",
+            target_table_name="target table",
+            mappings=_mappings(),
+            spool_directory=tmp_path,
+            oracle=oracle,
+            fetch_size=1,
+            control_callback=check_control,
+        )
+
+    assert control_checks == 3
+    assert source.commits == 0
+    assert source.rollbacks == 1
+    assert target.commits == 0
+
+
+def test_oracle_database_propagates_control_callback_into_spool_summary(
+    tmp_path: Path,
+) -> None:
+    oracle = load_oracle_module(ORACLE_PATH)
+    source = FakeConnection([[1, "a"]])
+    target = FakeConnection([[1, "a"]])
+    control_checks = 0
+
+    class OracleInterrupted(RuntimeError):
+        pass
+
+    def check_control() -> None:
+        nonlocal control_checks
+        control_checks += 1
+        # _read_side checks before the query, after the non-empty fetch,
+        # after spooling it and after the final empty fetch. Check five is the
+        # DigestSpool.summary entry boundary.
+        if control_checks == 5:
+            raise OracleInterrupted
+
+    with pytest.raises(OracleInterrupted):
+        verify_databases(
+            source,
+            target,
+            source_engine="POSTGRESQL_15",
+            target_engine="POSTGRESQL_15",
+            source_schema_name="public",
+            source_table_name="source table",
+            target_schema_name="public",
+            target_table_name="target table",
+            mappings=_mappings(),
+            spool_directory=tmp_path,
+            oracle=oracle,
+            fetch_size=10,
+            control_callback=check_control,
+        )
+
+    assert control_checks == 5
+    assert source.commits == 0
+    assert source.rollbacks == 1
+    assert target.commits == 0
+
+
 def test_oracle_loader_rejects_non_files(tmp_path: Path) -> None:
     with pytest.raises(Exception, match="unavailable"):
         load_oracle_module(tmp_path / "missing.py")

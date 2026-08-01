@@ -37,6 +37,7 @@ from datax_studio.core.db import (
     EndpointPolicyRevision,
     Execution,
     ExecutionAttempt,
+    ExecutionCancelRequest,
     JobVersion,
     PhysicalEndpointIdentity,
     Project,
@@ -55,8 +56,11 @@ from datax_studio.core.service import (
     _filtered_cursor_scope,
 )
 from datax_studio.credentials.routes import get_credential_service
+from datax_studio.recovery.db import RecoveryGate
 from datax_studio.schema_snapshot import schema_snapshot_hash
 from datax_studio.settings import Settings
+from datax_studio.worker.process import ProcessAction
+from datax_studio.worker.reconcile import WorkerReconciler
 
 
 @dataclass(frozen=True)
@@ -654,6 +658,357 @@ def test_worker_claim_fence_and_independent_verification_gate(
     assert succeeded["verification_summary"]["result"] == "PASSED"
     assert succeeded["summary_parse_status"] == "FAILED"
     assert succeeded["run_summary"] is None
+
+
+def test_success_transition_refuses_accepted_cancel_and_worker_finishes_canceled(
+    core_stack: CoreStack,
+) -> None:
+    published = _seed_published_job(core_stack, "verify-cancel")
+    execution_request = _execution_request(published.job_version_id)
+    created = core_stack.client.post(
+        f"/api/v1/jobs/{published.job_id}/executions",
+        headers={"Idempotency-Key": "execution-verify-cancel-001"},
+        json=execution_request,
+    )
+    assert created.status_code == 202, created.text
+    execution_id = UUID(created.json()["id"])
+    binding = CredentialBinding(
+        source_secret_id=published.source_secret_id,
+        target_secret_id=published.target_secret_id,
+        source_secret_envelope_id=uuid4(),
+        target_secret_envelope_id=uuid4(),
+        source_secret_version=1,
+        target_secret_version=1,
+    )
+    claim = core_stack.service.claim_next_execution(
+        worker_id="worker-verify-cancel",
+        host_boot_id="boot-verify-cancel",
+        cgroup_identity="container:verify-cancel",
+        credential_selector=_credential_selector(published, binding),
+    )
+    assert claim is not None
+    runtime_preflight = _runtime_preflight(published)
+    core_stack.service.record_claimed_preflight(
+        claim=claim,
+        runtime_preflight=runtime_preflight,
+        evidence_validator=_preflight_evidence_validator(
+            published,
+            claim,
+            runtime_preflight,
+        ),
+    )
+    core_stack.service.transition_claimed_execution(
+        claim=claim,
+        expected_state="STARTING",
+        new_state="RUNNING",
+        data_effect="NONE",
+        verification_state="NOT_STARTED",
+    )
+    core_stack.service.transition_claimed_execution(
+        claim=claim,
+        expected_state="RUNNING",
+        new_state="VERIFYING",
+        data_effect="POSSIBLE",
+        verification_state="NOT_STARTED",
+        exit_code=0,
+        summary_parse_status="FAILED",
+    )
+    core_stack.service.mark_claimed_oracle_started(claim=claim)
+    oracle_report = _passed_oracle_report(
+        execution_response=created.json(),
+        claimed_response=core_stack.client.get(
+            f"/api/v1/executions/{execution_id}"
+        ).json(),
+        claim=claim,
+        published=published,
+        runtime_preflight=runtime_preflight,
+        source_confirmed_at=execution_request[
+            "source_quiescence_confirmation"
+        ]["confirmed_at"],
+    )
+
+    cancel = core_stack.client.post(
+        f"/api/v1/executions/{execution_id}/cancel",
+        headers={"Idempotency-Key": "cancel-verifying-001"},
+        json={"reason": "operator canceled during oracle"},
+    )
+    assert cancel.status_code == 202, cancel.text
+    with pytest.raises(ProblemException) as blocked_success:
+        core_stack.service.transition_claimed_execution(
+            claim=claim,
+            expected_state="VERIFYING",
+            new_state="SUCCEEDED",
+            data_effect="CONFIRMED",
+            verification_state="PASSED",
+            exit_code=0,
+            verification_report=oracle_report,
+            verification_evidence_hash=oracle_report["artifact_sha256"],
+        )
+    assert blocked_success.value.code == "EXECUTION_CANCEL_PENDING"
+
+    reconciler = WorkerReconciler(
+        control=core_stack.service,
+        sessions=core_stack.sessions,
+    )
+    assert reconciler.poll_claim_action(claim) == ProcessAction.CANCEL
+    reconciler.complete_claimed_cancel(claim=claim, oracle_started=True)
+
+    canceled = core_stack.client.get(
+        f"/api/v1/executions/{execution_id}"
+    ).json()
+    assert canceled["process_state"] == "CANCELED"
+    assert canceled["data_effect"] == "UNKNOWN"
+    assert canceled["verification_state"] == "INCONCLUSIVE"
+    assert canceled["target_copy_lock"]["state"] == "RECOVERY_REQUIRED"
+    with core_stack.sessions() as session:
+        cancel_request = session.scalar(
+            select(ExecutionCancelRequest).where(
+                ExecutionCancelRequest.execution_id == execution_id
+            )
+        )
+        assert cancel_request is not None
+        assert cancel_request.status == "COMPLETED"
+
+
+@pytest.mark.parametrize(
+    "broken_kind",
+    ["REVOKED", "EXPIRED_BOUNDARY", "EXPIRED_TERMINAL"],
+)
+def test_verification_exclusivity_break_fails_closed_into_recovery_gate(
+    core_stack: CoreStack,
+    broken_kind: str,
+) -> None:
+    published = _seed_published_job(core_stack, f"verify-{broken_kind.lower()}")
+    execution_request = _execution_request(published.job_version_id)
+    created = core_stack.client.post(
+        f"/api/v1/jobs/{published.job_id}/executions",
+        headers={"Idempotency-Key": f"execution-{broken_kind.lower()}-001"},
+        json=execution_request,
+    )
+    assert created.status_code == 202, created.text
+    execution_id = UUID(created.json()["id"])
+    binding = CredentialBinding(
+        source_secret_id=published.source_secret_id,
+        target_secret_id=published.target_secret_id,
+        source_secret_envelope_id=uuid4(),
+        target_secret_envelope_id=uuid4(),
+        source_secret_version=1,
+        target_secret_version=1,
+    )
+    claim = core_stack.service.claim_next_execution(
+        worker_id=f"worker-{broken_kind.lower()}",
+        host_boot_id=f"boot-{broken_kind.lower()}",
+        cgroup_identity=f"container:{broken_kind.lower()}",
+        credential_selector=_credential_selector(published, binding),
+    )
+    assert claim is not None
+    runtime_preflight = _runtime_preflight(published)
+    core_stack.service.record_claimed_preflight(
+        claim=claim,
+        runtime_preflight=runtime_preflight,
+        evidence_validator=_preflight_evidence_validator(
+            published,
+            claim,
+            runtime_preflight,
+        ),
+    )
+    core_stack.service.transition_claimed_execution(
+        claim=claim,
+        expected_state="STARTING",
+        new_state="RUNNING",
+        data_effect="NONE",
+        verification_state="NOT_STARTED",
+    )
+    core_stack.service.transition_claimed_execution(
+        claim=claim,
+        expected_state="RUNNING",
+        new_state="VERIFYING",
+        data_effect="POSSIBLE",
+        verification_state="NOT_STARTED",
+        exit_code=0,
+        summary_parse_status="FAILED",
+    )
+    core_stack.service.mark_claimed_oracle_started(claim=claim)
+    oracle_report = _passed_oracle_report(
+        execution_response=created.json(),
+        claimed_response=core_stack.client.get(
+            f"/api/v1/executions/{execution_id}"
+        ).json(),
+        claim=claim,
+        published=published,
+        runtime_preflight=runtime_preflight,
+        source_confirmed_at=execution_request[
+            "source_quiescence_confirmation"
+        ]["confirmed_at"],
+    )
+
+    with core_stack.sessions.begin() as session:
+        execution = session.get(Execution, execution_id)
+        assert execution is not None
+        if broken_kind == "REVOKED":
+            execution.target_exclusivity_status = "REVOKED"
+            execution.target_exclusivity_revoked_at = datetime.now(UTC)
+            execution.target_exclusivity_revocation_reason = "DBA_REVOKED"
+        else:
+            confirmation = dict(execution.target_exclusivity_confirmation)
+            confirmation["valid_until"] = (
+                datetime.now(UTC) - timedelta(seconds=1)
+            ).isoformat()
+            execution.target_exclusivity_confirmation = confirmation
+
+    if broken_kind != "EXPIRED_TERMINAL":
+        with pytest.raises(ProblemException) as boundary_broken:
+            core_stack.service.assert_claimed_verification_exclusivity(
+                claim=claim
+            )
+        assert boundary_broken.value.code == "TARGET_EXCLUSIVITY_BROKEN"
+
+    # Even if revoke/expiry wins after the final callback, the SUCCEEDED row
+    # lock atomically commits the safe failed terminal result and returns the
+    # same stable code. EXPIRED_TERMINAL exercises expiry first observed here.
+    with pytest.raises(ProblemException) as terminal_broken:
+        core_stack.service.transition_claimed_execution(
+            claim=claim,
+            expected_state="VERIFYING",
+            new_state="SUCCEEDED",
+            data_effect="CONFIRMED",
+            verification_state="PASSED",
+            exit_code=0,
+            verification_report=oracle_report,
+            verification_evidence_hash=oracle_report["artifact_sha256"],
+        )
+    assert terminal_broken.value.code == "TARGET_EXCLUSIVITY_BROKEN"
+    failed = core_stack.client.get(f"/api/v1/executions/{execution_id}").json()
+    assert failed["process_state"] == "FAILED"
+    assert failed["data_effect"] == "UNKNOWN"
+    assert failed["verification_state"] == "INCONCLUSIVE"
+    assert failed["failure_code"] == "TARGET_EXCLUSIVITY_BROKEN"
+    assert failed["target_copy_lock"]["state"] == "RECOVERY_REQUIRED"
+    assert failed["target_exclusivity_status"] == (
+        "REVOKED" if broken_kind == "REVOKED" else "EXPIRED"
+    )
+    with core_stack.sessions() as session:
+        gate = session.scalar(
+            select(RecoveryGate).where(
+                RecoveryGate.execution_id == execution_id,
+            )
+        )
+        assert gate is not None
+        assert gate.status == "OPEN"
+        assert gate.data_effect_at_open == "UNKNOWN"
+        assert gate.reason_code == "TARGET_EXCLUSIVITY_BROKEN"
+
+
+@pytest.mark.parametrize(
+    ("verification_state", "data_effect", "failure_code"),
+    [
+        ("FAILED", "POSSIBLE", "ORACLE_MISMATCH"),
+        ("INCONCLUSIVE", "UNKNOWN", "ORACLE_READ_FAILED"),
+    ],
+)
+def test_verification_failure_transition_yields_to_accepted_cancel(
+    core_stack: CoreStack,
+    verification_state: str,
+    data_effect: str,
+    failure_code: str,
+) -> None:
+    label = verification_state.lower()
+    published = _seed_published_job(core_stack, f"verify-cancel-{label}")
+    created = core_stack.client.post(
+        f"/api/v1/jobs/{published.job_id}/executions",
+        headers={"Idempotency-Key": f"execution-cancel-{label}-001"},
+        json=_execution_request(published.job_version_id),
+    )
+    assert created.status_code == 202, created.text
+    execution_id = UUID(created.json()["id"])
+    binding = CredentialBinding(
+        source_secret_id=published.source_secret_id,
+        target_secret_id=published.target_secret_id,
+        source_secret_envelope_id=uuid4(),
+        target_secret_envelope_id=uuid4(),
+        source_secret_version=1,
+        target_secret_version=1,
+    )
+    claim = core_stack.service.claim_next_execution(
+        worker_id=f"worker-cancel-{label}",
+        host_boot_id=f"boot-cancel-{label}",
+        cgroup_identity=f"container:cancel-{label}",
+        credential_selector=_credential_selector(published, binding),
+    )
+    assert claim is not None
+    runtime_preflight = _runtime_preflight(published)
+    core_stack.service.record_claimed_preflight(
+        claim=claim,
+        runtime_preflight=runtime_preflight,
+        evidence_validator=_preflight_evidence_validator(
+            published,
+            claim,
+            runtime_preflight,
+        ),
+    )
+    core_stack.service.transition_claimed_execution(
+        claim=claim,
+        expected_state="STARTING",
+        new_state="RUNNING",
+        data_effect="NONE",
+        verification_state="NOT_STARTED",
+    )
+    core_stack.service.transition_claimed_execution(
+        claim=claim,
+        expected_state="RUNNING",
+        new_state="VERIFYING",
+        data_effect="POSSIBLE",
+        verification_state="NOT_STARTED",
+        exit_code=0,
+        summary_parse_status="FAILED",
+    )
+    core_stack.service.mark_claimed_oracle_started(claim=claim)
+
+    cancel = core_stack.client.post(
+        f"/api/v1/executions/{execution_id}/cancel",
+        headers={"Idempotency-Key": f"cancel-{label}-001"},
+        json={"reason": f"operator canceled before {label} terminal write"},
+    )
+    assert cancel.status_code == 202, cancel.text
+    with pytest.raises(ProblemException) as blocked_terminal:
+        core_stack.service.transition_claimed_execution(
+            claim=claim,
+            expected_state="VERIFYING",
+            new_state="FAILED",
+            data_effect=data_effect,
+            verification_state=verification_state,
+            exit_code=0,
+            failure_code=failure_code,
+            failure_message="safe failure",
+        )
+    assert blocked_terminal.value.code == "EXECUTION_CANCEL_PENDING"
+
+    reconciler = WorkerReconciler(
+        control=core_stack.service,
+        sessions=core_stack.sessions,
+    )
+    assert reconciler.poll_claim_action(claim) == ProcessAction.CANCEL
+    # An acknowledged request remains actionable, which makes retry after a
+    # Worker interruption safe before the atomic CANCELED transition.
+    assert reconciler.poll_claim_action(claim) == ProcessAction.CANCEL
+    reconciler.complete_claimed_cancel(claim=claim, oracle_started=True)
+
+    canceled = core_stack.client.get(
+        f"/api/v1/executions/{execution_id}"
+    ).json()
+    assert canceled["process_state"] == "CANCELED"
+    assert canceled["verification_state"] == "INCONCLUSIVE"
+    assert canceled["target_copy_lock"]["state"] == "RECOVERY_REQUIRED"
+    with core_stack.sessions() as session:
+        cancel_request = session.scalar(
+            select(ExecutionCancelRequest).where(
+                ExecutionCancelRequest.execution_id == execution_id
+            )
+        )
+        assert cancel_request is not None
+        assert cancel_request.status == "COMPLETED"
+        assert cancel_request.acknowledged_at is not None
+        assert cancel_request.completed_at is not None
 
 
 def test_claim_next_execution_advances_persisted_fairness_only_on_claim(

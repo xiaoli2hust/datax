@@ -107,6 +107,10 @@ class VerificationRun:
     oracle_started: bool = False
 
 
+class VerificationCanceled(RuntimeError):
+    """Internal control signal after the Worker acknowledges cancellation."""
+
+
 class LeaseKeeper:
     def __init__(
         self,
@@ -345,7 +349,6 @@ class ExecutionWorker:
                             ),
                             summary_parse_status="FAILED",
                         )
-                        self.reconciler.ensure_terminal_gate(claim.execution_id)
                         return
                     if process_result.end_reason == ProcessEndReason.CANCELED:
                         self.reconciler.complete_claimed_cancel(
@@ -365,7 +368,6 @@ class ExecutionWorker:
                             failure_message=("DataX exceeded the immutable execution timeout."),
                             summary_parse_status="FAILED",
                         )
-                        self.reconciler.ensure_terminal_gate(claim.execution_id)
                         return
                     if process_result.returncode != 0:
                         self.control.transition_claimed_execution(
@@ -379,7 +381,6 @@ class ExecutionWorker:
                             failure_message=("DataX exited non-zero; target effect is unknown."),
                             summary_parse_status="FAILED",
                         )
-                        self.reconciler.ensure_terminal_gate(claim.execution_id)
                         return
                     self.control.transition_claimed_execution(
                         claim=claim,
@@ -399,8 +400,13 @@ class ExecutionWorker:
                         target_password=target_password,
                         preflight=preflight,
                         verification_run=verification_run,
+                        lease=lease,
                     )
-                    lease.assert_owned()
+                    # Recheck immediately before choosing a terminal branch.
+                    # Every non-cancel terminal transaction repeats the active
+                    # cancel check under the Execution row lock to close the
+                    # final API-request/terminal-write race.
+                    self._poll_verification_control(claim=claim, lease=lease)
                     artifact_hash = str(report["artifact_sha256"])
                     if report["result"] == "PASSED":
                         self.control.transition_claimed_execution(
@@ -426,7 +432,6 @@ class ExecutionWorker:
                             failure_code="ORACLE_MISMATCH",
                             failure_message=("Independent row-multiset verification failed."),
                         )
-                        self.reconciler.ensure_terminal_gate(claim.execution_id)
                     else:
                         self.control.transition_claimed_execution(
                             claim=claim,
@@ -442,8 +447,23 @@ class ExecutionWorker:
                             ),
                             failure_message=("Independent verification was inconclusive."),
                         )
-                        self.reconciler.ensure_terminal_gate(claim.execution_id)
+            except VerificationCanceled:
+                self.reconciler.complete_claimed_cancel(
+                    claim=claim,
+                    oracle_started=verification_run.oracle_started,
+                )
+                return
             except ProblemException as exc:
+                if exc.code == "EXECUTION_CANCEL_PENDING":
+                    # transition_claimed_execution observed a cancel request
+                    # under the same row lock that would otherwise publish a
+                    # non-cancel terminal outcome. Finish the accepted cancel
+                    # instead, regardless of which terminal branch raced it.
+                    self._converge_accepted_cancel(
+                        claim=claim,
+                        oracle_started=verification_run.oracle_started,
+                    )
+                    return
                 if exc.code in {
                     "EXECUTION_FENCE_LOST",
                     "FENCE_STATE_CONFLICT",
@@ -856,7 +876,9 @@ class ExecutionWorker:
         target_password: bytearray,
         preflight: PreflightResult,
         verification_run: VerificationRun,
+        lease: LeaseKeeper,
     ) -> dict[str, Any]:
+        self._poll_verification_control(claim=claim, lease=lease)
         source_resolved = self.credentials.guard.resolve(
             context.source_policy,
             host=context.source_revision.host,
@@ -879,6 +901,7 @@ class ExecutionWorker:
             source_resolved=source_resolved,
             target_resolved=target_resolved,
         )
+        self._poll_verification_control(claim=claim, lease=lease)
         with (
             self.credentials.connector.connection(
                 context.source_revision,
@@ -919,6 +942,7 @@ class ExecutionWorker:
                 peer_ip=target_peer,
                 observed_at=target_observed_at,
             )
+            self._poll_verification_control(claim=claim, lease=lease)
             self.control.mark_claimed_oracle_started(claim=claim)
             verification_run.oracle_started = True
             reads = verify_databases(
@@ -933,6 +957,10 @@ class ExecutionWorker:
                 mappings=mappings,
                 spool_directory=workspace / "oracle-verification",
                 oracle=self.oracle,
+                control_callback=lambda: self._poll_verification_control(
+                    claim=claim,
+                    lease=lease,
+                ),
             )
         facts = self._verification_facts(claim)
         runtime_snapshot = ExecutionRuntimeSnapshot.model_validate(
@@ -982,6 +1010,27 @@ class ExecutionWorker:
                 for mapping in mappings
             ],
         )
+
+    def _poll_verification_control(
+        self,
+        *,
+        claim: ClaimedExecution,
+        lease: LeaseKeeper,
+    ) -> None:
+        """Fail closed on every bounded oracle batch control boundary."""
+
+        lease.assert_owned()
+        action = self.reconciler.poll_claim_action(claim)
+        if action == ProcessAction.CANCEL:
+            raise VerificationCanceled
+        if action == ProcessAction.FENCE_LOST:
+            raise ProblemException(
+                status=409,
+                code="EXECUTION_FENCE_LOST",
+                title="Execution 围栏已失效",
+                detail="旧 Worker 已停止推进当前 Execution。",
+            )
+        self.control.assert_claimed_verification_exclusivity(claim=claim)
 
     def _assert_current_schemas(
         self,
@@ -1262,9 +1311,31 @@ class ExecutionWorker:
                 failure_message=("Worker failed closed without exposing external error text."),
                 summary_parse_status=("FAILED" if state != "STARTING" else None),
             )
-            self.reconciler.ensure_terminal_gate(claim.execution_id)
-        except (ProblemException, ValueError):
+        except ProblemException as exc:
+            if exc.code == "EXECUTION_CANCEL_PENDING":
+                self._converge_accepted_cancel(
+                    claim=claim,
+                    oracle_started=oracle_started,
+                )
             return
+        except ValueError:
+            return
+
+    def _converge_accepted_cancel(
+        self,
+        *,
+        claim: ClaimedExecution,
+        oracle_started: bool,
+    ) -> bool:
+        """Acknowledge and atomically consume a cancel that won terminal ordering."""
+
+        if self.reconciler.poll_claim_action(claim) != ProcessAction.CANCEL:
+            return False
+        self.reconciler.complete_claimed_cancel(
+            claim=claim,
+            oracle_started=oracle_started,
+        )
+        return True
 
     def _create_workspace(self, claim: ClaimedExecution) -> Path:
         root = self.settings.workspace_volume_path.resolve()

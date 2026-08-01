@@ -12,7 +12,8 @@ import sys
 import tempfile
 import unicodedata
 from collections import Counter
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
+from contextlib import suppress
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
@@ -54,6 +55,13 @@ NORMALIZATION_CONTRACT = {
     "binary_encoding": "BASE64_RFC4648",
     "field_separator": "LENGTH_PREFIXED",
 }
+
+# SQLite may need to scan every distinct row digest after both databases have
+# already been read. Keep Worker control facts (cancel, fence and target
+# exclusivity) observable during those scans instead of checking only around
+# the database fetch loop. This is intentionally fixed rather than caller
+# configurable so every runtime has the same bounded polling contract.
+CONTROL_POLL_DIGEST_ROWS = 1000
 
 
 class NormalizationError(ValueError):
@@ -161,9 +169,15 @@ class DigestSpool:
                 [(side, digest, count) for digest, count in counts.items()],
             )
 
-    def summary(self, side: str) -> MultisetSummary:
+    def summary(
+        self,
+        side: str,
+        *,
+        control_callback: Callable[[], None] | None = None,
+    ) -> MultisetSummary:
         if side not in {"source", "target"}:
             raise ValueError("side must be source or target")
+        _invoke_control_callback(control_callback)
         digest = hashlib.sha256(MULTISET_DOMAIN)
         row_count = 0
         distinct = 0
@@ -181,48 +195,86 @@ class DigestSpool:
             digest.update(count.to_bytes(8, byteorder="big"))
             row_count += count
             distinct += 1
+            if distinct % CONTROL_POLL_DIGEST_ROWS == 0:
+                _invoke_control_callback(control_callback)
+        _invoke_control_callback(control_callback)
         return MultisetSummary(
             row_count=row_count,
             distinct_row_digest_count=distinct,
             multiset_sha256=digest.hexdigest(),
         )
 
-    def difference(self, *, sample_limit: int = 20) -> DigestDifference:
+    def difference(
+        self,
+        *,
+        sample_limit: int = 20,
+        control_callback: Callable[[], None] | None = None,
+    ) -> DigestDifference:
         if sample_limit < 0 or sample_limit > 20:
             raise ValueError("sample_limit must be between 0 and 20")
-        source = self.summary("source")
-        target = self.summary("target")
+        source = self.summary("source", control_callback=control_callback)
+        target = self.summary("target", control_callback=control_callback)
         missing = 0
         unexpected = 0
         samples: list[dict[str, int | str]] = []
-        rows = self._connection.execute(
-            """
-            SELECT
-                hex(digest) AS digest_hex,
-                SUM(CASE WHEN side = 'source' THEN occurrence_count ELSE 0 END)
-                    AS source_count,
-                SUM(CASE WHEN side = 'target' THEN occurrence_count ELSE 0 END)
-                    AS target_count
-            FROM digest_counts
-            GROUP BY digest
-            HAVING
-                SUM(CASE WHEN side = 'source' THEN occurrence_count ELSE 0 END)
-                !=
-                SUM(CASE WHEN side = 'target' THEN occurrence_count ELSE 0 END)
-            ORDER BY digest ASC
-            """
+        _invoke_control_callback(control_callback)
+        source_rows = iter(
+            self._connection.execute(
+                """
+                SELECT digest, occurrence_count
+                FROM digest_counts
+                WHERE side = 'source'
+                ORDER BY digest ASC
+                """
+            )
         )
-        for digest_hex, source_count, target_count in rows:
-            missing += max(source_count - target_count, 0)
-            unexpected += max(target_count - source_count, 0)
-            if len(samples) < sample_limit:
-                samples.append(
-                    {
-                        "row_sha256": digest_hex.lower(),
-                        "source_count": source_count,
-                        "target_count": target_count,
-                    }
-                )
+        target_rows = iter(
+            self._connection.execute(
+                """
+                SELECT digest, occurrence_count
+                FROM digest_counts
+                WHERE side = 'target'
+                ORDER BY digest ASC
+                """
+            )
+        )
+        source_row = next(source_rows, None)
+        target_row = next(target_rows, None)
+        compared = 0
+        while source_row is not None or target_row is not None:
+            if target_row is None or (
+                source_row is not None and source_row[0] < target_row[0]
+            ):
+                raw_digest = source_row[0]
+                source_count = int(source_row[1])
+                target_count = 0
+                source_row = next(source_rows, None)
+            elif source_row is None or target_row[0] < source_row[0]:
+                raw_digest = target_row[0]
+                source_count = 0
+                target_count = int(target_row[1])
+                target_row = next(target_rows, None)
+            else:
+                raw_digest = source_row[0]
+                source_count = int(source_row[1])
+                target_count = int(target_row[1])
+                source_row = next(source_rows, None)
+                target_row = next(target_rows, None)
+            compared += 1
+            if source_count != target_count:
+                missing += max(source_count - target_count, 0)
+                unexpected += max(target_count - source_count, 0)
+                if len(samples) < sample_limit:
+                    samples.append(
+                        {
+                            "row_sha256": bytes(raw_digest).hex(),
+                            "source_count": source_count,
+                            "target_count": target_count,
+                        }
+                    )
+            if compared % CONTROL_POLL_DIGEST_ROWS == 0:
+                _invoke_control_callback(control_callback)
+        _invoke_control_callback(control_callback)
         return DigestDifference(
             missing_row_count=missing,
             unexpected_row_count=unexpected,
@@ -236,16 +288,19 @@ class DigestSpool:
             return
         self._closed = True
         self._connection.close()
-        try:
+        with suppress(FileNotFoundError):
             self._path.unlink()
-        except FileNotFoundError:
-            pass
 
     def __enter__(self) -> Self:
         return self
 
     def __exit__(self, _type: object, _value: object, _traceback: object) -> None:
         self.close()
+
+
+def _invoke_control_callback(callback: Callable[[], None] | None) -> None:
+    if callback is not None:
+        callback()
 
 
 def _canonical_decimal(value: Any) -> str:
