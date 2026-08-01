@@ -39,13 +39,11 @@ def main() -> int:
             if entry.requirement_priority == "V1-MUST"
         }
         manifest = {
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "release_candidate": arguments.release_candidate,
             "commit_sha": arguments.commit,
             "generated_at": (
-                datetime.now(UTC)
-                .isoformat(timespec="seconds")
-                .replace("+00:00", "Z")
+                datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
             ),
             "requirements_catalog_sha256": sha256_bytes(catalog_raw),
             "environment_manifest_sha256": sha256_bytes(environment_raw),
@@ -63,6 +61,7 @@ def main() -> int:
                     "result": "NOT_RUN",
                     "evidence_level": "E0",
                     "oracle": None,
+                    "windows_evidence": None,
                     "evidence": [],
                     "executed_at": None,
                     "environment_id": None,

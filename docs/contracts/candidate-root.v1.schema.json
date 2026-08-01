@@ -1,0 +1,267 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xiaoli2hust/datax/blob/main/docs/contracts/candidate-root.v1.schema.json",
+  "title": "DataX Enterprise Studio Windows Candidate Root v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "root_status",
+    "release_approved",
+    "identity",
+    "artifacts",
+    "scenario_evidence",
+    "files"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "artifact_kind": {
+      "const": "WINDOWS_RELEASE_CANDIDATE_ROOT"
+    },
+    "root_status": {
+      "const": "BLOCKED"
+    },
+    "release_approved": {
+      "const": false
+    },
+    "identity": {
+      "$ref": "#/$defs/candidateIdentity"
+    },
+    "artifacts": {
+      "$ref": "#/$defs/requiredArtifacts"
+    },
+    "scenario_evidence": {
+      "$ref": "#/$defs/blockedScenarioEvidence"
+    },
+    "files": {
+      "type": "array",
+      "minItems": 12,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/fileArtifact"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "canonicalRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$"
+    },
+    "fileArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "size_bytes",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "$ref": "#/$defs/canonicalRelativePath"
+        },
+        "size_bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "candidateIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "workflow_path",
+        "workflow_run_id",
+        "workflow_run_attempt",
+        "protected_environment",
+        "source_ref",
+        "commit_sha",
+        "release_tag",
+        "product_version",
+        "release_candidate"
+      ],
+      "properties": {
+        "repository": {
+          "const": "xiaoli2hust/datax"
+        },
+        "workflow_path": {
+          "const": ".github/workflows/release.yml"
+        },
+        "workflow_run_id": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*$"
+        },
+        "workflow_run_attempt": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "protected_environment": {
+          "const": "windows-candidate-signing"
+        },
+        "source_ref": {
+          "type": "string",
+          "pattern": "^refs/(heads/main|tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*))$"
+        },
+        "commit_sha": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "release_tag": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "string",
+              "pattern": "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+            }
+          ]
+        },
+        "product_version": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+        },
+        "release_candidate": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-[0-9a-f]{12}$"
+        }
+      }
+    },
+    "supplyChainIndex": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "artifact"
+      ],
+      "properties": {
+        "kind": {
+          "const": "SPDX_SBOM_INDEX"
+        },
+        "artifact": {
+          "$ref": "#/$defs/fileArtifact"
+        }
+      }
+    },
+    "requiredArtifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "setup",
+        "launcher",
+        "release_manifest",
+        "compose",
+        "images_lock",
+        "embedded_images_lock",
+        "acl_helper",
+        "supply_chain_index",
+        "acceptance_manifest",
+        "acceptance_environment_manifest",
+        "requirements_catalog",
+        "windows_environment_manifest"
+      ],
+      "properties": {
+        "setup": {
+          "$ref": "#/$defs/fileArtifact"
+        },
+        "launcher": {
+          "$ref": "#/$defs/fileArtifact"
+        },
+        "release_manifest": {
+          "$ref": "#/$defs/fileArtifact"
+        },
+        "compose": {
+          "$ref": "#/$defs/fileArtifact"
+        },
+        "images_lock": {
+          "$ref": "#/$defs/fileArtifact"
+        },
+        "embedded_images_lock": {
+          "$ref": "#/$defs/fileArtifact"
+        },
+        "acl_helper": {
+          "$ref": "#/$defs/fileArtifact"
+        },
+        "supply_chain_index": {
+          "$ref": "#/$defs/supplyChainIndex"
+        },
+        "acceptance_manifest": {
+          "$ref": "#/$defs/fileArtifact"
+        },
+        "acceptance_environment_manifest": {
+          "$ref": "#/$defs/fileArtifact"
+        },
+        "requirements_catalog": {
+          "$ref": "#/$defs/fileArtifact"
+        },
+        "windows_environment_manifest": {
+          "$ref": "#/$defs/fileArtifact"
+        }
+      }
+    },
+    "blockedScenarioEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "status",
+        "scenario_profile_catalog",
+        "scenario_result_catalog",
+        "e3_e4_evidence_bundle",
+        "windows_baseline_id",
+        "harness_version",
+        "started_at",
+        "finished_at",
+        "blocked_reasons"
+      ],
+      "properties": {
+        "status": {
+          "const": "BLOCKED"
+        },
+        "scenario_profile_catalog": {
+          "type": "null"
+        },
+        "scenario_result_catalog": {
+          "type": "null"
+        },
+        "e3_e4_evidence_bundle": {
+          "type": "null"
+        },
+        "windows_baseline_id": {
+          "type": "null"
+        },
+        "harness_version": {
+          "type": "null"
+        },
+        "started_at": {
+          "type": "null"
+        },
+        "finished_at": {
+          "type": "null"
+        },
+        "blocked_reasons": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        }
+      }
+    }
+  }
+}

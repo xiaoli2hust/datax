@@ -267,6 +267,39 @@ function Assert-ExactJsonProperties {
     }
 }
 
+function Get-EvidenceRequirementsTupleComponent {
+    param(
+        [Parameter(Mandatory = $true)]
+        [object]$Entry,
+        [Parameter(Mandatory = $true)]
+        [string]$Description
+    )
+
+    $value = $Entry.evidence_requirements
+    if (-not ($value -is [Array])) {
+        throw "$Description evidence_requirements must be a JSON array."
+    }
+    [object[]]$requirements = @($value)
+    if ($requirements.Count -gt 2) {
+        throw "$Description contains too many evidence requirements."
+    }
+    $allowed = @("VERIFICATION_ORACLE_V1", "WINDOWS_E4")
+    $previous = $null
+    foreach ($requirement in $requirements) {
+        if (-not ($requirement -is [string]) -or
+            $allowed -cnotcontains $requirement -or
+            ($null -ne $previous -and
+                [StringComparer]::Ordinal.Compare(
+                    [string]$previous,
+                    [string]$requirement
+                ) -ge 0)) {
+            throw "$Description evidence_requirements is invalid or non-canonical."
+        }
+        $previous = $requirement
+    }
+    return "[$($requirements -join ',')]"
+}
+
 function Assert-AnonymousImagePullEvidence {
     param(
         [Parameter(Mandatory = $true)]
@@ -385,11 +418,11 @@ function Assert-BlockedAcceptanceEvidence {
         -Description "Requirements catalog"
 
     $expectedCandidate = "$Version-$($Commit.Substring(0, 12))"
-    if ($manifest.schema_version -cne "1.0" -or
+    if ($manifest.schema_version -cne "1.1" -or
         $manifest.release_candidate -cne $expectedCandidate -or
         $manifest.commit_sha -cne $Commit -or
         $manifest.gate_result -cne "BLOCKED" -or
-        $catalog.schema_version -cne "1.0") {
+        $catalog.schema_version -cne "1.1") {
         throw "Acceptance evidence is not bound to this blocked candidate."
     }
     $catalogHash = (
@@ -424,17 +457,22 @@ function Assert-BlockedAcceptanceEvidence {
         Assert-ExactJsonProperties `
             -Document $entry `
             -Expected @(
+                "evidence_requirements",
                 "minimum_evidence_level",
                 "requirement_id",
                 "requirement_priority",
                 "test_id"
             ) `
             -Description "Requirements catalog entry"
+        $evidenceRequirements = Get-EvidenceRequirementsTupleComponent `
+            -Entry $entry `
+            -Description "Requirements catalog entry"
         $key = @(
             $entry.requirement_id,
             $entry.requirement_priority,
             $entry.test_id,
-            $entry.minimum_evidence_level
+            $entry.minimum_evidence_level,
+            $evidenceRequirements
         ) -join "|"
         if ($expectedTuples.ContainsKey($key)) {
             throw "Requirements catalog contains a duplicate tuple."
@@ -449,27 +487,35 @@ function Assert-BlockedAcceptanceEvidence {
                 "requirement_id",
                 "requirement_priority",
                 "test_id",
+                "evidence_requirements",
                 "result",
                 "minimum_evidence_level",
                 "evidence_level",
                 "oracle",
+                "windows_evidence",
                 "evidence",
                 "executed_at",
                 "environment_id"
             ) `
             -Description "Blocked acceptance entry"
+        $evidenceRequirements = Get-EvidenceRequirementsTupleComponent `
+            -Entry $entry `
+            -Description "Blocked acceptance entry"
         $key = @(
             $entry.requirement_id,
             $entry.requirement_priority,
             $entry.test_id,
-            $entry.minimum_evidence_level
+            $entry.minimum_evidence_level,
+            $evidenceRequirements
         ) -join "|"
         if (-not $expectedTuples.ContainsKey($key) -or
             $actualTuples.ContainsKey($key) -or
             $entry.result -cne "NOT_RUN" -or
             $entry.evidence_level -cne "E0" -or
             $null -ne $entry.oracle -or
-            @($entry.evidence).Count -ne 0 -or
+            $null -ne $entry.windows_evidence -or
+            -not ($entry.evidence -is [Array]) -or
+            $entry.evidence.Count -ne 0 -or
             $null -ne $entry.executed_at -or
             $null -ne $entry.environment_id) {
             throw "Blocked acceptance entry is invalid or overstates evidence."
