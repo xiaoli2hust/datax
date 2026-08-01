@@ -1,0 +1,366 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/schema-snapshot.v1.schema.json",
+  "title": "DataX Enterprise Studio Schema Snapshot v1",
+  "description": "A deterministic, secret-free structural table snapshot. The hash is stored outside this object and equals SHA-256(UTF8(\"DXSCHEMASNAPSHOTv1\\n\") || RFC8785(snapshot)).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "normalization_version",
+    "engine",
+    "physical_endpoint_identity_id",
+    "physical_table_identity_hash",
+    "identifier_case_mode",
+    "catalog_name",
+    "schema_name",
+    "table_name",
+    "table_kind",
+    "columns",
+    "constraints",
+    "triggers",
+    "table_options"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "normalization_version": {
+      "const": "1.0"
+    },
+    "engine": {
+      "enum": [
+        "MYSQL_8",
+        "POSTGRESQL_15"
+      ]
+    },
+    "physical_endpoint_identity_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "physical_table_identity_hash": {
+      "$ref": "#/$defs/sha256"
+    },
+    "identifier_case_mode": {
+      "enum": [
+        "MYSQL_LOWER_CASE_TABLE_NAMES_0",
+        "MYSQL_LOWER_CASE_TABLE_NAMES_1",
+        "MYSQL_LOWER_CASE_TABLE_NAMES_2",
+        "POSTGRESQL_FOLDED_OR_QUOTED"
+      ]
+    },
+    "catalog_name": {
+      "$ref": "#/$defs/identifier"
+    },
+    "schema_name": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[^\\u0000-\\u001f\\u007f/\\\\]*$"
+    },
+    "table_name": {
+      "$ref": "#/$defs/identifier"
+    },
+    "table_kind": {
+      "const": "BASE_TABLE"
+    },
+    "columns": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2048,
+      "items": {
+        "$ref": "#/$defs/column"
+      }
+    },
+    "constraints": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "$ref": "#/$defs/constraint"
+      }
+    },
+    "triggers": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "$ref": "#/$defs/trigger"
+      }
+    },
+    "table_options": {
+      "$ref": "#/$defs/tableOptions"
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[^\\u0000-\\u001f\\u007f/\\\\]+$"
+    },
+    "nullableNonNegativeInteger": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 0
+    },
+    "nullablePositiveInteger": {
+      "type": [
+        "integer",
+        "null"
+      ],
+      "minimum": 1
+    },
+    "column": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ordinal_position",
+        "name",
+        "native_type",
+        "logical_type",
+        "nullable",
+        "unsigned",
+        "generated",
+        "identity",
+        "character_maximum_length",
+        "numeric_precision",
+        "numeric_scale",
+        "datetime_precision",
+        "character_set_name",
+        "collation_name",
+        "default_present",
+        "default_expression_sha256"
+      ],
+      "properties": {
+        "ordinal_position": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "name": {
+          "$ref": "#/$defs/identifier"
+        },
+        "native_type": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-z0-9_ (),]+$"
+        },
+        "logical_type": {
+          "enum": [
+            "INTEGER",
+            "DECIMAL",
+            "TEXT",
+            "BOOLEAN",
+            "DATE",
+            "TIME",
+            "TIMESTAMP",
+            "BINARY"
+          ]
+        },
+        "nullable": {
+          "type": "boolean"
+        },
+        "unsigned": {
+          "type": "boolean"
+        },
+        "generated": {
+          "type": "boolean"
+        },
+        "identity": {
+          "type": "boolean"
+        },
+        "character_maximum_length": {
+          "$ref": "#/$defs/nullablePositiveInteger"
+        },
+        "numeric_precision": {
+          "$ref": "#/$defs/nullablePositiveInteger"
+        },
+        "numeric_scale": {
+          "$ref": "#/$defs/nullableNonNegativeInteger"
+        },
+        "datetime_precision": {
+          "$ref": "#/$defs/nullableNonNegativeInteger"
+        },
+        "character_set_name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        },
+        "collation_name": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        },
+        "default_present": {
+          "type": "boolean"
+        },
+        "default_expression_sha256": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "default_present": {
+                "const": false
+              }
+            },
+            "required": [
+              "default_present"
+            ]
+          },
+          "then": {
+            "properties": {
+              "default_expression_sha256": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "default_expression_sha256": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "constraint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "columns",
+        "enforced",
+        "definition_sha256",
+        "referenced_physical_table_identity_hash"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "PRIMARY_KEY",
+            "UNIQUE",
+            "FOREIGN_KEY",
+            "CHECK"
+          ]
+        },
+        "columns": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 2048,
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "enforced": {
+          "type": "boolean"
+        },
+        "definition_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "referenced_physical_table_identity_hash": {
+          "oneOf": [
+            {
+              "$ref": "#/$defs/sha256"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "trigger": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name_sha256",
+        "timing",
+        "events",
+        "orientation",
+        "enabled",
+        "definition_sha256"
+      ],
+      "properties": {
+        "name_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "timing": {
+          "enum": [
+            "BEFORE",
+            "AFTER",
+            "INSTEAD_OF"
+          ]
+        },
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "INSERT",
+              "UPDATE",
+              "DELETE",
+              "TRUNCATE"
+            ]
+          }
+        },
+        "orientation": {
+          "enum": [
+            "ROW",
+            "STATEMENT"
+          ]
+        },
+        "enabled": {
+          "type": "boolean"
+        },
+        "definition_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "tableOptions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "partitioned",
+        "row_security_enabled"
+      ],
+      "properties": {
+        "partitioned": {
+          "type": "boolean"
+        },
+        "row_security_enabled": {
+          "type": [
+            "boolean",
+            "null"
+          ],
+          "description": "PostgreSQL boolean; null for MySQL."
+        }
+      }
+    }
+  }
+}

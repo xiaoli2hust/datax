@@ -4,23 +4,53 @@
 
 - `openapi.yaml`：HTTP API。
 - `job-spec.v1.schema.json`：平台任务契约。
+- `schema-snapshot.v1.schema.json`：MySQL/PostgreSQL 表结构的确定性、无秘密快照；发布校验与 Worker preflight 共同使用。
 - `plugin-manifest.v1.schema.json`：认证插件能力与参数 UI 契约。
-- `audit-event.v1.schema.json`：审计事件最小结构。
+- `audit-event.v1.schema.json`：审计事件最小结构；包含保留维护开始、完成、失败三类
+  SYSTEM 事件，但不把到期扫描声明成数据库外 WORM 锚定。
 - `verification-oracle.v1.schema.json`：独立数据核验规范和结果证据；使用规范化行多重集，不依赖 DataX 自报统计。
 - `acceptance-manifest.v1.schema.json`：候选版本的需求、唯一测试 ID、oracle 与证据文件清单。
+- `egress-guard-attestation.v1.schema.json`：共享网络命名空间内出口守卫的实时证明。
+- `egress-guard-lease.v1.schema.json`：精确 selected-IP `/32|/128 + TCP port` 短租约请求与响应。
+- `egress-guard.v1.md`：守卫只读数据库视图、loopback HTTP、nftables 和 fail-closed 边界。
+- `system-backup-manifest.v1.schema.json`：系统 DATA/SECRETS 分包、版本、数据树摘要与配对清单。
+- `system-restore-journal.v1.schema.json`：双恢复秘密认证的 staging journal、包证据、
+  状态和事件结构；不包含最终卷提交成功状态。
+- `system-backup.v1.md`：Windows Launcher 调用备份 helper 的停机、加密、恢复 journal 与失败关闭边界。
+
+截至 2026-07-31，Datasource、Job、Execution、日志与恢复处置契约已有候选代码消费方，
+但真实四方向 DataX（E3）和 Windows 11 安装链路（E4）仍为 `NOT_RUN/BLOCKED`。
+系统备份契约已有 DATA/SECRETS 分包导出，以及双包认证、配对、受认证 journal 和空目录
+staging 的 E1 候选实现；新空 PostgreSQL volume、`pg_restore`、证据重算、原子还原提交
+与升级路径仍未实现并保持失败关闭，不能把导出包、journal 或 staging 文件存在当作恢复
+验收。
 
 实现阶段 CI 必须完成：
 
 1. 文件可解析。
 2. JSON Schema 通过对应 Meta Schema 校验。
-3. OpenAPI 1.1.0 示例和本地引用有效，Execution 的三类状态与独立 oracle 一致；项目可读
+3. OpenAPI 1.2.0 示例和本地引用有效，Execution 的三类状态与独立 oracle 一致；项目可读
    Datasource 响应只能使用 `DatasourceRedactedSummary`，真实连接定位只允许
    `DatasourceAdminDetail` 与 Admin-only revision 路由。
+   OpenAPI `servers` 只能声明 Windows 本地工作站入口
+   `http://127.0.0.1:17860/api/v1`；部署验证必须证明仅 `web` 映射该 loopback 端口，
+   `api`、`worker`、`postgres` 无宿主端口，Health 也不得从 LAN/公网到达。
 4. 前后端生成类型与契约一致。
+   Datasource PATCH 的非秘密连接定位字段必须先真实探针、后新增不可变 revision；
+   密码轮换必须先用新 secret 探针、后原子切换。Datasource 与 metadata 列表的 cursor
+   必须签名并绑定 actor、资源、筛选和排序，不能忽略、跨用户复用或返回重复第一页。
 5. JobSpec 固定安全的一次性复制策略和 V1 脏数据阈值 `record_count=0/percentage=0`；
    非空目标、任一脏行、未确认源静默、目标排他声明版本非 `1.0`、缺少有限
    `valid_until`、`confirmed_at >= valid_until`、状态非 `ACTIVE` 或未通过恢复门禁均有
    反例，UI/API 不提供正数阈值。
+   Schema 快照哈希固定为
+   `SHA-256(UTF8("DXSCHEMASNAPSHOTv1\n") || RFC8785(snapshot))`；快照本身不包含哈希或
+   观测时间。列必须按连续 `ordinal_position` 排序且名称唯一，constraint/trigger 使用
+   稳定顺序。发布校验器和 Worker preflight 必须用同一适配器重算；任意形状、类型映射、
+   约束、触发器或表属性差异都以 `SCHEMA_DRIFT_DETECTED` 阻断，不接受调用方自报哈希。
+   目标空表证据哈希固定为
+   `SHA-256(UTF8("DXTARGETEMPTYv1\n") || RFC8785(evidence_without_evidence_hash))`；
+   Worker 写入前与服务端接受时都必须重算，不接受调用方自报哈希。
 6. OpenAPI 对 EndpointPolicyRevision、PhysicalEndpointIdentity、TargetNamespace、
    TransferPolicy 精确 `scope_json/scope_hash`、CredentialSecret/Envelope 生命周期、
    EndpointConnectionEvidence、RecoveryProbe/Attempt、目标排他撤回/破坏报告接口、LogGap
@@ -59,6 +89,16 @@
     Worker 领取原子转 ACTIVE 并创建 Attempt/fence，未领取取消必须释放预留。
 12. 恢复声明固定 `action/cleanup_performed/reason/confirmed_at`；无需清理时如实记录
     `NO_CLEANUP_REQUIRED/false`，但任何情况都必须经过独立 RecoveryProbe 空表复检。
-13. 破坏性变更提升版本并提供迁移说明。
+13. Windows `Setup.exe`/`launcher.exe` 生命周期不进入业务 OpenAPI；launcher 只在
+    loopback ready=200 后打开浏览器，强制停止后的已领取工作必须由 reconciler 收敛
+    `LOST`。运行态 PostgreSQL、脱敏日志和无秘密、受限的 oracle 产物使用固定 Docker
+    named volumes；明文 `job.json`、临时凭据、未脱敏日志和 DataX 进程工作目录只能进入
+    Worker 的受限 tmpfs。DATA 备份只允许一致性 PostgreSQL 逻辑 dump、脱敏日志和固定
+    发布元数据，绝不归档 workspace、`job.json` 或物理数据库卷，SECRETS 必须独立加密。
+    staging journal 只能授权配对包解包与限定范围清理；新空目标卷 `pg_restore`、证据
+    重算与原子提交完成前，恢复和升级保持失败关闭。
+14. `egress-guard` 内部 HTTP 不进入产品 OpenAPI。API/Worker 必须共享守卫 netns；
+    ACTIVE CIDR 只作准入，实际 nft allow 只能来自守卫生成的 selected-IP 短租约。
+15. 破坏性变更提升版本并提供迁移说明。
 
 不得直接修改生成代码来绕过契约。

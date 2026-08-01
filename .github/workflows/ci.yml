@@ -1,0 +1,239 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "agent/**"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend-contracts:
+    name: Backend and contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: |
+            backend/build-requirements.lock
+            backend/requirements-dev.lock
+
+      - name: Install hash-locked dependencies
+        run: |
+          python -m pip install --disable-pip-version-check \
+            --require-hashes -r backend/build-requirements.lock
+          python -m pip install --disable-pip-version-check \
+            --require-hashes -r backend/requirements-dev.lock
+          python -m pip install --disable-pip-version-check \
+            --no-build-isolation --no-deps -e backend
+
+      - name: Lint Python
+        run: >-
+          python -m ruff check
+          backend/src
+          backend/tests
+          backend/migrations
+          runtime
+          scripts/acceptance
+          scripts/release
+          deploy/windows/egress-guard
+
+      - name: Run backend and machine-contract tests
+        run: python -m pytest backend/tests
+
+      - name: Run fail-closed egress guard tests
+        run: python -m unittest discover -s deploy/windows/egress-guard -p "test_*.py" -v
+
+      - name: Run anonymous image-pull gate tests
+        run: python -m unittest scripts/release/test_verify_anonymous_image_pulls.py -v
+
+      - name: Validate the acceptance catalog and validator
+        run: |
+          python scripts/acceptance/build_requirements_catalog.py \
+            --matrix docs/12_需求追踪矩阵.md \
+            --output docs/contracts/requirements-catalog.v1.json \
+            --check
+          python -m unittest scripts.acceptance.test_acceptance_manifest -v
+
+      - name: Verify the committed upstream DataX source identity
+        run: python runtime/verify_upstream_source.py
+
+      - name: Validate Windows Compose topology
+        shell: bash
+        run: |
+          secret_dir="$(mktemp -d)"
+          trap 'rmdir "$secret_dir"' EXIT
+          DES_SECRET_DIR="$secret_dir" docker compose \
+            --env-file deploy/windows/images.dev.env \
+            -f deploy/windows/compose.yaml \
+            -f deploy/windows/compose.dev.yaml \
+            config --quiet
+
+  postgres-migrations:
+    name: PostgreSQL migration round trip
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:15.18-alpine3.24@sha256:3d0f7584ed7d04e27fa050d6683a74746608faf21f202be78460d679cc56461f
+        env:
+          POSTGRES_DB: datax_studio
+          POSTGRES_USER: datax_studio
+          POSTGRES_PASSWORD: 3333333333333333333333333333333333333333333333333333333333333333
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U datax_studio -d datax_studio"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: |
+            backend/build-requirements.lock
+            backend/requirements-dev.lock
+
+      - name: Install hash-locked backend and tests
+        run: |
+          python -m pip install --disable-pip-version-check \
+            --require-hashes -r backend/build-requirements.lock
+          python -m pip install --disable-pip-version-check \
+            --require-hashes -r backend/requirements-dev.lock
+          python -m pip install --disable-pip-version-check \
+            --no-build-isolation --no-deps -e backend
+
+      - name: Exercise upgrade and downgrade paths on PostgreSQL 15
+        working-directory: backend
+        env:
+          DES_DATABASE_HOST: 127.0.0.1
+          DES_DATABASE_PORT: "5432"
+          DES_DATABASE_NAME: datax_studio
+          DES_DATABASE_USER: datax_studio
+          DES_DATABASE_PASSWORD_FILE: ${{ runner.temp }}/postgres-password
+          DES_EGRESS_GUARD_DATABASE_PASSWORD_FILE: ${{ runner.temp }}/egress-guard-database-password
+          DES_API_DATABASE_PASSWORD_FILE: ${{ runner.temp }}/api-database-password
+          DES_WORKER_DATABASE_PASSWORD_FILE: ${{ runner.temp }}/worker-database-password
+        run: |
+          printf '%s' '3333333333333333333333333333333333333333333333333333333333333333' \
+            > "$DES_DATABASE_PASSWORD_FILE"
+          printf '%s' '0000000000000000000000000000000000000000000000000000000000000000' \
+            > "$DES_EGRESS_GUARD_DATABASE_PASSWORD_FILE"
+          printf '%s' '1111111111111111111111111111111111111111111111111111111111111111' \
+            > "$DES_API_DATABASE_PASSWORD_FILE"
+          printf '%s' '2222222222222222222222222222222222222222222222222222222222222222' \
+            > "$DES_WORKER_DATABASE_PASSWORD_FILE"
+          chmod 600 \
+            "$DES_DATABASE_PASSWORD_FILE" \
+            "$DES_EGRESS_GUARD_DATABASE_PASSWORD_FILE" \
+            "$DES_API_DATABASE_PASSWORD_FILE" \
+            "$DES_WORKER_DATABASE_PASSWORD_FILE"
+          alembic -c alembic.ini upgrade head
+          DATAX_MIGRATION_POSTGRES_TEST_URL='postgresql+psycopg://datax_studio:3333333333333333333333333333333333333333333333333333333333333333@127.0.0.1:5432/datax_studio' \
+            python -m pytest tests/test_audit_append_only_postgres.py
+          DATAX_MIGRATION_POSTGRES_TEST_URL='postgresql+psycopg://datax_studio:3333333333333333333333333333333333333333333333333333333333333333@127.0.0.1:5432/datax_studio' \
+          DATAX_EGRESS_GUARD_POSTGRES_TEST_URL='postgresql+psycopg://datax_egress_guard:0000000000000000000000000000000000000000000000000000000000000000@127.0.0.1:5432/datax_studio' \
+            python -m pytest tests/test_egress_guard_postgres.py
+          DATAX_MIGRATION_POSTGRES_TEST_URL='postgresql+psycopg://datax_studio:3333333333333333333333333333333333333333333333333333333333333333@127.0.0.1:5432/datax_studio' \
+          DATAX_API_POSTGRES_TEST_URL='postgresql+psycopg://datax_api:1111111111111111111111111111111111111111111111111111111111111111@127.0.0.1:5432/datax_studio' \
+          DATAX_WORKER_POSTGRES_TEST_URL='postgresql+psycopg://datax_worker:2222222222222222222222222222222222222222222222222222222222222222@127.0.0.1:5432/datax_studio' \
+            python -m pytest tests/test_runtime_database_roles_postgres.py
+          alembic -c alembic.ini downgrade base
+          alembic -c alembic.ini upgrade head
+
+  frontend:
+    name: Frontend
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Activate the repository-pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+
+      - name: Install frontend dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Type-check and build
+        run: |
+          pnpm typecheck
+          pnpm build
+
+  windows-launcher:
+    name: Windows launcher
+    runs-on: windows-2025
+    timeout-minutes: 25
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install the pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.97.0 --profile minimal
+          rustup default 1.97.0
+
+      - name: Test and lint the native launcher
+        shell: pwsh
+        run: |
+          cargo test --locked --manifest-path desktop/windows/Cargo.toml
+          cargo clippy --locked --manifest-path desktop/windows/Cargo.toml --all-targets -- -D warnings
+
+      - name: Parse Windows release scripts
+        shell: pwsh
+        run: |
+          $paths = @(
+            "scripts/windows/build-installer.ps1",
+            "scripts/windows/validate-release.ps1",
+            "desktop/windows/resources/secure-acl.ps1"
+          )
+          foreach ($path in $paths) {
+            $tokens = $null
+            $errors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile(
+              (Resolve-Path $path),
+              [ref]$tokens,
+              [ref]$errors
+            )
+            if ($errors.Count -ne 0) {
+              $errors | ForEach-Object { Write-Error $_.Message }
+              throw "PowerShell parse failed: $path"
+            }
+          }

@@ -2,7 +2,7 @@
 
 > 文档状态：V2 设计基线
 >
-> 适用范围：AI 辅助能力，不属于 V1 交付范围；必须继承 V1.1 安全一次性全量复制语义
+> 适用范围：AI 辅助能力，不属于 V1 交付范围；必须继承 V1.2 Windows 本地工作站与安全一次性全量复制语义
 >
 > 核心约束：未配置或不可用 AI Provider 时，V1 全部手工功能仍须正常使用
 
@@ -51,6 +51,22 @@ V2 首批 Agent：
 - **Privacy by default**：默认不向 Provider 发送凭据、连接串、样例数据或完整的脱敏后原序日志，只发送经策略限量的必要片段。
 - **Fail closed**：权限、审计、校验或 Provider 状态不明确时，不产生可采纳草稿，更不能执行。
 - **No hidden reasoning retention**：不记录模型隐藏推理过程；只保存必要的脱敏输入摘要、结构化输出和决策证据。
+
+### 2.1 Windows 本地工作站继承边界
+
+- Agent Orchestrator、Provider Adapter 和工具适配器只在固定摘要的 Linux 容器内运行；
+  `launcher.exe` 不执行模型生成内容、工具命令或 DataX，也不把 Windows 宿主当作 Agent
+  工具执行面。
+- V2 沿用 V1.2 的唯一入口 `http://127.0.0.1:17860`。仅 Web 容器映射该 IPv4
+  loopback；Agent/API/Worker/PostgreSQL 不映射宿主端口，不建立 LAN/WAN 入口。
+- Agent 工具不得访问 Docker Socket、Windows 命名管道、注册表、剪贴板、用户目录、
+  UNC/网络盘或任意宿主路径。确需新增宿主能力时，必须先更新威胁模型和 Accepted ADR。
+- Provider 凭据保存于平台受保护的 secret/Envelope 边界，不由 Setup 或 Launcher
+  采集、显示、导出或写入其诊断日志。AI 未配置或不可用时，Launcher 与全部 V1 手工流程
+  仍可正常启动。
+- Windows 睡眠/恢复、Docker Desktop/WSL2 停止或重启时，正在进行的 Agent Run
+  必须进入明确的不可用/待对账状态；恢复后先核对 run、tool-call 幂等身份和审计，再决定
+  失败关闭或显式恢复，禁止静默重放有副作用调用。
 
 ## 3. 总体架构
 
@@ -153,6 +169,8 @@ Provider 配置必须使用以下可见状态：
 - 默认禁止自动跨 Provider 降级；若管理员明确配置候选 Provider，降级也必须满足相同的数据区域、隐私和评测门槛，并在 UI 中明确显示。
 - 仅对无副作用的 Provider 请求重试；重试次数、退避、超时和 Token/费用上限必须配置化。
 - 模型或提示模板升级前必须执行完整回归评测，不得直接替换线上别名。
+- Provider 出口只由容器内白名单策略控制；不得借用 Windows 系统代理、用户浏览器会话、
+  Docker Desktop 管理接口或宿主凭据绕过数据区域和 egress 规则。
 
 ## 6. 工具统一契约
 
@@ -313,6 +331,7 @@ Provider 配置必须使用以下可见状态：
           "target_ordinal": 1,
           "target_type": "bigint",
           "target_nullable": false,
+          "oracle_logical_type": "INTEGER",
           "compatibility": "EXACT"
         }
       ],
@@ -590,6 +609,8 @@ actor → agent_run → provider_call → tool_calls
 | 审计不可用 | Fail closed | 无审计运行 |
 | 上下文过长 | 分页、摘要并保留证据引用，或明确停止 | 静默截断后给出确定结论 |
 | 费用/Token 超限 | 停止并显示限额原因 | 自动切换到未经批准模型 |
+| Windows 睡眠或 Docker/WSL2 中断 | 标记运行不可用并停止接收新调用，恢复后先对账 | 把旧调用静默重放或显示成功 |
+| Launcher/容器边界检查失败 | 保留 V1 手工入口，禁用 Agent 并给出可操作错误 | 在 Windows 宿主执行工具或放宽端口/挂载 |
 
 ## 12. 评测与发布硬门槛
 
@@ -622,6 +643,9 @@ actor → agent_run → provider_call → tool_calls
 10. Provider 未配置、不可用和输出损坏用例进入明确手工降级路径的比例 100%。
 11. Agent Run、Provider、Tool、Validation、Draft 与确认审计关联完整率 100%。
 12. 所有 Provider/模型/提示模板变更均通过同一回归集，无未审批的线上漂移。
+13. Windows 宿主路径、Docker Socket、命名管道和非 loopback 端口访问成功次数为 0。
+14. 睡眠/恢复、Docker Desktop restart 和 `wsl --shutdown` 故障注入中，无工具重复副作用、
+    无审计断链，未完成调用均有明确最终状态。
 
 ### 12.3 证据
 
@@ -633,16 +657,23 @@ actor → agent_run → provider_call → tool_calls
 - 权限/项目隔离测试报告。
 - 提示注入和敏感数据泄漏测试报告。
 - Provider 故障注入和手工降级录像或自动化证据。
+- 干净 Windows 11 x64 VM 上已签名 Setup/Launcher、固定镜像摘要、仅
+  `127.0.0.1:17860` 暴露，以及睡眠/Docker/WSL2 中断恢复的证据。macOS/Linux
+  测试、容器构建成功或安装包存在不能替代该 Windows 证据。
 - 至少一次完整的“用户意图 → Agent 草稿 → 确定性校验 → 差异预览 → 人工采纳为 JobDraft → V1 校验/发布 JobVersion → 用户确认源静默 → 服务端复检目标为空 → 手工运行 → 独立 oracle 核验”真实闭环，其中 Agent 不直接接触 DataX Worker。
 
 ## 13. V2 完成定义
 
 只有同时满足以下条件，Agent 能力才可称为工程化完成：
 
-- V1 在完全关闭 AI 时可独立安装、启动并完成真实 DataX 一次性复制、数据影响识别和独立核验闭环。
+- V1 在完全关闭 AI 时可通过已签名 Setup/Launcher 在干净 Windows 11 x64 VM 独立安装、
+  启动，并完成真实 DataX 一次性复制、数据影响识别和独立核验闭环。
 - Provider Adapter、Tools、Policy Gate、Validator、Audit 均有版本化契约和自动化测试。
 - 所有角色、项目隔离、草稿采纳和人工运行路径均通过授权测试。
 - 隐私数据流、保留策略和管理员配置已实现并经过安全评审。
 - 第 12 节全部硬门槛通过。
 - UI 明确区分“AI 草稿”“JobDraft”“已发布 JobVersion”“执行进程状态”“数据影响”“核验结果”，无可能把已发布、进程退出或未核验结果误导为数据成功的文案。
 - README、配置说明、运行手册、降级手册和已知限制与实现一致。
+- V2 发布制品复用 V1.2 的 Windows 数据保留、卸载、签名、哈希、SBOM、固定镜像、
+  loopback-only 和恢复门禁；这些门禁未完成时只能报告 Agent 工程测试结果，不能称为
+  Windows 可交付版本。

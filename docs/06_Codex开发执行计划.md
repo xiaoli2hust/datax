@@ -2,11 +2,24 @@
 
 | 项 | 值 |
 |---|---|
-| 文档版本 | 1.1 |
-| 状态 | 实施候选；Discovery Gate 未通过，除有界技术 spike 外横向开发 `BLOCKED` |
-| 适用基线 | DataX Enterprise Studio V1 |
+| 文档版本 | 1.2 |
+| 状态 | 工程候选实施中；Discovery Gate 未取证，企业试点/发布 `BLOCKED` |
+| 适用基线 | DataX Enterprise Studio V1.2 Windows 本地工作站 |
 | 执行原则 | 纵向切片、阶段停靠、真实证据、不可伪装 |
 | 完成目标 | 企业试点可运行版本，不声称 HA 或生产认证 |
+
+## 当前执行快照（2026-07-31）
+
+下表只记录工程候选状态，不替代各 Phase 的退出条件：
+
+| 切片 | 当前状态 | 不能据此声称 |
+|---|---|---|
+| 数据源、任务、执行/日志/恢复 UI 与正式 API 适配 | 候选代码已存在 | 浏览器真实闭环、可访问性或 E3/E4 已通过 |
+| 数据库运行角色 | 迁移 owner、API、Worker 独立登录/密码且运行角色无 DDL/TEMP；两类运行角色当前仍有相同全表 DML | 数据库已强制 API/Worker 的细粒度状态写入边界 |
+| Worker 敏感运行区 | 含密 Job、未脱敏日志和进程工作目录进入 256 MiB tmpfs；Compose 已设资源上限 | Windows Docker/WSL2 的残留、SIGKILL 与资源故障 E4 已通过 |
+| 系统备份 | DATA/SECRETS 分离加密导出、双包认证 journal 与全新空 staging 已实现并测到 E1 | 新空 PostgreSQL volume、真实 `pg_restore`、证据重算、卷/secret 原子提交、覆盖升级、异机演练或 RPO/RTO 已通过 |
+| GitHub 安全工作流 | PR 已配置 Gitleaks、hash-lock pip-audit、pnpm、Cargo OSV、CodeQL 与真实 patched Worker 镜像 Syft+OSV 应用门禁；候选发布配置六份 SPDX SBOM、OSV 应用和 Grype distro 策略 | 线上 CI/真实 release 已通过、主分支已强制保护，或当前 OS 扫描已有线上证据 |
+| 外部发布门禁 | release 候选显式生成 `BLOCKED` manifest | 四方向真实 DataX、签名 Setup、干净 Windows E4、外部 WORM 或恢复完成 |
 
 ## 1. 目标与约束
 
@@ -16,10 +29,18 @@
 
 - Web：Vue 3、TypeScript、Vite、Element Plus，依赖由 `pnpm-lock.yaml` 锁定。
 - API/Worker：Python 3.12、FastAPI、SQLAlchemy 2、Alembic，依赖由锁文件锁定。
-- 数据库：PostgreSQL 15。
+- 数据库：PostgreSQL `15.18-alpine3.24`；egress-guard 使用同一固定摘要基础。
+- API/Worker 最终 Python 运行层：Python 3.12.13 `slim-trixie`（Debian 13）。
 - 队列：PostgreSQL 15 事实队列，使用 `FOR UPDATE SKIP LOCKED` 原子领取；`LISTEN/NOTIFY` 只作唤醒并由轮询兜底。
 - Runtime：Alibaba DataX `datax_v202309`、JDK 8；制品与插件记录 SHA-256。
-- 部署：Docker Compose 单节点。
+- 交付宿主：Windows 11 x64 本地工作站；已签名 `Setup.exe` 安装、已签名
+  `launcher.exe` 编排固定 Linux Docker Compose。
+- 当前仓库所在 Mac 只用于开发与自动化层验证；最终运行和 E4 目标是另一台 Windows 11
+  x64 电脑。
+- 前置依赖：Docker Desktop + WSL2 + CPU 虚拟化由用户/组织预先提供并接受许可；
+  安装器不得静默安装或代接受许可。
+- 默认入口：`http://127.0.0.1:17860`；只有 Web 映射 loopback，API/Worker/PostgreSQL
+  不映射宿主端口。
 - V1 不实现 AI、调度、DAG、告警、插件市场、CDC 或任意 SQL。
 - V1 只交付“安全的一次性离线全量复制”：源端静默确认、目标外部独占声明与空表复检、
   `insert-only`、固定 `dirty_data_limit=0/0`、独立数据核验和失败后人工恢复门禁。目标声明
@@ -53,7 +74,10 @@
 - 分析至少 20 个脱敏真实任务样本，记录筛选规则、数据源方向、规模、失败模式和现有处置。
 - 由 3 个设计伙伴合计完成不少于 10 个真实一次性复制任务，记录从准备到独立核验及故障恢复的可用性证据。
 
-Discovery Gate 未完成时，完整管理后台、全量页面、横向领域模块和 Phase 2—Phase 8 均为 `BLOCKED`。发现工作可与有界技术 spike 并行；spike 仅用于证伪固定 Runtime、独立 oracle、目标安全预检、网络出口或 Worker 围栏等高风险假设，不形成 V1 用户功能，也不计入完成度。Phase 0 与 Phase 1 中超出这些 spike 的工程化和产品化工作，同样必须等待 Discovery Gate 通过。
+Discovery Gate 未完成时，企业试点、公开发布和 V1 完成声明均为 `BLOCKED`。按
+ADR-0007，仓库所有者可以明确授权风险自担的 Phase 0—Phase 8 工程候选；当前任务已有
+该授权。候选实现、自动测试与内部演示不形成 Discovery 证据，不能改变门禁状态；真实
+用户研究证伪假设时，候选实现必须接受返工或废弃。
 
 ### Phase 0：仓库、契约与真实运行时预检
 
@@ -67,10 +91,15 @@ Discovery Gate 未完成时，完整管理后台、全量页面、横向领域�
 - Runtime 获取/构建说明与 SHA-256 manifest，不提交大型 Runtime 二进制。
 - 启动隔离的 MySQL 8、PostgreSQL 15 和平台 PostgreSQL，并用固定 Runtime 完成最小命令行复制探测。
 - 固化 `verification-oracle.v1`、10,000 行确定性夹具和独立比较器的输入/输出格式。
+- 建立 `installer/windows/` 与 `desktop/windows/` 最小工程：版本资源、Authenticode
+  签名接口、固定 Compose/镜像 manifest、Windows 路径/ACL/端口/依赖预检。
+- 固定程序目录与数据边界分离合同：业务数据使用
+  `des-postgres-data`/`des-log-data`/`des-workspace-data` named volumes，不用
+  Windows bind mount；卸载默认保留这些卷、config 与导出 backups。
 
 退出条件：
 
-- 全新检出可按 README 安装开发依赖。
+- 全新检出可按 README 安装开发依赖；这不是 Windows 安装器验收。
 - 空项目检查全部通过。
 - 仓库中不存在密钥或真实连接串。
 - 失败的配置校验能阻止服务启动并给出非敏感错误。
@@ -232,26 +261,36 @@ Discovery Gate 未完成时，完整管理后台、全量页面、横向领域�
 - 数据库、日志产物和主密钥材料的备份恢复演练。
 - 数据库迁移、Runtime 升级失败和应用回滚演练。
 - SBOM、依赖许可证清单和漏洞扫描报告。
+- 在干净 Windows 11 x64 VM 自动化/人工联合验证：Setup/Launcher 签名与哈希、安装/
+  升级/回滚、卸载保留数据、Docker/WSL2/虚拟化缺失、Docker 未启动、端口冲突、磁盘
+  不足、loopback/LAN 拒绝、Windows 重启、睡眠/恢复、Docker/WSL 重启和备份恢复。
+- 运行 `E2E-WIN-001`（`PRD-FR-WS-001`）与 `E2E-WIN-002`（`ACC-PRD-014`）；在同一
+  发布环境完成固定 Linux DataX 容器内四方向完整表/选列与独立 oracle，Windows 宿主
+  不得直接运行 DataX/JDK。
 
 退出条件：
 
 - `acceptance-manifest.v1` 中所有 `V1-MUST` 需求均有唯一测试、oracle、证据和 PASS 结果。
 - P0/P1 缺陷为 0，Critical/High 安全发现为 0；需求发布级别与缺陷严重度不得混用。
 - 备份恢复后的任务、版本、执行和审计完整。
+- macOS/Linux 构建、容器包存在或非 Windows E2E 不得标为 Windows E4。
 - 性能结果记录硬件、数据集、请求配比、队列深度、日志量、磁盘水位、重复次数、版本和瓶颈，不用模糊“很快”描述。
 
 ### Phase 8：试点发布
 
 交付：
 
-- 固定镜像摘要、迁移版本和 Runtime manifest。
+- 已签名 `DataX-Enterprise-Studio-Setup-<version>-x64.exe`、已签名 `launcher.exe`、
+  发布 SHA-256、SBOM、第三方许可证、固定镜像摘要、迁移版本和 Runtime manifest。
 - 安装、升级、回滚、备份、恢复、事故处置手册。
 - 已知限制、变更日志、验收报告和签署记录。
 - 试点环境容量与网络白名单。
 
 退出条件：
 
-- 在干净主机按文档启动并通过健康/就绪检查。
+- 在干净 Windows 11 x64 VM 安装并通过依赖预检、幂等启动、健康/就绪、仅
+  `127.0.0.1:17860` 暴露、四方向真实 DataX、备份恢复、睡眠/重启/Docker/WSL 恢复和
+  卸载保留 named volumes/导出备份；`E2E-WIN-001/002` 均为 PASS。
 - 真实验收链路由非开发者复核。
 - 所有 `V1-MUST` 需求通过；P0/P1 缺陷为 0，不允许用环境原因或人工豁免替代核心门禁。
 - 文案只声明“V1 企业试点”，不宣称高可用或生产认证。

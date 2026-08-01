@@ -1,0 +1,273 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/system-backup-manifest.v1.schema.json",
+  "title": "DataX Enterprise Studio System Backup Manifest V1",
+  "description": "通过 AEAD 和归档 allowlist 校验的 Windows 本地工作站备份清单。DATA 仅含一致性 PostgreSQL 逻辑备份、脱敏日志和固定发布元数据；SECRETS 独立加密并按 related_data_backup_id 配对。",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/dataManifest"
+    },
+    {
+      "$ref": "#/$defs/secretsManifest"
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "backupId": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{32}$"
+    },
+    "treeEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "root_name",
+        "file_count",
+        "directory_count",
+        "uncompressed_bytes",
+        "tree_sha256"
+      ],
+      "properties": {
+        "root_name": {
+          "enum": [
+            "des-log-data",
+            "secrets"
+          ]
+        },
+        "file_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "directory_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "uncompressed_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tree_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "logTree": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/treeEvidence"
+        },
+        {
+          "properties": {
+            "root_name": {
+              "const": "des-log-data"
+            }
+          }
+        }
+      ]
+    },
+    "secretsTree": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/treeEvidence"
+        },
+        {
+          "properties": {
+            "root_name": {
+              "const": "secrets"
+            }
+          }
+        }
+      ]
+    },
+    "databaseDump": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "filename",
+        "format",
+        "size",
+        "sha256"
+      ],
+      "properties": {
+        "filename": {
+          "const": "postgres.dump"
+        },
+        "format": {
+          "const": "POSTGRESQL_CUSTOM"
+        },
+        "size": {
+          "type": "integer",
+          "minimum": 6
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "metadataEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "size",
+        "sha256"
+      ],
+      "properties": {
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4194304
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "releaseMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "compose.yaml",
+        "images.release.env",
+        "release-manifest.json"
+      ],
+      "properties": {
+        "compose.yaml": {
+          "$ref": "#/$defs/metadataEvidence"
+        },
+        "images.release.env": {
+          "$ref": "#/$defs/metadataEvidence"
+        },
+        "release-manifest.json": {
+          "$ref": "#/$defs/metadataEvidence"
+        }
+      }
+    },
+    "dataManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "backup_id",
+        "created_at",
+        "product_version",
+        "installation_id",
+        "migration_revision",
+        "backup_helper_version",
+        "trees",
+        "database_dump",
+        "release_metadata"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "kind": {
+          "const": "DATA"
+        },
+        "backup_id": {
+          "$ref": "#/$defs/backupId"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "product_version": {
+          "type": "string",
+          "pattern": "^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$"
+        },
+        "installation_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "migration_revision": {
+          "type": "string",
+          "pattern": "^[0-9a-z][0-9a-z_]{0,63}$"
+        },
+        "backup_helper_version": {
+          "const": "1.0"
+        },
+        "trees": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/logTree"
+            }
+          ],
+          "items": false,
+          "minItems": 1,
+          "maxItems": 1
+        },
+        "database_dump": {
+          "$ref": "#/$defs/databaseDump"
+        },
+        "release_metadata": {
+          "$ref": "#/$defs/releaseMetadata"
+        }
+      }
+    },
+    "secretsManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "kind",
+        "backup_id",
+        "created_at",
+        "product_version",
+        "installation_id",
+        "migration_revision",
+        "backup_helper_version",
+        "trees",
+        "related_data_backup_id"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "kind": {
+          "const": "SECRETS"
+        },
+        "backup_id": {
+          "$ref": "#/$defs/backupId"
+        },
+        "created_at": {
+          "type": "string",
+          "format": "date-time",
+          "pattern": "Z$"
+        },
+        "product_version": {
+          "type": "string",
+          "pattern": "^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$"
+        },
+        "installation_id": {
+          "$ref": "#/$defs/sha256"
+        },
+        "migration_revision": {
+          "type": "string",
+          "pattern": "^[0-9a-z][0-9a-z_]{0,63}$"
+        },
+        "backup_helper_version": {
+          "const": "1.0"
+        },
+        "trees": {
+          "type": "array",
+          "prefixItems": [
+            {
+              "$ref": "#/$defs/secretsTree"
+            }
+          ],
+          "items": false,
+          "minItems": 1,
+          "maxItems": 1
+        },
+        "related_data_backup_id": {
+          "$ref": "#/$defs/backupId"
+        }
+      }
+    }
+  }
+}

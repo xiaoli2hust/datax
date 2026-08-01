@@ -11,6 +11,14 @@ ADR 记录已接受或被替代的关键决策，避免 Issue、代码和文档�
 
 变更 V1 范围、组件边界、状态机、凭据、权限、执行隔离、插件或 AI 工具权限时必须新增 ADR。
 
+V1.2 终端交付宿主固定为 Windows 11 x64 本地工作站。`Setup.exe` 只安装产品文件和
+`launcher.exe`，Docker Desktop、WSL2 与虚拟化由用户/组织预先提供并自行接受许可；
+固定 Linux 容器承载全部服务。默认入口仅为 `http://127.0.0.1:17860`，只映射 Web
+容器，API/Worker/PostgreSQL 不映射宿主端口。业务数据使用
+`des-postgres-data`、`des-log-data`、`des-workspace-data` named volumes，不用
+Windows bind mount，卸载默认保留。该交付边界是下列 ADR 的共同部署前提，不改变
+一次性复制、不可变版本、传输授权和执行围栏语义。
+
 当前决策：
 
 - [ADR-0001：V1 范围与非目标](0001-v1-范围与非目标.md)
@@ -19,3 +27,4 @@ ADR 记录已接受或被替代的关键决策，避免 Issue、代码和文档�
 - [ADR-0004：V1 安全一次性全量复制](0004-v1-安全一次性全量复制.md)
 - [ADR-0005：不可变数据源修订与传输授权](0005-不可变数据源修订与传输授权.md)
 - [ADR-0006：PostgreSQL 事实队列与执行围栏](0006-PostgreSQL事实队列与执行围栏.md)
+- [ADR-0007：Discovery Gate 与工程实施分离](0007-Discovery-Gate与工程实施分离.md)

@@ -360,8 +360,11 @@
       "additionalProperties": false,
       "required": [
         "row_algorithm",
+        "row_preimage",
+        "field_encoding",
         "collection_semantics",
         "stable_order",
+        "multiset_preimage",
         "null_encoding",
         "text_encoding",
         "unicode_normalization",
@@ -378,11 +381,20 @@
         "row_algorithm": {
           "const": "SHA-256"
         },
+        "row_preimage": {
+          "const": "DOMAIN_NUL_FIELD_COUNT_U32_BE_FIELDS"
+        },
+        "field_encoding": {
+          "const": "TAG_LENGTH_U16_BE_TAG_VALUE_LENGTH_U64_BE_VALUE"
+        },
         "collection_semantics": {
           "const": "MULTISET_WITH_COUNTS"
         },
         "stable_order": {
           "const": "ROW_DIGEST_ASC_THEN_COUNT"
+        },
+        "multiset_preimage": {
+          "const": "DOMAIN_NUL_ROW_DIGEST_RAW32_COUNT_U64_BE"
         },
         "null_encoding": {
           "const": "TYPE_TAGGED_NULL"

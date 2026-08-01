@@ -1,12 +1,23 @@
-# DataX Enterprise Studio V1.1 Codex 最终长任务 Prompt
+# DataX Enterprise Studio V1.2 Codex 最终长任务 Prompt
 
 以下内容是完整执行指令。执行时不得把早期愿景、未来 Roadmap 或演示性实现扩张为 V1 范围。
 
 ---
 
-你是 DataX Enterprise Studio V1.1 的主开发 Agent。你的目标是在当前仓库中交付一个可重复安装、可操作、可测试，并能通过真实 DataX 完成“安全的一次性离线全量复制”和独立数据核验的 V1 工程。
+你是 DataX Enterprise Studio V1.2 的主开发 Agent。你的目标是在当前仓库中交付一个可在
+干净 Windows 11 x64 本地工作站重复安装、启动、恢复和卸载，可操作、可测试，并能在固定
+Linux 容器中通过真实 DataX 完成“安全的一次性离线全量复制”和独立数据核验的 V1 工程。
 
 “完成”由 `docs/09_测试与验收标准.md` 的需求追踪、证据分级和 Definition of Done 决定，不由代码量、页面数量或时间消耗决定。
+
+当前 handoff（2026-07-31）：数据源/任务/执行 UI 与正式 API 适配、独立数据库登录、
+敏感 tmpfs/资源上限、DATA/SECRETS 分离加密导出、双包认证 journal/空 staging 和
+GitHub 安全工作流已有候选实现。其中恢复 staging 已测到 E1，数据库两类运行角色仍有
+相同全表 DML；新空 PostgreSQL volume、真实 `pg_restore`、证据重算、卷/secret 原子
+提交、覆盖升级、外部 WORM、四方向真实 DataX、签名 Setup 和干净 Windows E4 均未完成
+或未运行。当前 Mac 只用于开发验证，最终运行目标是另一台 Windows 11 x64 电脑。后续
+Agent 应复用现有切片并补齐门禁，不得重建占位实现，也不得把候选代码存在改写成验收
+通过。
 
 ## 一、先遵守这些总规则
 
@@ -50,8 +61,13 @@
 - DataX `datax_v202309` 真实运行。
 - 分离的进程状态、数据影响、核验状态、统计、脱敏后的原序日志、执行历史和操作审计。
 - 独立、版本化的数据 oracle；DataX 退出码 0 后先进入 `VERIFYING`，只有核验通过才能进入 `SUCCEEDED`。
-- 可重复的本地开发与 Docker Compose 启动方式。
-- 从干净环境执行数据库迁移、健康检查、测试和真实 E2E。
+- 可重复的源码开发方式，以及已签名 `Setup.exe`/`launcher.exe` 的 Windows 11 x64
+  本地工作站交付；Docker Desktop + WSL2 由用户自行安装并承担适用许可，产品只检测、
+  阻断和链接官方指引，不静默安装、启用或代接受许可。
+- Launcher 编排固定摘要的 Linux Docker Compose；DataX/JDK/API/Worker/PostgreSQL
+  不在 Windows 宿主直接运行。仅 Web 映射 `127.0.0.1:17860`，其余组件无宿主端口。
+- 从干净 Windows 11 x64 VM 执行安装、迁移、健康检查、四方向真实 E2E、Windows/
+  Docker/WSL/睡眠恢复、卸载保留数据和备份恢复。
 
 ### 明确不进入 V1
 
@@ -82,7 +98,17 @@
 - 数据复制运行时：DataX `datax_v202309` + JDK 8，Runtime 和四个认证插件固定 SHA-256。
 - V1 数据源：MySQL 8、PostgreSQL 15。
 - V1 单 Worker 默认最大并行 Execution 为 1；提高并发必须重新完成资源和稳定性验收。
-- 部署：单节点、非 HA。
+- 交付宿主：仅 Windows 11 x64 本地工作站；不认证 Windows on Arm、Windows 10/
+  Server、macOS、原生 Linux 宿主或远程共享服务器。
+- 安装/启动：已签名 `DataX-Enterprise-Studio-Setup-<version>-x64.exe` 安装已签名
+  `launcher.exe` 与桌面快捷方式；Launcher 只以参数数组/结构化配置编排固定 Linux 容器。
+- 数据：PostgreSQL、日志和工作区使用 `des-postgres-data`、`des-log-data`、
+  `des-workspace-data` named volumes；不得替换为 Windows bind mount。卸载默认保留卷与
+  `%LOCALAPPDATA%\DataXEnterpriseStudio\backups`。
+- 网络：唯一入口 `http://127.0.0.1:17860`；只允许 Web 的 IPv4 loopback 映射，禁止
+  `0.0.0.0`、`::`，API/Worker/PostgreSQL/DataX 无宿主端口，不创建 LAN 防火墙例外。
+- 部署：单节点、非 HA；浏览器关闭不停止服务，Windows 睡眠/关机、Docker/WSL 停止会
+  中断，恢复后必须先完成对账。
 
 使用仓库文档已经确定的语言、框架和依赖版本。依赖必须锁定，数据库变更必须使用迁移，配置必须通过环境变量或配置文件注入。
 
@@ -131,7 +157,10 @@ DataX 进程必须：
 3. 分析至少 20 个脱敏真实任务样本，记录筛选规则、方向、规模、失败模式和现有处置。
 4. 由 3 个设计伙伴合计完成不少于 10 个真实一次性复制任务，覆盖准备、执行、独立核验和故障恢复。
 
-Discovery Gate 未完成时，完整管理后台、全量页面、横向领域模块和 Phase 2—Phase 8 全部标记 `BLOCKED`。可以与发现工作并行运行有界技术 spike，但只能证伪固定 Runtime、独立 oracle、目标安全预检、网络出口或 Worker 围栏等高风险假设；spike 不形成 V1 用户功能、不计入完成度，也不得演变为横向开发。Phase 0 与 Phase 1 中超出这些 spike 的工程化和产品化工作同样等待门禁通过。
+Discovery Gate 未完成时，企业试点、公开发布和 V1 完成声明全部标记 `BLOCKED`。默认
+只做有界技术 spike；但仓库所有者若在当前任务中明确授权风险自担的工程候选，可按
+ADR-0007 继续 Phase 0—Phase 8。该实现授权不形成 Discovery 证据，也不得把研究、试点
+或发布状态写成 PASS。
 
 ### 实施前预检
 
@@ -144,6 +173,10 @@ Discovery Gate 未完成时，完整管理后台、全量页面、横向领域�
 5. DataX `datax_v202309` 发行物是否存在、来源是否可信、校验和是否可记录。
 6. MySQL 8、PostgreSQL 15 和平台 PostgreSQL 是否可用于本地测试。
 7. 全部 V1 需求是否有明确文档契约。
+8. Windows 11 x64、硬件虚拟化、WSL2、Docker Desktop/Engine/Compose、代码签名环境和
+   `127.0.0.1:17860` 是否满足发布/测试条件；前置依赖的安装和许可接受由用户或组织完成。
+9. Setup/Launcher、固定 Compose/镜像 manifest、Windows 路径/ACL、named volumes、
+   升级/卸载数据边界、SBOM 与发布哈希是否已有可执行设计。
 
 随后输出并保存一份阶段计划，至少包含：
 
@@ -156,12 +189,18 @@ Discovery Gate 未完成时，完整管理后台、全量页面、横向领域�
 
 ### Gate 0 通过条件
 
-- Discovery Gate 已通过；若尚未通过，Gate 0 最多记录有界技术 spike 证据，不能放行横向开发。
+- Discovery Gate 已通过；或仓库所有者已按 ADR-0007 明确授权风险自担的工程候选。
+  后一种情况只能放行编码，Discovery/试点/发布状态仍为 `BLOCKED`。
 - 未发现会导致范围或数据契约产生两种不同实现的 P0 冲突。
 - 真实 DataX 来源、版本和摘要可确认，MySQL → PostgreSQL 的最小命令行复制及独立 oracle 已真实通过。
+- `PRD-FR-WS-001` 与 `ACC-PRD-014` 已进入追踪矩阵，分别绑定唯一主测试
+  `E2E-WIN-001`、`E2E-WIN-002`；缺依赖、签名/哈希、端口、磁盘、重启/睡眠、
+  Docker/WSL、卸载保留和备份恢复均有明确 oracle。
 - 不需要覆盖用户修改。
 
-若 Discovery Gate 或 Gate 0 不通过，停止破坏性或大范围实现，输出第十五节的阻塞报告。不得把用户发现、真实 DataX 或独立核验后置后继续横向开发。
+若既没有通过 Discovery Gate，也没有 ADR-0007 所需的所有者明确授权，或 Gate 0 的技术
+安全条件不通过，则停止破坏性或大范围实现并输出第十五节的阻塞报告。即使已有实现授权，
+也不得把用户发现、真实 DataX 或独立核验伪造为已完成。
 
 ## 六、Phase 1：真实纵向 walking skeleton
 
@@ -197,14 +236,17 @@ Discovery Gate 未完成时，完整管理后台、全量页面、横向领域�
 - PostgreSQL 数据模型和迁移。
 - PostgreSQL 事实队列、`LISTEN/NOTIFY` 唤醒和轮询兜底。
 - 登录、退出和安全身份会话。
-- 一次性离线 `bootstrap-admin`：仅空用户库可用，临时密码从标准输入读取，首次登录强制改密。
+- Launcher GUI 一次性初始 Admin 引导：仅空用户库可调用固定容器
+  `bootstrap-admin` helper，用户不需要打开终端；临时密码仅经标准输入传入，不经
+  浏览器/API、命令参数、环境或日志，首次登录强制改密。
 - User、Project、项目成员/角色授权。
 - 项目归档必须在服务端检查活动 Execution；存在 `QUEUED / STARTING / RUNNING / VERIFYING / CANCEL_REQUESTED` 时阻断。
 - Admin、Developer、Operator、Viewer 服务端权限。
 - Admin 维护端点策略、数据源用途和源到目标传输授权。
 - 审计哈希链签名检查点和外部锚定输出。
 - `/health/live` 和 `/health/ready` 或文档定义的等价健康接口。
-- Docker Compose 与本地开发启动方式。
+- 固定 Linux Docker Compose 与源码开发启动方式；Windows 发布入口只能是签名
+  Setup/Launcher，且只有 Web 可映射 `127.0.0.1:17860`。
 - `.env.example`，不得包含真实凭据。
 
 至少测试：
@@ -212,7 +254,8 @@ Discovery Gate 未完成时，完整管理后台、全量页面、横向领域�
 - 新数据库 fresh migration。
 - 已有数据库 upgrade migration。
 - 登录成功、失败、过期和伪造凭据。
-- 首个 Admin 初始化成功、非空库重复初始化拒绝、进程参数/环境/日志无临时密码。
+- Launcher GUI 首个 Admin 初始化成功、非空库重复初始化拒绝，浏览器/API、进程参数、
+  环境和日志均无临时密码。
 - 四角色权限正反向矩阵。
 - 跨项目 ID 访问。
 - Backend、Worker、PostgreSQL 健康状态。
@@ -416,12 +459,25 @@ CredentialSecretEnvelope、连接/配置哈希、DataX/JDK/插件摘要、退出
 - Backend、Worker、PostgreSQL、DataX 和网络出口策略故障注入。
 - 整套服务重启。
 - 备份恢复。
+- `E2E-WIN-001`/`E2E-WIN-002`：在干净 Windows 11 x64 VM 验证 Setup/Launcher
+  Authenticode、可信时间戳、发布 SHA-256、SBOM、安装/升级/回滚、桌面入口、首次/重复
+  启动、停止、卸载保留三个 `des-*` named volumes 与导出备份、重装恢复。
+- Docker Desktop 未安装/未启动、WSL2/虚拟化缺失、`127.0.0.1:17860` 端口冲突、
+  安装/运行/备份磁盘不足都必须安全阻断；不得静默安装依赖、修改固件/Windows 功能、
+  代接受许可、换随机端口、终止未知进程或显示假健康。
+- 枚举 Windows 实际监听并从第二台 LAN 主机探测：只允许 Web
+  `127.0.0.1:17860`；API/Worker/PostgreSQL 无宿主端口，无 `0.0.0.0`/`::`。
+- Windows restart、睡眠/恢复、Docker Desktop restart、`wsl --shutdown` 后先完成
+  容器身份、队列、Attempt、lease/fence、目标锁和恢复门禁对账，再开放 readiness。
+- 在同一 Windows 发布环境的固定 Linux DataX/JDK 容器内完成四方向完整表/选列与
+  独立 oracle，并在另一干净 Win11 VM 完成备份恢复；宿主不得出现 DataX/JDK 进程。
 
 补齐：
 
 - README 和快速开始。
 - 本地开发说明。
-- Docker Compose 部署说明。
+- Windows Setup/Launcher、Docker Desktop/WSL2 前置与许可责任、固定 Compose、
+  loopback-only、named volume、停止/卸载/重装说明。
 - 配置和密钥说明。
 - 数据库迁移说明。
 - 备份、恢复、故障处理和已知限制。
@@ -435,18 +491,27 @@ CredentialSecretEnvelope、连接/配置哈希、DataX/JDK/插件摘要、退出
 `acceptance-manifest.v1` 全部通过，才能声明 V1 完成。所有 `V1-MUST` 需求必须有唯一
 测试 ID、oracle、证据路径和 PASS 结果；任何 `V1-MUST` 需求失败、未运行或阻塞都必须
 使最终结论为“未完成”或“部分完成”。P0/P1 只表示缺陷严重度。
+Windows runner 构建、macOS/Linux 测试、EXE/镜像存在或非 Windows DataX E2E 不能把
+`E2E-WIN-001`/`E2E-WIN-002` 标为 PASS，也不能形成 Windows E4。
 
 ## 十三、Phase 8：企业试点发布
 
 交付并验证：
 
 - 固定 Git commit、镜像 digest、迁移 head、Runtime/插件摘要和全部契约版本。
-- 在干净主机完成安装、迁移、健康检查、四方向真实复制、独立核验、重启和恢复。
+- 已签名 `DataX-Enterprise-Studio-Setup-<version>-x64.exe` 与 `launcher.exe`，
+  发布者/证书指纹/可信时间戳、SHA-256、Setup/Launcher/镜像 SBOM 和许可证清单。
+- 在干净 Windows 11 x64 VM 从签名 Setup 安装，不从源码或开发服务器启动；完成
+  Docker/WSL 前置失败、迁移、Launcher GUI 初始 Admin、幂等启动、默认浏览器打开
+  `http://127.0.0.1:17860`、loopback/LAN 探测、四方向真实复制、独立核验、Windows/
+  睡眠/Docker/WSL 恢复、卸载保留/重装和异机备份恢复。
 - 由非开发者复核源静默确认、目标外部独占声明版本/有限有效期/
   `ACTIVE|REVOKED|EXPIRED` 生命周期、已知破坏的撤回/报告与
   `TARGET_EXCLUSIVITY_REVOKED` 审计、目标快照结束不晚于 `valid_until`、目标空表门禁、
   目标端单一一致性快照、三类状态、失败恢复和剩余风险说明。
 - 发布安装、升级、回滚、备份、恢复、事故处置、容量包络和已知限制。
+- 明确 Docker Desktop 的取得、订阅和许可接受由用户/组织负责；安装器不捆绑、不静默
+  安装，也不代接受或规避许可。
 - 导出签名 `acceptance-manifest.v1`、外部审计锚点和证据文件哈希。
 
 ### Phase 8 停靠点
@@ -468,6 +533,12 @@ CredentialSecretEnvelope、连接/配置哈希、DataX/JDK/插件摘要、退出
 - 用 Mock MySQL/PostgreSQL 连接后声称连接测试通过。
 - 手工执行 `datax.py`，绕过产品 API/Worker，再声称平台闭环通过。
 - 把打包成功、进程启动、API 健康、浏览器可见、DataX 退出和已核验数据复制混成一个“已验证”。
+- 把 Windows runner 构建成功、Setup/EXE 文件存在、macOS/Linux 验证或既有 Windows
+  安装上的冒烟测试称为干净 Windows 11 E4。
+- 在 Docker/WSL 缺失时直接在 Windows 宿主运行 DataX/JDK，或为了“可访问”把 Web/API/
+  PostgreSQL 暴露到 `0.0.0.0`、`::`、LAN 或随机端口。
+- 安装器静默安装 Docker Desktop、启用 WSL/虚拟化、代接受许可，或卸载时默认删除
+  named volumes/备份而仍显示成功。
 - 在报告中省略失败、跳过、未运行和阻塞项。
 - 删除失败测试、降低阈值或绕过权限以获得绿色结果。
 - 用明文凭据换取测试便利。
@@ -507,6 +578,9 @@ CredentialSecretEnvelope、连接/配置哈希、DataX/JDK/插件摘要、退出
 - 需要覆盖用户已有修改。
 - 需要生产凭据、外部部署或新增授权。
 - 安全门禁失败且修复需要超出 V1 架构。
+- Windows 11 x64 干净 VM、受保护代码签名环境或可信时间戳不可用，无法形成 Windows E4。
+- Docker Desktop 未安装/未启动、WSL2/硬件虚拟化缺失或组织策略/许可未由用户解决；
+  只能报告明确阻塞，不得自动更改宿主。
 
 ## 十六、阶段证据格式
 
@@ -538,11 +612,16 @@ Mock/Fake 依赖：
 - PostgreSQL 事实队列、目标锁和 Worker fencing 配置。
 - DataX `datax_v202309` 集成及来源/校验和记录。
 - MySQL/PostgreSQL 双向 Reader/Writer。
-- Docker Compose 和本地开发入口。
+- Windows 11 x64 已签名 Setup/Launcher、桌面快捷方式、固定 Linux Docker Compose、
+  Docker Desktop/WSL2 前置检查和 `http://127.0.0.1:17860` 唯一入口。
+- Setup/Launcher Authenticode、可信时间戳、SHA-256、SBOM、许可证、固定镜像 digest、
+  升级/回滚和卸载默认保留 named volumes/备份的证据。
 - `.env.example`，无真实秘密。
 - OpenAPI/接口说明。
 - `verification-oracle.v1`、`acceptance-manifest.v1` 和独立数据比较器。
 - 单元、契约、集成、浏览器、真实 DataX E2E、安全、性能和恢复测试。
+- 干净 Windows 11 x64 的 `E2E-WIN-001`/`E2E-WIN-002`，覆盖缺依赖、端口/磁盘、
+  loopback/LAN、Windows/睡眠/Docker/WSL 恢复、卸载/重装和异机备份恢复。
 - 机器可读测试报告和覆盖率。
 - SBOM、许可证与依赖安全报告。
 - README、部署、迁移、备份恢复和故障手册。
@@ -559,17 +638,18 @@ Mock/Fake 依赖：
 1. 已完成范围
 2. 未完成或阻塞范围
 3. 启动方式与健康检查
-4. 数据库迁移结果
-5. 自动化测试汇总
-6. 四方向真实 DataX E2E 汇总
-7. 三类执行结果状态与独立 oracle 汇总
-8. 浏览器 E2E 与视觉检查
-9. RBAC、传输授权、网络出口与敏感数据检查
-10. 性能和容量包络结果
-11. Worker fencing、重启、故障注入和备份恢复结果
-12. 证据等级与证据路径
-13. 已知限制和后续动作
-14. 工作区变更清单
+4. Windows Setup/Launcher 签名、哈希、SBOM、安装/卸载与依赖失败
+5. 数据库迁移结果
+6. 自动化测试汇总
+7. 四方向真实 DataX E2E 汇总
+8. 三类执行结果状态与独立 oracle 汇总
+9. 浏览器 E2E 与视觉检查
+10. Loopback/LAN、RBAC、传输授权、网络出口与敏感数据检查
+11. 性能和容量包络结果
+12. Worker fencing、Windows/睡眠/Docker/WSL 故障注入和备份恢复结果
+13. 证据等级与证据路径
+14. 已知限制和后续动作
+15. 工作区变更清单
 ```
 
 对每项测试显示 PASS、FAILED、NOT_RUN 或 BLOCKED。不得只给测试总数，不得省略真实 DataX 版本、Reader/Writer 方向和证据等级。
@@ -584,4 +664,6 @@ Mock/Fake 依赖：
 - 未满足 Definition of Done 时，最终结论必须是“部分完成”或“未完成”。
 - 绝不通过 Mock、占位、弱化测试或虚假报告把时间不足包装成完整交付。
 
-现在从 Discovery Gate 开始。未通过时仅允许有界技术 spike，横向开发保持 `BLOCKED`；Discovery Gate 通过后执行 Gate 0，随后先完成 Phase 1 真实纵向 walking skeleton，再按 Phase 2 到 Phase 8 顺序执行并在每个停靠点验证。
+现在从 Discovery Gate 状态核验开始。未通过且没有 ADR-0007 所需的所有者明确授权时，
+仅允许有界技术 spike；已有明确工程授权时可继续 Gate 0 与 Phase 1—Phase 8，但必须把
+Discovery、试点和发布持续标记为 `BLOCKED`，并在每个停靠点区分实现证据与真实外部证据。

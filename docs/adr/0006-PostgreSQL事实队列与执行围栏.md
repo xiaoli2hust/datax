@@ -7,7 +7,9 @@
 
 V1 为单节点、单 Worker。额外的 Redis 队列没有承载不可替代业务状态，却增加部署、
 恢复和双写一致性成本。另一方面，数据库租约加 PID/PGID 不能阻止失租 Worker 或 PID
-重用后的错误进程继续写状态或目标数据。
+重用后的错误进程继续写状态或目标数据。V1 改为 Windows 11 x64 本地工作站交付后，
+Windows 睡眠/休眠/关机和 Docker Desktop/WSL2 生命周期又增加了“进程可能暂停后恢复”
+的不连续性，但不能因此把事实队列退化为 Windows 内存队列或把旧 JVM 当作仍受控。
 
 ## 决策
 
@@ -17,6 +19,10 @@ V1 为单节点、单 Worker。额外的 Redis 队列没有承载不可替代业
   未服务 eligible 项目，再按 class/priority/queued_at/id 选择，只有成功领取才推进游标。
 - `LISTEN/NOTIFY` 仅发送 `work_kind + work_id` 作为低延迟提示；通知可丢失，Worker 以
   5 秒默认、可配置且带抖动的轮询保证恢复。V1 Compose、readiness 和备份不包含 Redis。
+- Compose 运行在 Windows 11 x64 的 Docker Desktop/WSL2 Linux 环境；只有 `web` 映射
+  `127.0.0.1:17860`，`api`、`worker`、`postgres` 不映射宿主端口。Windows
+  `launcher.exe` 管理 Compose 生命周期，但没有 Execution 三轴状态写权限，不能代替
+  Worker/reconciler 或建立第二套队列。
 - API 创建 `QUEUED` Execution 时，在同一事务按 TargetNamespace 创建
   `TargetCopyLock=RESERVED`、初始 Event/Audit 和幂等结果；部分唯一索引拒绝第二个同目标
   排队意图。
@@ -28,7 +34,13 @@ V1 为单节点、单 Worker。额外的 Redis 队列没有承载不可替代业
   必须满足当前 `active_attempt_id + fence_epoch + lease_token_hash`；0 行更新等同失租，
   Worker 必须停止工作并终止其进程树。
 - 进程证据记录 `host_boot_id`、`pid`、`pid_start_time`、`process_group_id` 和
-  `cgroup_identity`。reconciler 只有在全部身份匹配时才可发送信号，避免 PID 重用误杀。
+  `cgroup_identity`。`host_boot_id` 指 WSL2 Linux kernel，不是 Windows 机器名。
+  reconciler 只有在全部身份匹配时才可发送信号，避免 PID 重用误杀。
+- 心跳续租使用 PostgreSQL 当前时间，禁止在 lease 已过期或 runtime continuity gap 后
+  补写成连续心跳。Windows 睡眠/休眠、关机、强制停止、Docker Desktop/WSL2 重启后，
+  已领取非终态工作只要不能证明在整个间隔持续受当前 fence 控制，就收敛为 `LOST` 并把
+  目标锁转为 `RECOVERY_REQUIRED`；DataX 不从暂停点自动续跑。未领取 `QUEUED` 事实仍在
+  PostgreSQL 中，可在恢复后按原公平顺序首次领取。
 - 同一不可变 TargetNamespace 使用数据库唯一未释放锁，状态为
   `RESERVED/ACTIVE/RECOVERY_REQUIRED`。预留从 Execution 创建开始，活动锁从领取延续到
   oracle 核验结束；
@@ -54,6 +66,10 @@ V1 为单节点、单 Worker。额外的 Redis 队列没有承载不可替代业
 - 默认 200 GiB 主机采用日志/数据库/工作区/安全保留分区预算、绿色/黄色/红色水位
   admission 与 20 小时/24 小时服务预算。轻量 200 次/天和大表 20 次/天是不同组合档，
   不能与单执行 100 MiB 日志硬上限同时取峰值。
+- PostgreSQL、脱敏日志和执行工作区分别使用固定 Docker named volumes；本地备份由
+  launcher 调用固定备份容器后原子导出到
+  `%LOCALAPPDATA%\DataXEnterpriseStudio\backups`。普通备份不包含 KEK/明文 secret，
+  本机导出与 Docker 虚拟磁盘位于同一物理设备时不算整机灾难恢复证据。
 - 超过容量公式/队列 200/预计 8 小时 backlog 时拒绝普通新运行请求并暴露稳定原因；
   既有事实保持 `QUEUED`。不得通过增加未验收并发静默扩容。
 
@@ -68,6 +84,10 @@ V1 为单节点、单 Worker。额外的 Redis 队列没有承载不可替代业
   任意带外写入的完整侦测。
 - Worker/reconciler 重启不会重置项目公平顺序；未领取取消和 RecoveryProbe 不再依赖
   DataX 槽位才有机会推进。
+- Windows launcher 崩溃或关闭窗口不改变事实队列；重新打开只恢复生命周期视图。
+  Windows/WSL2 暂停后的旧 Attempt 不会因同一容器名或 PID 再出现而恢复写权限。
+- named volumes 保留 PostgreSQL 事实和公平游标，因而 Compose/WSL2 重启、应用升级和
+  默认卸载不会静默清空队列；删除卷必须是独立的显式破坏性操作。
 - 容量是可计算的组合约束，并带事实发现、eligible 等待、RecoveryProbe 和取消收敛
   SLO；超水位 fail closed。
 - 多 Worker、跨节点 HA 或外部队列均不属于 V1；引入时必须以新的 ADR 重新证明队列

@@ -1,0 +1,4 @@
+# Keep this file synchronized with [build-system] in pyproject.toml.
+pip==26.2
+setuptools==83.0.0
+wheel==0.47.0

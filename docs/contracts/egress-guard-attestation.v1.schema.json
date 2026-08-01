@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xiaoli2hust/datax/docs/contracts/egress-guard-attestation.v1.schema.json",
+  "title": "DataX Enterprise Studio egress guard attestation v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "status",
+    "policy_engine_version",
+    "resolver_policy_version",
+    "network_namespace_id",
+    "policy_set_hash",
+    "policies",
+    "ruleset_hash",
+    "applied_at",
+    "checked_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "status": {
+      "enum": [
+        "VERIFIED",
+        "BLOCKED"
+      ]
+    },
+    "policy_engine_version": {
+      "const": "des-nftables-egress-v1"
+    },
+    "resolver_policy_version": {
+      "const": "des-system-dns-v1"
+    },
+    "network_namespace_id": {
+      "type": "string",
+      "pattern": "^net:\\[[0-9]+\\]$"
+    },
+    "policy_set_hash": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "policies": {
+      "type": "object",
+      "maxProperties": 1024,
+      "propertyNames": {
+        "$ref": "#/$defs/canonicalUuid"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/sha256"
+      }
+    },
+    "ruleset_hash": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "applied_at": {
+      "oneOf": [
+        {
+          "type": "string",
+          "format": "date-time"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "checked_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "VERIFIED"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "properties": {
+          "policy_set_hash": {
+            "$ref": "#/$defs/sha256"
+          },
+          "ruleset_hash": {
+            "$ref": "#/$defs/sha256"
+          },
+          "applied_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "canonicalUuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    }
+  }
+}

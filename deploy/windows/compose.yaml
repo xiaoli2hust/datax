@@ -1,0 +1,239 @@
+name: datax-enterprise-studio
+
+x-backend-environment: &backend-environment
+  DES_APP_ENVIRONMENT: windows-local
+  DES_UI_ORIGIN: http://127.0.0.1:17860
+  DES_TRUSTED_HOST: 127.0.0.1
+  DES_DATABASE_HOST: postgres
+  DES_DATABASE_PORT: "5432"
+  DES_DATABASE_NAME: datax_studio
+  DES_DATABASE_USER: datax_studio
+  DES_DATABASE_PASSWORD_FILE: /run/secrets/database_password
+  DES_KEK_KEYRING_DIR: /run/secrets
+  DES_KEK_ACTIVE_VERSION: v1
+  DES_RESOLVER_POLICY_VERSION: des-system-dns-v1
+  DES_EGRESS_POLICY_VERSION: des-nftables-egress-v1
+  DES_EGRESS_ATTESTATION_URL: http://127.0.0.1:17990/v1/attestation
+  DES_EGRESS_ATTESTATION_TIMEOUT_SECONDS: "0.5"
+  DES_EGRESS_ATTESTATION_MAX_AGE_SECONDS: "15"
+  DES_RUNTIME_MANIFEST_PATH: /opt/datax/runtime-manifest.json
+  DES_LOG_VOLUME_PATH: /var/lib/datax-studio/logs
+  DES_WORKSPACE_VOLUME_PATH: /var/lib/datax-studio/runs
+  DES_WORKER_ID: worker-1
+
+services:
+  postgres:
+    image: ${DES_POSTGRES_IMAGE:?DES_POSTGRES_IMAGE must be a release-locked digest}
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: datax_studio
+      POSTGRES_USER: datax_studio
+      POSTGRES_PASSWORD_FILE: /run/secrets/postgres_password
+    secrets:
+      - postgres_password
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U datax_studio -d datax_studio"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - control
+
+  migrate:
+    image: ${DES_API_IMAGE:?DES_API_IMAGE must be a release-locked digest}
+    command: ["alembic", "-c", "alembic.ini", "upgrade", "head"]
+    restart: "no"
+    environment:
+      <<: *backend-environment
+      DES_EGRESS_GUARD_DATABASE_PASSWORD_FILE: /run/secrets/egress_guard_database_password
+      DES_API_DATABASE_PASSWORD_FILE: /run/secrets/api_database_password
+      DES_WORKER_DATABASE_PASSWORD_FILE: /run/secrets/worker_database_password
+    secrets:
+      - source: postgres_password
+        target: database_password
+      - egress_guard_database_password
+      - api_database_password
+      - worker_database_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - control
+
+  egress-guard:
+    image: ${DES_EGRESS_GUARD_IMAGE:?DES_EGRESS_GUARD_IMAGE must be a release-locked digest}
+    restart: unless-stopped
+    secrets:
+      - egress_guard_database_password
+    read_only: true
+    tmpfs:
+      - /run/datax-egress-guard:rw,noexec,nosuid,size=4m
+      - /tmp:rw,noexec,nosuid,size=8m
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_ADMIN
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python3", "/opt/datax-egress-guard/healthcheck.py"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+      start_period: 5s
+    networks:
+      - control
+
+  api:
+    image: ${DES_API_IMAGE:?DES_API_IMAGE must be a release-locked digest}
+    restart: unless-stopped
+    environment:
+      <<: *backend-environment
+      DES_DATABASE_USER: datax_api
+    secrets:
+      - source: api_database_password
+        target: database_password
+      - source: jwt_private_key
+        target: jwt_private_key.pem
+      - source: jwt_public_key
+        target: jwt_public_key.pem
+      - refresh_token_hmac_key
+      - idempotency_hmac_key
+      - source: credential_kek_v1
+        target: credential-kek-v1.key
+    volumes:
+      - log-data:/var/lib/datax-studio/logs
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      egress-guard:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-c",
+          "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/v1/health/live', timeout=2).read()"
+        ]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    network_mode: "service:egress-guard"
+
+  worker:
+    image: ${DES_WORKER_IMAGE:?DES_WORKER_IMAGE must be a release-locked digest}
+    command: ["python", "-m", "datax_studio.worker.main"]
+    restart: unless-stopped
+    environment:
+      <<: *backend-environment
+      DES_DATABASE_USER: datax_worker
+      DES_SENSITIVE_RUNTIME_ROOT: /tmp/datax-studio-sensitive
+    secrets:
+      - source: worker_database_password
+        target: database_password
+      - source: credential_kek_v1
+        target: credential-kek-v1.key
+    volumes:
+      - log-data:/var/lib/datax-studio/logs
+      - workspace-data:/var/lib/datax-studio/runs
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=256m
+    mem_limit: 2g
+    cpus: 2.0
+    pids_limit: 256
+    ulimits:
+      nofile:
+        soft: 4096
+        hard: 8192
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      egress-guard:
+        condition: service_healthy
+    network_mode: "service:egress-guard"
+
+  web:
+    image: ${DES_WEB_IMAGE:?DES_WEB_IMAGE must be a release-locked digest}
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:17860:8080"
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+      - /var/cache/nginx:rw,noexec,nosuid,size=32m
+      - /var/run:rw,noexec,nosuid,size=8m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      api:
+        condition: service_healthy
+    networks:
+      - control
+
+secrets:
+  postgres_password:
+    file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/postgres_password.txt
+  egress_guard_database_password:
+    file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/egress_guard_database_password.txt
+  api_database_password:
+    file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/api_database_password.txt
+  worker_database_password:
+    file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/worker_database_password.txt
+  jwt_private_key:
+    file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/jwt_private_key.pem
+  jwt_public_key:
+    file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/jwt_public_key.pem
+  refresh_token_hmac_key:
+    file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/refresh_token_hmac_key
+  idempotency_hmac_key:
+    file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/idempotency_hmac_key
+  credential_kek_v1:
+    file: ${DES_SECRET_DIR:?DES_SECRET_DIR must point to the launcher-managed secret directory}/credential-kek-v1.key
+
+volumes:
+  postgres-data:
+    name: des-postgres-data
+    labels:
+      com.xiaoli.datax.installation-id: ${DES_INSTALLATION_ID:-UNINITIALIZED}
+      com.xiaoli.datax.volume-role: postgres-data
+  log-data:
+    name: des-log-data
+    labels:
+      com.xiaoli.datax.installation-id: ${DES_INSTALLATION_ID:-UNINITIALIZED}
+      com.xiaoli.datax.volume-role: log-data
+  workspace-data:
+    name: des-workspace-data
+    labels:
+      com.xiaoli.datax.installation-id: ${DES_INSTALLATION_ID:-UNINITIALIZED}
+      com.xiaoli.datax.volume-role: workspace-data
+
+networks:
+  control:
+    driver: bridge

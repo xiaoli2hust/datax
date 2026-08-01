@@ -91,7 +91,12 @@
       ],
       "properties": {
         "schema_name": {
-          "$ref": "#/$defs/identifier"
+          "allOf": [
+            {
+              "$ref": "#/$defs/identifier"
+            }
+          ],
+          "description": "PostgreSQL 填 schema；MySQL 没有独立 schema，固定填写 datasource revision 的 database_name。SchemaSnapshot 对 MySQL 仍使用 catalog_name=database_name、schema_name=\"\" 的空哨兵。"
         },
         "table_name": {
           "$ref": "#/$defs/identifier"
@@ -168,6 +173,7 @@
         "target_ordinal",
         "target_type",
         "target_nullable",
+        "oracle_logical_type",
         "compatibility"
       ],
       "properties": {
@@ -202,6 +208,20 @@
         },
         "target_nullable": {
           "type": "boolean"
+        },
+        "oracle_logical_type": {
+          "type": "string",
+          "description": "由服务端根据两端 SchemaSnapshot 证明可无损规范化的共同 oracle 类型；不得由浏览器自行猜测。",
+          "enum": [
+            "INTEGER",
+            "DECIMAL",
+            "TEXT",
+            "BOOLEAN",
+            "DATE",
+            "TIME",
+            "TIMESTAMP",
+            "BINARY"
+          ]
         },
         "compatibility": {
           "type": "string",
@@ -313,6 +333,7 @@
           "target_ordinal": 1,
           "target_type": "bigint",
           "target_nullable": false,
+          "oracle_logical_type": "INTEGER",
           "compatibility": "EXACT"
         },
         {
@@ -324,6 +345,7 @@
           "target_ordinal": 2,
           "target_type": "numeric(18,2)",
           "target_nullable": false,
+          "oracle_logical_type": "DECIMAL",
           "compatibility": "EXACT"
         }
       ],
