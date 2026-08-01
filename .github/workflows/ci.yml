@@ -71,9 +71,13 @@ jobs:
             --output docs/contracts/requirements-catalog.v1.json \
             --check
           python -m unittest scripts.acceptance.test_acceptance_manifest -v
+          python -m unittest scripts.acceptance.test_candidate_root -v
 
-      - name: Verify the committed upstream DataX source identity
-        run: python runtime/verify_upstream_source.py
+      - name: Verify the committed upstream DataX source and plugin inventory
+        run: |
+          python runtime/verify_upstream_source.py
+          python runtime/build_upstream_plugin_inventory.py --check
+          python -m unittest runtime.test_upstream_plugin_inventory -v
 
       - name: Validate Windows Compose topology
         shell: bash

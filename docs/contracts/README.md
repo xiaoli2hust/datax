@@ -6,10 +6,37 @@
 - `job-spec.v1.schema.json`：平台任务契约。
 - `schema-snapshot.v1.schema.json`：MySQL/PostgreSQL 表结构的确定性、无秘密快照；发布校验与 Worker preflight 共同使用。
 - `plugin-manifest.v1.schema.json`：认证插件能力与参数 UI 契约。
+- `upstream-plugin-inventory.v1.schema.json`：从固定 Alibaba DataX 根 POM、模块 POM 与
+  `plugin.json` 重建的 Reader/Writer 源码能力目录。对应规范化制品位于
+  `runtime/upstream-plugin-inventory.v1.json`；当前 72 项都只证明 `SOURCE_PRESENT`，固定
+  `ordinary_user_executable=false`。`V1_BUSINESS` 与 `INTERNAL_SMOKE` 只是候选分类，不能
+  当作 `PACKAGED/CONTRACTED/E3/E4` 证据。72 项只覆盖根 POM 中的 Reader/Writer；
+  Transformer、任务模板和其他 DataX 原生参数/功能尚未进入本 inventory，不能据此声明
+  “DataX 全功能已盘点”或“全功能可用”。
 - `audit-event.v1.schema.json`：审计事件最小结构；包含保留维护开始、完成、失败三类
   SYSTEM 事件，但不把到期扫描声明成数据库外 WORM 锚定。
 - `verification-oracle.v1.schema.json`：独立数据核验规范和结果证据；使用规范化行多重集，不依赖 DataX 自报统计。
-- `acceptance-manifest.v1.schema.json`：候选版本的需求、唯一测试 ID、oracle 与证据文件清单。
+- `acceptance-manifest.v1.schema.json`：候选版本的精确“需求 ID + 测试 ID”对、oracle 与
+  证据文件清单；同一可复核执行可显式覆盖多个需求，但每个需求必须独立绑定结果与证据；
+  E3 数据 oracle 和 E4 Windows 证据必须以结构化 JSON 绑定候选版本、commit、需求、测试、
+  环境及执行身份，普通文本、截图或自声明 `PASS` 不能通过发布 validator。
+  该兼容修复把 manifest 与 requirements catalog 的 `schema_version` 提升为 `1.1`；旧
+  `1.0` 清单缺少 `evidence_requirements/windows_evidence` 及 oracle binding，必须重新生成，
+  不允许原样晋级。
+- `candidate-root.v1.schema.json`：ADR-0010 的 canonical Windows 候选证据根基础契约。
+  `scripts/acceptance/candidate_root.py` 以外部 CI 身份参数绑定固定仓库、release workflow、
+  run/attempt、保护环境、source ref、commit、tag、candidate，并把候选目录中除候选根自身
+  以外的全部普通文件按安全相对路径、大小和 SHA-256 进行完整有序盘点；Setup、Launcher、
+  final release manifest 1.1、Compose、顶层/内嵌镜像 lock、ACL helper、SPDX SBOM index、
+  acceptance/environment/catalog 和 Windows build environment 还必须映射到该完整盘点并
+  通过跨文件身份/hash 校验；manifest 内三项资源摘要与 canonical signer SHA-256 allowlist
+  也须复核。Acceptance 不是抽查少数字段，而是复用权威 Schema、需求矩阵、catalog、
+  environment/evidence root 和完整语义 validator。路径逃逸、大小写
+  冲突、符号链接/Windows reparse point、额外/缺失/被改文件、重复 JSON key 和非 canonical
+  JSON 均失败关闭。校验器只接受当前 checkout 中固定权威 Schema，并在 Schema 外再次硬
+  断言 BLOCKED 语义，调用方不能用宽松 `--schema` 放开。当前 `1.0` 只允许 `root_status=BLOCKED`、
+  `release_approved=false`，机器场景 profile/result、Windows baseline、harness 边界和 E3/E4
+  证据包必须显式为 `null` 并给出阻塞原因；它不能表达可发布 PASS。
 - `egress-guard-attestation.v1.schema.json`：共享网络命名空间内出口守卫的实时证明。
 - `egress-guard-lease.v1.schema.json`：精确 selected-IP `/32|/128 + TCP port` 短租约请求与响应。
 - `egress-guard.v1.md`：守卫只读数据库视图、loopback HTTP、nftables 和 fail-closed 边界。
@@ -67,11 +94,14 @@ staging 的 E1 候选实现；`LEGACY` 指针原子提交与 Compose 消费也�
    `defect_severity` 只允许 `P0/P1/P2/P3`；`gate_result=PASS` 时不得存在任何
    `P0/P1`，即使其状态为 `ACCEPTED`，`ACCEPTED` 只能用于不阻塞发布的 P2/P3。
    同时拒绝用 `BLOCKED/NOT_RUN` 或“无 P0”伪装需求通过。
-8. 发布 CI 从权威追踪矩阵生成规范化需求 catalog，重算
+8. 发布 CI 按 Markdown 表格表头定位并只解析 `需求/规则/验收 ID`、`需求级别`、
+   `测试 ID`、`Oracle`、`最低证据` 和 `证据字段` 的对应列，不得从整行其他需求 ID 或
+   `NFR-PERF/NFR-SEC` 字符串中猜测测试 ID。随后生成规范化需求 catalog，重算
    `requirements_catalog_sha256`，并以独立 validator 比较 catalog 与 entries 的
-   `requirement_id/requirement_priority/test_id/minimum_evidence_level` 四元组及 V1-MUST
+   `requirement_id/requirement_priority/test_id/minimum_evidence_level/evidence_requirements`
+   五元组及 V1-MUST
    集合。Manifest entry 必填 `minimum_evidence_level`；Schema 拒绝 PASS 的实际
-   `evidence_level` 低于该下限，validator 还必须拒绝运行器自行下调 catalog 下限。
+   `evidence_level` 不精确等于该等级，validator 还必须拒绝运行器自行修改 catalog 等级。
    它必须验证 `expected_v1_must_count=covered_v1_must_count=当前 catalog 中的
    V1-MUST 数`、`catalog_exact_match=true`、缺失数组为空、重复“需求 ID + 测试 ID”数组
    为空；JSON Schema 不承担跨数组计数相等。
@@ -84,6 +114,36 @@ staging 的 E1 候选实现；`LEGACY` 指针原子提交与 Compose 消费也�
    `target_exclusivity.target_snapshot_id=target_result.snapshot_id`，以及
    `confirmed_at` ≤ `target_empty_checked_at` ≤ `target_result.snapshot_started_at` ≤
    `target_result.snapshot_finished_at` ≤ `valid_until`。
+   源/目标各自的 read 起止必须落在 oracle `started_at..finished_at` 全局窗口内，distinct
+   digest 数不得大于行数；entry `executed_at` 定义为测试尝试完成时间，不得早于 oracle
+   `finished_at`，environment `captured_at` 不得晚于该完成时间。
+   `VERIFICATION_ORACLE_V1` 条目的 oracle binding 必须逐字段匹配 acceptance candidate、
+   commit、requirement/test、环境清单 SHA、execution/job version，并实际解析引用的
+   `verification-oracle.v1` JSON，完成 Schema、RFC 8785 哈希和跨字段语义校验；只验证外层
+   文件 SHA 不足以成为 PASS。同一个 oracle artifact path/hash 或 execution ID 不得在多个
+   manifest entry 间重放。`WINDOWS_E4` 条目必须引用结构化 Windows E4 JSON，绑定同一
+   candidate/commit/requirement/test/environment，证明干净 Win11 x64、签名制品、唯一
+   loopback 端口和逐项断言；`assertions` 必须包含 binding 中的精确 `test_id`，不能借用
+   另一个测试的 PASS；Setup/Launcher 必须是 evidence-root 中可读取并重算 SHA-256 的实际
+   文件，不能只填裸摘要，其嵌套证据也必须重算 SHA-256。
+   `--require-pass` 还必须由可信发布编排从 Git checkout/tag 上下文分别传入
+   `--expected-commit` 与 `--expected-release-candidate`；缺失或与 manifest 不同即失败。
+   这些检查只证明证据包结构、身份引用和内部一致性，不证明 JSON 由可信 Windows harness
+   产生，也不验证 Authenticode、物理/虚拟机洁净度或真实设备行为；必须另由受保护 Windows
+   runner 执行签名验证和 E4 取证，不能把自声明 `VALID` 当作签名证明。
+   Candidate-root Schema、BLOCKED 生成/验证器及
+   `scripts/acceptance/verify_candidate_attestation.py` 的 E1 基础件已经存在。后者先重算完整
+   candidate file set，再以参数数组调用调用方指定绝对路径的 `gh attestation verify`，固定 repository、
+   signer workflow/digest、source ref/digest、GitHub Actions OIDC issuer、SLSA predicate，
+   并传入 `--deny-self-hosted-runners`；成功后还复核证书中的 hosted runner、精确
+   run/attempt URI、workflow、commit、candidate-root subject SHA 和 verified timestamp，最后
+   再次重算文件集。但路径/文件类型检查不能证明该 verifier 二进制可信；托管 attestor
+   workflow 尚未固定其路径、版本和摘要前，即使低层策略全部匹配，wrapper 也必须非零返回
+   `TRUSTED_ATTESTATION_VERIFIER_TCB_NOT_IMPLEMENTED`，不得返回 `ready=true` 或
+   attestation-valid。该基础件尚未接入 release workflow，也没有机器场景 catalog、受保护
+   Windows E4 harness、托管 attestor 真实 bundle 或完整发布语义编排。因此
+   `--require-pass` 仍无条件返回 `TRUSTED_RELEASE_ATTESTATION_NOT_IMPLEMENTED`；非发布校验
+   即使得到结构 `gate_result=PASS`，也固定返回 `release_approved=false`。
 10. `data_effect=CONFIRMED` 只表示目标影响已测得，测得值可以是 0 行，不代表内容正确；
     空源成功固定为 `SUCCEEDED/CONFIRMED/PASSED`。
 11. Execution 创建事务原子写 `QUEUED+TargetCopyLock=RESERVED`；同一 TargetNamespace 的

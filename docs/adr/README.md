@@ -30,3 +30,5 @@ Docker named volumes；旧式首次安装仍可引用 `des-postgres-data`、`des
 - [ADR-0006：PostgreSQL 事实队列与执行围栏](0006-PostgreSQL事实队列与执行围栏.md)
 - [ADR-0007：Discovery Gate 与工程实施分离](0007-Discovery-Gate与工程实施分离.md)
 - [ADR-0008：干净目标恢复与原子运行代际](0008-干净目标恢复与原子运行代际.md)
+- [ADR-0009：DataX 完整上游随包与认证能力分级](0009-DataX完整上游与认证能力分级.md)
+- [ADR-0010：Windows 发布证据采用双重信任根](0010-Windows发布证据双重信任根.md)
