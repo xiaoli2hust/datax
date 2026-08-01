@@ -77,7 +77,7 @@ class WindowsHostedPreflightTests(unittest.TestCase):
         python_step = next(
             step for step in self.job["steps"] if step.get("uses") == PYTHON_ACTION
         )
-        self.assertEqual(python_step["with"], {"python-version": "3.12.13"})
+        self.assertEqual(python_step["with"], {"python-version": "3.12.10"})
         self.assertIn("rustup toolchain install 1.97.0", self.raw)
         self.assertIn("cargo test --locked", self.raw)
         self.assertIn("cargo build --locked --release", self.raw)

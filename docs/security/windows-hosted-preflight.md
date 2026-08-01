@@ -10,6 +10,10 @@
 - Launcher 的纯单元测试失败；
 - NSIS 语法、宏、资源打包路径或 Unicode 插件引用失败。
 
+该 hosted-only 静态检查显式使用 `Python 3.12.10`：这是 `windows-2025` 当前可用的精确
+3.12 patch 版本，用来运行 hash-locked 的检查依赖，并不改变产品 API/Worker 镜像固定的
+Python 3.12.13，也不构成产品 Runtime 的供应链证明。
+
 该工作流若在线成功，最高证据等级也只能是 **E1**。当前仅完成 workflow 源码和本地静态约束
 测试，尚无 GitHub-hosted 实际运行记录。它不创建、上传或保留任何候选安装包；临时
 `nonrelease-installer-preflight.exe`、其非发布资源、NSIS 和 Cargo 输出都只存在于
