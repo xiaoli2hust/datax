@@ -447,6 +447,36 @@ def verify_harness_qualification(
     return verified
 
 
+def inspect_harness_qualification_evidence(
+    raw: bytes,
+    *,
+    release_payload: ReleasePayload,
+    expected_harness: ExpectedHarness,
+    now: datetime,
+) -> VerifiedHarnessQualification:
+    """Inspect a QH without consuming its nonce or granting any capability.
+
+    This is deliberately narrower than :func:`verify_harness_qualification`:
+    it is only for a protected private filesystem loader to reject malformed,
+    stale, wrongly signed, or wrongly bound evidence before the future issuer
+    has begun its one atomic nonce-and-grant transaction.  The returned value
+    deliberately has no raw nonce and is not an authorization, a durable
+    record, an E3/E4 result, or an ordinary-user execution capability.
+
+    A future issuer must re-read and re-verify the exact QH while atomically
+    consuming its nonce and writing its PAG.  It must never treat this
+    inspection as a substitute for that transaction.
+    """
+
+    verified, _nonce_use = _verified_harness_qualification_facts(
+        raw,
+        release_payload=release_payload,
+        expected_harness=expected_harness,
+        now=now,
+    )
+    return verified
+
+
 def verify_harness_qualification_with_recorder[RecordedQualification](
     raw: bytes,
     *,

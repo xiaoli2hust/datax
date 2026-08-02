@@ -546,6 +546,74 @@ struct ActiveRuntimeVolumeContract {
     names: RuntimeVolumeNames,
 }
 
+// This journal is deliberately Launcher-internal.  It is only an ACL-protected
+// pending record which lets a first installation resume the *same* immutable
+// FRESH generation after interruption; it is not an API or backup interchange
+// format, so no public JSON Schema is introduced for it.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct FreshInitializationJournal {
+    schema_version: String,
+    state: String,
+    generation: RuntimeGeneration,
+}
+
+impl FreshInitializationJournal {
+    fn new(generation: RuntimeGeneration) -> Result<Self, LauncherError> {
+        let value = Self {
+            schema_version: "1.0".to_owned(),
+            state: "PENDING".to_owned(),
+            generation,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn to_bytes(&self) -> Result<Vec<u8>, LauncherError> {
+        self.validate()?;
+        serde_json::to_vec(self).map_err(|_| {
+            LauncherError::new(
+                "FRESH_INITIALIZATION_JOURNAL_INVALID",
+                "无法编码 FRESH 首次初始化 journal。",
+            )
+        })
+    }
+
+    fn parse(bytes: &[u8]) -> Result<Self, LauncherError> {
+        if bytes.is_empty() || bytes.len() > 16 * 1024 {
+            return Err(LauncherError::new(
+                "FRESH_INITIALIZATION_JOURNAL_INVALID",
+                "FRESH 首次初始化 journal 大小无效。",
+            ));
+        }
+        let value: Self = serde_json::from_slice(bytes).map_err(|_| {
+            LauncherError::new(
+                "FRESH_INITIALIZATION_JOURNAL_INVALID",
+                "FRESH 首次初始化 journal 不是严格 JSON。",
+            )
+        })?;
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), LauncherError> {
+        if self.schema_version != "1.0" || self.state != "PENDING" {
+            return Err(LauncherError::new(
+                "FRESH_INITIALIZATION_JOURNAL_INVALID",
+                "FRESH 首次初始化 journal 的版本或状态无效。",
+            ));
+        }
+        self.generation.validate()?;
+        if self.generation.source != "FRESH" || self.generation.restore_journal_id.is_some() {
+            return Err(LauncherError::new(
+                "FRESH_INITIALIZATION_JOURNAL_INVALID",
+                "FRESH 首次初始化 journal 未精确绑定 FRESH 运行代际。",
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ComposeProjectInventory {
     fn is_empty(&self) -> bool {
         matches!(self, Self::Empty)
@@ -700,11 +768,17 @@ enum StorageIdentityDecision {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum InitializationRecoveryDecision {
-    RegenerateSecrets,
-    CompleteVolumes,
-    Finalize,
-    Unsafe,
+enum UninitializedRuntimePath {
+    LegacyMigration,
+    Fresh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LegacyRootObjectPresence {
+    installation_id: bool,
+    secret_directory: bool,
+    fixed_volume_presence: [bool; 3],
+    generations_directory: bool,
 }
 
 pub fn run<I>(arguments: I) -> Result<RunOutcome, LauncherError>
@@ -1619,31 +1693,277 @@ fn ensure_runtime_secrets(
 
     let sid = current_user_sid(start_tools, installation)?;
     restrict_directory_acl(start_tools, installation, &installation.app_data_root, &sid)?;
-    create_controlled_directory(&installation.secret_dir)?;
-    platform::ensure_directory(&installation.secret_dir)?;
-    restrict_directory_acl(start_tools, installation, &installation.secret_dir, &sid)?;
 
     if installation.initialization_state.exists() {
-        return resume_runtime_initialization(tools, start_tools, installation, &sid);
+        return resume_fresh_runtime_initialization(tools, start_tools, installation, &sid);
     }
 
-    let presence = runtime_volume_presence(tools, installation)?;
-    let has_marker = installation.installation_id.exists();
-    let has_any_secret = runtime_secret_paths(installation)
-        .iter()
-        .any(|path| path.exists());
-    if storage_identity_decision(presence, has_marker, has_any_secret)
-        == StorageIdentityDecision::Fresh
+    // Once a pointer exists, it is the sole current-runtime source.  In
+    // particular, FRESH never falls back to root installation-id or secrets.
+    if installation.runtime_generation.exists() {
+        let active = load_verified_active_runtime_snapshot(start_tools, installation, &sid)?;
+        validate_active_runtime_volume_contract(tools, installation, &active.volume_contract())?;
+        return verify_active_runtime_secret_set(start_tools, installation, &sid, &active);
+    }
+
+    match select_uninitialized_runtime_path(tools, installation)? {
+        UninitializedRuntimePath::LegacyMigration => {
+            // This is the one retained migration path: a complete historical
+            // fixed-object installation becomes one immutable LEGACY pointer.
+            create_controlled_directory(&installation.secret_dir)?;
+            platform::ensure_directory(&installation.secret_dir)?;
+            restrict_directory_acl(start_tools, installation, &installation.secret_dir, &sid)?;
+            let storage_was_existing =
+                ensure_storage_identity(tools, start_tools, installation, &sid)?;
+            ensure_existing_runtime_secrets(start_tools, installation, &sid, storage_was_existing)?;
+            let installation_id = read_installation_id(&installation.installation_id)?;
+            ensure_legacy_runtime_generation(start_tools, installation, &sid, &installation_id)
+        }
+        UninitializedRuntimePath::Fresh => {
+            create_fresh_initialization_journal(start_tools, installation, &sid)?;
+            resume_fresh_runtime_initialization(tools, start_tools, installation, &sid)
+        }
+    }
+}
+
+// This discriminator runs before a FRESH journal exists.  It never opens a root
+// secret or root installation-id; it only rejects their metadata presence as an
+// ambiguous old state.  Once FRESH is selected, every subsequent operation is
+// driven solely by its journal and generated object names.
+fn select_uninitialized_runtime_path(
+    tools: &Tools,
+    installation: &Installation,
+) -> Result<UninitializedRuntimePath, LauncherError> {
+    uninitialized_runtime_path_for_legacy_presence(LegacyRootObjectPresence {
+        installation_id: uninitialized_root_object_exists(&installation.installation_id)?,
+        secret_directory: uninitialized_root_object_exists(&installation.secret_dir)?,
+        fixed_volume_presence: runtime_volume_presence(tools, installation)?,
+        generations_directory: uninitialized_root_object_exists(
+            &installation.app_data_root.join("generations"),
+        )?,
+    })
+}
+
+// An unreadable root entry is never equivalent to an absent one: treating an
+// I/O error as "clean" could make FRESH initialise next to an unknown legacy
+// object.  This helper only reports metadata presence; the FRESH branch never
+// opens root legacy identity or secret material.
+fn uninitialized_root_object_exists(path: &Path) -> Result<bool, LauncherError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(LauncherError::new(
+            "FRESH_INITIALIZATION_TARGET_INSPECTION_FAILED",
+            "无法证明首次初始化目标不存在旧式运行对象；Launcher 已安全阻断。",
+        )),
+    }
+}
+
+fn uninitialized_runtime_path_for_legacy_presence(
+    presence: LegacyRootObjectPresence,
+) -> Result<UninitializedRuntimePath, LauncherError> {
+    if presence.installation_id {
+        return Ok(UninitializedRuntimePath::LegacyMigration);
+    }
+    if presence.fixed_volume_presence != [false; 3]
+        || presence.secret_directory
+        || presence.generations_directory
     {
-        ensure_initialization_containers_absent(tools, installation)?;
-        create_initialization_state(start_tools, installation, &sid)?;
-        return resume_runtime_initialization(tools, start_tools, installation, &sid);
+        return Err(LauncherError::new(
+            "FRESH_INITIALIZATION_TARGET_NOT_CLEAN",
+            "未找到完整 LEGACY installation-id，但检测到旧式或未提交运行对象；Launcher 不会读取、覆盖或混合它们。",
+        ));
+    }
+    Ok(UninitializedRuntimePath::Fresh)
+}
+
+fn create_fresh_initialization_journal(
+    start_tools: &StartTools,
+    installation: &Installation,
+    sid: &str,
+) -> Result<(), LauncherError> {
+    let generation_id = random_runtime_generation_id()?;
+    let mut random_installation_id = Zeroizing::new([0_u8; 32]);
+    fill_random(&mut *random_installation_id).map_err(|_| {
+        LauncherError::new(
+            "INSTALLATION_ID_RANDOM_FAILED",
+            "Windows 安全随机数生成失败，未创建 FRESH 运行代际。",
+        )
+    })?;
+    let installation_id = hex_lower_32(&random_installation_id);
+    random_installation_id.zeroize();
+    let generation = RuntimeGeneration::fresh(
+        generation_id,
+        String::from_utf8(installation_id.to_vec()).map_err(|_| {
+            LauncherError::new(
+                "INSTALLATION_ID_RANDOM_FAILED",
+                "无法编码 FRESH 运行代际 installation-id。",
+            )
+        })?,
+        current_utc_timestamp(SystemTime::now())?,
+    )?;
+    let journal = FreshInitializationJournal::new(generation)?;
+    let encoded = journal.to_bytes()?;
+    write_new_secret_file(
+        &installation.initialization_state,
+        &encoded,
+        "FRESH_INITIALIZATION_JOURNAL_CREATE_FAILED",
+    )?;
+    if let Err(error) = restrict_file_acl(
+        start_tools,
+        installation,
+        &installation.initialization_state,
+        sid,
+    ) {
+        let _ = fs::remove_file(&installation.initialization_state);
+        return Err(error);
+    }
+    let persisted = read_fresh_initialization_journal(&installation.initialization_state)?;
+    if persisted != journal {
+        let _ = fs::remove_file(&installation.initialization_state);
+        return Err(LauncherError::new(
+            "FRESH_INITIALIZATION_JOURNAL_INVALID",
+            "FRESH 首次初始化 journal 回读不一致；未创建运行对象。",
+        ));
+    }
+    Ok(())
+}
+
+fn read_fresh_initialization_journal(
+    path: &Path,
+) -> Result<FreshInitializationJournal, LauncherError> {
+    platform::ensure_regular_file(path).map_err(|_| {
+        LauncherError::new(
+            "FRESH_INITIALIZATION_JOURNAL_INVALID",
+            "FRESH 首次初始化 journal 不是受控普通文件。",
+        )
+    })?;
+    let bytes = read_bounded_file(path, 16 * 1024, "FRESH_INITIALIZATION_JOURNAL_INVALID")?;
+    FreshInitializationJournal::parse(&bytes)
+}
+
+fn resume_fresh_runtime_initialization(
+    tools: &Tools,
+    start_tools: &StartTools,
+    installation: &Installation,
+    sid: &str,
+) -> Result<(), LauncherError> {
+    restrict_file_acl(
+        start_tools,
+        installation,
+        &installation.initialization_state,
+        sid,
+    )?;
+    let journal = read_fresh_initialization_journal(&installation.initialization_state)?;
+    let active = ActiveRuntimeSnapshot::from_generation(
+        &installation.app_data_root,
+        journal.generation.clone(),
+    )?;
+
+    if installation.runtime_generation.exists() {
+        let committed = load_verified_active_runtime_snapshot(start_tools, installation, sid)?;
+        if committed.generation != journal.generation {
+            return Err(LauncherError::new(
+                "FRESH_INITIALIZATION_POINTER_MISMATCH",
+                "FRESH journal 与已存在活动运行代际指针不一致；Launcher 不会覆盖任何指针。",
+            ));
+        }
+        validate_active_runtime_volume_contract(tools, installation, &committed.volume_contract())?;
+        verify_active_runtime_secret_set(start_tools, installation, sid, &committed)?;
+        return remove_fresh_initialization_journal(installation);
     }
 
-    let storage_was_existing = ensure_storage_identity(tools, start_tools, installation, &sid)?;
-    ensure_existing_runtime_secrets(start_tools, installation, &sid, storage_was_existing)?;
-    let installation_id = read_installation_id(&installation.installation_id)?;
-    ensure_legacy_runtime_generation(start_tools, installation, &sid, &installation_id)
+    ensure_initialization_containers_absent_for(tools, installation, &active.volumes)?;
+    ensure_fresh_secret_directory(start_tools, installation, sid, &active.secrets.directory)?;
+    let secret_count = active
+        .secrets
+        .all()
+        .iter()
+        .filter(|path| path.exists())
+        .count();
+    if secret_count != 0 && secret_count != RUNTIME_SECRET_COUNT {
+        return Err(LauncherError::new(
+            "FRESH_INITIALIZATION_SECRET_SET_INCOMPLETE",
+            "FRESH journal 对应的 secret 集合不完整；Launcher 只允许继续同一完整集合，拒绝替换或删除其中任一密钥。",
+        ));
+    }
+    let presence = runtime_volume_presence_for(tools, installation, &active.volumes)?;
+    validate_present_runtime_volume_identity_for(
+        tools,
+        installation,
+        &active.volumes,
+        &active.generation.installation_id,
+        presence,
+    )?;
+    if secret_count == 0 {
+        ensure_runtime_secret_paths(start_tools, installation, sid, &active.secrets, false)?;
+    } else {
+        verify_active_runtime_secret_set(start_tools, installation, sid, &active)?;
+    }
+    if active.secrets.all().iter().any(|path| !path.exists()) {
+        return Err(LauncherError::new(
+            "FRESH_INITIALIZATION_SECRET_SET_INCOMPLETE",
+            "FRESH journal 对应的完整 secret 集合尚未落盘；未创建或补写任何数据卷。",
+        ));
+    }
+    create_missing_runtime_volumes_for(
+        tools,
+        installation,
+        &active.volumes,
+        &active.generation.installation_id,
+        presence,
+    )?;
+    let completed_presence = runtime_volume_presence_for(tools, installation, &active.volumes)?;
+    if completed_presence != [true; 3] {
+        return Err(LauncherError::new(
+            "RUNTIME_VOLUME_SET_INCOMPLETE",
+            "FRESH journal 对应的三个数据卷尚未完整创建；journal 已保留供安全重试。",
+        ));
+    }
+    validate_active_runtime_volume_contract(tools, installation, &active.volume_contract())?;
+    verify_active_runtime_secret_set(start_tools, installation, sid, &active)?;
+    commit_runtime_generation(start_tools, installation, sid, &journal.generation)?;
+    remove_fresh_initialization_journal(installation)
+}
+
+fn ensure_fresh_secret_directory(
+    start_tools: &StartTools,
+    installation: &Installation,
+    sid: &str,
+    secret_directory: &Path,
+) -> Result<(), LauncherError> {
+    let generations_directory = installation.app_data_root.join("generations");
+    let generation_directory = secret_directory.parent().ok_or_else(|| {
+        LauncherError::new(
+            "FRESH_INITIALIZATION_JOURNAL_INVALID",
+            "FRESH 运行代际 secret 目录没有 generation 父目录。",
+        )
+    })?;
+    if generation_directory.parent() != Some(generations_directory.as_path()) {
+        return Err(LauncherError::new(
+            "FRESH_INITIALIZATION_JOURNAL_INVALID",
+            "FRESH 运行代际 secret 路径不在固定 generations 根下。",
+        ));
+    }
+    for path in [
+        generations_directory.as_path(),
+        generation_directory,
+        secret_directory,
+    ] {
+        create_controlled_directory(path)?;
+        platform::ensure_directory(path)?;
+        restrict_directory_acl(start_tools, installation, path, sid)?;
+    }
+    Ok(())
+}
+
+fn remove_fresh_initialization_journal(installation: &Installation) -> Result<(), LauncherError> {
+    fs::remove_file(&installation.initialization_state).map_err(|_| {
+        LauncherError::new(
+            "FRESH_INITIALIZATION_COMMIT_FAILED",
+            "FRESH 运行代际指针已提交，但无法清除受控 journal；服务未启动，可仅继续同一 journal。",
+        )
+    })
 }
 
 fn ensure_existing_runtime_secrets(
@@ -1652,14 +1972,43 @@ fn ensure_existing_runtime_secrets(
     sid: &str,
     storage_was_existing: bool,
 ) -> Result<(), LauncherError> {
-    ensure_postgres_secret(start_tools, installation, sid, storage_was_existing)?;
-    ensure_egress_guard_database_secret(start_tools, installation, sid, storage_was_existing)?;
+    let secrets = RuntimeSecretPaths::from_directory(installation.secret_dir.clone());
+    ensure_runtime_secret_paths(
+        start_tools,
+        installation,
+        sid,
+        &secrets,
+        storage_was_existing,
+    )
+}
+
+fn ensure_runtime_secret_paths(
+    start_tools: &StartTools,
+    installation: &Installation,
+    sid: &str,
+    secrets: &RuntimeSecretPaths,
+    storage_was_existing: bool,
+) -> Result<(), LauncherError> {
+    ensure_postgres_secret_path(
+        start_tools,
+        installation,
+        sid,
+        &secrets.postgres,
+        storage_was_existing,
+    )?;
+    ensure_egress_guard_database_secret_paths(
+        start_tools,
+        installation,
+        sid,
+        secrets,
+        storage_was_existing,
+    )?;
     ensure_runtime_database_secret(
         start_tools,
         installation,
         sid,
         storage_was_existing,
-        &installation.api_database_secret,
+        &secrets.api_database,
         "API_DATABASE_SECRET",
         "API 运行数据库密码",
     )?;
@@ -1668,14 +2017,32 @@ fn ensure_existing_runtime_secrets(
         installation,
         sid,
         storage_was_existing,
-        &installation.worker_database_secret,
+        &secrets.worker_database,
         "WORKER_DATABASE_SECRET",
         "Worker 运行数据库密码",
     )?;
-    validate_database_secret_domain_separation(installation)?;
-    ensure_egress_lease_creation_capability(start_tools, installation, sid, storage_was_existing)?;
-    ensure_auth_secret_bundle(start_tools, installation, sid, storage_was_existing)?;
-    ensure_credential_kek(start_tools, installation, sid, storage_was_existing)
+    validate_database_secret_domain_separation_paths(secrets)?;
+    ensure_egress_lease_creation_capability_paths(
+        start_tools,
+        installation,
+        sid,
+        secrets,
+        storage_was_existing,
+    )?;
+    ensure_auth_secret_bundle_paths(
+        start_tools,
+        installation,
+        sid,
+        secrets,
+        storage_was_existing,
+    )?;
+    ensure_credential_kek_paths(
+        start_tools,
+        installation,
+        sid,
+        secrets,
+        storage_was_existing,
+    )
 }
 
 fn runtime_secret_paths(installation: &Installation) -> [&Path; RUNTIME_SECRET_COUNT] {
@@ -1693,157 +2060,16 @@ fn runtime_secret_paths(installation: &Installation) -> [&Path; RUNTIME_SECRET_C
     ]
 }
 
-fn initialization_recovery_decision(
-    presence: [bool; 3],
-    has_installation_id: bool,
-    secret_count: usize,
-) -> InitializationRecoveryDecision {
-    if secret_count > RUNTIME_SECRET_COUNT {
-        return InitializationRecoveryDecision::Unsafe;
-    }
-    let volume_count = presence.iter().filter(|exists| **exists).count();
-    if volume_count == 0 {
-        return if has_installation_id {
-            InitializationRecoveryDecision::Unsafe
-        } else {
-            InitializationRecoveryDecision::RegenerateSecrets
-        };
-    }
-    if secret_count != RUNTIME_SECRET_COUNT {
-        return InitializationRecoveryDecision::Unsafe;
-    }
-    if has_installation_id {
-        if volume_count == presence.len() {
-            InitializationRecoveryDecision::Finalize
-        } else {
-            InitializationRecoveryDecision::Unsafe
-        }
-    } else {
-        InitializationRecoveryDecision::CompleteVolumes
-    }
-}
-
-fn resume_runtime_initialization(
-    tools: &Tools,
-    start_tools: &StartTools,
-    installation: &Installation,
-    sid: &str,
-) -> Result<(), LauncherError> {
-    platform::ensure_regular_file(&installation.initialization_state)?;
-    restrict_file_acl(
-        start_tools,
-        installation,
-        &installation.initialization_state,
-        sid,
-    )?;
-    let initialization_id = read_installation_id(&installation.initialization_state)?;
-    ensure_initialization_containers_absent(tools, installation)?;
-
-    let presence = runtime_volume_presence(tools, installation)?;
-    validate_present_runtime_volume_identity(tools, installation, &initialization_id, presence)?;
-    let secret_count = runtime_secret_paths(installation)
-        .iter()
-        .filter(|path| path.exists())
-        .count();
-    let decision = initialization_recovery_decision(
-        presence,
-        installation.installation_id.exists(),
-        secret_count,
-    );
-    if decision == InitializationRecoveryDecision::Unsafe {
-        return Err(LauncherError::new(
-            "INITIALIZATION_RECOVERY_UNSAFE",
-            "首次初始化日志与 installation-id、secret 或数据卷状态矛盾；Launcher 不会补写密钥、删除卷或猜测恢复。",
-        ));
-    }
-
-    if decision == InitializationRecoveryDecision::RegenerateSecrets {
-        clear_uncommitted_initialization_secrets(installation)?;
-        ensure_existing_runtime_secrets(start_tools, installation, sid, false)?;
-    } else {
-        ensure_existing_runtime_secrets(start_tools, installation, sid, true)?;
-    }
-    if runtime_secret_paths(installation)
-        .iter()
-        .any(|path| !path.exists())
-    {
-        return Err(LauncherError::new(
-            "INITIALIZATION_SECRET_SET_INCOMPLETE",
-            "首次初始化 secret 集合未完整落盘，未创建或补写任何数据卷。",
-        ));
-    }
-
-    if decision != InitializationRecoveryDecision::Finalize {
-        create_missing_runtime_volumes(tools, installation, &initialization_id, presence)?;
-    }
-    let completed_presence = runtime_volume_presence(tools, installation)?;
-    if completed_presence != [true; 3] {
-        return Err(LauncherError::new(
-            "RUNTIME_VOLUME_SET_INCOMPLETE",
-            "首次初始化尚未完整创建三个数据卷；日志已保留供安全重试，未删除任何卷。",
-        ));
-    }
-    validate_runtime_volume_identity(tools, installation, &initialization_id)?;
-
-    if installation.installation_id.exists() {
-        platform::ensure_regular_file(&installation.installation_id)?;
-        restrict_file_acl(
-            start_tools,
-            installation,
-            &installation.installation_id,
-            sid,
-        )?;
-        let committed = read_installation_id(&installation.installation_id)?;
-        if !constant_time_ascii_equal(&committed, &initialization_id) {
-            return Err(LauncherError::new(
-                "INITIALIZATION_ID_MISMATCH",
-                "首次初始化日志与已提交 installation-id 不一致；Launcher 已安全阻断。",
-            ));
-        }
-    } else {
-        commit_installation_id(start_tools, installation, sid, &initialization_id)?;
-    }
-
-    ensure_legacy_runtime_generation(start_tools, installation, sid, &initialization_id)?;
-
-    fs::remove_file(&installation.initialization_state).map_err(|_| {
-        LauncherError::new(
-            "INITIALIZATION_COMMIT_FAILED",
-            "首次初始化已生成完整 secret 和数据卷，但无法清除受控初始化日志；服务未启动，可安全重试。",
-        )
-    })?;
-    Ok(())
-}
-
-fn clear_uncommitted_initialization_secrets(
-    installation: &Installation,
-) -> Result<(), LauncherError> {
-    for path in runtime_secret_paths(installation) {
-        if !path.exists() {
-            continue;
-        }
-        platform::ensure_regular_file(path)?;
-        fs::remove_file(path).map_err(|_| {
-            LauncherError::new(
-                "INITIALIZATION_SECRET_RESET_FAILED",
-                "无法清理从未被服务使用的未提交初始化 secret；Launcher 已安全阻断。",
-            )
-        })?;
-    }
-    Ok(())
-}
-
-fn ensure_initialization_containers_absent(
+fn ensure_initialization_containers_absent_for(
     tools: &Tools,
     installation: &Installation,
+    volume_names: &RuntimeVolumeNames,
 ) -> Result<(), LauncherError> {
     let mut filters = vec![format!(
         "label=com.docker.compose.project={COMPOSE_PROJECT}"
     )];
     filters.extend(
-        RUNTIME_VOLUMES
-            .iter()
-            .map(|(name, _)| format!("volume={name}")),
+        runtime_volume_name_role_pairs(volume_names).map(|(name, _)| format!("volume={name}")),
     );
     for filter in filters {
         let output = docker(
@@ -1868,22 +2094,18 @@ fn ensure_initialization_containers_absent(
     Ok(())
 }
 
-fn ensure_postgres_secret(
+fn ensure_postgres_secret_path(
     start_tools: &StartTools,
     installation: &Installation,
     sid: &str,
+    postgres_secret: &Path,
     volume_exists: bool,
 ) -> Result<(), LauncherError> {
-    if installation.postgres_secret.exists() {
-        platform::ensure_regular_file(&installation.postgres_secret)?;
-        restrict_file_acl(
-            start_tools,
-            installation,
-            &installation.postgres_secret,
-            sid,
-        )?;
+    if postgres_secret.exists() {
+        platform::ensure_regular_file(postgres_secret)?;
+        restrict_file_acl(start_tools, installation, postgres_secret, sid)?;
         validate_existing_hex_secret(
-            &installation.postgres_secret,
+            postgres_secret,
             "POSTGRES_SECRET_INVALID",
             "PostgreSQL 密码",
         )?;
@@ -1910,7 +2132,7 @@ fn ensure_postgres_secret(
     let mut file = OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&installation.postgres_secret)
+        .open(postgres_secret)
         .map_err(|_| {
             LauncherError::new(
                 "SECRET_CREATE_FAILED",
@@ -1924,41 +2146,37 @@ fn ensure_postgres_secret(
     drop(file);
     secret.zeroize();
     if write_result.is_err() {
-        let _ = fs::remove_file(&installation.postgres_secret);
+        let _ = fs::remove_file(postgres_secret);
         return Err(LauncherError::new(
             "SECRET_WRITE_FAILED",
             "PostgreSQL 密码文件写入失败，已清理不完整文件。",
         ));
     }
-    if let Err(error) = restrict_file_acl(
-        start_tools,
-        installation,
-        &installation.postgres_secret,
-        sid,
-    ) {
-        let _ = fs::remove_file(&installation.postgres_secret);
+    if let Err(error) = restrict_file_acl(start_tools, installation, postgres_secret, sid) {
+        let _ = fs::remove_file(postgres_secret);
         return Err(error);
     }
     Ok(())
 }
 
-fn ensure_egress_guard_database_secret(
+fn ensure_egress_guard_database_secret_paths(
     start_tools: &StartTools,
     installation: &Installation,
     sid: &str,
+    secrets: &RuntimeSecretPaths,
     volume_exists: bool,
 ) -> Result<(), LauncherError> {
-    let existed = installation.egress_guard_database_secret.exists();
+    let existed = secrets.egress_guard_database.exists();
     if existed {
-        platform::ensure_regular_file(&installation.egress_guard_database_secret)?;
+        platform::ensure_regular_file(&secrets.egress_guard_database)?;
         restrict_file_acl(
             start_tools,
             installation,
-            &installation.egress_guard_database_secret,
+            &secrets.egress_guard_database,
             sid,
         )?;
         validate_existing_hex_secret(
-            &installation.egress_guard_database_secret,
+            &secrets.egress_guard_database,
             "EGRESS_GUARD_DATABASE_SECRET_INVALID",
             "出口守卫数据库密码",
         )?;
@@ -1979,7 +2197,7 @@ fn ensure_egress_guard_database_secret(
         let mut secret = hex_lower_32(&random);
         random.zeroize();
         let result = write_new_secret_file(
-            &installation.egress_guard_database_secret,
+            &secrets.egress_guard_database,
             &secret,
             "EGRESS_GUARD_DATABASE_SECRET_CREATE_FAILED",
         );
@@ -1988,27 +2206,27 @@ fn ensure_egress_guard_database_secret(
         if let Err(error) = restrict_file_acl(
             start_tools,
             installation,
-            &installation.egress_guard_database_secret,
+            &secrets.egress_guard_database,
             sid,
         ) {
-            let _ = fs::remove_file(&installation.egress_guard_database_secret);
+            let _ = fs::remove_file(&secrets.egress_guard_database);
             return Err(error);
         }
     }
 
     let postgres = Zeroizing::new(read_bounded_file(
-        &installation.postgres_secret,
+        &secrets.postgres,
         64,
         "DATABASE_SECRET_DOMAIN_SEPARATION_FAILED",
     )?);
     let guard = Zeroizing::new(read_bounded_file(
-        &installation.egress_guard_database_secret,
+        &secrets.egress_guard_database,
         64,
         "DATABASE_SECRET_DOMAIN_SEPARATION_FAILED",
     )?);
     if !independent_database_passwords_valid(&postgres, &guard) {
         if !existed {
-            let _ = fs::remove_file(&installation.egress_guard_database_secret);
+            let _ = fs::remove_file(&secrets.egress_guard_database);
         }
         return Err(LauncherError::new(
             "DATABASE_SECRET_DOMAIN_SEPARATION_FAILED",
@@ -2058,14 +2276,6 @@ fn ensure_runtime_database_secret(
     Ok(())
 }
 
-fn validate_database_secret_domain_separation(
-    installation: &Installation,
-) -> Result<(), LauncherError> {
-    validate_database_secret_domain_separation_paths(&RuntimeSecretPaths::from_directory(
-        installation.secret_dir.clone(),
-    ))
-}
-
 fn validate_database_secret_domain_separation_paths(
     secrets: &RuntimeSecretPaths,
 ) -> Result<(), LauncherError> {
@@ -2103,37 +2313,30 @@ fn validate_database_secret_domain_separation_paths(
     Ok(())
 }
 
-fn ensure_egress_lease_creation_capability(
+fn ensure_egress_lease_creation_capability_paths(
     start_tools: &StartTools,
     installation: &Installation,
     sid: &str,
+    secrets: &RuntimeSecretPaths,
     storage_was_existing: bool,
 ) -> Result<(), LauncherError> {
-    let existed = installation.egress_lease_creation_capability.exists();
+    let existed = secrets.egress_lease_creation_capability.exists();
     ensure_runtime_database_secret(
         start_tools,
         installation,
         sid,
         storage_was_existing,
-        &installation.egress_lease_creation_capability,
+        &secrets.egress_lease_creation_capability,
         "EGRESS_LEASE_CREATION_CAPABILITY",
         "出口租约创建能力密钥",
     )?;
-    if let Err(error) = validate_egress_lease_creation_capability_domain_separation(installation) {
+    if let Err(error) = validate_egress_lease_creation_capability_domain_separation_paths(secrets) {
         if !existed {
-            let _ = fs::remove_file(&installation.egress_lease_creation_capability);
+            let _ = fs::remove_file(&secrets.egress_lease_creation_capability);
         }
         return Err(error);
     }
     Ok(())
-}
-
-fn validate_egress_lease_creation_capability_domain_separation(
-    installation: &Installation,
-) -> Result<(), LauncherError> {
-    validate_egress_lease_creation_capability_domain_separation_paths(
-        &RuntimeSecretPaths::from_directory(installation.secret_dir.clone()),
-    )
 }
 
 fn validate_egress_lease_creation_capability_domain_separation_paths(
@@ -2179,17 +2382,18 @@ fn validate_egress_lease_creation_capability_domain_separation_paths(
     Ok(())
 }
 
-fn ensure_auth_secret_bundle(
+fn ensure_auth_secret_bundle_paths(
     start_tools: &StartTools,
     installation: &Installation,
     sid: &str,
+    secrets: &RuntimeSecretPaths,
     volume_exists: bool,
 ) -> Result<(), LauncherError> {
     let paths = [
-        &installation.jwt_private_key,
-        &installation.jwt_public_key,
-        &installation.refresh_token_hmac_key,
-        &installation.idempotency_hmac_key,
+        &secrets.jwt_private_key,
+        &secrets.jwt_public_key,
+        &secrets.refresh_token_hmac_key,
+        &secrets.idempotency_hmac_key,
     ];
     let existing = paths.iter().filter(|path| path.exists()).count();
     if existing == paths.len() {
@@ -2197,7 +2401,7 @@ fn ensure_auth_secret_bundle(
             platform::ensure_regular_file(path)?;
             restrict_file_acl(start_tools, installation, path, sid)?;
         }
-        return validate_existing_auth_secret_bundle(installation);
+        return validate_existing_auth_secret_bundle_paths(secrets);
     }
     if existing != 0 {
         return Err(LauncherError::new(
@@ -2212,13 +2416,14 @@ fn ensure_auth_secret_bundle(
         ));
     }
 
-    create_auth_secret_bundle(start_tools, installation, sid)
+    create_auth_secret_bundle_paths(start_tools, installation, sid, secrets)
 }
 
-fn create_auth_secret_bundle(
+fn create_auth_secret_bundle_paths(
     start_tools: &StartTools,
     installation: &Installation,
     sid: &str,
+    secrets: &RuntimeSecretPaths,
 ) -> Result<(), LauncherError> {
     let mut seed = [0_u8; 32];
     fill_random(&mut seed).map_err(|_| {
@@ -2273,52 +2478,47 @@ fn create_auth_secret_bundle(
     let mut created = Vec::with_capacity(4);
     let result = (|| {
         write_new_secret_file(
-            &installation.jwt_private_key,
+            &secrets.jwt_private_key,
             private_pem.as_bytes(),
             "AUTH_SECRET_CREATE_FAILED",
         )?;
-        created.push(installation.jwt_private_key.clone());
-        restrict_file_acl(
-            start_tools,
-            installation,
-            &installation.jwt_private_key,
-            sid,
-        )?;
+        created.push(secrets.jwt_private_key.clone());
+        restrict_file_acl(start_tools, installation, &secrets.jwt_private_key, sid)?;
 
         write_new_secret_file(
-            &installation.jwt_public_key,
+            &secrets.jwt_public_key,
             public_pem.as_bytes(),
             "AUTH_SECRET_CREATE_FAILED",
         )?;
-        created.push(installation.jwt_public_key.clone());
-        restrict_file_acl(start_tools, installation, &installation.jwt_public_key, sid)?;
+        created.push(secrets.jwt_public_key.clone());
+        restrict_file_acl(start_tools, installation, &secrets.jwt_public_key, sid)?;
 
         write_new_secret_file(
-            &installation.refresh_token_hmac_key,
+            &secrets.refresh_token_hmac_key,
             &refresh_hmac_key,
             "AUTH_SECRET_CREATE_FAILED",
         )?;
-        created.push(installation.refresh_token_hmac_key.clone());
+        created.push(secrets.refresh_token_hmac_key.clone());
         restrict_file_acl(
             start_tools,
             installation,
-            &installation.refresh_token_hmac_key,
+            &secrets.refresh_token_hmac_key,
             sid,
         )?;
 
         write_new_secret_file(
-            &installation.idempotency_hmac_key,
+            &secrets.idempotency_hmac_key,
             &idempotency_hmac_key,
             "AUTH_SECRET_CREATE_FAILED",
         )?;
-        created.push(installation.idempotency_hmac_key.clone());
+        created.push(secrets.idempotency_hmac_key.clone());
         restrict_file_acl(
             start_tools,
             installation,
-            &installation.idempotency_hmac_key,
+            &secrets.idempotency_hmac_key,
             sid,
         )?;
-        validate_existing_auth_secret_bundle(installation)
+        validate_existing_auth_secret_bundle_paths(secrets)
     })();
     refresh_hmac_key.zeroize();
     idempotency_hmac_key.zeroize();
@@ -2464,14 +2664,43 @@ fn ensure_legacy_runtime_generation(
         ));
     }
     if installation.runtime_generation.exists() {
-        platform::ensure_regular_file(&installation.runtime_generation)?;
-        let generation = read_runtime_generation(&installation.runtime_generation)?;
-        if generation.source != "LEGACY"
-            || !constant_time_ascii_equal(&generation.installation_id, installation_id)
+        let existing = read_runtime_generation(&installation.runtime_generation)?;
+        if existing.source != "LEGACY"
+            || !constant_time_ascii_equal(&existing.installation_id, installation_id)
         {
             return Err(LauncherError::new(
                 "RUNTIME_GENERATION_IDENTITY_MISMATCH",
                 "活动运行代际不是当前完整旧式对象集合；Launcher 不会拼接或覆盖它。",
+            ));
+        }
+        return commit_runtime_generation(start_tools, installation, sid, &existing);
+    }
+    let generation_id = random_runtime_generation_id()?;
+    let generation = RuntimeGeneration::legacy(
+        generation_id,
+        installation_id.to_owned(),
+        current_utc_timestamp(SystemTime::now())?,
+    )?;
+    commit_runtime_generation(start_tools, installation, sid, &generation)
+}
+
+// Uses only create-new pending files and MoveFileExW without replacement.  A
+// FRESH journal may safely retry this exact generation if interruption happens
+// after the pending file exists; no path ever substitutes a new current value.
+fn commit_runtime_generation(
+    start_tools: &StartTools,
+    installation: &Installation,
+    sid: &str,
+    generation: &RuntimeGeneration,
+) -> Result<(), LauncherError> {
+    generation.validate()?;
+    if installation.runtime_generation.exists() {
+        platform::ensure_regular_file(&installation.runtime_generation)?;
+        let existing = read_runtime_generation(&installation.runtime_generation)?;
+        if existing != *generation {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_IDENTITY_MISMATCH",
+                "活动运行代际不是 pending journal 精确绑定的对象集合；Launcher 不会覆盖它。",
             ));
         }
         restrict_file_acl(
@@ -2480,8 +2709,7 @@ fn ensure_legacy_runtime_generation(
             &installation.runtime_generation,
             sid,
         )?;
-        let rechecked = read_runtime_generation(&installation.runtime_generation)?;
-        if rechecked != generation {
+        if read_runtime_generation(&installation.runtime_generation)? != existing {
             return Err(LauncherError::new(
                 "RUNTIME_GENERATION_CHANGED_DURING_CHECK",
                 "活动运行代际在 ACL 核验期间发生变化；Launcher 已安全阻断。",
@@ -2490,45 +2718,45 @@ fn ensure_legacy_runtime_generation(
         return Ok(());
     }
 
-    let generation_id = random_runtime_generation_id()?;
-    let generation = RuntimeGeneration::legacy(
-        generation_id.clone(),
-        installation_id.to_owned(),
-        current_utc_timestamp(SystemTime::now())?,
-    )?;
     let encoded = generation.to_bytes()?;
-    let pending = installation
-        .app_data_root
-        .join(format!(".runtime-generation-{generation_id}.pending"));
-    write_new_secret_file(
-        &pending,
-        &encoded,
-        "RUNTIME_GENERATION_PENDING_CREATE_FAILED",
-    )?;
-
-    let prepared = (|| {
+    let pending = installation.app_data_root.join(format!(
+        ".runtime-generation-{}.pending",
+        generation.generation_id
+    ));
+    if pending.exists() {
+        platform::ensure_regular_file(&pending)?;
+        restrict_file_acl(start_tools, installation, &pending, sid)?;
+        if read_runtime_generation(&pending)? != *generation {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_PENDING_INVALID",
+                "运行代际 pending 文件与同一 journal 的对象集合不一致；Launcher 已安全阻断。",
+            ));
+        }
+    } else {
+        write_new_secret_file(
+            &pending,
+            &encoded,
+            "RUNTIME_GENERATION_PENDING_CREATE_FAILED",
+        )?;
         restrict_file_acl(start_tools, installation, &pending, sid)?;
         let parsed = read_runtime_generation(&pending)?;
-        if parsed != generation {
+        if parsed != *generation {
             return Err(LauncherError::new(
                 "RUNTIME_GENERATION_PENDING_INVALID",
                 "运行代际 pending 文件回读不一致；未提交活动指针。",
             ));
         }
-        platform::move_new_write_through(&pending, &installation.runtime_generation)?;
-        let committed = read_runtime_generation(&installation.runtime_generation)?;
-        if committed != generation {
-            return Err(LauncherError::new(
-                "RUNTIME_GENERATION_COMMIT_INVALID",
-                "活动运行代际指针提交后回读不一致；服务未启动。",
-            ));
-        }
-        Ok(())
-    })();
-    if prepared.is_err() && pending.exists() {
-        let _ = fs::remove_file(&pending);
     }
-    prepared
+
+    platform::move_new_write_through(&pending, &installation.runtime_generation)?;
+    let committed = read_runtime_generation(&installation.runtime_generation)?;
+    if committed != *generation {
+        return Err(LauncherError::new(
+            "RUNTIME_GENERATION_COMMIT_INVALID",
+            "活动运行代际指针提交后回读不一致；服务未启动。",
+        ));
+    }
+    Ok(())
 }
 
 fn random_runtime_generation_id() -> Result<String, LauncherError> {
@@ -2591,12 +2819,6 @@ fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
     (year, month, day)
 }
 
-fn validate_existing_auth_secret_bundle(installation: &Installation) -> Result<(), LauncherError> {
-    validate_existing_auth_secret_bundle_paths(&RuntimeSecretPaths::from_directory(
-        installation.secret_dir.clone(),
-    ))
-}
-
 fn validate_existing_auth_secret_bundle_paths(
     secrets: &RuntimeSecretPaths,
 ) -> Result<(), LauncherError> {
@@ -2639,16 +2861,17 @@ fn validate_existing_auth_secret_bundle_paths(
     })
 }
 
-fn ensure_credential_kek(
+fn ensure_credential_kek_paths(
     start_tools: &StartTools,
     installation: &Installation,
     sid: &str,
+    secrets: &RuntimeSecretPaths,
     volume_exists: bool,
 ) -> Result<(), LauncherError> {
-    if installation.credential_kek.exists() {
-        platform::ensure_regular_file(&installation.credential_kek)?;
-        restrict_file_acl(start_tools, installation, &installation.credential_kek, sid)?;
-        return validate_existing_credential_kek(installation);
+    if secrets.credential_kek.exists() {
+        platform::ensure_regular_file(&secrets.credential_kek)?;
+        restrict_file_acl(start_tools, installation, &secrets.credential_kek, sid)?;
+        return validate_existing_credential_kek_paths(secrets);
     }
     if volume_exists {
         return Err(LauncherError::new(
@@ -2665,12 +2888,12 @@ fn ensure_credential_kek(
         )
     })?;
     let refresh_hmac = Zeroizing::new(read_bounded_file(
-        &installation.refresh_token_hmac_key,
+        &secrets.refresh_token_hmac_key,
         32,
         "CREDENTIAL_KEK_INVALID",
     )?);
     let idempotency_hmac = Zeroizing::new(read_bounded_file(
-        &installation.idempotency_hmac_key,
+        &secrets.idempotency_hmac_key,
         32,
         "CREDENTIAL_KEK_INVALID",
     )?);
@@ -2682,24 +2905,18 @@ fn ensure_credential_kek(
     }
     let result = (|| {
         write_new_secret_file(
-            &installation.credential_kek,
+            &secrets.credential_kek,
             &*credential_kek,
             "CREDENTIAL_KEK_CREATE_FAILED",
         )?;
-        restrict_file_acl(start_tools, installation, &installation.credential_kek, sid)?;
-        validate_existing_credential_kek(installation)
+        restrict_file_acl(start_tools, installation, &secrets.credential_kek, sid)?;
+        validate_existing_credential_kek_paths(secrets)
     })();
     if let Err(error) = result {
-        let _ = fs::remove_file(&installation.credential_kek);
+        let _ = fs::remove_file(&secrets.credential_kek);
         return Err(error);
     }
     Ok(())
-}
-
-fn validate_existing_credential_kek(installation: &Installation) -> Result<(), LauncherError> {
-    validate_existing_credential_kek_paths(&RuntimeSecretPaths::from_directory(
-        installation.secret_dir.clone(),
-    ))
 }
 
 fn validate_existing_credential_kek_paths(
@@ -2917,8 +3134,19 @@ fn runtime_volume_presence(
     tools: &Tools,
     installation: &Installation,
 ) -> Result<[bool; 3], LauncherError> {
+    runtime_volume_presence_for(tools, installation, &legacy_runtime_volume_names())
+}
+
+fn runtime_volume_presence_for(
+    tools: &Tools,
+    installation: &Installation,
+    names: &RuntimeVolumeNames,
+) -> Result<[bool; 3], LauncherError> {
     let mut presence = [false; 3];
-    for (index, (name, _)) in RUNTIME_VOLUMES.iter().enumerate() {
+    for (index, (name, _)) in runtime_volume_name_role_pairs(names)
+        .into_iter()
+        .enumerate()
+    {
         let filter = format!("name={name}");
         let output = docker(
             tools,
@@ -2934,78 +3162,25 @@ fn runtime_volume_presence(
         }
         presence[index] = normalize_text(&output.stdout)
             .lines()
-            .any(|line| line.trim() == *name);
+            .any(|line| line.trim() == name);
     }
     Ok(presence)
 }
 
-fn create_initialization_state(
-    start_tools: &StartTools,
-    installation: &Installation,
-    sid: &str,
-) -> Result<(), LauncherError> {
-    let mut random = Zeroizing::new([0_u8; 32]);
-    fill_random(&mut *random).map_err(|_| {
-        LauncherError::new(
-            "INSTALLATION_ID_RANDOM_FAILED",
-            "Windows 安全随机数生成失败，未创建首次初始化日志。",
-        )
-    })?;
-    let mut installation_id = Zeroizing::new(hex_lower_32(&random));
-    write_new_secret_file(
-        &installation.initialization_state,
-        &installation_id[..],
-        "INITIALIZATION_STATE_CREATE_FAILED",
-    )?;
-    if let Err(error) = restrict_file_acl(
-        start_tools,
-        installation,
-        &installation.initialization_state,
-        sid,
-    ) {
-        installation_id.zeroize();
-        let _ = fs::remove_file(&installation.initialization_state);
-        return Err(error);
+fn legacy_runtime_volume_names() -> RuntimeVolumeNames {
+    RuntimeVolumeNames {
+        postgres: RUNTIME_VOLUMES[0].0.to_owned(),
+        logs: RUNTIME_VOLUMES[1].0.to_owned(),
+        workspace: RUNTIME_VOLUMES[2].0.to_owned(),
     }
-    read_installation_id(&installation.initialization_state)?;
-    Ok(())
 }
 
-fn commit_installation_id(
-    start_tools: &StartTools,
-    installation: &Installation,
-    sid: &str,
-    initialization_id: &str,
-) -> Result<(), LauncherError> {
-    if !is_secret_bytes(initialization_id.as_bytes()) {
-        return Err(LauncherError::new(
-            "INSTALLATION_ID_INVALID",
-            "首次初始化日志中的 installation-id 格式无效。",
-        ));
-    }
-    write_new_secret_file(
-        &installation.installation_id,
-        initialization_id.as_bytes(),
-        "INSTALLATION_ID_CREATE_FAILED",
-    )?;
-    if let Err(error) = restrict_file_acl(
-        start_tools,
-        installation,
-        &installation.installation_id,
-        sid,
-    ) {
-        let _ = fs::remove_file(&installation.installation_id);
-        return Err(error);
-    }
-    let committed = read_installation_id(&installation.installation_id)?;
-    if !constant_time_ascii_equal(&committed, initialization_id) {
-        let _ = fs::remove_file(&installation.installation_id);
-        return Err(LauncherError::new(
-            "INSTALLATION_ID_COMMIT_FAILED",
-            "提交的 installation-id 与首次初始化日志不一致；服务未启动。",
-        ));
-    }
-    Ok(())
+fn runtime_volume_name_role_pairs(names: &RuntimeVolumeNames) -> [(&str, &'static str); 3] {
+    [
+        (names.postgres.as_str(), "postgres-data"),
+        (names.logs.as_str(), "log-data"),
+        (names.workspace.as_str(), "workspace-data"),
+    ]
 }
 
 fn read_installation_id(path: &Path) -> Result<String, LauncherError> {
@@ -3023,13 +3198,17 @@ fn read_installation_id(path: &Path) -> Result<String, LauncherError> {
     Ok(value)
 }
 
-fn create_missing_runtime_volumes(
+fn create_missing_runtime_volumes_for(
     tools: &Tools,
     installation: &Installation,
+    names: &RuntimeVolumeNames,
     installation_id: &str,
     presence: [bool; 3],
 ) -> Result<(), LauncherError> {
-    for ((name, role), exists) in RUNTIME_VOLUMES.iter().zip(presence) {
+    for ((name, role), exists) in runtime_volume_name_role_pairs(names)
+        .into_iter()
+        .zip(presence)
+    {
         if exists {
             continue;
         }
@@ -3045,11 +3224,11 @@ fn create_missing_runtime_volumes(
                 &identity_label,
                 "--label",
                 &role_label,
-                *name,
+                name,
             ],
             PROCESS_TIMEOUT,
         )?;
-        if !output.status.success() || normalize_text(&output.stdout).trim() != *name {
+        if !output.status.success() || normalize_text(&output.stdout).trim() != name {
             return Err(LauncherError::new(
                 "RUNTIME_VOLUME_CREATE_FAILED",
                 "无法以受控 installation-id 创建完整运行数据卷；初始化日志已保留供安全重试，Launcher 不会删除已有卷。",
@@ -3064,7 +3243,13 @@ fn validate_runtime_volume_identity(
     installation: &Installation,
     installation_id: &str,
 ) -> Result<(), LauncherError> {
-    validate_present_runtime_volume_identity(tools, installation, installation_id, [true; 3])
+    validate_present_runtime_volume_identity_for(
+        tools,
+        installation,
+        &legacy_runtime_volume_names(),
+        installation_id,
+        [true; 3],
+    )
 }
 
 fn active_runtime_volume_contract(
@@ -3084,11 +3269,7 @@ fn validate_active_runtime_volume_contract(
             "installation-id 格式无效。",
         ));
     }
-    for (name, role) in [
-        (contract.names.postgres.as_str(), "postgres-data"),
-        (contract.names.logs.as_str(), "log-data"),
-        (contract.names.workspace.as_str(), "workspace-data"),
-    ] {
+    for (name, role) in runtime_volume_name_role_pairs(&contract.names) {
         let output = docker(
             tools,
             installation,
@@ -3304,9 +3485,10 @@ fn docker_storage_probe_arguments(
     Ok(arguments)
 }
 
-fn validate_present_runtime_volume_identity(
+fn validate_present_runtime_volume_identity_for(
     tools: &Tools,
     installation: &Installation,
+    names: &RuntimeVolumeNames,
     installation_id: &str,
     presence: [bool; 3],
 ) -> Result<(), LauncherError> {
@@ -3316,7 +3498,10 @@ fn validate_present_runtime_volume_identity(
             "installation-id 格式无效。",
         ));
     }
-    for ((name, role), exists) in RUNTIME_VOLUMES.iter().zip(presence) {
+    for ((name, role), exists) in runtime_volume_name_role_pairs(names)
+        .into_iter()
+        .zip(presence)
+    {
         if !exists {
             continue;
         }
@@ -3328,7 +3513,7 @@ fn validate_present_runtime_volume_identity(
                 "inspect",
                 "--format",
                 RUNTIME_VOLUME_INSPECT_FORMAT,
-                *name,
+                name,
             ],
             PROCESS_TIMEOUT,
         )?;
@@ -9446,37 +9631,158 @@ mod tests {
     }
 
     #[test]
-    fn incomplete_initialization_recovers_only_before_any_runtime_use() {
-        assert_eq!(RUNTIME_SECRET_COUNT, 10);
+    fn fresh_initialization_journal_round_trips_one_immutable_generated_object_set() {
+        let generation = RuntimeGeneration::fresh(
+            "a".repeat(32),
+            "b".repeat(64),
+            "2026-08-02T03:30:00Z".to_owned(),
+        )
+        .unwrap();
+        let journal = FreshInitializationJournal::new(generation.clone()).unwrap();
+        let parsed = FreshInitializationJournal::parse(&journal.to_bytes().unwrap()).unwrap();
+
+        assert_eq!(parsed, journal);
+        assert_eq!(parsed.generation, generation);
+        assert_eq!(parsed.state, "PENDING");
+        assert_eq!(parsed.generation.source, "FRESH");
+    }
+
+    #[test]
+    fn fresh_initialization_journal_rejects_non_fresh_or_mutated_contracts() {
+        let legacy = RuntimeGeneration::legacy(
+            "a".repeat(32),
+            "b".repeat(64),
+            "2026-08-02T03:30:00Z".to_owned(),
+        )
+        .unwrap();
         assert_eq!(
-            initialization_recovery_decision([false; 3], false, 0),
-            InitializationRecoveryDecision::RegenerateSecrets,
+            FreshInitializationJournal::new(legacy).unwrap_err().code(),
+            "FRESH_INITIALIZATION_JOURNAL_INVALID"
         );
+
+        let restore = RuntimeGeneration::restore(
+            "a".repeat(32),
+            "b".repeat(64),
+            "c".repeat(32),
+            "2026-08-02T03:30:00Z".to_owned(),
+        )
+        .unwrap();
         assert_eq!(
-            initialization_recovery_decision([false; 3], false, RUNTIME_SECRET_COUNT),
-            InitializationRecoveryDecision::RegenerateSecrets,
+            FreshInitializationJournal::new(restore).unwrap_err().code(),
+            "FRESH_INITIALIZATION_JOURNAL_INVALID"
         );
+
+        let fresh = FreshInitializationJournal::new(
+            RuntimeGeneration::fresh(
+                "a".repeat(32),
+                "b".repeat(64),
+                "2026-08-02T03:30:00Z".to_owned(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut invalid: serde_json::Value =
+            serde_json::from_slice(&fresh.to_bytes().unwrap()).unwrap();
+        invalid["state"] = serde_json::Value::String("COMMITTED".to_owned());
         assert_eq!(
-            initialization_recovery_decision([true, false, false], false, RUNTIME_SECRET_COUNT,),
-            InitializationRecoveryDecision::CompleteVolumes,
+            FreshInitializationJournal::parse(&serde_json::to_vec(&invalid).unwrap())
+                .unwrap_err()
+                .code(),
+            "FRESH_INITIALIZATION_JOURNAL_INVALID"
         );
+        invalid["state"] = serde_json::Value::String("PENDING".to_owned());
+        invalid["unexpected"] = serde_json::Value::Bool(true);
         assert_eq!(
-            initialization_recovery_decision([true; 3], false, RUNTIME_SECRET_COUNT),
-            InitializationRecoveryDecision::CompleteVolumes,
+            FreshInitializationJournal::parse(&serde_json::to_vec(&invalid).unwrap())
+                .unwrap_err()
+                .code(),
+            "FRESH_INITIALIZATION_JOURNAL_INVALID"
         );
+    }
+
+    #[test]
+    fn fresh_path_is_selected_only_when_no_legacy_or_generated_object_exists() {
+        let clean = LegacyRootObjectPresence {
+            installation_id: false,
+            secret_directory: false,
+            fixed_volume_presence: [false; 3],
+            generations_directory: false,
+        };
         assert_eq!(
-            initialization_recovery_decision([true; 3], true, RUNTIME_SECRET_COUNT),
-            InitializationRecoveryDecision::Finalize,
+            uninitialized_runtime_path_for_legacy_presence(clean).unwrap(),
+            UninitializedRuntimePath::Fresh
         );
-        for unsafe_state in [
-            initialization_recovery_decision([false; 3], true, RUNTIME_SECRET_COUNT),
-            initialization_recovery_decision([true, false, false], false, RUNTIME_SECRET_COUNT - 1),
-            initialization_recovery_decision([true, false, false], true, RUNTIME_SECRET_COUNT),
-            initialization_recovery_decision([true; 3], true, RUNTIME_SECRET_COUNT - 1),
-            initialization_recovery_decision([false; 3], false, RUNTIME_SECRET_COUNT + 1),
+
+        let legacy = LegacyRootObjectPresence {
+            installation_id: true,
+            ..clean
+        };
+        assert_eq!(
+            uninitialized_runtime_path_for_legacy_presence(legacy).unwrap(),
+            UninitializedRuntimePath::LegacyMigration
+        );
+        for ambiguous in [
+            LegacyRootObjectPresence {
+                secret_directory: true,
+                ..clean
+            },
+            LegacyRootObjectPresence {
+                fixed_volume_presence: [true, false, false],
+                ..clean
+            },
+            LegacyRootObjectPresence {
+                generations_directory: true,
+                ..clean
+            },
         ] {
-            assert_eq!(unsafe_state, InitializationRecoveryDecision::Unsafe);
+            assert_eq!(
+                uninitialized_runtime_path_for_legacy_presence(ambiguous)
+                    .unwrap_err()
+                    .code(),
+                "FRESH_INITIALIZATION_TARGET_NOT_CLEAN"
+            );
         }
+    }
+
+    #[test]
+    fn fresh_journal_derives_no_root_identity_secret_or_fixed_volume_reference() {
+        let generation_id = "a".repeat(32);
+        let generation = RuntimeGeneration::fresh(
+            generation_id.clone(),
+            "b".repeat(64),
+            "2026-08-02T03:30:00Z".to_owned(),
+        )
+        .unwrap();
+        let journal = FreshInitializationJournal::new(generation).unwrap();
+        let root = Path::new("/datax-app");
+        let snapshot =
+            ActiveRuntimeSnapshot::from_generation(root, journal.generation.clone()).unwrap();
+        let values = snapshot.compose_environment(root);
+
+        assert_ne!(snapshot.secrets.directory, root.join("secrets"));
+        assert_ne!(snapshot.volumes, legacy_runtime_volume_names());
+        assert_eq!(
+            snapshot.volumes.postgres,
+            format!("des-postgres-{generation_id}")
+        );
+        assert_eq!(snapshot.volumes.logs, format!("des-log-{generation_id}"));
+        assert_eq!(
+            snapshot.volumes.workspace,
+            format!("des-workspace-{generation_id}")
+        );
+        assert!(!values.iter().any(|(_, value)| {
+            value == &OsString::from(root.join("secrets"))
+                || value == &OsString::from("des-postgres-data")
+                || value == &OsString::from("des-log-data")
+                || value == &OsString::from("des-workspace-data")
+        }));
+        assert_eq!(
+            runtime_volume_name_role_pairs(&snapshot.volumes)
+                .into_iter()
+                .map(|(_, role)| role)
+                .collect::<Vec<_>>(),
+            vec!["postgres-data", "log-data", "workspace-data"]
+        );
     }
 
     #[test]

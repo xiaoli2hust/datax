@@ -29,17 +29,21 @@
    实际证书 SHA-256 完全相同。五个镜像只能使用固定允许仓库的
    `repository@sha256:<64 lowercase hex>`。
 6. 首次初始化先以 `create_new` 写入 ACL 受控的
-   `%LOCALAPPDATA%\DataXEnterpriseStudio\initialization-incomplete`，其中保存本次
-   32-byte OS CSPRNG 安装实例标识；在服务或 PostgreSQL 启动前，先完整生成并验证全部
-   secret，再以同一标识创建并核验 `des-postgres-data`、`des-log-data`、
-   `des-workspace-data` 三个卷，最后提交 `installation-id` 并清除初始化日志。中途崩溃
-   只在日志仍有效、当前没有任何产品/数据卷容器、已存在卷标签与日志一致，而且卷一旦
-   出现时全部 secret 已完整的条件下补齐；只存在未提交 secret 且零卷时可整组重新生成。
-   任何矛盾都 fail closed，绝不自动删除卷、容器或可能已有数据。正常启动时三个卷必须
-   同时存在并与当前安装实例/各自 volume-role 匹配；Docker 被重置、卷部分丢失、标签
-   不符或已有卷却缺失实例标识时不会自动创建空库覆盖旧状态。
-   Launcher 在 `%LOCALAPPDATA%\DataXEnterpriseStudio\secrets` 中以 `create_new`
-   创建彼此独立的强随机 PostgreSQL 管理密码、出口守卫只读数据库密码、API 数据库
+   `%LOCALAPPDATA%\DataXEnterpriseStudio\initialization-incomplete` FRESH journal。journal
+   固定一个随机 `RuntimeGeneration`：generation id、installation identity、
+   `generations/<generation-id>/secrets` 和三个随机 `des-*-<generation-id>` 卷名。
+   服务或 PostgreSQL 启动前，Launcher 只从此 journal 派生并完整生成/验证全部 secret，
+   再以同一 identity 创建、核验三个随机卷；最后以不覆盖、write-through rename 提交
+   `runtime-generation.json`，再清除 journal。FRESH 不读写 root `installation-id`、root
+   `secrets/` 或固定 LEGACY 卷；活动 pointer 是启动、Compose 和后续运行时唯一的当前来源。
+   断电/崩溃只可继续相同 journal：不得替换 identity/secret/卷名，半套 secret、卷标签不符、
+   pointer 不一致或旧式残留都 fail closed，绝不自动删除卷、容器或可能已有数据。journal
+   仅为 Launcher 内部状态，未新增公开 API/JSON Schema；活动 pointer 仍由
+   `runtime-generation.v1.schema.json` 约束。
+   已有候选安装只有在 root `installation-id`、root `secrets/` 和固定三卷全部通过身份检查时，
+   才能一次性迁移成 `LEGACY` pointer；不会复制、移动或重命名旧对象。
+   Launcher 在 FRESH 的 generation secret 目录（LEGACY 迁移时才为 root `secrets/`）中以
+   `create_new` 创建彼此独立的强随机 PostgreSQL 管理密码、出口守卫只读数据库密码、API 数据库
    角色密码与 Worker 数据库角色密码、
    Ed25519 PKCS#8/SPKI JWT 密钥对、32-byte
    refresh-token HMAC key、独立的 32-byte idempotency HMAC key，以及独立的 32-byte

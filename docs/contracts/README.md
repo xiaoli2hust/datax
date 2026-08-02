@@ -75,6 +75,13 @@
   `phase-a-qualification-grant.v1.schema.json`：ADR-0011 的不可变 P、短期 QH 与受保护私有
   Phase-A 单 pair 授权记录。后者固定 P/harness/QH/Reader-Writer 的精确绑定和生命周期形状，
   但不是普通 API、Worker、Compose 或用户可提交的契约，更不是 E3/E4 或发布结论。
+- `datax_studio.qualification.private_harness_loader`（J0c-1）是**内部 E1 实现，不是新 JSON
+  Schema、公开 API 或普通配置格式**。它仅接受未来受保护基础设施显式注入的 trusted private
+  filesystem root、hash-pinned P/QH 文件、独立 P root 与固定 harness identity；返回不含 raw QH/raw
+nonce 的不可序列化事实，且不消费 nonce、不写 grant、不创建 Execution 或启动 DataX。它没有
+Settings/env/API/Worker/标准 Compose/Launcher 接线，不能当作可信 harness、private source/override 或
+`E3/E4`/发布证据；不具备安全 descriptor-open primitive 的宿主固定失败关闭，未提供 Windows
+harness source provisioning。
 - `phase-a-execution-authorization.v1.schema.json`：J0b.1 的**E1 私有 PEA read-record**
   形状，精确对应 0022 consumer `des_read_active_phase_a_execution_authorization` 的返回列。
   0022 的 immutable PEA 对 `grant_id` 和 `execution_id` 各自唯一，绑定一个既有 PAG 到一个精确
@@ -195,9 +202,11 @@ BLOCKED/release_approved=false；不得用新增可选字段、宽松 schema、�
 截至 2026-08-01，Datasource、Job、Execution、日志与恢复处置契约已有候选代码消费方，
 但真实四方向 DataX（E3）和 Windows 11 安装链路（E4）仍为 `NOT_RUN/BLOCKED`。
 系统备份契约已有 DATA/SECRETS 分包导出，以及双包认证、配对、受认证 journal 和空目录
-staging 的 E1 候选实现；`LEGACY` 指针原子提交与 Compose 消费也已有候选实现。新空 PostgreSQL volume、`pg_restore`、证据重算、`RESTORE` 原子还原提交
-与升级路径仍未实现并保持失败关闭，不能把导出包、journal 或 staging 文件存在当作恢复
-验收。
+staging 的 E1 候选实现；`LEGACY` 指针原子提交与 Compose 消费也已有候选实现。FRESH 首次
+初始化的随机 generation/secret/三卷/无覆盖 pointer 源码切片已接入，但其 journal 是 Launcher
+内部状态，未新增公开 Schema，且没有真实 Windows Docker/E4 证据。新空 PostgreSQL volume、
+`pg_restore`、证据重算、`RESTORE` 原子还原提交与升级路径仍未实现并保持失败关闭，不能把导出包、
+journal、pointer 或 staging 文件存在当作恢复验收。
 
 实现阶段 CI 必须完成：
 

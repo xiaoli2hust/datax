@@ -11,9 +11,11 @@ RecoveryGate 与这里的系统灾难恢复不是同一概念。
 两把恢复秘密共同认证的 restore journal；该能力只达到 E1
 `IMPLEMENTED_STAGING_ONLY`。ADR-0008、运行代际机器契约、严格 Rust 解析/摘要/对象集合
 校验、旧式完整集合到 `LEGACY` 活动指针的不覆盖原子提交，以及 Compose 从单一指针整组
-注入 secret/installation-id/三个 volume name 已落地为工程候选。`FRESH/RESTORE` 的严格
-构造器与活动快照也已用于 Compose 卷归属和本机备份的卷/secret/helper identity；这不等于
-FRESH 初始化或 RESTORE 提交已实现。新空
+注入 secret/installation-id/三个 volume name 已落地为工程候选。FRESH 首次初始化的源码/E1
+切片也已使用严格内部 journal 创建随机 `RuntimeGeneration`、generation secret 目录和三个
+随机卷，并以无覆盖 pointer 提交；该 journal 不是本契约的公开交换对象。`RESTORE` 的严格
+构造器与活动快照也已用于 Compose 卷归属和本机备份的卷/secret/helper identity；这仍不等于
+RESTORE 提交或可恢复性已实现。新空
 PostgreSQL named volume、`pg_restore`、数据库/审计链证据重算、日志与 secrets 的原子
 提交、签名安装包集成、实际 Docker named volume 演练、异机 Windows 11 x64 恢复与
 RPO/RTO 仍为 `NOT_RUN/BLOCKED`。
@@ -224,15 +226,19 @@ rename/compare-and-swap，因此 V1 restore 只允许无旧 installation-id、�
 pointer，再冻结一个活动快照；config、preflight、停应用、`pg_dump`、停 PostgreSQL、包导出
 和 resume 的 Compose 环境/容器归属均显式使用该快照的 installation-id、三卷和 secret 目录，
 并在 Compose 命令前后重读 pointer 作精确等值复核。pointer 变化时不得用新身份继续或 resume；
-DATA/SECRETS helper identity 也包含 generation ID/状态摘要。当前首次初始化或既有工程候选
-安装**仍只**在固定卷、固定 secret 集和旧 installation-id 全部通过原有身份检查后创建
-`LEGACY` 指针。pending 文件先刷盘并限制 ACL，再以同目录、`MOVEFILE_WRITE_THROUGH` 且不含
-replace flag 的 rename 提交；目标已存在、链接、摘要篡改、身份或对象集合不一致时均拒绝覆盖。
-所有 Compose 子进程先移除宿主同名环境变量，再从已验证指针整组注入五个值。
+DATA/SECRETS helper identity 也包含 generation ID/状态摘要。当前 FRESH 初始化先以 ACL 受控的
+内部 journal 固定一个随机 generation、installation identity、secret 目录和三卷名；进入
+FRESH 后不得读取/写 root `installation-id`、root secret 或固定 LEGACY 卷。完整 FRESH secret
+集合与同代际卷标签复核后，pending pointer 先刷盘并限制 ACL，再以同目录、
+`MOVEFILE_WRITE_THROUGH` 且不含 replace flag 的 rename 提交；目标已存在、链接、摘要篡改、
+journal/identity/对象集合不一致时均拒绝覆盖。中断只能继续同一 journal，半套 secret 不会被
+删除或替换。既有工程候选安装只有固定卷、固定 secret 集和旧 installation-id 全部通过原有
+身份检查后才可一次性创建 `LEGACY` pointer；所有 Compose 子进程先移除宿主同名环境变量，再
+从已验证 pointer 整组注入五个值。内部 FRESH journal 不新增公开 Schema，活动 pointer 仍由
+`runtime-generation.v1.schema.json` 定义。
 
-FRESH pending journal、新随机 volume 的创建、代际 secret 目录的生成与 Docker staging 尚未
-消费或提交活动 `FRESH/RESTORE` 指针。备份 package manifest 也尚未记录 generation identity，
-因此不能把当前 helper identity 或 snapshot 重读表述为完整包对/恢复绑定。现有失败关闭的
+备份 package manifest 也尚未记录 generation identity，因此不能把当前 helper identity 或
+snapshot 重读表述为完整包对/恢复绑定。现有失败关闭的
 `restore` 分支仍位于 secrets/volume 初始化之前，不会读取恢复 key、生成替代 KEK/密码或
 创建固定卷。
 
