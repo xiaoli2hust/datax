@@ -36,10 +36,18 @@
    再以同一 identity 创建、核验三个随机卷；最后以不覆盖、write-through rename 提交
    `runtime-generation.json`，再清除 journal。FRESH 不读写 root `installation-id`、root
    `secrets/` 或固定 LEGACY 卷；活动 pointer 是启动、Compose 和后续运行时唯一的当前来源。
-   断电/崩溃只可继续相同 journal：不得替换 identity/secret/卷名，半套 secret、卷标签不符、
-   pointer 不一致或旧式残留都 fail closed，绝不自动删除卷、容器或可能已有数据。journal
+   断电/崩溃只可继续相同 journal：只有三个该 generation 卷都不存在时才可生成零 secret 集；
+   任一卷已存在则必须已有完整同代际 secret，绝不替换 identity/secret/卷名。半套 secret、卷标签
+   不符、pointer 不一致或旧式残留都 fail closed，绝不自动删除卷、容器或可能已有数据。journal
    仅为 Launcher 内部状态，未新增公开 API/JSON Schema；活动 pointer 仍由
    `runtime-generation.v1.schema.json` 约束。
+   在选择 FRESH/LEGACY 前，以及读取 FRESH journal 或活动 pointer 后，Launcher 都同时枚举全部
+   Docker volume 名和带 `com.xiaoli.datax.volume-role` 标签的 volume：全新 FRESH 不允许任何此类
+   旧对象；一次性 LEGACY 迁移只允许三条固定 LEGACY 卷；已有 journal/pointer 只允许其精确绑定的
+   三条卷。额外的随机产品卷、固定卷或任意带该角色标签的未绑定卷均以
+   `FRESH_INITIALIZATION_TARGET_NOT_CLEAN` 阻断，发生在 secret 或 volume 写入之前。journal、活动
+   pointer 与 pending pointer 的存在性只以 `symlink_metadata` 判定：只有明确 `NotFound` 才是不存在；
+   目录、链接/reparse point、悬空链接或元数据 I/O 异常均在 ACL 修改或 `create_new` 前失败关闭。
    已有候选安装只有在 root `installation-id`、root `secrets/` 和固定三卷全部通过身份检查时，
    才能一次性迁移成 `LEGACY` pointer；不会复制、移动或重命名旧对象。
    Launcher 在 FRESH 的 generation secret 目录（LEGACY 迁移时才为 root `secrets/`）中以

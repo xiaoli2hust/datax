@@ -774,6 +774,23 @@ enum UninitializedRuntimePath {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshInitializationSecretDecision {
+    Generate,
+    Verify,
+    Unsafe,
+}
+
+// `Path::exists()` follows reparse points and intentionally maps metadata
+// errors to `false`.  That is not a safe existence predicate for a pending
+// journal or a current-runtime pointer: only a definite NotFound result may
+// enter a create-new path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlledRegularFilePresence {
+    Absent,
+    Present,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LegacyRootObjectPresence {
     installation_id: bool,
     secret_directory: bool,
@@ -1694,16 +1711,36 @@ fn ensure_runtime_secrets(
     let sid = current_user_sid(start_tools, installation)?;
     restrict_directory_acl(start_tools, installation, &installation.app_data_root, &sid)?;
 
-    if installation.initialization_state.exists() {
-        return resume_fresh_runtime_initialization(tools, start_tools, installation, &sid);
+    match controlled_regular_file_presence(
+        &installation.initialization_state,
+        "FRESH_INITIALIZATION_JOURNAL_INVALID",
+        "FRESH 首次初始化 journal",
+    )? {
+        ControlledRegularFilePresence::Present => {
+            return resume_fresh_runtime_initialization(tools, start_tools, installation, &sid);
+        }
+        ControlledRegularFilePresence::Absent => {}
     }
 
     // Once a pointer exists, it is the sole current-runtime source.  In
     // particular, FRESH never falls back to root installation-id or secrets.
-    if installation.runtime_generation.exists() {
-        let active = load_verified_active_runtime_snapshot(start_tools, installation, &sid)?;
-        validate_active_runtime_volume_contract(tools, installation, &active.volume_contract())?;
-        return verify_active_runtime_secret_set(start_tools, installation, &sid, &active);
+    match controlled_regular_file_presence(
+        &installation.runtime_generation,
+        "RUNTIME_GENERATION_INVALID",
+        "活动运行代际指针",
+    )? {
+        ControlledRegularFilePresence::Present => {
+            let active = load_verified_active_runtime_snapshot(start_tools, installation, &sid)?;
+            let allowed_volume_names = runtime_volume_name_set(&active.volumes);
+            ensure_no_unbound_product_volumes(tools, installation, &allowed_volume_names)?;
+            validate_active_runtime_volume_contract(
+                tools,
+                installation,
+                &active.volume_contract(),
+            )?;
+            return verify_active_runtime_secret_set(start_tools, installation, &sid, &active);
+        }
+        ControlledRegularFilePresence::Absent => {}
     }
 
     match select_uninitialized_runtime_path(tools, installation)? {
@@ -1734,8 +1771,16 @@ fn select_uninitialized_runtime_path(
     tools: &Tools,
     installation: &Installation,
 ) -> Result<UninitializedRuntimePath, LauncherError> {
+    let legacy_installation_id_present =
+        uninitialized_root_object_exists(&installation.installation_id)?;
+    let allowed_volume_names = if legacy_installation_id_present {
+        runtime_volume_name_set(&legacy_runtime_volume_names())
+    } else {
+        BTreeSet::new()
+    };
+    ensure_no_unbound_product_volumes(tools, installation, &allowed_volume_names)?;
     uninitialized_runtime_path_for_legacy_presence(LegacyRootObjectPresence {
-        installation_id: uninitialized_root_object_exists(&installation.installation_id)?,
+        installation_id: legacy_installation_id_present,
         secret_directory: uninitialized_root_object_exists(&installation.secret_dir)?,
         fixed_volume_presence: runtime_volume_presence(tools, installation)?,
         generations_directory: uninitialized_root_object_exists(
@@ -1759,10 +1804,43 @@ fn uninitialized_root_object_exists(path: &Path) -> Result<bool, LauncherError> 
     }
 }
 
+fn controlled_regular_file_presence(
+    path: &Path,
+    error_code: &str,
+    object_name: &str,
+) -> Result<ControlledRegularFilePresence, LauncherError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => {
+            platform::ensure_regular_file(path).map_err(|_| {
+                LauncherError::new(
+                    error_code,
+                    format!(
+                        "无法证明{object_name}是受控普通文件；检测到目录、链接或 reparse point。"
+                    ),
+                )
+            })?;
+            Ok(ControlledRegularFilePresence::Present)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(ControlledRegularFilePresence::Absent)
+        }
+        Err(_) => Err(LauncherError::new(
+            error_code,
+            format!("无法证明{object_name}不存在或是受控普通文件；Launcher 已安全阻断。"),
+        )),
+    }
+}
+
 fn uninitialized_runtime_path_for_legacy_presence(
     presence: LegacyRootObjectPresence,
 ) -> Result<UninitializedRuntimePath, LauncherError> {
     if presence.installation_id {
+        if presence.generations_directory {
+            return Err(LauncherError::new(
+                "FRESH_INITIALIZATION_TARGET_NOT_CLEAN",
+                "旧式 installation-id 与未提交 generation 目录同时存在；Launcher 不会迁移或混合两个运行对象集合。",
+            ));
+        }
         return Ok(UninitializedRuntimePath::LegacyMigration);
     }
     if presence.fixed_volume_presence != [false; 3]
@@ -1775,6 +1853,144 @@ fn uninitialized_runtime_path_for_legacy_presence(
         ));
     }
     Ok(UninitializedRuntimePath::Fresh)
+}
+
+// A new FRESH generation must not hide a previous randomly named generation
+// merely because its `%LOCALAPPDATA%` journal or secret tree was lost.  The
+// only product volumes permitted before the one-time LEGACY migration are the
+// three exact fixed LEGACY names, and only when its root marker is present.
+fn ensure_no_unbound_product_volumes(
+    tools: &Tools,
+    installation: &Installation,
+    allowed_volume_names: &BTreeSet<String>,
+) -> Result<(), LauncherError> {
+    let all_output = docker(
+        tools,
+        installation,
+        &["volume", "ls", "--quiet"],
+        PROCESS_TIMEOUT,
+    )?;
+    if !all_output.status.success() {
+        return Err(LauncherError::new(
+            "FRESH_INITIALIZATION_PRODUCT_VOLUME_INSPECTION_FAILED",
+            "无法枚举 Docker named volume；Launcher 不会把未知产品数据识别为全新安装。",
+        ));
+    }
+    let all_names = parse_docker_volume_name_listing(&all_output.stdout)?;
+
+    let labelled_output = docker(
+        tools,
+        installation,
+        &[
+            "volume",
+            "ls",
+            "--quiet",
+            "--filter",
+            "label=com.xiaoli.datax.volume-role",
+        ],
+        PROCESS_TIMEOUT,
+    )?;
+    if !labelled_output.status.success() {
+        return Err(LauncherError::new(
+            "FRESH_INITIALIZATION_PRODUCT_VOLUME_INSPECTION_FAILED",
+            "无法枚举带产品角色标签的 Docker volume；Launcher 不会继续初始化。",
+        ));
+    }
+    let labelled_names = parse_docker_volume_name_listing(&labelled_output.stdout)?;
+
+    if unbound_product_volumes_present(&all_names, &labelled_names, allowed_volume_names) {
+        return Err(LauncherError::new(
+            "FRESH_INITIALIZATION_TARGET_NOT_CLEAN",
+            "检测到未被当前 journal/pointer 绑定的随机产品 volume 或产品角色标签；Launcher 不会新建、迁移、覆盖或忽略它。",
+        ));
+    }
+    Ok(())
+}
+
+fn parse_docker_volume_name_listing(output: &[u8]) -> Result<BTreeSet<String>, LauncherError> {
+    let output = std::str::from_utf8(output).map_err(|_| {
+        LauncherError::new(
+            "FRESH_INITIALIZATION_PRODUCT_VOLUME_INSPECTION_FAILED",
+            "Docker named volume 枚举输出不是有效 UTF-8；Launcher 已安全阻断。",
+        )
+    })?;
+    if output.len() > COMMAND_OUTPUT_LIMIT || output.contains('\0') {
+        return Err(LauncherError::new(
+            "FRESH_INITIALIZATION_PRODUCT_VOLUME_INSPECTION_FAILED",
+            "Docker named volume 枚举输出大小或控制字符无效；Launcher 已安全阻断。",
+        ));
+    }
+    let mut names = BTreeSet::new();
+    for raw_line in output.split('\n') {
+        let line = raw_line.strip_suffix('\r').unwrap_or(raw_line);
+        if line.is_empty() {
+            continue;
+        }
+        if raw_line.contains('\r') && !raw_line.ends_with('\r')
+            || !is_valid_docker_volume_name(line)
+            || !names.insert(line.to_owned())
+        {
+            return Err(LauncherError::new(
+                "FRESH_INITIALIZATION_PRODUCT_VOLUME_INSPECTION_FAILED",
+                "Docker named volume 枚举包含无效、重复或不可认证的名称；Launcher 已安全阻断。",
+            ));
+        }
+    }
+    Ok(names)
+}
+
+fn is_valid_docker_volume_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.len() <= 255
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'.' | b'-'))
+}
+
+fn unbound_product_volumes_present(
+    all_names: &BTreeSet<String>,
+    labelled_names: &BTreeSet<String>,
+    allowed_volume_names: &BTreeSet<String>,
+) -> bool {
+    all_names
+        .iter()
+        .any(|name| is_product_volume_name(name) && !allowed_volume_names.contains(name))
+        || labelled_names
+            .iter()
+            .any(|name| !allowed_volume_names.contains(name))
+}
+
+// A named volume can already contain PostgreSQL or encrypted credentials even
+// if no product container is currently running. It is therefore safe to
+// generate the FRESH secret set only before *any* generation volume exists;
+// once a volume exists, every secret must already be the complete same set.
+fn fresh_initialization_secret_decision(
+    volume_presence: [bool; 3],
+    secret_count: usize,
+) -> FreshInitializationSecretDecision {
+    match secret_count {
+        0 if volume_presence == [false; 3] => FreshInitializationSecretDecision::Generate,
+        RUNTIME_SECRET_COUNT => FreshInitializationSecretDecision::Verify,
+        _ => FreshInitializationSecretDecision::Unsafe,
+    }
+}
+
+// Secret cardinality is part of the FRESH resume safety decision.  Do not use
+// `Path::exists()` here: it follows a dangling reparse point and maps metadata
+// errors to `false`, either of which could otherwise look like a safely absent
+// secret and allow a new secret to be generated beside existing data volumes.
+fn fresh_runtime_secret_file_count(secrets: &RuntimeSecretPaths) -> Result<usize, LauncherError> {
+    secrets.all().iter().try_fold(
+        0_usize,
+        |count, path| match controlled_regular_file_presence(
+            path,
+            "FRESH_INITIALIZATION_SECRET_SET_INCOMPLETE",
+            "FRESH 运行 secret 文件",
+        )? {
+            ControlledRegularFilePresence::Absent => Ok(count),
+            ControlledRegularFilePresence::Present => Ok(count + 1),
+        },
+    )
 }
 
 fn create_fresh_initialization_journal(
@@ -1848,6 +2064,19 @@ fn resume_fresh_runtime_initialization(
     installation: &Installation,
     sid: &str,
 ) -> Result<(), LauncherError> {
+    match controlled_regular_file_presence(
+        &installation.initialization_state,
+        "FRESH_INITIALIZATION_JOURNAL_INVALID",
+        "FRESH 首次初始化 journal",
+    )? {
+        ControlledRegularFilePresence::Present => {}
+        ControlledRegularFilePresence::Absent => {
+            return Err(LauncherError::new(
+                "FRESH_INITIALIZATION_JOURNAL_INVALID",
+                "FRESH 首次初始化 journal 在恢复前消失；Launcher 不会创建替代运行对象。",
+            ));
+        }
+    }
     restrict_file_acl(
         start_tools,
         installation,
@@ -1859,34 +2088,36 @@ fn resume_fresh_runtime_initialization(
         &installation.app_data_root,
         journal.generation.clone(),
     )?;
+    let allowed_volume_names = runtime_volume_name_set(&active.volumes);
+    ensure_no_unbound_product_volumes(tools, installation, &allowed_volume_names)?;
 
-    if installation.runtime_generation.exists() {
-        let committed = load_verified_active_runtime_snapshot(start_tools, installation, sid)?;
-        if committed.generation != journal.generation {
-            return Err(LauncherError::new(
-                "FRESH_INITIALIZATION_POINTER_MISMATCH",
-                "FRESH journal 与已存在活动运行代际指针不一致；Launcher 不会覆盖任何指针。",
-            ));
+    match controlled_regular_file_presence(
+        &installation.runtime_generation,
+        "RUNTIME_GENERATION_INVALID",
+        "活动运行代际指针",
+    )? {
+        ControlledRegularFilePresence::Present => {
+            let committed = load_verified_active_runtime_snapshot(start_tools, installation, sid)?;
+            if committed.generation != journal.generation {
+                return Err(LauncherError::new(
+                    "FRESH_INITIALIZATION_POINTER_MISMATCH",
+                    "FRESH journal 与已存在活动运行代际指针不一致；Launcher 不会覆盖任何指针。",
+                ));
+            }
+            validate_active_runtime_volume_contract(
+                tools,
+                installation,
+                &committed.volume_contract(),
+            )?;
+            verify_active_runtime_secret_set(start_tools, installation, sid, &committed)?;
+            return remove_fresh_initialization_journal(installation);
         }
-        validate_active_runtime_volume_contract(tools, installation, &committed.volume_contract())?;
-        verify_active_runtime_secret_set(start_tools, installation, sid, &committed)?;
-        return remove_fresh_initialization_journal(installation);
+        ControlledRegularFilePresence::Absent => {}
     }
 
     ensure_initialization_containers_absent_for(tools, installation, &active.volumes)?;
     ensure_fresh_secret_directory(start_tools, installation, sid, &active.secrets.directory)?;
-    let secret_count = active
-        .secrets
-        .all()
-        .iter()
-        .filter(|path| path.exists())
-        .count();
-    if secret_count != 0 && secret_count != RUNTIME_SECRET_COUNT {
-        return Err(LauncherError::new(
-            "FRESH_INITIALIZATION_SECRET_SET_INCOMPLETE",
-            "FRESH journal 对应的 secret 集合不完整；Launcher 只允许继续同一完整集合，拒绝替换或删除其中任一密钥。",
-        ));
-    }
+    let secret_count = fresh_runtime_secret_file_count(&active.secrets)?;
     let presence = runtime_volume_presence_for(tools, installation, &active.volumes)?;
     validate_present_runtime_volume_identity_for(
         tools,
@@ -1895,12 +2126,21 @@ fn resume_fresh_runtime_initialization(
         &active.generation.installation_id,
         presence,
     )?;
-    if secret_count == 0 {
-        ensure_runtime_secret_paths(start_tools, installation, sid, &active.secrets, false)?;
-    } else {
-        verify_active_runtime_secret_set(start_tools, installation, sid, &active)?;
+    match fresh_initialization_secret_decision(presence, secret_count) {
+        FreshInitializationSecretDecision::Generate => {
+            ensure_runtime_secret_paths(start_tools, installation, sid, &active.secrets, false)?;
+        }
+        FreshInitializationSecretDecision::Verify => {
+            verify_active_runtime_secret_set(start_tools, installation, sid, &active)?;
+        }
+        FreshInitializationSecretDecision::Unsafe => {
+            return Err(LauncherError::new(
+                "FRESH_INITIALIZATION_SECRET_SET_INCOMPLETE",
+                "FRESH journal 对应的 secret 集合不完整，或已有数据卷却缺失 secret；Launcher 不会生成替代密码或 KEK。",
+            ));
+        }
     }
-    if active.secrets.all().iter().any(|path| !path.exists()) {
+    if fresh_runtime_secret_file_count(&active.secrets)? != RUNTIME_SECRET_COUNT {
         return Err(LauncherError::new(
             "FRESH_INITIALIZATION_SECRET_SET_INCOMPLETE",
             "FRESH journal 对应的完整 secret 集合尚未落盘；未创建或补写任何数据卷。",
@@ -2663,17 +2903,24 @@ fn ensure_legacy_runtime_generation(
             "无法用格式无效的 installation-id 提交运行代际。",
         ));
     }
-    if installation.runtime_generation.exists() {
-        let existing = read_runtime_generation(&installation.runtime_generation)?;
-        if existing.source != "LEGACY"
-            || !constant_time_ascii_equal(&existing.installation_id, installation_id)
-        {
-            return Err(LauncherError::new(
-                "RUNTIME_GENERATION_IDENTITY_MISMATCH",
-                "活动运行代际不是当前完整旧式对象集合；Launcher 不会拼接或覆盖它。",
-            ));
+    match controlled_regular_file_presence(
+        &installation.runtime_generation,
+        "RUNTIME_GENERATION_INVALID",
+        "活动运行代际指针",
+    )? {
+        ControlledRegularFilePresence::Present => {
+            let existing = read_runtime_generation(&installation.runtime_generation)?;
+            if existing.source != "LEGACY"
+                || !constant_time_ascii_equal(&existing.installation_id, installation_id)
+            {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_IDENTITY_MISMATCH",
+                    "活动运行代际不是当前完整旧式对象集合；Launcher 不会拼接或覆盖它。",
+                ));
+            }
+            return commit_runtime_generation(start_tools, installation, sid, &existing);
         }
-        return commit_runtime_generation(start_tools, installation, sid, &existing);
+        ControlledRegularFilePresence::Absent => {}
     }
     let generation_id = random_runtime_generation_id()?;
     let generation = RuntimeGeneration::legacy(
@@ -2694,28 +2941,34 @@ fn commit_runtime_generation(
     generation: &RuntimeGeneration,
 ) -> Result<(), LauncherError> {
     generation.validate()?;
-    if installation.runtime_generation.exists() {
-        platform::ensure_regular_file(&installation.runtime_generation)?;
-        let existing = read_runtime_generation(&installation.runtime_generation)?;
-        if existing != *generation {
-            return Err(LauncherError::new(
-                "RUNTIME_GENERATION_IDENTITY_MISMATCH",
-                "活动运行代际不是 pending journal 精确绑定的对象集合；Launcher 不会覆盖它。",
-            ));
+    match controlled_regular_file_presence(
+        &installation.runtime_generation,
+        "RUNTIME_GENERATION_INVALID",
+        "活动运行代际指针",
+    )? {
+        ControlledRegularFilePresence::Present => {
+            let existing = read_runtime_generation(&installation.runtime_generation)?;
+            if existing != *generation {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_IDENTITY_MISMATCH",
+                    "活动运行代际不是 pending journal 精确绑定的对象集合；Launcher 不会覆盖它。",
+                ));
+            }
+            restrict_file_acl(
+                start_tools,
+                installation,
+                &installation.runtime_generation,
+                sid,
+            )?;
+            if read_runtime_generation(&installation.runtime_generation)? != existing {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_CHANGED_DURING_CHECK",
+                    "活动运行代际在 ACL 核验期间发生变化；Launcher 已安全阻断。",
+                ));
+            }
+            return Ok(());
         }
-        restrict_file_acl(
-            start_tools,
-            installation,
-            &installation.runtime_generation,
-            sid,
-        )?;
-        if read_runtime_generation(&installation.runtime_generation)? != existing {
-            return Err(LauncherError::new(
-                "RUNTIME_GENERATION_CHANGED_DURING_CHECK",
-                "活动运行代际在 ACL 核验期间发生变化；Launcher 已安全阻断。",
-            ));
-        }
-        return Ok(());
+        ControlledRegularFilePresence::Absent => {}
     }
 
     let encoded = generation.to_bytes()?;
@@ -2723,28 +2976,34 @@ fn commit_runtime_generation(
         ".runtime-generation-{}.pending",
         generation.generation_id
     ));
-    if pending.exists() {
-        platform::ensure_regular_file(&pending)?;
-        restrict_file_acl(start_tools, installation, &pending, sid)?;
-        if read_runtime_generation(&pending)? != *generation {
-            return Err(LauncherError::new(
-                "RUNTIME_GENERATION_PENDING_INVALID",
-                "运行代际 pending 文件与同一 journal 的对象集合不一致；Launcher 已安全阻断。",
-            ));
+    match controlled_regular_file_presence(
+        &pending,
+        "RUNTIME_GENERATION_PENDING_INVALID",
+        "运行代际 pending 文件",
+    )? {
+        ControlledRegularFilePresence::Present => {
+            restrict_file_acl(start_tools, installation, &pending, sid)?;
+            if read_runtime_generation(&pending)? != *generation {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_PENDING_INVALID",
+                    "运行代际 pending 文件与同一 journal 的对象集合不一致；Launcher 已安全阻断。",
+                ));
+            }
         }
-    } else {
-        write_new_secret_file(
-            &pending,
-            &encoded,
-            "RUNTIME_GENERATION_PENDING_CREATE_FAILED",
-        )?;
-        restrict_file_acl(start_tools, installation, &pending, sid)?;
-        let parsed = read_runtime_generation(&pending)?;
-        if parsed != *generation {
-            return Err(LauncherError::new(
-                "RUNTIME_GENERATION_PENDING_INVALID",
-                "运行代际 pending 文件回读不一致；未提交活动指针。",
-            ));
+        ControlledRegularFilePresence::Absent => {
+            write_new_secret_file(
+                &pending,
+                &encoded,
+                "RUNTIME_GENERATION_PENDING_CREATE_FAILED",
+            )?;
+            restrict_file_acl(start_tools, installation, &pending, sid)?;
+            let parsed = read_runtime_generation(&pending)?;
+            if parsed != *generation {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_PENDING_INVALID",
+                    "运行代际 pending 文件回读不一致；未提交活动指针。",
+                ));
+            }
         }
     }
 
@@ -3181,6 +3440,13 @@ fn runtime_volume_name_role_pairs(names: &RuntimeVolumeNames) -> [(&str, &'stati
         (names.logs.as_str(), "log-data"),
         (names.workspace.as_str(), "workspace-data"),
     ]
+}
+
+fn runtime_volume_name_set(names: &RuntimeVolumeNames) -> BTreeSet<String> {
+    runtime_volume_name_role_pairs(names)
+        .into_iter()
+        .map(|(name, _)| name.to_owned())
+        .collect()
 }
 
 fn read_installation_id(path: &Path) -> Result<String, LauncherError> {
@@ -4815,15 +5081,24 @@ fn prepare_system_backup(
     data_key: &Path,
     secrets_key: &Path,
 ) -> Result<PreparedBackup, LauncherError> {
-    if installation.initialization_state.exists() {
-        return Err(LauncherError::new(
-            "BACKUP_INITIALIZATION_INCOMPLETE",
-            "首次初始化日志仍存在；系统身份尚未完整提交，已拒绝备份。",
-        ));
+    match controlled_regular_file_presence(
+        &installation.initialization_state,
+        "BACKUP_INITIALIZATION_INCOMPLETE",
+        "首次初始化 journal",
+    )? {
+        ControlledRegularFilePresence::Present => {
+            return Err(LauncherError::new(
+                "BACKUP_INITIALIZATION_INCOMPLETE",
+                "首次初始化日志仍存在；系统身份尚未完整提交，已拒绝备份。",
+            ));
+        }
+        ControlledRegularFilePresence::Absent => {}
     }
     let current_user_sid = current_user_sid(start_tools, installation)?;
     let active_runtime =
         load_verified_active_runtime_snapshot(start_tools, installation, &current_user_sid)?;
+    let allowed_volume_names = runtime_volume_name_set(&active_runtime.volumes);
+    ensure_no_unbound_product_volumes(tools, installation, &allowed_volume_names)?;
     let volume_contract = active_runtime.volume_contract();
     validate_active_runtime_volume_contract(tools, installation, &volume_contract)?;
     verify_active_runtime_secret_set(
@@ -9741,6 +10016,224 @@ mod tests {
                     .code(),
                 "FRESH_INITIALIZATION_TARGET_NOT_CLEAN"
             );
+        }
+
+        assert_eq!(
+            uninitialized_runtime_path_for_legacy_presence(LegacyRootObjectPresence {
+                installation_id: true,
+                generations_directory: true,
+                ..clean
+            })
+            .unwrap_err()
+            .code(),
+            "FRESH_INITIALIZATION_TARGET_NOT_CLEAN"
+        );
+    }
+
+    #[test]
+    fn fresh_volume_inventory_allows_only_the_exact_bound_generation_or_legacy_set() {
+        let empty = BTreeSet::new();
+        assert!(!unbound_product_volumes_present(&empty, &empty, &empty));
+
+        let legacy_allowed = runtime_volume_name_set(&legacy_runtime_volume_names());
+        assert!(!unbound_product_volumes_present(
+            &legacy_allowed,
+            &legacy_allowed,
+            &legacy_allowed,
+        ));
+        assert!(unbound_product_volumes_present(
+            &legacy_allowed,
+            &legacy_allowed,
+            &empty,
+        ));
+
+        let random_generation = "a".repeat(32);
+        let random_bound = RuntimeVolumeNames {
+            postgres: format!("des-postgres-{random_generation}"),
+            logs: format!("des-log-{random_generation}"),
+            workspace: format!("des-workspace-{random_generation}"),
+        };
+        let current_allowed = runtime_volume_name_set(&random_bound);
+        assert!(!unbound_product_volumes_present(
+            &current_allowed,
+            &current_allowed,
+            &current_allowed,
+        ));
+        assert!(unbound_product_volumes_present(
+            &current_allowed,
+            &current_allowed,
+            &legacy_allowed,
+        ));
+
+        let mut with_extra_product_volume = current_allowed.clone();
+        with_extra_product_volume.insert(String::from("des-postgres-data"));
+        assert!(unbound_product_volumes_present(
+            &with_extra_product_volume,
+            &current_allowed,
+            &current_allowed,
+        ));
+
+        let labelled_unrelated = BTreeSet::from([String::from("unrelated-volume")]);
+        assert!(unbound_product_volumes_present(
+            &empty,
+            &labelled_unrelated,
+            &legacy_allowed,
+        ));
+    }
+
+    #[test]
+    fn fresh_volume_listing_parser_rejects_ambiguous_docker_output() {
+        let random = format!("des-postgres-{}", "a".repeat(32));
+        let parsed =
+            parse_docker_volume_name_listing(format!("des-postgres-data\r\n{random}\n").as_bytes())
+                .unwrap();
+        assert_eq!(
+            parsed,
+            BTreeSet::from([String::from("des-postgres-data"), random.clone()]),
+        );
+
+        for output in [
+            b"des-postgres-data\ndes-postgres-data\n".as_slice(),
+            b"des-postgres data\n".as_slice(),
+            b"des-postgres-data\rbroken\n".as_slice(),
+            b"des-postgres-data\0\n".as_slice(),
+        ] {
+            assert_eq!(
+                parse_docker_volume_name_listing(output).unwrap_err().code(),
+                "FRESH_INITIALIZATION_PRODUCT_VOLUME_INSPECTION_FAILED"
+            );
+        }
+        assert_eq!(
+            parse_docker_volume_name_listing(&vec![b'x'; COMMAND_OUTPUT_LIMIT + 1])
+                .unwrap_err()
+                .code(),
+            "FRESH_INITIALIZATION_PRODUCT_VOLUME_INSPECTION_FAILED"
+        );
+    }
+
+    #[test]
+    fn controlled_file_presence_treats_only_not_found_as_absent() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "datax-controlled-file-presence-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let error_code = "FRESH_INITIALIZATION_JOURNAL_INVALID";
+        for (file_name, object_name, code) in [
+            (
+                "initialization-incomplete",
+                "FRESH journal",
+                "FRESH_INITIALIZATION_JOURNAL_INVALID",
+            ),
+            (
+                "runtime-generation.json",
+                "current pointer",
+                "RUNTIME_GENERATION_INVALID",
+            ),
+            (
+                ".runtime-generation-test.pending",
+                "pending pointer",
+                "RUNTIME_GENERATION_PENDING_INVALID",
+            ),
+        ] {
+            let path = root.join(file_name);
+            assert_eq!(
+                controlled_regular_file_presence(&path, code, object_name).unwrap(),
+                ControlledRegularFilePresence::Absent
+            );
+            fs::write(&path, b"controlled file").unwrap();
+            assert_eq!(
+                controlled_regular_file_presence(&path, code, object_name).unwrap(),
+                ControlledRegularFilePresence::Present
+            );
+        }
+
+        let directory = root.join("directory");
+        fs::create_dir(&directory).unwrap();
+        assert_eq!(
+            controlled_regular_file_presence(&directory, error_code, "测试目录")
+                .unwrap_err()
+                .code(),
+            error_code
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let dangling = root.join("dangling-pointer");
+            symlink(root.join("missing-target"), &dangling).unwrap();
+            assert!(!dangling.exists());
+            assert_eq!(
+                controlled_regular_file_presence(&dangling, error_code, "测试链接")
+                    .unwrap_err()
+                    .code(),
+                error_code
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_secret_cardinality_rejects_a_dangling_secret_instead_of_counting_it_missing() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "datax-fresh-secret-cardinality-test-{}-{unique}",
+            std::process::id()
+        ));
+        let secret_directory = root.join("secrets");
+        fs::create_dir_all(&secret_directory).unwrap();
+        let secrets = RuntimeSecretPaths::from_directory(secret_directory);
+
+        assert_eq!(fresh_runtime_secret_file_count(&secrets).unwrap(), 0);
+        fs::write(&secrets.postgres, b"secret").unwrap();
+        assert_eq!(fresh_runtime_secret_file_count(&secrets).unwrap(), 1);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            symlink(root.join("missing-secret"), &secrets.api_database).unwrap();
+            assert!(!secrets.api_database.exists());
+            assert_eq!(
+                fresh_runtime_secret_file_count(&secrets)
+                    .unwrap_err()
+                    .code(),
+                "FRESH_INITIALIZATION_SECRET_SET_INCOMPLETE"
+            );
+        }
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn fresh_secret_generation_never_replaces_missing_secrets_after_volume_creation() {
+        assert_eq!(
+            fresh_initialization_secret_decision([false; 3], 0),
+            FreshInitializationSecretDecision::Generate
+        );
+        for safe_existing_set in [[false; 3], [true, false, false], [true; 3]] {
+            assert_eq!(
+                fresh_initialization_secret_decision(safe_existing_set, RUNTIME_SECRET_COUNT,),
+                FreshInitializationSecretDecision::Verify
+            );
+        }
+        for unsafe_state in [
+            fresh_initialization_secret_decision([true, false, false], 0),
+            fresh_initialization_secret_decision([true; 3], 0),
+            fresh_initialization_secret_decision([false; 3], 1),
+            fresh_initialization_secret_decision([true, false, false], RUNTIME_SECRET_COUNT - 1),
+            fresh_initialization_secret_decision([true; 3], RUNTIME_SECRET_COUNT + 1),
+        ] {
+            assert_eq!(unsafe_state, FreshInitializationSecretDecision::Unsafe);
         }
     }
 
