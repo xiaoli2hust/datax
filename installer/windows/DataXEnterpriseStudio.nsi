@@ -303,8 +303,8 @@ uninstaller_interactive:
     Abort
   ${EndIf}
   StrCpy $INSTDIR "${INSTALL_DIRECTORY}"
-  Call AssertInstallationPathsNoReparse
-  Call AssertInstalledLeavesNoReparse
+  Call un.AssertInstallationPathsNoReparse
+  Call un.AssertInstalledLeavesNoReparse
 
   MessageBox MB_YESNO|MB_ICONEXCLAMATION|MB_DEFBUTTON2 \
     "卸载只删除当前用户的程序文件和快捷方式。$\r$\n$\r$\n以下内容会保留：$\r$\n%LOCALAPPDATA%\DataXEnterpriseStudio$\r$\nDocker named volumes（包括数据库、日志和工作目录）。$\r$\n$\r$\n继续前，卸载程序会尝试安全停止服务；存在活动 Attempt 时会拒绝卸载。是否继续？" \
@@ -454,12 +454,92 @@ Function AssertInstalledLeavesNoReparse
   Pop $0
 FunctionEnd
 
+; NSIS keeps installer and uninstaller function namespaces separate.  The
+; uninstaller must therefore use un.* copies of the path guards instead of
+; calling installer functions, while preserving the same fail-closed checks
+; before it invokes the launcher or mutates any installed path.
+Function un.AssertPathNotReparseOrMissing
+  ; Input: absolute path. Output: PRESENT or MISSING. Any other attribute
+  ; query failure or a reparse point aborts before a later path mutation.
+  Exch $0
+  Push $1
+  Push $2
+  System::Call 'kernel32::GetFileAttributesW(w r0)i .r1?e'
+  Pop $2
+
+  ${If} $1 == ${DES_INVALID_FILE_ATTRIBUTES}
+    ${If} $2 == ${DES_ERROR_FILE_NOT_FOUND}
+      StrCpy $0 "MISSING"
+      Goto un_assert_path_not_reparse_complete
+    ${ElseIf} $2 == ${DES_ERROR_PATH_NOT_FOUND}
+      StrCpy $0 "MISSING"
+      Goto un_assert_path_not_reparse_complete
+    ${Else}
+      MessageBox MB_OK|MB_ICONSTOP "无法安全读取安装路径属性。安装或卸载已终止。"
+      Abort
+    ${EndIf}
+  ${EndIf}
+
+  IntOp $2 $1 & ${DES_FILE_ATTRIBUTE_REPARSE_POINT}
+  ${If} $2 != 0
+    MessageBox MB_OK|MB_ICONSTOP "检测到安装目录或发布资源为重解析点（junction/symlink）。安装或卸载已终止。"
+    Abort
+  ${EndIf}
+  StrCpy $0 "PRESENT"
+
+un_assert_path_not_reparse_complete:
+  Pop $2
+  Pop $1
+  Exch $0
+FunctionEnd
+
+Function un.AssertInstallationPathsNoReparse
+  Push "$LOCALAPPDATA"
+  Call un.AssertPathNotReparseOrMissing
+  Pop $0
+  ${If} $0 == "MISSING"
+    MessageBox MB_OK|MB_ICONSTOP "无法定位当前用户的 LocalAppData 目录。安装或卸载已终止。"
+    Abort
+  ${EndIf}
+
+  Push "$LOCALAPPDATA\Programs"
+  Call un.AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR"
+  Call un.AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\resources"
+  Call un.AssertPathNotReparseOrMissing
+  Pop $0
+FunctionEnd
+
+Function un.AssertInstalledLeavesNoReparse
+  Push "$INSTDIR\launcher.exe"
+  Call un.AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\resources\compose.yaml"
+  Call un.AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\resources\images.release.env"
+  Call un.AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\resources\secure-acl.ps1"
+  Call un.AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\resources\release-manifest.json"
+  Call un.AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\Uninstall.exe"
+  Call un.AssertPathNotReparseOrMissing
+  Pop $0
+FunctionEnd
+
 Section "Uninstall"
   SetRegView 64
   SetShellVarContext current
 
-  Call AssertInstallationPathsNoReparse
-  Call AssertInstalledLeavesNoReparse
+  Call un.AssertInstallationPathsNoReparse
+  Call un.AssertInstalledLeavesNoReparse
 
   Delete "$DESKTOP\DataX Enterprise Studio.lnk"
   Delete "$SMPROGRAMS\${START_MENU_DIR}\启动 DataX Enterprise Studio.lnk"

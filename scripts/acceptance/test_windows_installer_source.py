@@ -169,13 +169,44 @@ class WindowsInstallerSourceTests(unittest.TestCase):
 
         uninstaller = function_body(self.source, "un.onInit")
         self.assertLess(
-            uninstaller.index("Call AssertInstallationPathsNoReparse"),
+            uninstaller.index("Call un.AssertInstallationPathsNoReparse"),
             uninstaller.index('ExecWait \'"$INSTDIR\\launcher.exe" stop\' $0'),
         )
         uninstall_section = section_body(self.source, "Uninstall")
         self.assertLess(
-            uninstall_section.index("Call AssertInstallationPathsNoReparse"),
+            uninstall_section.index("Call un.AssertInstallationPathsNoReparse"),
             uninstall_section.index('Delete "$INSTDIR\\resources\\compose.yaml"'),
+        )
+
+        uninstall_attribute_guard = function_body(
+            self.source, "un.AssertPathNotReparseOrMissing"
+        )
+        self.assertIn(
+            "System::Call 'kernel32::GetFileAttributesW(w r0)i .r1?e'",
+            uninstall_attribute_guard,
+        )
+        self.assertIn(
+            "IntOp $2 $1 & ${DES_FILE_ATTRIBUTE_REPARSE_POINT}",
+            uninstall_attribute_guard,
+        )
+
+        uninstall_tree_guard = function_body(
+            self.source, "un.AssertInstallationPathsNoReparse"
+        )
+        self.assertIn(
+            "Call un.AssertPathNotReparseOrMissing", uninstall_tree_guard
+        )
+        uninstall_leaves_guard = function_body(
+            self.source, "un.AssertInstalledLeavesNoReparse"
+        )
+        self.assertIn(
+            "Call un.AssertPathNotReparseOrMissing", uninstall_leaves_guard
+        )
+        self.assertNotIn(
+            "Call AssertInstallationPathsNoReparse", uninstaller
+        )
+        self.assertNotIn(
+            "Call AssertInstallationPathsNoReparse", uninstall_section
         )
 
 
