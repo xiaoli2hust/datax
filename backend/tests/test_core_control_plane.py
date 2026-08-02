@@ -766,6 +766,46 @@ def test_standard_execution_create_capacity_ignores_private_phase_a_queue(
         assert standard_execution.authorization_mode == "STANDARD"
 
 
+def test_standard_execution_does_not_disclose_private_global_lock(
+    core_stack: CoreStack,
+) -> None:
+    """A private global lock blocks the normal path with the standard code.
+
+    PostgreSQL RLS hides the protected row from the ordinary runtime roles, so
+    the real database still reaches the partial-unique-index catch path.  This
+    service-level regression test pins the API result: neither the private
+    authorization mode nor its execution identity may reach the caller.
+    """
+
+    published = _seed_published_job(core_stack, "private-global-lock")
+    private_created = core_stack.client.post(
+        f"/api/v1/jobs/{published.job_id}/executions",
+        headers={"Idempotency-Key": "private-global-lock-seed-001"},
+        json=_execution_request(published.job_version_id),
+    )
+    assert private_created.status_code == 202, private_created.text
+    private_execution_id = UUID(private_created.json()["id"])
+    with core_stack.sessions.begin() as session:
+        private_execution = session.get(Execution, private_execution_id)
+        assert private_execution is not None
+        private_execution.authorization_mode = "PHASE_A_HARNESS"
+        private_execution.queue_eligibility_state = "BLOCKED"
+        private_execution.queue_block_reason = "PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED"
+
+    blocked = core_stack.client.post(
+        f"/api/v1/jobs/{published.job_id}/executions",
+        headers={"Idempotency-Key": "private-global-lock-normal-001"},
+        json=_execution_request(published.job_version_id),
+    )
+
+    assert blocked.status_code == 409
+    body = blocked.json()
+    assert body["code"] == "TARGET_ACTIVE_EXECUTION"
+    assert str(private_execution_id) not in blocked.text
+    assert "PHASE_A_HARNESS" not in blocked.text
+    assert "private" not in blocked.text.lower()
+
+
 def test_execution_api_only_queues_reserves_and_records_cancel_or_revoke(
     core_stack: CoreStack,
 ) -> None:

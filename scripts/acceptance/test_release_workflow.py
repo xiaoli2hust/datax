@@ -87,6 +87,26 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("windows-e4-scenario-profile.v1.json", manifest_script)
         self.assertIn("--require-authoritative", manifest_script)
 
+    def test_candidate_assembly_requires_a_nonempty_regular_owner_license(self) -> None:
+        job = self.workflow["jobs"]["linux-images"]
+        names = [step["name"] for step in job["steps"]]
+        identity_index = names.index("Validate candidate identity")
+        license_index = names.index(
+            "Require an owner-selected root license before candidate assembly"
+        )
+        manifest_index = names.index(
+            "Bind an explicit blocked acceptance manifest to this candidate"
+        )
+        self.assertLess(identity_index, license_index)
+        self.assertLess(license_index, manifest_index)
+
+        script = job["steps"][license_index]["run"]
+        self.assertIn("set -euo pipefail", script)
+        self.assertIn("[[ ! -f LICENSE || -L LICENSE || ! -s LICENSE ]]", script)
+        self.assertIn('Path("LICENSE").read_text(encoding="utf-8")', script)
+        self.assertIn('"\\x00" in contents or not contents.strip()', script)
+        self.assertIn("repository owner", script)
+
     def test_all_candidate_artifacts_and_the_policy_remain_explicitly_blocked(
         self,
     ) -> None:

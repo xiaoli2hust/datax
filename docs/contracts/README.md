@@ -81,8 +81,16 @@
   Execution、JobVersion、两侧 Datasource/EndpointPolicy revision、TransferPolicy、TargetNamespace
   和 P/runtime/harness/QH（仅 `nonce_sha256`，绝无 raw nonce）摘要。PEA 无独立 `state`，只在
   PAG 当前 `ACTIVE`、QH 时间窗有效且全量 current-fact 联结相等时由 read 函数返回。该 Schema 不是
-  私有 API/Worker 通道；当前没有私有 Phase-A Worker/runner，保持硬禁用。私有 execution lock/fence、
-  confirmation、audit checkpoint 与凭据/日志/维护隔离未落地前，它不给普通用户能力，也不形成 E3/E4、QR 或发布结论。
+  私有 API/Worker 通道；当前没有私有 Phase-A Worker/runner，保持硬禁用。0023 的 lock/fence
+  前置原语也不能替代完整 PEA/current-fact/confirmation、audit checkpoint 与凭据/日志/维护隔离，
+  因而不给普通用户能力，也不形成 E3/E4、QR 或发布结论。
+- `phase-a-execution-lock.v1.schema.json`：0023 private reader 的**E1 私有 lock/fence read-record**
+  形状。它复用 `public.target_copy_locks`、`public.execution_attempts` 和
+  `public.executions.fence_epoch`，而不创建平行私有锁；故 `STANDARD` 与
+  `PHASE_A_HARNESS` 对同一 `TargetNamespace` 共用一个 partial-unique 排他约束。
+  它只描述受限 `SECURITY DEFINER` reserve/claim/heartbeat/recovery/release/read 的非秘密事实；
+  没有 private Worker/runner、Compose credential、私有创建/rerun、Popen、完整 PEA/current-fact
+  revalidation、confirmation 或 audit 接线，保持硬禁用，不是 E3/E4 或公开 capability。
 - `egress-guard-attestation.v1.schema.json`：共享网络命名空间内出口守卫的实时证明。
 - `egress-guard-lease.v1.schema.json`：精确 selected-IP `/32|/128 + TCP port` 短租约请求与响应。
 - `egress-guard.v1.md`：守卫只读数据库视图、loopback HTTP、nftables 和 fail-closed 边界。
@@ -98,8 +106,8 @@
 - `system-backup.v1.md`：Windows Launcher 调用备份 helper 的停机、加密、恢复 journal 与失败关闭边界；0022 后标准 backup 会在 `pg_dump` 前后重验无 `PHASE_A_HARNESS` public Execution，存在/非 `t` 输出或 psql 非零均拒绝导出，受保护 Phase-A backup/restore 未实现。
 
 ADR-0011 的 Phase-A 契约基础件现包括 `release-payload.v1.schema.json`、
-`harness-qualification.v1.schema.json`、`phase-a-qualification-grant.v1.schema.json` 与
-`phase-a-execution-authorization.v1.schema.json`：前者
+`harness-qualification.v1.schema.json`、`phase-a-qualification-grant.v1.schema.json`、
+`phase-a-execution-authorization.v1.schema.json` 与 `phase-a-execution-lock.v1.schema.json`：前者
 定义不含 QH/PAG/QR/最终安装包的不可变 P 及其 `payload_root_sha256`，第二者定义最长 24 小时、
 一次性、域分隔 Ed25519 QH；PAG 则只记录一个受保护私有 Phase-A 授权的 `grant_id`、精确
 P/harness binding、完整 P binding 的 `payload_binding_sha256`、QH
@@ -144,23 +152,33 @@ facts 仍相等时返回该 PEA；PEA 不存独立 `state`。0022 还令普通 W
 attempt/lock/event/cancel/log/recovery/evidence/work-termination descendants 启用 parent-linked RLS；普通 runtime DB
 直连不能从这些表读取或写入 private row。issuer authorize 后 row 仍为
 `BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`。本轮真实 PostgreSQL 15 E2 已以 API/Worker direct DB
-验证普通路径/RLS 边界（脚本退出 `0`，pytest `29 passed`），但它仍不是 private Worker/runner、E3 或 E4。
+验证普通路径/RLS 边界（脚本退出 `0`，pytest `30 passed`），但它仍不是 private Worker/runner、E3 或 E4。
+
+`20260802_0023` 在同一 private schema 新增 NOLOGIN `datax_phase_a_runner` 和仅该角色可调用的
+六个 `SECURITY DEFINER` lock/fence entrypoint。它使用**既有**全局 `TargetCopyLock` partial unique
+index，私有 reservation 会阻止同 namespace 的标准创建；RLS 隐藏私有 row 时，普通 API 的既有
+`IntegrityError -> TARGET_ACTIVE_EXECUTION` 映射仍只返回通用冲突，不泄露 private execution。
+私有 lifecycle 仅为 `RESERVED -> ACTIVE -> RECOVERY_REQUIRED -> RELEASED`，撤回/过期 PAG 会使
+heartbeat 失败关闭；`RECOVERY_REQUIRED` 不自动释放、重试或重新领取。0023 不提供 runner login
+provisioning、任何标准 Settings/Compose/API/Worker/Launcher 接线或 DataX 进程启动。
 
 没有私有 Execution 创建/rerun 入口、private API/Worker 四检查点、Compose credential provisioning、
 QH/PAG/PEA source/override、受保护 harness、QR reader 或真实 E3/E4 证据。不得把 PAG 或 PEA 放入标准 Compose/Setup/Launcher、公开候选、备份/诊断包、
 环境变量、普通 API/UI、Plugin Manifest 或普通 Worker 检查点；它们不得改变
 `ordinary_user_executable`、创建 E3/E4 PASS、`WINDOWS_E4_CERTIFIED`、QR 或公开发布批准。
 标准系统备份与诊断必须固定排除完整 `des_phase_a_qualification` schema；普通 restore 不得复制、
-恢复或重新激活任何 Phase-A nonce/grant/PEA authority。当前 dump 会保留 `alembic_version=20260802_0022` 却排除
+恢复或重新激活任何 Phase-A nonce/grant/PEA authority。当前 dump 会保留 `alembic_version=20260802_0023` 却排除
 该 schema，因此真实 restore/bootstrap/start 不是现有能力且继续 `BLOCKED`。若未来需要继续资格化，
 只能由独立受保护 issuer 在新 restore epoch 后重新验证 P/QH 并重新签发。
 
 本轮 `scripts/test-postgres-e2.sh` 已在临时、一次性真实 PostgreSQL 15 容器退出 `0`，PostgreSQL pytest
-取得 `29 passed`：覆盖 0021 role/function、issuer → consumer → revoke 与 role-collision fail-closed，和
-0022 PEA authorization、普通路径拒绝、API/Worker RLS；同轮验证 private schema exclusion 的 TOC 与空数据库
+取得 `30 passed`：覆盖 0021 role/function、issuer → consumer → revoke 与 role-collision fail-closed，
+0022 PEA authorization、普通路径拒绝、API/Worker RLS，以及 0023 global lock/fence、标准同目标
+unique-conflict、私有 lock/attempt RLS 隐藏、双 claim/旧 fence 拒绝和 PAG revoke heartbeat fail-closed；
+同轮验证 private schema exclusion 的 TOC 与空数据库
 `pg_restore` 探针。这只是受限 PostgreSQL **E2**：不启动产品 Compose、API/Worker/DataX/MySQL 或独立数据
 oracle，也不验证 restore bootstrap/start，因而不是 DataX E3、Windows E4、私有 harness 验收或任何发布结论；
-测试/脚本文件存在本身不能代替这次 `29 passed` 运行记录。
+测试/脚本文件存在本身不能代替这次 `30 passed` 运行记录。
 
 `ReleasePayload`、`PhaseAHarnessAuthorization` 与 `PhaseAExecutionBinding` 的进程内 provenance
 marker 只能捕获同一 Python 进程中的意外构造或篡改；Python 内存不是 protected issuer/consumer

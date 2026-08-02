@@ -66,6 +66,8 @@ class OracleMapping:
     source_column: str
     target_column: str
     logical_type: str
+    source_native_type: str
+    target_native_type: str
 
 
 def quote_identifier(engine: EngineName, value: str) -> str:
@@ -282,6 +284,8 @@ def build_oracle_mappings(
                 source_column=mapping.source_column,
                 target_column=mapping.target_column,
                 logical_type=mapping.oracle_logical_type,
+                source_native_type=mapping.source_type,
+                target_native_type=mapping.target_type,
             )
         )
     return result
@@ -357,6 +361,12 @@ def build_datax_job(
         writer_parameter["writeMode"] = "insert"
 
     job: dict[str, Any] = {
+        # DataX v202309's core.json defaults `common.column.timeZone` to
+        # GMT+8. It formats DateColumn values through that setting even when
+        # the Worker JVM itself was launched with -Duser.timezone=UTC. Pin the
+        # job-level value so the fixed cross-database oracle's UTC timestamp
+        # contract is not silently shifted by the upstream default.
+        "common": {"column": {"timeZone": "UTC"}},
         "job": {
             "setting": {
                 "speed": {"channel": spec.execution_policy.channel},

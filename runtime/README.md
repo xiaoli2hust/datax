@@ -63,3 +63,33 @@ Exception 1.0 提供，其原始完整许可文件随 Runtime 一起分发。
 当前证据只证明隔离 Maven 构建、Python 契约测试和内部 stream 自检；四种真实数据库复制
 方向，以及 MySQL 正确 CA、错误 CA、正确主机名和错误主机名的 TLS 握手，仍必须在干净
 Windows 11 x64 验收环境中运行，不能用 URL 字符串断言或内部自检替代。
+
+## 可重复的直接 Runtime E2 诊断（不是产品 E3/E4）
+
+为发现和复现固定 Runtime 与数据库类型互操作问题，可由操作者显式提供已经构建好的
+Worker 镜像运行：
+
+```bash
+docker build -f backend/Dockerfile.worker -t datax-enterprise-studio-worker:runtime-e2 .
+./scripts/test-datax-runtime-e2.sh \
+  --worker-image datax-enterprise-studio-worker:runtime-e2
+```
+
+脚本绝不会自动构建、拉取或选择 Worker 镜像。它创建一个名称唯一的内部 Docker 网络，启动
+四个临时 MySQL 8/PostgreSQL 15 fixture（均无宿主端口、无命名卷、数据库目录为 tmpfs），
+并在受限且只读的容器中直接调用固定 DataX Runtime。每个 DataX 作业都有上限（默认
+180 秒，可在 1–900 秒内显式调整），其输出只以截断字节数和状态进入报告；原始 DataX
+日志、密码和连接串不输出。正常退出、失败、`HUP`、`INT` 或 `TERM` 都会精确清理临时
+Worker、fixture 与网络，并拒绝残留同前缀的命名卷。
+
+临时 Worker 只读 bind mount 单个 runner 脚本；`datax_studio` 与 oracle 均从所提供的
+Worker image 本身加载，不会把整个开发仓库挂入带有 fixture 凭据的容器。清理始终以启动时
+返回的不可变 Docker ID（并复核 runtime-E2 label）为目标，名称重用时不删除替代对象。
+在创建任何 fixture 前，runner 还会校验 image 内 `/opt/datax/runtime-manifest.json`、固定
+JDK、DataX Runtime、四个插件、驱动与 oracle；校验失败不会生成通过证据。
+
+该诊断会用真实 DataX 和独立 oracle 对四个方向（MySQL→MySQL、MySQL→PostgreSQL、
+PostgreSQL→MySQL、PostgreSQL→PostgreSQL）的全列与选列复制进行核验。它不启动产品
+Compose、API、PostgreSQL 事实库、队列或产品 Worker 服务，因此**不能**作为产品 E3、
+Windows E4、TLS、授权、插件认证、目标独占、审计或发布验收。已记录的运行时证据、已修复
+问题和未覆盖项见 [直接 Runtime E2 证据](../docs/evidence/datax-runtime-e2.md)。

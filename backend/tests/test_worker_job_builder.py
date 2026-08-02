@@ -159,6 +159,16 @@ def test_mysql_writer_is_explicit_insert_but_postgres_omits_unsupported_mode() -
     assert "postSql" not in postgres_parameters
 
 
+def test_generated_job_pins_datax_column_timezone_to_utc() -> None:
+    job = build_datax_job(
+        _spec("mysqlreader", "postgresqlwriter"),
+        source=_connection("MYSQL_8"),
+        target=_connection("POSTGRESQL_15"),
+    )
+
+    assert job["common"] == {"column": {"timeZone": "UTC"}}
+
+
 @pytest.mark.parametrize(
     ("ssl_mode", "connector_mode"),
     [

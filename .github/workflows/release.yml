@@ -76,6 +76,29 @@ jobs:
             --output-directory "${RUNNER_TEMP}/linux-candidate-evidence" \
             --github-output "${GITHUB_OUTPUT}"
 
+      - name: Require an owner-selected root license before candidate assembly
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f LICENSE || -L LICENSE || ! -s LICENSE ]]; then
+            echo "A non-empty, regular root LICENSE selected by the repository owner is required before candidate assembly." >&2
+            exit 1
+          fi
+          python3 - <<'PY'
+          from pathlib import Path
+
+          try:
+              contents = Path("LICENSE").read_text(encoding="utf-8")
+          except (OSError, UnicodeDecodeError) as error:
+              raise SystemExit(
+                  "Root LICENSE must be readable UTF-8 text before candidate assembly."
+              ) from error
+          if "\x00" in contents or not contents.strip():
+              raise SystemExit(
+                  "Root LICENSE must contain non-whitespace, non-binary license text before candidate assembly."
+              )
+          PY
+
       - name: Define immutable artifact name
         id: artifact-name
         shell: bash

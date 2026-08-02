@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import re
 import sys
 from collections.abc import Callable, Sequence
 from contextlib import suppress
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Literal, Protocol
@@ -17,6 +18,15 @@ from datax_studio.worker.job_builder import (
     OracleMapping,
     qualified_table,
     quote_identifier,
+)
+
+_MYSQL_BOOLEAN_NATIVE_TYPE = re.compile(
+    r"^\s*tinyint\s*\(\s*1\s*\)(?:\s+(?:unsigned|zerofill))*\s*$",
+    re.IGNORECASE,
+)
+_MYSQL_TIME_NATIVE_TYPE = re.compile(
+    r"^\s*time(?:\s*\(\s*[0-6]\s*\))?\s*$",
+    re.IGNORECASE,
 )
 
 
@@ -105,6 +115,7 @@ def capture_source_preflight(
             table_name=table_name,
             column_names=[mapping.source_column for mapping in mappings],
             logical_types=[mapping.logical_type for mapping in mappings],
+            native_types=[mapping.source_native_type for mapping in mappings],
             spool=spool,
             side="source",
             target_snapshot=False,
@@ -145,6 +156,7 @@ def verify_databases(
             table_name=source_table_name,
             column_names=[mapping.source_column for mapping in mappings],
             logical_types=logical_types,
+            native_types=[mapping.source_native_type for mapping in mappings],
             spool=spool,
             side="source",
             target_snapshot=False,
@@ -158,6 +170,7 @@ def verify_databases(
             table_name=target_table_name,
             column_names=[mapping.target_column for mapping in mappings],
             logical_types=logical_types,
+            native_types=[mapping.target_native_type for mapping in mappings],
             spool=spool,
             side="target",
             target_snapshot=True,
@@ -217,13 +230,18 @@ def _read_side(
     table_name: str,
     column_names: Sequence[str],
     logical_types: Sequence[str],
+    native_types: Sequence[str],
     spool: Any,
     side: Literal["source", "target"],
     target_snapshot: bool,
     fetch_size: int,
     control_callback: Callable[[], None] | None = None,
 ) -> SideRead:
-    if not column_names or len(column_names) != len(logical_types):
+    if (
+        not column_names
+        or len(column_names) != len(logical_types)
+        or len(column_names) != len(native_types)
+    ):
         raise OracleDatabaseError("oracle mapping is empty or inconsistent")
     if not 1 <= fetch_size <= 100_000:
         raise ValueError("fetch_size must be between 1 and 100000")
@@ -263,7 +281,12 @@ def _read_side(
                 break
             spool.add_rows(
                 side,
-                batch,
+                _normalize_rows_for_oracle(
+                    batch,
+                    engine=engine,
+                    logical_types=logical_types,
+                    native_types=native_types,
+                ),
                 logical_types,
                 batch_size=fetch_size,
             )
@@ -289,6 +312,90 @@ def _read_side(
     finally:
         if cursor is not None:
             cursor.close()
+
+
+def _normalize_rows_for_oracle(
+    rows: Sequence[Sequence[Any]],
+    *,
+    engine: EngineName,
+    logical_types: Sequence[str],
+    native_types: Sequence[str],
+) -> list[Sequence[Any]]:
+    """Adapt lossless DB-driver representations to the fixed oracle contract.
+
+    MySQL exposes ``TINYINT(1)`` as an ``int`` and ``TIME`` as a
+    ``datetime.timedelta`` through PyMySQL, even when the immutable
+    schema-validation artifact has certified the exact native types as the
+    BOOLEAN and TIME logical families. The fixed oracle deliberately accepts
+    only Python bools and ``datetime.time`` respectively, so translate only
+    the exact, lossless MySQL representations for those precise
+    engine/native-type pairs. Any other representation remains untouched and
+    is rejected by the oracle, rather than silently broadening the
+    cross-database comparison contract.
+    """
+
+    if engine != "MYSQL_8" or not any(
+        _needs_mysql_oracle_normalization(logical_type, native_type)
+        for logical_type, native_type in zip(logical_types, native_types, strict=True)
+    ):
+        return list(rows)
+
+    normalized_rows: list[Sequence[Any]] = []
+    for row in rows:
+        # Keep row-width validation in the fixed oracle so malformed driver
+        # output still produces its established error rather than an adapter
+        # error with different semantics.
+        if len(row) != len(logical_types):
+            normalized_rows.append(row)
+            continue
+        normalized_row = list(row)
+        for index, (logical_type, native_type) in enumerate(
+            zip(logical_types, native_types, strict=True)
+        ):
+            value = normalized_row[index]
+            if (
+                logical_type.upper() == "BOOLEAN"
+                and _MYSQL_BOOLEAN_NATIVE_TYPE.fullmatch(native_type) is not None
+                and type(value) is int
+                and value in (0, 1)
+            ):
+                normalized_row[index] = bool(value)
+            elif (
+                logical_type.upper() == "TIME"
+                and _MYSQL_TIME_NATIVE_TYPE.fullmatch(native_type) is not None
+                and isinstance(value, timedelta)
+            ):
+                normalized_time = _mysql_timedelta_to_time(value)
+                if normalized_time is not None:
+                    normalized_row[index] = normalized_time
+        normalized_rows.append(tuple(normalized_row))
+    return normalized_rows
+
+
+def _needs_mysql_oracle_normalization(logical_type: str, native_type: str) -> bool:
+    normalized_logical_type = logical_type.upper()
+    return (
+        normalized_logical_type == "BOOLEAN"
+        and _MYSQL_BOOLEAN_NATIVE_TYPE.fullmatch(native_type) is not None
+    ) or (
+        normalized_logical_type == "TIME"
+        and _MYSQL_TIME_NATIVE_TYPE.fullmatch(native_type) is not None
+    )
+
+
+def _mysql_timedelta_to_time(value: timedelta) -> time | None:
+    """Return a lossless wall-clock time only for the portable MySQL range."""
+
+    if value < timedelta() or value >= timedelta(days=1):
+        return None
+    hours, remaining_seconds = divmod(value.seconds, 60 * 60)
+    minutes, seconds = divmod(remaining_seconds, 60)
+    return time(
+        hour=hours,
+        minute=minutes,
+        second=seconds,
+        microsecond=value.microseconds,
+    )
 
 
 def _invoke_control_callback(callback: Callable[[], None] | None) -> None:

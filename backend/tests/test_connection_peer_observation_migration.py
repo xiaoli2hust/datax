@@ -102,7 +102,7 @@ def test_0012_distinguishes_observed_peer_from_enforced_destination() -> None:
         column == "peer_ip" and options["nullable"] is True
         for _table, column, options in operations.altered_columns
     )
-    assert Settings().database_schema_revision == "20260802_0022"
+    assert Settings().database_schema_revision == "20260802_0023"
 
 
 def test_0012_downgrade_refuses_to_fabricate_missing_peer() -> None:

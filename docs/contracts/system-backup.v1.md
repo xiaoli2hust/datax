@@ -19,7 +19,7 @@ PostgreSQL named volume、`pg_restore`、数据库/审计链证据重算、日�
 RPO/RTO 仍为 `NOT_RUN/BLOCKED`。
 
 本轮 `scripts/test-postgres-e2.sh` 在 disposable PostgreSQL 15 退出 `0`，其 PostgreSQL pytest 段
-`29 passed`，并已让标准 `--exclude-schema=des_phase_a_qualification` dump 在空数据库 `pg_restore`
+`30 passed`，并已让标准 `--exclude-schema=des_phase_a_qualification` dump 在空数据库 `pg_restore`
 成功。该探针只证明 schema-exclusion 的 dump/restore 引用完整性；它不创建产品 named volume、不会
 bootstrap 私有 ledger/issuance epoch，也不改变本节系统恢复仍为 `NOT_RUN/BLOCKED` 的结论。
 
@@ -49,8 +49,9 @@ journal 或 staging 文件存在都不能表述为“Windows 可恢复门禁已�
   `pg_dump --format=custom --compress=0 --serializable-deferrable`
   `--exclude-schema=des_phase_a_qualification` 并取得单一一致性快照；该排除项是
   Launcher 固定字面量，不能由用户、环境变量或备份请求改写。该私有 schema 当前包含 Phase-A 的三张
-  ledger 表、schema 内触发器、私有 ledger guard functions 和私有 0021/0022 `SECURITY DEFINER`
-  issuer/consumer entrypoints；PEA 已在同一完整 schema exclusion 范围内。保护 public `executions`
+  ledger 表、schema 内触发器、私有 ledger guard functions 和私有 0021/0022/0023 `SECURITY DEFINER`
+  issuer/consumer/lock-fence entrypoints；PEA 与未接线 runner lock primitive 已在同一完整 schema exclusion
+  范围内。保护 public `executions`
   trigger 的 `public.des_phase_a_execution_mode_guard()` 则故意不被排除，必须随标准 dump/restore 保留；
   它仍由无登录 ledger owner 持有，并向 `PUBLIC`、runtime、issuer 与 consumer 撤销执行权。使用 schema
   排除而不是 `--exclude-table-data`，以避免 custom dump 留下私有 schema/function metadata。禁用 dump 压缩是为了让导出前的部署 secret 精确 byte 扫描可执行。helper 只接受
@@ -90,7 +91,7 @@ DATA 包只允许以下归档项：
   KEK、数据源明文凭据；
 - `des_phase_a_qualification` 整个私有 schema（当前 `phase_a_qualification_nonces`、
   `phase_a_qualification_grants`、`phase_a_execution_authorizations`、schema 内触发器、私有 ledger guard
-  functions、私有 0021/0022 `SECURITY DEFINER` issuer/consumer entrypoints 及其记录；PEA 仅可含 nonce
+  functions、私有 0021/0022/0023 `SECURITY DEFINER` issuer/consumer/lock-fence entrypoints 及其记录；PEA 仅可含 nonce
   SHA-256，绝不可含 raw nonce），以及任何
   QH/PAG/PEA/QR/private qualification source；标准 backup 与 diagnostics 均不得携带这些受保护
   资格材料；
@@ -156,8 +157,8 @@ DATA 包只允许以下归档项：
 
 由于标准 backup 在任一 `PHASE_A_HARNESS` public Execution 存在时必须拒绝导出，并且标准 DATA dump
 特意不含整个 `des_phase_a_qualification` schema，任何未来完整恢复也**不得**复活备份时存在的
-QH/PAG/PEA 或重放防护状态。受保护 Phase-A backup/restore 是独立的未来能力，当前不存在。恢复后的数据库仍会携带 `alembic_version=20260802_0022`，
-却不会有该 schema、其私有 0021/0022 `SECURITY DEFINER` issuer/consumer entrypoints 或无登录 ledger roles；
+QH/PAG/PEA 或重放防护状态。受保护 Phase-A backup/restore 是独立的未来能力，当前不存在。恢复后的数据库仍会携带 `alembic_version=20260802_0023`，
+却不会有该 schema、其私有 0021/0022/0023 `SECURITY DEFINER` issuer/consumer/lock-fence entrypoints 或无登录 ledger roles；
 `public.des_phase_a_execution_mode_guard()` 会随 public trigger 保留；所以当前真实
 `pg_restore`、应用启动和迁移后的 ledger bootstrap 均保持
 `BLOCKED`，不得把空 probe restore 写成可恢复系统。未来完整恢复必须先在受保护的 restore

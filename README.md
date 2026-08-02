@@ -19,6 +19,12 @@ DataX Enterprise Studio 是面向企业内部数据工程团队的 DataX 可视�
 责任人、关闭证据和修复顺序见
 [第一性原理问题台账与开发修复计划](docs/14_第一性原理问题台账与开发修复计划.md)。
 
+本轮还在隔离临时 MySQL 8/PostgreSQL 15 fixture 上实际复跑了固定 DataX Runtime：四个方向各
+覆盖完整表和选列，共 8 组、每组 10,000 行，进程返回码、独立 oracle 摘要、缺失行和意外行均通过。
+这证明的是直接 Runtime E2 的类型/时区互操作，不启动产品 API、队列或产品 Worker，故绝不是
+产品 E3 或 Windows E4；完整边界和可重复命令见
+[Runtime E2 证据](docs/evidence/datax-runtime-e2.md)。
+
 同轮审查发现并在源码层修复了两条本机入口资源耗尽路径：登录在数据库/Argon2/审计前
 实行全局准入，审计 readiness 使用水位线和有界重放而不在每次请求全量验链。它们受
 [ADR-0012](docs/adr/0012-本机入口准入与审计就绪有界核验.md) 约束，仅适用于单 API
@@ -67,29 +73,33 @@ cancel/log/recovery/evidence/work-termination 后代事实启用 parent-linked R
 读取或修改 private execution/后代行。issuer authorize 成功后仍把该 execution 保持为 `BLOCKED`，原因
 `PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，绝不转为可领取。RLS 和该 blocker 已进入 migration/source，
 并已在本轮临时、一次性真实 PostgreSQL 15 E2 中，以 `datax_api`/`datax_worker` 直接数据库连接验证
-private Execution 不可读、其后代写入受拒绝（脚本退出 `0`，PostgreSQL pytest `29 passed`）。这是数据库
+private Execution 不可读、其后代写入受拒绝（脚本退出 `0`，PostgreSQL pytest `30 passed`）。这是数据库
 边界 E2，绝不是 DataX E3、Windows E4 或产品交付验收。
 
 这仍不是可运行的 qualification workflow：标准 Settings、Compose、Launcher、API、Worker 和公开
-Plugin Manifest 都没有 issuer/consumer 登录凭据、QH/PAG/PEA override 或读取入口；也没有私有
+Plugin Manifest 都没有 issuer/consumer/runner 登录凭据、QH/PAG/PEA override 或读取入口；也没有私有
 Execution 创建/`rerun` 入口来产生 `PHASE_A_HARNESS`、私有 Worker 领取/启动四检查点、受保护
 harness、QR、受信 reader、已签发资格或真实外部 E3/E4 证据。0022 的 database authorize/read
 boundary 不会自行启动 DataX，也不会解除生产普通路径的 deny-all。发布继续 `BLOCKED`。
-当前也没有任何私有 Phase-A Worker/runner；它是**硬禁用**的，不是可由配置打开的隐藏功能。未来启用前必须
-在单独的受保护纵向切片中补齐 private execution lock/fence、源静默/目标独占确认检查点、可关联 execution/fence 的
-审计检查点，以及专用凭据、日志、维护和备份隔离；详见 ADR-0011 §3.1。即使这些门禁完成，也只允许开始真实 E3 取证，绝不等于 E3/E4 已通过。
+`20260802_0023` 只补入未接线的 private global lock/fence 前置原语：NOLOGIN runner 只能调用六个
+`SECURITY DEFINER` 函数，且复用标准 `TargetCopyLock`/`Execution.fence_epoch`，因此 private reservation
+与标准任务对同一 TargetNamespace 互斥。它没有产品凭据、Compose/API/Worker/Launcher 接线或 DataX 启动；
+私有 runner 仍是**硬禁用**的。未来启用前仍须完成完整 PEA/current-fact、源静默/目标独占确认、可关联
+execution/fence 的审计、专用凭据、日志、进程树和崩溃对账维护隔离；详见 ADR-0011 §3.1。
 
 本轮 `scripts/test-postgres-e2.sh` 在临时、一次性真实 PostgreSQL 15 中退出 `0`，PostgreSQL pytest
-取得 `29 passed` 的受限 E2：覆盖 0021 的升级/回滚/再升级、issuer/consumer 函数边界、Python issuer →
+取得 `30 passed` 的受限 E2：覆盖 0021 的升级/回滚/再升级、issuer/consumer 函数边界、Python issuer →
 consumer preflight → revoke、预存私有角色失败关闭和 future-function `PUBLIC EXECUTE` 默认权负例；也覆盖 0022
-PEA issuer-authorize/consumer-read、普通路径拒绝与 runtime-role parent-linked RLS。标准
+PEA issuer-authorize/consumer-read、普通路径拒绝与 runtime-role parent-linked RLS，以及 0023 的 global
+lock/fence、standard 同目标 unique-conflict、private lock/attempt RLS 隐藏、double claim/stale fence 和
+PAG revoke heartbeat fail-closed。标准
 `pg_dump --exclude-schema=des_phase_a_qualification` 的 TOC 排除私有账本，并已成功对空数据库执行
 `pg_restore` 探针；私有角色预占冲突同样失败关闭。该 E2 不启动产品 Compose/API/Worker/DataX/MySQL/独立
 oracle，也不验证完整 restore/bootstrap/start 或 Windows，因此绝不是 E3、E4 或最终安装包验收。
 
 标准备份/诊断必须固定排除完整私有 schema `des_phase_a_qualification`：三张 ledger 表、schema 内
-触发器和私有 ledger guard 函数，以及 0021/0022 位于该 schema 的 `SECURITY DEFINER`
-issuer/consumer entrypoints。保护 public `executions` 触发器的
+触发器和私有 ledger guard 函数，以及 0021/0022/0023 位于该 schema 的 `SECURITY DEFINER`
+issuer/consumer/runner entrypoints。保护 public `executions` 触发器的
 `public.des_phase_a_execution_mode_guard()` 则必须随标准 dump/restore 保留；它仍为
 `SECURITY DEFINER`、由无登录 ledger owner 持有，并已向 `PUBLIC`、runtime、issuer 与 consumer
 撤销执行权，public 位置不放宽角色边界。当前 Launcher 在 `pg_dump` 前后（PostgreSQL 停止前）固定检查
@@ -97,7 +107,7 @@ issuer/consumer entrypoints。保护 public `executions` 触发器的
 `BACKUP_PHASE_A_PRIVATE_EXECUTION_PRESENT`，`psql` 正常完成但非零时返回
 `BACKUP_PHASE_A_PRIVATE_EXECUTION_CHECK_FAILED`，底层命令错误也失败关闭；不能把其 public Execution/日志元数据带入 DATA 包；受保护 Phase-A backup/restore 尚未实现。
 该空数据库 `pg_restore` 探针不等于系统完整恢复：普通恢复不得复活 Phase-A authority。当前真实 restore/start/ledger bootstrap
-仍阻断：dump 会保留 `alembic_version=20260802_0022` 而不会保留私有 schema。未来只能由在
+仍阻断：dump 会保留 `alembic_version=20260802_0023` 而不会保留私有 schema。未来只能由在
 restore epoch 后重新验证 P/QH 的受保护 issuer 重新签发，而当前不存在该 runtime issuer 或其
 受保护凭据配置。
 
@@ -230,7 +240,8 @@ Docker Desktop 停止期间服务不可用，恢复后必须先完成执行状�
 DataX 上游为 [alibaba/DataX](https://github.com/alibaba/DataX)，上游代码采用 Apache
 License 2.0。该事实不自动决定本仓库原创代码的许可证；在仓库所有者明确选择并加入
 `LICENSE` 前，本仓库不授予额外开源许可。依赖、插件和镜像必须分别记录来源、版本、
-许可证与校验和。
+许可证与校验和。发布工作流会在候选组装前拒绝缺失、空白、NUL/非 UTF-8 或 symlink
+的根 `LICENSE`，但不会替所有者或 Legal 选择、解释许可证。
 
 ## 参与方式
 

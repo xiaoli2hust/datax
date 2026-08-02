@@ -510,7 +510,7 @@ def test_phase_a_qualification_ledger_enforces_real_postgresql_guards() -> None:
         with engine.begin() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == "20260802_0022"
+            ).scalar_one() == "20260802_0023"
             _assert_runtime_roles_have_no_ledger_table_privileges(connection)
 
             nonce = _insert_nonce(

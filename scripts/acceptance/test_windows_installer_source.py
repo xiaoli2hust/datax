@@ -111,6 +111,19 @@ class WindowsInstallerSourceTests(unittest.TestCase):
             uninstaller.index('ExecWait \'"$INSTDIR\\launcher.exe" stop\' $0'),
         )
 
+    def test_same_version_repair_stops_with_the_verified_candidate_launcher(self) -> None:
+        same_version_stop = function_body(self.source, "StopExistingSameVersion")
+        candidate_stop = (
+            'ExecWait \'"$PLUGINSDIR\\release-check\\launcher.exe" stop\' $2'
+        )
+        self.assertIn(candidate_stop, same_version_stop)
+        self.assertNotIn('$1\\launcher.exe', same_version_stop)
+        self.assertNotIn("existing_launcher_missing:", self.source)
+        self.assertLess(
+            same_version_stop.index("Call AssertInstallationPathsNoReparse"),
+            same_version_stop.index(candidate_stop),
+        )
+
     def test_reparse_points_fail_closed_at_install_repair_and_uninstall_boundaries(self) -> None:
         self.assertIn("!define DES_FILE_ATTRIBUTE_REPARSE_POINT 0x0400", self.source)
         self.assertIn("!define DES_ERROR_FILE_NOT_FOUND 2", self.source)

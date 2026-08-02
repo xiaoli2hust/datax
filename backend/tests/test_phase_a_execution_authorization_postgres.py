@@ -31,6 +31,7 @@ API_POSTGRES_URL = os.getenv("DATAX_API_POSTGRES_TEST_URL")
 WORKER_POSTGRES_URL = os.getenv("DATAX_WORKER_POSTGRES_TEST_URL")
 ISSUER_POSTGRES_URL = os.getenv("DATAX_PHASE_A_ISSUER_POSTGRES_TEST_URL")
 CONSUMER_POSTGRES_URL = os.getenv("DATAX_PHASE_A_CONSUMER_POSTGRES_TEST_URL")
+RUNNER_POSTGRES_URL = os.getenv("DATAX_PHASE_A_RUNNER_POSTGRES_TEST_URL")
 
 _SCHEMA = "des_phase_a_qualification"
 _AUTHORIZATION_TABLE = f"{_SCHEMA}.phase_a_execution_authorizations"
@@ -71,6 +72,61 @@ _REVOKE_SQL = text(
     ) AS revoked
     """
 )
+_RESERVE_LOCK_SQL = text(
+    f"""
+    SELECT {_SCHEMA}.des_reserve_phase_a_execution_lock(
+        :lock_id,
+        :execution_id
+    ) AS lock_id
+    """
+)
+_CLAIM_LOCK_SQL = text(
+    f"""
+    SELECT *
+    FROM {_SCHEMA}.des_claim_phase_a_execution_lock(
+        :execution_id,
+        :attempt_id,
+        :worker_id,
+        :lease_token_hash,
+        :host_boot_id,
+        :cgroup_identity,
+        :lease_seconds
+    )
+    """
+)
+_HEARTBEAT_LOCK_SQL = text(
+    f"""
+    SELECT {_SCHEMA}.des_heartbeat_phase_a_execution_lock(
+        :execution_id,
+        :attempt_id,
+        :fence_epoch,
+        :lease_token_hash,
+        :lease_seconds
+    ) AS lease_expires_at
+    """
+)
+_RECOVERY_LOCK_SQL = text(
+    f"""
+    SELECT {_SCHEMA}.des_require_phase_a_execution_recovery(
+        :execution_id,
+        :attempt_id,
+        :fence_epoch,
+        :lease_token_hash,
+        :reason
+    ) AS transitioned
+    """
+)
+_RELEASE_LOCK_SQL = text(
+    f"""
+    SELECT {_SCHEMA}.des_release_phase_a_execution_lock(
+        :execution_id,
+        :attempt_id,
+        :fence_epoch,
+        :lease_token_hash,
+        :reason
+    ) AS released
+    """
+)
 
 pytestmark = pytest.mark.skipif(
     not POSTGRES_URL,
@@ -86,7 +142,11 @@ def _assert_sqlstate(error: DBAPIError, expected: str) -> None:
     assert getattr(error.orig, "sqlstate", None) == expected
 
 
-def _seed_pending_private_execution(engine_url: str) -> tuple[UUID, dict[str, str]]:
+def _seed_pending_private_execution(
+    engine_url: str,
+    *,
+    authorization_mode: str = "PHASE_A_HARNESS",
+) -> tuple[UUID, dict[str, str]]:
     """Create the smallest valid public binding the private function accepts.
 
     The setup deliberately uses product ORM facts rather than temporary fake
@@ -94,6 +154,8 @@ def _seed_pending_private_execution(engine_url: str) -> tuple[UUID, dict[str, st
     of the PostgreSQL boundary, not an E3 product execution.
     """
 
+    if authorization_mode not in {"PHASE_A_HARNESS", "STANDARD"}:
+        raise ValueError("unsupported synthetic execution authorization mode")
     engine = create_engine(engine_url, pool_pre_ping=True)
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
     now = datetime.now(UTC)
@@ -387,7 +449,7 @@ def _seed_pending_private_execution(engine_url: str) -> tuple[UUID, dict[str, st
                         job_version_id=job_version_id,
                         rerun_of_execution_id=None,
                         trigger_type="MANUAL",
-                        authorization_mode="PHASE_A_HARNESS",
+                        authorization_mode=authorization_mode,
                         requested_by=user_id,
                         process_state="QUEUED",
                         data_effect="NONE",
@@ -400,8 +462,16 @@ def _seed_pending_private_execution(engine_url: str) -> tuple[UUID, dict[str, st
                         service_reservation_seconds=3600,
                         log_reservation_bytes=0,
                         workspace_reservation_bytes=0,
-                        queue_eligibility_state="BLOCKED",
-                        queue_block_reason="PHASE_A_AUTHORIZATION_PENDING",
+                        queue_eligibility_state=(
+                            "BLOCKED"
+                            if authorization_mode == "PHASE_A_HARNESS"
+                            else "ELIGIBLE"
+                        ),
+                        queue_block_reason=(
+                            "PHASE_A_AUTHORIZATION_PENDING"
+                            if authorization_mode == "PHASE_A_HARNESS"
+                            else None
+                        ),
                         queue_state_changed_at=now,
                         eligible_wait_milliseconds=0,
                         queued_at=now,
@@ -567,7 +637,7 @@ def test_phase_a_authorization_is_private_immutable_and_excludes_standard_worker
         with owner.connect() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == "20260802_0022"
+            ).scalar_one() == "20260802_0023"
             for role in ("datax_api", "datax_worker", "datax_egress_guard"):
                 assert connection.execute(
                     text(
@@ -740,6 +810,287 @@ def test_phase_a_authorization_is_private_immutable_and_excludes_standard_worker
     finally:
         consumer.dispose()
         issuer.dispose()
+        owner.dispose()
+
+
+@pytest.mark.skipif(
+    not all(
+        (
+            API_POSTGRES_URL,
+            WORKER_POSTGRES_URL,
+            ISSUER_POSTGRES_URL,
+            RUNNER_POSTGRES_URL,
+        )
+    ),
+    reason="runtime, issuer, and private Phase-A runner PostgreSQL role URLs are not configured",
+)
+def test_phase_a_lock_is_global_fenced_and_hidden_from_standard_runtime() -> None:
+    """Exercise the protected lock primitive against real PostgreSQL only.
+
+    This is E2 evidence for the database boundary.  It deliberately does not
+    create a product runner, invoke DataX, or turn a Phase-A execution into a
+    supported execution path.
+    """
+
+    assert POSTGRES_URL is not None
+    assert API_POSTGRES_URL is not None
+    assert WORKER_POSTGRES_URL is not None
+    assert ISSUER_POSTGRES_URL is not None
+    assert RUNNER_POSTGRES_URL is not None
+    execution_id, facts = _seed_pending_private_execution(POSTGRES_URL)
+    standard_execution_id, _standard_facts = _seed_pending_private_execution(
+        POSTGRES_URL,
+        authorization_mode="STANDARD",
+    )
+    grant_id = uuid4()
+    authorization_id = uuid4()
+    lock_id = uuid4()
+    attempt_id = uuid4()
+    lease_token_hash = _hash(f"phase-a-lock-e2:{execution_id}:lease")
+    owner = create_engine(POSTGRES_URL, pool_pre_ping=True, poolclass=NullPool)
+    api = create_engine(API_POSTGRES_URL, pool_pre_ping=True, poolclass=NullPool)
+    worker = create_engine(WORKER_POSTGRES_URL, pool_pre_ping=True, poolclass=NullPool)
+    issuer = create_engine(ISSUER_POSTGRES_URL, pool_pre_ping=True, poolclass=NullPool)
+    runner = create_engine(RUNNER_POSTGRES_URL, pool_pre_ping=True, poolclass=NullPool)
+    try:
+        with issuer.begin() as connection:
+            assert connection.execute(
+                _ISSUE_SQL,
+                _issue_parameters(
+                    grant_id=grant_id,
+                    nonce_id=uuid4(),
+                    facts=facts,
+                ),
+            ).scalar_one() == grant_id
+            assert connection.execute(
+                _AUTHORIZE_SQL,
+                {
+                    "authorization_id": authorization_id,
+                    "grant_id": grant_id,
+                    "execution_id": execution_id,
+                },
+            ).scalar_one() == authorization_id
+
+        # The runner has only the exact SECURITY DEFINER entrypoints.  It
+        # cannot enumerate public locks/attempts directly, even before we
+        # demonstrate the corresponding standard-role RLS hiding behavior.
+        with owner.connect() as connection:
+            for function in (
+                "des_reserve_phase_a_execution_lock(uuid,uuid)",
+                "des_claim_phase_a_execution_lock(uuid,uuid,text,text,text,text,integer)",
+                "des_heartbeat_phase_a_execution_lock(uuid,uuid,bigint,text,integer)",
+                "des_require_phase_a_execution_recovery(uuid,uuid,bigint,text,text)",
+                "des_release_phase_a_execution_lock(uuid,uuid,bigint,text,text)",
+                "des_read_phase_a_execution_lock(uuid)",
+            ):
+                assert connection.execute(
+                    text(
+                        "SELECT has_function_privilege("
+                        "'datax_phase_a_runner', "
+                        "to_regprocedure(:function_name), 'EXECUTE')"
+                    ),
+                    {"function_name": f"{_SCHEMA}.{function}"},
+                ).scalar_one() is True
+            for table_name in ("public.target_copy_locks", "public.execution_attempts"):
+                assert connection.execute(
+                    text(
+                        "SELECT has_table_privilege("
+                        "'datax_phase_a_runner', :table_name, 'SELECT,INSERT,UPDATE,DELETE')"
+                    ),
+                    {"table_name": table_name},
+                ).scalar_one() is False
+
+        with runner.begin() as connection:
+            assert connection.execute(
+                _RESERVE_LOCK_SQL,
+                {"lock_id": lock_id, "execution_id": execution_id},
+            ).scalar_one() == lock_id
+
+        # A standard runtime sees neither the protected parent nor its shared
+        # global lock.  The next assertion drives the same namespace through a
+        # STANDARD child as datax_api: the RLS check permits that child, then
+        # the one public partial-unique index rejects the conflicting private
+        # reservation with 23505.  The normal API service maps this race-safe
+        # database outcome to generic TARGET_ACTIVE_EXECUTION (unit-covered).
+        with owner.begin() as connection:
+            connection.execute(
+                text(
+                    "UPDATE public.executions "
+                    "SET target_namespace_id = :target_namespace_id "
+                    "WHERE id = :execution_id"
+                ),
+                {
+                    "target_namespace_id": UUID(facts["target_namespace_id"]),
+                    "execution_id": standard_execution_id,
+                },
+            )
+        with pytest.raises(DBAPIError) as failure, api.begin() as connection:
+            connection.execute(
+                text(
+                    "INSERT INTO public.target_copy_locks "
+                    "(id, target_namespace_id, physical_table_identity_hash, execution_id, "
+                    "attempt_id, fence_epoch, state, reserved_at, acquired_at, released_at) "
+                    "VALUES (:id, :target_namespace_id, :physical_table_identity_hash, "
+                    ":execution_id, NULL, NULL, 'RESERVED', clock_timestamp(), NULL, NULL)"
+                ),
+                {
+                    "id": uuid4(),
+                    "target_namespace_id": UUID(facts["target_namespace_id"]),
+                    "physical_table_identity_hash": facts["target_table_hash"],
+                    "execution_id": standard_execution_id,
+                },
+            )
+        _assert_sqlstate(failure.value, "23505")
+
+        with runner.begin() as connection:
+            claim = connection.execute(
+                _CLAIM_LOCK_SQL,
+                {
+                    "execution_id": execution_id,
+                    "attempt_id": attempt_id,
+                    "worker_id": "phase-a-e2-runner",
+                    "lease_token_hash": lease_token_hash,
+                    "host_boot_id": "phase-a-e2-boot",
+                    "cgroup_identity": "/phase-a/e2/runner",
+                    "lease_seconds": 30,
+                },
+            ).mappings().one()
+        assert claim["attempt_id"] == attempt_id
+        assert claim["fence_epoch"] == 1
+        assert claim["lease_expires_at"] > datetime.now(UTC)
+
+        for role_engine in (api, worker):
+            with role_engine.connect() as connection:
+                assert connection.execute(
+                    text(
+                        "SELECT count(*) FROM public.target_copy_locks "
+                        "WHERE execution_id = :execution_id"
+                    ),
+                    {"execution_id": execution_id},
+                ).scalar_one() == 0
+                assert connection.execute(
+                    text(
+                        "SELECT count(*) FROM public.execution_attempts "
+                        "WHERE execution_id = :execution_id"
+                    ),
+                    {"execution_id": execution_id},
+                ).scalar_one() == 0
+
+        # A second claim cannot create a second active attempt or advance the
+        # same execution's fence.  A stale-fence heartbeat is rejected too.
+        with pytest.raises(DBAPIError) as failure, runner.begin() as connection:
+            connection.execute(
+                _CLAIM_LOCK_SQL,
+                {
+                    "execution_id": execution_id,
+                    "attempt_id": uuid4(),
+                    "worker_id": "phase-a-e2-runner-2",
+                    "lease_token_hash": _hash("phase-a-lock-e2:second-lease"),
+                    "host_boot_id": "phase-a-e2-boot-2",
+                    "cgroup_identity": "/phase-a/e2/runner-2",
+                    "lease_seconds": 30,
+                },
+            )
+        _assert_sqlstate(failure.value, "22023")
+        with pytest.raises(DBAPIError) as failure, runner.begin() as connection:
+            connection.execute(
+                _HEARTBEAT_LOCK_SQL,
+                {
+                    "execution_id": execution_id,
+                    "attempt_id": attempt_id,
+                    "fence_epoch": 2,
+                    "lease_token_hash": lease_token_hash,
+                    "lease_seconds": 30,
+                },
+            )
+        _assert_sqlstate(failure.value, "P0001")
+        with runner.begin() as connection:
+            assert connection.execute(
+                _HEARTBEAT_LOCK_SQL,
+                {
+                    "execution_id": execution_id,
+                    "attempt_id": attempt_id,
+                    "fence_epoch": 1,
+                    "lease_token_hash": lease_token_hash,
+                    "lease_seconds": 30,
+                },
+            ).scalar_one() > datetime.now(UTC)
+
+        # Revocation fails closed at the next active checkpoint.  The holder
+        # can still only move into RECOVERY_REQUIRED and later release that
+        # recovery lock; no automatic retry, re-claim, or process launch is
+        # available through this slice.
+        with issuer.begin() as connection:
+            assert connection.execute(_REVOKE_SQL, {"grant_id": grant_id}).scalar_one() is True
+        with pytest.raises(DBAPIError) as failure, runner.begin() as connection:
+            connection.execute(
+                _HEARTBEAT_LOCK_SQL,
+                {
+                    "execution_id": execution_id,
+                    "attempt_id": attempt_id,
+                    "fence_epoch": 1,
+                    "lease_token_hash": lease_token_hash,
+                    "lease_seconds": 30,
+                },
+            )
+        _assert_sqlstate(failure.value, "P0001")
+        with runner.begin() as connection:
+            assert connection.execute(
+                _RECOVERY_LOCK_SQL,
+                {
+                    "execution_id": execution_id,
+                    "attempt_id": attempt_id,
+                    "fence_epoch": 1,
+                    "lease_token_hash": lease_token_hash,
+                    "reason": "GRANT_REVOKED",
+                },
+            ).scalar_one() is True
+            assert connection.execute(
+                _RELEASE_LOCK_SQL,
+                {
+                    "execution_id": execution_id,
+                    "attempt_id": attempt_id,
+                    "fence_epoch": 1,
+                    "lease_token_hash": lease_token_hash,
+                    "reason": "RECOVERY_CONFIRMED",
+                },
+            ).scalar_one() is True
+
+        with owner.connect() as connection:
+            execution = dict(connection.execute(
+                text(
+                    "SELECT process_state, data_effect, verification_state, fence_epoch "
+                    "FROM public.executions WHERE id = :execution_id"
+                ),
+                {"execution_id": execution_id},
+            ).mappings().one())
+            lock = dict(connection.execute(
+                text(
+                    "SELECT state, attempt_id, fence_epoch FROM public.target_copy_locks "
+                    "WHERE execution_id = :execution_id"
+                ),
+                {"execution_id": execution_id},
+            ).mappings().one())
+            attempts = tuple(connection.execute(
+                text(
+                    "SELECT count(*), min(fence_epoch), max(fence_epoch) "
+                    "FROM public.execution_attempts WHERE execution_id = :execution_id"
+                ),
+                {"execution_id": execution_id},
+            ).one())
+        assert execution == {
+            "process_state": "LOST",
+            "data_effect": "UNKNOWN",
+            "verification_state": "INCONCLUSIVE",
+            "fence_epoch": 1,
+        }
+        assert lock == {"state": "RELEASED", "attempt_id": attempt_id, "fence_epoch": 1}
+        assert attempts == (1, 1, 1)
+    finally:
+        runner.dispose()
+        issuer.dispose()
+        worker.dispose()
+        api.dispose()
         owner.dispose()
 
 

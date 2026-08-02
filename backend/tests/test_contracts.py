@@ -282,6 +282,57 @@ def test_phase_a_qualification_grant_contract_remains_private_and_binds_qh_docum
     assert not validator.is_valid(ordinary_path_unlock)
 
 
+def test_phase_a_execution_lock_contract_remains_private_and_fenced() -> None:
+    schema = json.loads(
+        (CONTRACT_ROOT / "phase-a-execution-lock.v1.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    validator = Draft202012Validator(schema)
+    reserved = {
+        "schema_version": "1.0",
+        "artifact_kind": "PHASE_A_EXECUTION_LOCK",
+        "purpose": "PRIVATE_PHASE_A_LOCK_FENCING_PREREQUISITE",
+        "visibility": "PROTECTED_PRIVATE",
+        "ordinary_path_authorized": False,
+        "evidence_conclusion": "NOT_E3_OR_E4",
+        "lock_id": "00000000-0000-4000-8000-000000000020",
+        "execution_id": "00000000-0000-4000-8000-000000000021",
+        "target_namespace_id": "00000000-0000-4000-8000-000000000022",
+        "physical_table_identity_hash": "a" * 64,
+        "state": "RESERVED",
+        "attempt_id": None,
+        "fence_epoch": None,
+        "worker_id": None,
+        "host_boot_id": None,
+        "cgroup_identity": None,
+        "reserved_at": "2026-08-02T12:00:00Z",
+        "acquired_at": None,
+        "heartbeat_at": None,
+        "lease_expires_at": None,
+        "released_at": None,
+    }
+    assert validator.is_valid(reserved)
+
+    active = {
+        **reserved,
+        "state": "ACTIVE",
+        "attempt_id": "00000000-0000-4000-8000-000000000023",
+        "fence_epoch": 1,
+        "worker_id": "phase-a-runner-01",
+        "host_boot_id": "host-boot-01",
+        "cgroup_identity": "/des/phase-a/runner-01",
+        "acquired_at": "2026-08-02T12:00:01Z",
+        "heartbeat_at": "2026-08-02T12:00:02Z",
+        "lease_expires_at": "2026-08-02T12:00:32Z",
+    }
+    assert validator.is_valid(active)
+    assert not validator.is_valid({**active, "ordinary_path_authorized": True})
+    assert not validator.is_valid({**active, "fence_epoch": 0})
+    assert not validator.is_valid({**active, "lease_token_hash": "b" * 64})
+    assert not validator.is_valid({**reserved, "state": "RESERVED", "fence_epoch": 1})
+
+
 def test_runtime_generation_schema_separates_legacy_and_generation_objects() -> None:
     schema = json.loads(
         (CONTRACT_ROOT / "runtime-generation.v1.schema.json").read_text(encoding="utf-8")

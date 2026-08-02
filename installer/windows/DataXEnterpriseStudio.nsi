@@ -181,17 +181,17 @@ Function StopExistingSameVersion
   ${EndIf}
   Call AssertInstallationPathsNoReparse
   Call AssertInstalledLeavesNoReparse
-  IfFileExists "$1\launcher.exe" 0 existing_launcher_missing
-  ExecWait '"$1\launcher.exe" stop' $2
+  ; The staged candidate Launcher has already verified its own Authenticode
+  ; identity, the incoming Setup signer, and every release resource. Use that
+  ; verified copy instead of executing an old installed launcher that may be
+  ; missing or no longer match the incoming candidate.
+  ExecWait '"$PLUGINSDIR\release-check\launcher.exe" stop' $2
   ${If} $2 != 0
     MessageBox MB_OK|MB_ICONSTOP "现有同版本服务未能安全停止，安装已取消。"
     Abort
   ${EndIf}
   Return
 
-existing_launcher_missing:
-  MessageBox MB_OK|MB_ICONSTOP "现有同版本缺少 launcher.exe，无法安全覆盖。"
-  Abort
 FunctionEnd
 
 Section "DataX Enterprise Studio" SEC_MAIN

@@ -52,12 +52,14 @@ api_secret="$temporary_directory/api-password"
 worker_secret="$temporary_directory/worker-password"
 issuer_secret="$temporary_directory/phase-a-issuer-password"
 consumer_secret="$temporary_directory/phase-a-consumer-password"
+runner_secret="$temporary_directory/phase-a-runner-password"
 write_hex_secret "$owner_secret"
 write_hex_secret "$guard_secret"
 write_hex_secret "$api_secret"
 write_hex_secret "$worker_secret"
 write_hex_secret "$issuer_secret"
 write_hex_secret "$consumer_secret"
+write_hex_secret "$runner_secret"
 
 owner_password=$(cat "$owner_secret")
 guard_password=$(cat "$guard_secret")
@@ -65,6 +67,7 @@ api_password=$(cat "$api_secret")
 worker_password=$(cat "$worker_secret")
 issuer_password=$(cat "$issuer_secret")
 consumer_password=$(cat "$consumer_secret")
+runner_password=$(cat "$runner_secret")
 
 docker run --detach --rm \
   --name "$container_name" \
@@ -96,6 +99,7 @@ worker_url="postgresql+psycopg://datax_worker:${worker_password}@127.0.0.1:${hos
 guard_url="postgresql+psycopg://datax_egress_guard:${guard_password}@127.0.0.1:${host_port}/datax_e2_test"
 issuer_url="postgresql+psycopg://datax_phase_a_issuer:${issuer_password}@127.0.0.1:${host_port}/datax_e2_test"
 consumer_url="postgresql+psycopg://datax_phase_a_consumer:${consumer_password}@127.0.0.1:${host_port}/datax_e2_test"
+runner_url="postgresql+psycopg://datax_phase_a_runner:${runner_password}@127.0.0.1:${host_port}/datax_e2_test"
 
 run_alembic() {
 (
@@ -120,14 +124,15 @@ run_alembic upgrade head
 run_alembic downgrade 20260802_0016
 run_alembic upgrade head
 
-# 0021 deliberately leaves these privileged roles NOLOGIN in the standard
+# 0021/0023 deliberately leave these privileged roles NOLOGIN in the standard
 # product. Give them disposable E2-only logins only after migration cycling;
 # they are never exposed to Compose, Settings, or the Windows launcher.
 docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
   psql --no-psqlrc --set ON_ERROR_STOP=1 \
   --username=datax_migration_test --dbname=datax_e2_test \
   --command "ALTER ROLE datax_phase_a_issuer LOGIN PASSWORD '$issuer_password';
-             ALTER ROLE datax_phase_a_consumer LOGIN PASSWORD '$consumer_password';" \
+             ALTER ROLE datax_phase_a_consumer LOGIN PASSWORD '$consumer_password';
+             ALTER ROLE datax_phase_a_runner LOGIN PASSWORD '$runner_password';" \
   >/dev/null
 
 cd "$repository_root"
@@ -137,6 +142,7 @@ DATAX_WORKER_POSTGRES_TEST_URL="$worker_url" \
 DATAX_EGRESS_GUARD_POSTGRES_TEST_URL="$guard_url" \
 DATAX_PHASE_A_ISSUER_POSTGRES_TEST_URL="$issuer_url" \
 DATAX_PHASE_A_CONSUMER_POSTGRES_TEST_URL="$consumer_url" \
+DATAX_PHASE_A_RUNNER_POSTGRES_TEST_URL="$runner_url" \
 DATAX_CREDENTIAL_POSTGRES_TEST_URL="$owner_url" \
 DATAX_AUTH_POSTGRES_TEST_URL="$owner_url" \
 PYTHONDONTWRITEBYTECODE=1 \

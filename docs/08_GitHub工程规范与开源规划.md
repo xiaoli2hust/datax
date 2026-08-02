@@ -53,8 +53,10 @@
 > consumer、最小 `SECURITY DEFINER` 签发/撤回/读取/PEA-authorize 函数和未接入标准路径的 private adapter。
 > 0022 令普通 API、Worker、recovery/reconciler 与公开日志路径只处理 `STANDARD`，并为三类 runtime DB role
 > 的 `executions` 及 execution-linked descendants 实现 parent-linked RLS；issuer authorize 后仍为
-> `BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，PEA 不能变成普通执行旁路。0022 RLS/authorization 已在本切片
-> 真实 PostgreSQL E2 中验证。它们
+> `BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，PEA 不能变成普通执行旁路。`20260802_0023` 进一步提供无登录
+> private runner 的 reserve/claim/heartbeat/recovery/release/read 数据库原语，复用全局 `TargetCopyLock` 与
+> `Execution` fence；它只是私有 runner 的 PostgreSQL E2 前置，并未配置 runner 凭据或接入 API、Worker、Compose、Launcher。
+> 0022 RLS/authorization 与 0023 lock/fence 原语已在本切片真实 PostgreSQL E2 中验证。它们
 > 不等于已签发 P/QH、可运行的 qualification workflow 或 release approval：没有标准角色凭据、
 > QH/PAG/PEA source/override、私有 Execution 创建/rerun、私有 API/Worker 四检查点、受保护 harness、QR reader、
 > candidate-root.v2 或真实 Windows/签名/OIDC 证据，发布仍只能生成显式 BLOCKED 候选。
@@ -231,9 +233,10 @@ Windows release runner 或签名结果已经在线验证。Java 源码也没有�
   API 或普通 Worker 接入；还必须验证预存私有角色名/成员关系失败关闭，以及 ledger owner 后续
   新建函数默认无 `PUBLIC EXECUTE`。
   本轮 `scripts/test-postgres-e2.sh` 已在 disposable real PostgreSQL 15 退出 `0`，PostgreSQL pytest
-  `29 passed`，提供 0022 PEA authorization、普通路径拒绝、API/Worker runtime-role RLS、私有 schema
-  exclusion 与空库 `pg_restore` 探针的数据库 E2/负向验证；private create/rerun/claim/start 四检查点仍须再有
-  私有 harness 负向验证。
+  `30 passed`，提供 0022 PEA authorization、普通路径拒绝、API/Worker runtime-role RLS，以及 0023 无登录
+  private runner、全局 `TargetCopyLock` 互斥与 `Execution` fence 函数、私有 schema exclusion 与空库
+  `pg_restore` 探针的数据库 E2/负向验证；private create/rerun/claim/start 四检查点仍须再有私有 harness
+  负向验证。
   该临时 PostgreSQL 容器检查最多是数据库 E2；未启动产品 Compose、API、Worker、DataX、
   MySQL 或独立 oracle 时，绝不能称为 Phase-A E3、Windows E4 或发布证据。
 - Docker 镜像构建、健康检查、非 root 和制品摘要检查。
@@ -316,7 +319,9 @@ ADR-0011 要求把未来 release workflow 拆成以下不可互相替代的阶�
 3. 0022 的 protected issuer 已能以 immutable、`UNIQUE(grant_id)` + `UNIQUE(execution_id)` PEA 将既有
    ACTIVE PAG 与一个已存在的 pending `PHASE_A_HARNESS` Execution/JobVersion/revision/policy/namespace/
    P/runtime/harness/QH/nonce-SHA-256 facts 原子绑定；consumer read 已对有效 PAG/QH/current facts
-   失败关闭。private create/rerun/claim/start 四检查点尚未接线；只有它们完成后，真实 E3/私有 Windows harness/payload
+   失败关闭。0023 只在数据库中为未来私有 runner 提供复用全局 `TargetCopyLock` 与 `Execution` fence 的
+   reserve/claim/heartbeat/recovery/release/read 原语；没有 runner 凭据，也没有 API/Worker/Compose/Launcher
+   接线。private create/rerun/claim/start 四检查点尚未接线；只有它们完成后，真实 E3/私有 Windows harness/payload
    qualification（不是 E4）的独立复核通过后，独立
    RQA 才能签发 detached QR。HQA、RQA、Authenticode 证书和 GitHub OIDC 不是同一把密钥或
    同一角色。
@@ -332,9 +337,10 @@ self-hosted runner 的自述 JSON 当作公开 release 证明。
 当前的 E1 状态包括 P/QH parser、私有 payload/runtime/job binding 与 durable nonce/grant/PEA
 账本；`20260802_0021/0022` 已用无登录 dedicated role 与精确 `SECURITY DEFINER` 函数把 atomic
 nonce+PAG issue/revoke、current-grant read 和 PEA issuer-authorize/consumer-read 分离，并提供只接受未来受保护 Engine
-注入的 private adapter。0022 的 PEA 是私有数据库 record，普通 API/Worker/Recovery/日志只处理 `STANDARD`，
-runtime DB role 的 parent-linked RLS 也拒绝 private row/后代直连访问；该 E1 migration 已在本切片真实 PostgreSQL E2 中验证。整体仍没有
-private override、私有 Execution 创建/rerun、四检查点、普通 API/Worker 接线或受保护 harness；因此不能产生
+注入的 private adapter；0023 只增加 private runner 复用全局 `TargetCopyLock`/`Execution` fence 的数据库原语。
+0022 的 PEA 是私有数据库 record，普通 API/Worker/Recovery/日志只处理 `STANDARD`，runtime DB role 的
+parent-linked RLS 也拒绝 private row/后代直连访问；0022/0023 migration 已在本切片真实 PostgreSQL E2 中验证。
+整体仍没有 runner 凭据、private override、私有 Execution 创建/rerun、四检查点、API/Worker/Compose/Launcher 接线或受保护 harness；因此不能产生
 QH、普通运行路径的 PAG/PEA 消费、QR、E3/E4、普通用户能力或可发布候选。
 
 ## 7. Issue 规范
@@ -428,6 +434,10 @@ Windows 安装器、Launcher 框架、代码签名工具、WebView/浏览器组�
 - README 明确当前无额外许可授予。
 - 允许公开阅读，但不得对再分发或商业使用作承诺。
 - 首次公开源码发布前，由所有者在 Apache-2.0、其他许可证或闭源策略中做出明确决定。
+- `release.yml` 在任何候选制品、镜像或 SBOM 组装前，要求根目录存在非空、非 symlink
+  的普通 UTF-8 文本 `LICENSE`；缺失、空文件、只含空白、NUL 字节、无效 UTF-8 或
+  reparse/symlink 一律失败关闭。该检查只证明所有者已提供文本，不能替 Legal 判定许可证
+  内容、兼容性或再分发义务。
 
 ## 11. 安全响应
 
