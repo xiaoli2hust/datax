@@ -6,7 +6,9 @@
 - 关联：`docs/14_第一性原理问题台账与开发修复计划.md`、
   `docs/contracts/plugin-manifest.v2.schema.json`（v1 仅保留为历史契约）、
   `docs/contracts/upstream-plugin-inventory.v1.schema.json`、
-  `runtime/upstream-plugin-inventory.v1.json`、`runtime/upstream.lock.json`
+  `docs/contracts/capability-target-set.v1.schema.json`、
+  `runtime/upstream-plugin-inventory.v1.json`、`runtime/capability-target-set.v1.json`、
+  `runtime/upstream.lock.json`
 
 ## 背景
 
@@ -99,7 +101,7 @@ qualification，绝不写入 Plugin Manifest 或成为 E4 状态；在当前尚�
   受保护 harness 的短期资格、detached release qualification、最终安装包和公开发布
   晋级必须按 ADR-0011 分离；测试注入和自申报 JSON 不是其中任一对象。
 
-### 6. 已落地的第一安全切片：只证明源码存在
+### 6. 已落地的第一安全切片：源码 inventory 与完整目标集只证明范围，不能证明可用
 
 `runtime/build_upstream_plugin_inventory.py` 已从锁定上游根 POM、模块 POM 与规范位置的
 `plugin.json` 生成 `runtime/upstream-plugin-inventory.v1.json`，并由
@@ -113,9 +115,22 @@ Reader/Writer 模块（31 Reader、41 Writer），没有用手抄插件名代替
 插件只带候选分类。该分类不是 `BUILD_VERIFIED`、`PACKAGED`、`CONTRACTED`、E3 或 E4
 证据，不能改变 V1 普通用户可执行边界。
 
-72 项只覆盖根 POM 中的 Reader/Writer 模块。本切片尚未生成 Transformer、任务模板、
-DataX 核心/配置以及任意 SQL、`preSql/postSql`、脚本转换等原生功能的机器 inventory；
-因此不能把“72 个 Reader/Writer 已登记”表述为“DataX 全部功能已盘点”或“全功能已实现”。
+72 项只覆盖根 POM 中的 Reader/Writer 模块，不能单独作为“全功能”范围。为使“完整
+DataX”有可证伪的对象集合，本轮新增由同一锁定源码生成的
+`runtime/capability-target-set.v1.json` 和
+`docs/contracts/capability-target-set.v1.schema.json`。它固定 83 个最终产品目标：72 个
+Reader/Writer、`TransformerRegistry` 实际注册的 6 个 native Transformer，以及 5 个跨插件
+执行表面（任意 Job JSON、外部 Transformer JAR、`querySql`、`preSql`、`postSql`）。每项都
+绑定其上游文件 SHA-256、风险分类、V1 处置与后续 E3/E4 test ID；生成器和负向测试拒绝
+目标丢失、重复、非规范 source binding、伪造 test ID、擅自 E4 提升或普通用户执行。
+
+目标集不是新的“已认证清单”：83 项当前均只到 `SOURCE_PRESENT`，
+`windows_e4_certified_count=0`。V1 明确禁止的任意 SQL、脚本/外部 Transformer 和
+`dx_groovy` 被标记为 `EXPLICITLY_UNSUPPORTED_V1`，只是将排除项公开冻结，不是把它们从
+最终范围问题中删除；若未来要开放，必须先有新的 Accepted ADR。其余 native Transformer 与
+非 V1 Reader/Writer 为 `FUTURE_CERTIFICATION_REQUIRED`。故本切片解决“完成集合不可计算”的
+范围缺口，但不提供 build、许可、参数契约、真实 E3、Windows E4 或发布晋级证据，也不能把
+“83 项已登记”表述为“完整 DataX 已实现”。
 
 ### 7. 已落地的第二安全切片：E1 失败关闭
 

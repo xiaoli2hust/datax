@@ -35,6 +35,14 @@ DataX Enterprise Studio 是面向企业内部数据工程团队的 DataX 可视�
 Reader/Writer；当前生产证据源为 deny-all，普通用户实际开放能力为 **0 个**。任何候选
 未达到精确最终 Windows E4 与公开晋级前，都不得在普通用户 UI 中执行或宣称稳定支持。
 
+“完整 DataX”不再是无边界口号：
+[`runtime/capability-target-set.v1.json`](runtime/capability-target-set.v1.json) 已从固定
+`datax_v202309` 源码生成 83 项目标（72 个 Reader/Writer、6 个 native Transformer、5 个
+SQL/任意 Job JSON/外部 Transformer 执行入口）。每项均绑定 source-file SHA-256 和后续
+E3/E4 test ID；当前全体仍为 `SOURCE_PRESENT`、普通用户可执行数为 0、Windows E4 数为 0。
+其中 V1 禁止的 SQL/脚本入口被显式列出为排除项，而不是被静默遗漏。这个 target set 只让
+后续“全部功能”可以逐项验收，**不**代表 83 项已打包、已认证或能在 Windows 使用。
+
 `GET /api/v1/plugins` 现按 `plugin-manifest.v2` 返回上游锁定、制品、
 依赖/许可、网络/文件边界、oracle、候选证据和阻断原因。
 生产默认没有可信 Windows E4 证据源，因此四个 V1 候选最多只会

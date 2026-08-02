@@ -13,9 +13,15 @@
   `plugin.json` 重建的 Reader/Writer 源码能力目录。对应规范化制品位于
   `runtime/upstream-plugin-inventory.v1.json`；当前 72 项都只证明 `SOURCE_PRESENT`，固定
   `ordinary_user_executable=false`。`V1_BUSINESS` 与 `INTERNAL_SMOKE` 只是候选分类，不能
-  当作 `PACKAGED/CONTRACTED/E3/E4` 证据。72 项只覆盖根 POM 中的 Reader/Writer；
-  Transformer、任务模板和其他 DataX 原生参数/功能尚未进入本 inventory，不能据此声明
-  “DataX 全功能已盘点”或“全功能可用”。
+  当作 `PACKAGED/CONTRACTED/E3/E4` 证据。
+- `capability-target-set.v1.schema.json`：以同一锁定上游为输入的完整产品**目标集**；对应
+  `runtime/capability-target-set.v1.json`。当前冻结 83 项：72 个 Reader/Writer、6 个
+  native Transformer 和 5 个跨插件 SQL/任意 Job JSON/外部 Transformer 执行入口。每项绑定
+  上游文件 SHA-256、风险分类、V1 处置及未来 E3/E4 test ID，且统一
+  `ordinary_user_executable=false`。它不是插件 manifest 或发布资格：
+  `windows_e4_certified_count=0`，不能把目标项、源码项或 test ID 当成已打包、已认证或可执行。
+  V1 明确禁止的任意 SQL、脚本/外部 Transformer 仍被列出为
+  `EXPLICITLY_UNSUPPORTED_V1`，以便后续“完整 DataX”声明必须正面处理而不能静默遗漏。
 - `audit-event.v1.schema.json`：审计事件最小结构；包含保留维护开始、完成、失败三类
   SYSTEM 事件，但不把到期扫描声明成数据库外 WORM 锚定。
 - `verification-oracle.v1.schema.json`：独立数据核验规范和结果证据；使用规范化行多重集，不依赖 DataX 自报统计。

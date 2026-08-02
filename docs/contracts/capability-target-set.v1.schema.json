@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/capability-target-set.v1.schema.json",
+  "title": "DataX Complete Capability Target Set V1",
+  "description": "固定上游源码下、为最终完整 DataX 桌面交付必须逐项裁决的能力目标集。该文档不是可执行能力清单；所有条目均不可由普通用户执行。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "catalog_kind",
+    "completion_rule",
+    "counts",
+    "items",
+    "schema_version",
+    "upstream"
+  ],
+  "properties": {
+    "catalog_kind": {
+      "const": "DATAX_COMPLETE_CAPABILITY_TARGET_SET"
+    },
+    "completion_rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ordinary_user_execution_requires",
+        "statement_rule"
+      ],
+      "properties": {
+        "ordinary_user_execution_requires": {
+          "type": "array",
+          "const": [
+            "BUILD_VERIFIED",
+            "LICENSE_REVIEWED",
+            "CONTRACTED",
+            "E3_CERTIFIED",
+            "WINDOWS_E4_CERTIFIED",
+            "RELEASE_PROMOTED_FOR_SAME_FINAL_PACKAGE"
+          ]
+        },
+        "statement_rule": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "CORE_EXECUTION_SURFACE",
+        "NATIVE_TRANSFORMER",
+        "READER_PLUGIN",
+        "WRITER_PLUGIN",
+        "explicitly_unsupported_v1",
+        "item_count",
+        "windows_e4_certified_count"
+      ],
+      "properties": {
+        "CORE_EXECUTION_SURFACE": { "type": "integer", "minimum": 1 },
+        "NATIVE_TRANSFORMER": { "type": "integer", "minimum": 1 },
+        "READER_PLUGIN": { "type": "integer", "minimum": 1 },
+        "WRITER_PLUGIN": { "type": "integer", "minimum": 1 },
+        "explicitly_unsupported_v1": { "type": "integer", "minimum": 0 },
+        "item_count": { "type": "integer", "minimum": 1 },
+        "windows_e4_certified_count": { "const": 0 }
+      }
+    },
+    "items": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/item" }
+    },
+    "schema_version": { "const": "1.0" },
+    "upstream": { "$ref": "#/$defs/upstream" }
+  },
+  "$defs": {
+    "sha1": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "sourceFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": {
+          "type": "string",
+          "pattern": "^third_party/alibaba-datax/[A-Za-z0-9._/-]+$"
+        },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "kind",
+        "module",
+        "name",
+        "ordinary_user_executable",
+        "plugin_name",
+        "required_e3_test_id",
+        "required_e4_test_id",
+        "risk_category",
+        "source_evidence_level",
+        "source_files",
+        "v1_disposition"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{2,95}$"
+        },
+        "kind": {
+          "enum": [
+            "READER_PLUGIN",
+            "WRITER_PLUGIN",
+            "NATIVE_TRANSFORMER",
+            "CORE_EXECUTION_SURFACE"
+          ]
+        },
+        "module": {
+          "type": ["string", "null"],
+          "maxLength": 64
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "ordinary_user_executable": { "const": false },
+        "plugin_name": {
+          "type": ["string", "null"],
+          "maxLength": 64
+        },
+        "required_e3_test_id": {
+          "type": "string",
+          "pattern": "^(?:E2E|E3)-[A-Z0-9][A-Z0-9-]{2,95}$"
+        },
+        "required_e4_test_id": {
+          "type": "string",
+          "pattern": "^(?:E2E|E4)-[A-Z0-9][A-Z0-9-]{2,95}$"
+        },
+        "risk_category": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{2,95}$"
+        },
+        "source_evidence_level": { "const": "SOURCE_PRESENT" },
+        "source_files": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/sourceFile" }
+        },
+        "v1_disposition": {
+          "enum": [
+            "V1_SCOPE_CANDIDATE",
+            "FUTURE_CERTIFICATION_REQUIRED",
+            "EXPLICITLY_UNSUPPORTED_V1"
+          ]
+        }
+      }
+    },
+    "upstream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commit",
+        "repository",
+        "root_pom_path",
+        "root_pom_sha256",
+        "source_manifest_path",
+        "source_manifest_sha256",
+        "source_tree",
+        "tag",
+        "upstream_lock_path",
+        "upstream_lock_sha256"
+      ],
+      "properties": {
+        "commit": { "$ref": "#/$defs/sha1" },
+        "repository": {
+          "type": "string",
+          "const": "https://github.com/alibaba/DataX.git"
+        },
+        "root_pom_path": {
+          "const": "third_party/alibaba-datax/pom.xml"
+        },
+        "root_pom_sha256": { "$ref": "#/$defs/sha256" },
+        "source_manifest_path": {
+          "const": "runtime/upstream-files.sha256"
+        },
+        "source_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "source_tree": { "$ref": "#/$defs/sha1" },
+        "tag": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._-]{1,128}$"
+        },
+        "upstream_lock_path": { "const": "runtime/upstream.lock.json" },
+        "upstream_lock_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

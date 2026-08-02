@@ -78,11 +78,13 @@ jobs:
           python -m unittest scripts.acceptance.test_windows_hosted_preflight -v
           python -m unittest scripts.acceptance.test_validate_windows_e4_preflight -v
 
-      - name: Verify the committed upstream DataX source and plugin inventory
+      - name: Verify the committed upstream DataX source, plugin inventory, and complete target set
         run: |
           python runtime/verify_upstream_source.py
           python runtime/build_upstream_plugin_inventory.py --check
           python -m unittest runtime.test_upstream_plugin_inventory -v
+          python runtime/build_capability_target_set.py --check
+          python -m unittest runtime.test_capability_target_set -v
 
       - name: Validate Windows Compose topology
         shell: bash

@@ -10,6 +10,8 @@ Windows 产品在 Docker Desktop + WSL2 的 Linux Worker 容器内运行 DataX�
 - 逐文件哈希清单：`upstream-files.sha256`
 - Reader/Writer 源码 inventory：`upstream-plugin-inventory.v1.json`
 - inventory 生成器：`build_upstream_plugin_inventory.py`
+- 完整能力目标集：`capability-target-set.v1.json`
+- 目标集生成器：`build_capability_target_set.py`
 - 最小构建补丁：`patches/0001-reproducible-safe-runtime.patch`
 - 只读运行配置：`config/`
 - 独立数据核验算法：`oracle/verification_oracle.py`
@@ -30,9 +32,17 @@ commit、tree、根 POM、模块 POM 以及每个 `plugin.json` 的相对路径�
 Dockerfile 或候选名称推断 `BUILD_VERIFIED/PACKAGED/CONTRACTED/E3/E4`。
 
 这里的 72 项严格只表示根 POM 中名称以 `reader`/`writer` 结尾且具有规范位置
-`plugin.json` 的模块。Transformer、`plugin_job_template.json` 参数语义、DataX 核心/模板、
-任意 SQL、`preSql/postSql`、脚本转换及其他原生功能不在本切片的 inventory 内；“72 个
-Reader/Writer 源码条目”绝不等于“DataX 全部功能已盘点、已打包或可稳定执行”。
+`plugin.json` 的模块。它们仍不能单独表示完整 DataX 范围。为避免把这个 72 项子集误称为
+“全功能”，`capability-target-set.v1.json` 从同一已锁定的源码生成 **83 项**最终目标：72 个
+Reader/Writer、6 个内置 native Transformer，以及 5 个跨插件的 SQL/任意 Job JSON/外部
+Transformer 执行入口。每项均绑定上游文件 SHA-256，固定为
+`ordinary_user_executable=false`，并预分配 E3/E4 取证 ID。它只冻结“将来必须作出产品/许可/
+安全/测试裁决的目标集合”：当前 `windows_e4_certified_count=0`，绝不表示上述 83 项已经
+打包、已签合同、已认证或可稳定运行。
+
+V1 明确拒绝任意 Job JSON、`querySql`、`preSql`、`postSql`、外部 Transformer JAR 与
+`dx_groovy`；这些入口仍进入目标集，以免在未来“完整 DataX”声明时被静默遗漏。非 Groovy
+native Transformer 与非 V1 Reader/Writer 均只是 `FUTURE_CERTIFICATION_REQUIRED`，不是承诺。
 
 重建与校验命令：
 
@@ -40,12 +50,16 @@ Reader/Writer 源码条目”绝不等于“DataX 全部功能已盘点、已打
 python runtime/build_upstream_plugin_inventory.py
 python runtime/build_upstream_plugin_inventory.py --check
 python -m unittest runtime.test_upstream_plugin_inventory -v
+python runtime/build_capability_target_set.py
+python runtime/build_capability_target_set.py --check
+python -m unittest runtime.test_capability_target_set -v
 ```
 
-`--check` 会拒绝缺失/重复插件、非法 Reader/Writer 方向、锁后源码篡改、catalog 篡改和
-非规范 JSON。JSON Schema 位于
-`docs/contracts/upstream-plugin-inventory.v1.schema.json`；schema 有效性和跨字段不变量都在
-测试中复核。
+两个 `--check` 都会拒绝锁后源码篡改、catalog 篡改和非规范 JSON；目标集还拒绝重复目标、
+擅自提升为 E4、擅自变为普通用户可执行、伪造 E3/E4 test ID 或不规范的 source-file
+绑定。JSON Schema 分别位于
+`docs/contracts/upstream-plugin-inventory.v1.schema.json` 和
+`docs/contracts/capability-target-set.v1.schema.json`；schema 有效性和跨字段不变量都在测试中复核。
 
 构建补丁把上游 MySQL Connector/J `5.1.47` 固定升级到 `9.7.0`，构建阶段还校验官方
 Maven 制品 SHA-256 `0353648e…43eb44`，并把 DataX 的驱动类名改为
