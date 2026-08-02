@@ -166,6 +166,8 @@
         "images_lock",
         "embedded_images_lock",
         "acl_helper",
+        "release_payload",
+        "release_qualification",
         "supply_chain_index",
         "acceptance_manifest",
         "acceptance_environment_manifest",
@@ -192,6 +194,12 @@
           "$ref": "#/$defs/fileArtifact"
         },
         "acl_helper": {
+          "$ref": "#/$defs/fileArtifact"
+        },
+        "release_payload": {
+          "$ref": "#/$defs/fileArtifact"
+        },
+        "release_qualification": {
           "$ref": "#/$defs/fileArtifact"
         },
         "supply_chain_index": {

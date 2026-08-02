@@ -350,6 +350,12 @@ def _required_artifacts(
             descriptors, "resources/images.release.env"
         ),
         "acl_helper": _require_descriptor(descriptors, "resources/secure-acl.ps1"),
+        "release_payload": _require_descriptor(
+            descriptors, "resources/release-payload.json"
+        ),
+        "release_qualification": _require_descriptor(
+            descriptors, "resources/release-qualification.json"
+        ),
         "supply_chain_index": {
             "kind": "SPDX_SBOM_INDEX",
             "artifact": _require_descriptor(
@@ -448,6 +454,8 @@ def _validate_cross_file_bindings(
         artifacts["images_lock"],
         artifacts["embedded_images_lock"],
         artifacts["acl_helper"],
+        artifacts["release_payload"],
+        artifacts["release_qualification"],
         artifacts["supply_chain_index"]["artifact"],
         artifacts["acceptance_manifest"],
         artifacts["acceptance_environment_manifest"],
@@ -504,6 +512,8 @@ def _validate_cross_file_bindings(
         "compose_sha256",
         "images_sha256",
         "acl_script_sha256",
+        "release_payload",
+        "release_qualification",
         "allowed_authenticode_signer_certificate_sha256",
     }
     allowed_signers = release_manifest.get(
@@ -511,7 +521,7 @@ def _validate_cross_file_bindings(
     )
     if (
         set(release_manifest) != release_manifest_keys
-        or release_manifest.get("schema_version") != "1.3"
+        or release_manifest.get("schema_version") != "1.4"
         or release_manifest.get("product_version") != identity["product_version"]
         or release_manifest.get("release_candidate")
         != identity["release_candidate"]
@@ -521,6 +531,26 @@ def _validate_cross_file_bindings(
         != artifacts["embedded_images_lock"]["sha256"]
         or release_manifest.get("acl_script_sha256")
         != artifacts["acl_helper"]["sha256"]
+        or not isinstance(release_manifest.get("release_payload"), dict)
+        or release_manifest["release_payload"].get("path")
+        != "release-payload.json"
+        or release_manifest["release_payload"].get("sha256")
+        != artifacts["release_payload"]["sha256"]
+        or re.fullmatch(
+            r"[0-9a-f]{64}",
+            str(release_manifest["release_payload"].get("payload_root_sha256", "")),
+        )
+        is None
+        or not isinstance(release_manifest.get("release_qualification"), dict)
+        or release_manifest["release_qualification"].get("path")
+        != "release-qualification.json"
+        or release_manifest["release_qualification"].get("sha256")
+        != artifacts["release_qualification"]["sha256"]
+        or re.fullmatch(
+            r"[A-Za-z0-9._-]{8,128}",
+            str(release_manifest["release_qualification"].get("issuer_key_id", "")),
+        )
+        is None
         or not isinstance(allowed_signers, list)
         or not 1 <= len(allowed_signers) <= 8
         or any(
@@ -530,7 +560,7 @@ def _validate_cross_file_bindings(
         or allowed_signers != sorted(set(allowed_signers))
     ):
         raise ValueError(
-            "final release manifest 1.3 does not bind the full candidate commit, resources and signer allowlist"
+            "final release manifest 1.4 does not bind the full candidate commit, Phase-B resources and signer allowlist"
         )
 
     if (

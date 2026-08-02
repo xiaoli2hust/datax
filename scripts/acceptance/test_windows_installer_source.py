@@ -113,6 +113,8 @@ class WindowsInstallerSourceTests(unittest.TestCase):
             "compose.yaml",
             "images.release.env",
             "secure-acl.ps1",
+            "release-payload.json",
+            "release-qualification.json",
             "release-manifest.json",
         ]:
             self.assertIn(
@@ -180,6 +182,8 @@ class WindowsInstallerSourceTests(unittest.TestCase):
             "compose.yaml",
             "images.release.env",
             "secure-acl.ps1",
+            "release-payload.json",
+            "release-qualification.json",
             "release-manifest.json",
             "Uninstall.exe",
         ]:

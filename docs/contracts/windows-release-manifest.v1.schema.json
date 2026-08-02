@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/windows-release-manifest.v1.schema.json",
+  "title": "DataX Enterprise Studio Windows Release Manifest 1.4",
+  "description": "最终 Windows 候选 F 的安装资源完整性清单。签名 Launcher 的编译期 SHA-256 必须绑定本文件；本文件再绑定固定 Compose、镜像锁、ACL helper、不可变 release payload (P) 和 detached release qualification (QR)。本清单只证明同一安装包中的字节与候选身份一致，不验证 QR 签名，不派生 Windows E4、普通用户执行能力或公开发布批准；QR 的语义必须由 ADR-0011 后续受信 Phase-B reader 在固定路径中独立失败关闭验证。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "product_version",
+    "release_candidate",
+    "candidate_commit",
+    "compose_sha256",
+    "images_sha256",
+    "acl_script_sha256",
+    "release_payload",
+    "release_qualification",
+    "allowed_authenticode_signer_certificate_sha256"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.4" },
+    "product_version": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$"
+    },
+    "release_candidate": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-[0-9a-f]{12}$"
+    },
+    "candidate_commit": { "$ref": "#/$defs/commitSha" },
+    "compose_sha256": { "$ref": "#/$defs/sha256" },
+    "images_sha256": { "$ref": "#/$defs/sha256" },
+    "acl_script_sha256": { "$ref": "#/$defs/sha256" },
+    "release_payload": { "$ref": "#/$defs/releasePayload" },
+    "release_qualification": { "$ref": "#/$defs/releaseQualification" },
+    "allowed_authenticode_signer_certificate_sha256": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/sha256" }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "commitSha": {
+      "type": "string",
+      "minLength": 40,
+      "maxLength": 40,
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$"
+    },
+    "releasePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "payload_root_sha256"],
+      "properties": {
+        "path": { "const": "release-payload.json" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "payload_root_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "releaseQualification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "issuer_key_id"],
+      "properties": {
+        "path": { "const": "release-qualification.json" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "issuer_key_id": { "$ref": "#/$defs/identifier" }
+      }
+    }
+  }
+}

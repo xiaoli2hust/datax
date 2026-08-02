@@ -5,8 +5,8 @@
 - 固定安装到 `%LOCALAPPDATA%\Programs\DataXEnterpriseStudio`；`.onInit` 拒绝 NSIS
   默认 `/D=<path>` 覆盖，`CRCCheck force` 拒绝 `/NCRC` 跳过自身损坏校验（CRC 不是
   Authenticode 信任证明）；
-- 安装签名 `launcher.exe`、固定 `compose.yaml`、发布镜像锁、受控 ACL helper 和
-  带 SHA-256 的发布清单；
+- 安装签名 `launcher.exe`、固定 `compose.yaml`、发布镜像锁、受控 ACL helper、P/QR 只读资源和
+  带 SHA-256 的发布清单；P/QR 只作候选资源完整性绑定，不是用户配置或普通执行授权；
 - 写入程序目录前，先在 NSIS 临时目录运行签名 Launcher：校验自身信任链、发布清单
   绑定、发布证书 DER SHA-256 允许集，并要求当前 `Setup.exe` 与 Launcher 由同一张
   允许证书签名；缺失、无效、证书不匹配或资源被替换时不写入程序目录；
@@ -53,8 +53,10 @@ Setup 变成可信程序；用户/组织在首次执行前仍必须通过 Window
 
 流水线先核验实际 PFX 证书 DER SHA-256 属于该受保护、严格排序去重的允许集；
 `scripts/windows/build-installer.ps1` 必须显式接收同一份 `-AllowedSignerFile`，并只会生成
-包含该 allowlist、精确 `release_candidate` 和完整 40 位 `candidate_commit` 的清单 `1.3`、由同一证书签名的 Launcher/Setup。Launcher
-还把这两个候选身份字段编译期绑定；随后
+包含该 allowlist、精确 `release_candidate`、完整 40 位 `candidate_commit`、P/QR 文件 SHA-256 及其
+非秘密识别摘要的清单 `1.4`、由同一证书签名的 Launcher/Setup。P/QR 输入是受保护签名环境中
+预置的只读本机文件路径；构建器只作大小/UTF-8/最小识别字段检查，不能替代 QR 的 canonical JSON
+解析、RQA 验签或 E4。Launcher 还把这些候选身份和资源清单字段编译期绑定；随后
 `scripts/release/finalize_windows_publisher_binding.ps1` 再次校验该 allowlist，并重建、重签
 最终发布绑定。Linux 阶段还必须先以全新空 `DOCKER_CONFIG`、不继承 registry 凭据的方式
 匿名拉取五个固定 digest，并生成与镜像锁一致的 `anonymous-image-pulls.json`；任一镜像只能

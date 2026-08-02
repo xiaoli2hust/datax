@@ -163,12 +163,14 @@ $manifestProperties = [string[]]@(
     "compose_sha256",
     "images_sha256",
     "acl_script_sha256",
+    "release_payload",
+    "release_qualification",
     "allowed_authenticode_signer_certificate_sha256"
 )
 $manifestSigners = Get-CanonicalAllowlist `
     -Document $manifest `
     -ExpectedProperties $manifestProperties `
-    -SchemaVersion "1.3"
+    -SchemaVersion "1.4"
 $releaseCandidatePattern = "^$([Regex]::Escape($ExpectedVersion))-[0-9a-f]{12}$"
 if ($ExpectedReleaseCandidate -cnotmatch $releaseCandidatePattern -or
     $ExpectedReleaseCandidate -cne "$ExpectedVersion-$($ExpectedCommit.Substring(0, 12))" -or
@@ -179,6 +181,24 @@ if ($ExpectedReleaseCandidate -cnotmatch $releaseCandidatePattern -or
     $manifest.images_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
     $manifest.acl_script_sha256 -cnotmatch '^[0-9a-f]{64}$') {
     throw "Release manifest version or resource hashes are invalid."
+}
+$payloadProperties = @($manifest.release_payload.PSObject.Properties.Name)
+$qualificationProperties = @($manifest.release_qualification.PSObject.Properties.Name)
+if ($payloadProperties.Count -ne 3 -or
+    $payloadProperties[0] -cne "path" -or
+    $payloadProperties[1] -cne "sha256" -or
+    $payloadProperties[2] -cne "payload_root_sha256" -or
+    $manifest.release_payload.path -cne "release-payload.json" -or
+    $manifest.release_payload.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+    $manifest.release_payload.payload_root_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+    $qualificationProperties.Count -ne 3 -or
+    $qualificationProperties[0] -cne "path" -or
+    $qualificationProperties[1] -cne "sha256" -or
+    $qualificationProperties[2] -cne "issuer_key_id" -or
+    $manifest.release_qualification.path -cne "release-qualification.json" -or
+    $manifest.release_qualification.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+    $manifest.release_qualification.issuer_key_id -cnotmatch '^[A-Za-z0-9._-]{8,128}$') {
+    throw "Release manifest Phase-B resource bindings are invalid."
 }
 
 $expectedDocument = Read-StrictJson `
@@ -207,6 +227,8 @@ $resourceRules = [ordered]@{
     "compose.yaml" = [string]$manifest.compose_sha256
     "images.release.env" = [string]$manifest.images_sha256
     "secure-acl.ps1" = [string]$manifest.acl_script_sha256
+    "release-payload.json" = [string]$manifest.release_payload.sha256
+    "release-qualification.json" = [string]$manifest.release_qualification.sha256
 }
 foreach ($entry in $resourceRules.GetEnumerator()) {
     $path = Resolve-ExistingFile `

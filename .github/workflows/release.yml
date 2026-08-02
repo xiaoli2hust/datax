@@ -914,6 +914,8 @@ jobs:
           RUSTC_PATH: ${{ vars.RUSTC_PATH }}
           MAKENSIS_PATH: ${{ vars.MAKENSIS_PATH }}
           SIGNTOOL_PATH: ${{ vars.SIGNTOOL_PATH }}
+          RELEASE_PAYLOAD_PATH: ${{ vars.RELEASE_PAYLOAD_PATH }}
+          RELEASE_QUALIFICATION_PATH: ${{ vars.RELEASE_QUALIFICATION_PATH }}
           TIMESTAMP_URL: https://timestamp.digicert.com
         run: |
           $ErrorActionPreference = "Stop"
@@ -932,6 +934,8 @@ jobs:
                     "${env:RUNNER_TEMP}\linux-candidate-evidence" `
                     "images.release.env"
               )
+              ReleasePayloadFile = $env:RELEASE_PAYLOAD_PATH
+              ReleaseQualificationFile = $env:RELEASE_QUALIFICATION_PATH
               OutputDirectory = $outputDirectory
               CargoPath = $env:CARGO_PATH
               RustcPath = $env:RUSTC_PATH
@@ -947,6 +951,8 @@ jobs:
               ReleaseCandidate = $env:RELEASE_CANDIDATE
               CandidateCommit = $env:GITHUB_SHA
               BuildOutputDirectory = $outputDirectory
+              ReleasePayloadFile = $env:RELEASE_PAYLOAD_PATH
+              ReleaseQualificationFile = $env:RELEASE_QUALIFICATION_PATH
               CargoPath = $env:CARGO_PATH
               RustcPath = $env:RUSTC_PATH
               MakensisPath = $env:MAKENSIS_PATH

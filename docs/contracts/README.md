@@ -50,8 +50,8 @@
   `scripts/acceptance/candidate_root.py` 以外部 CI 身份参数绑定固定仓库、release workflow、
   run/attempt、保护环境、source ref、commit、tag、candidate，并把候选目录中除候选根自身
   以外的全部普通文件按安全相对路径、大小和 SHA-256 进行完整有序盘点；Setup、Launcher、
-  final release manifest 1.3（精确绑定 `release_candidate` 与完整 `candidate_commit`）、Compose、顶层/内嵌镜像 lock、Linux build evidence 中生成的
-  image lock、ACL helper、SPDX SBOM index、
+  final release manifest 1.4（精确绑定 `release_candidate`、完整 `candidate_commit` 与 P/QR 资源摘要）、Compose、顶层/内嵌镜像 lock、Linux build evidence 中生成的
+  image lock、ACL helper、P/QR、SPDX SBOM index、
   acceptance/environment/catalog 和 Windows build environment 还必须映射到该完整盘点并
   通过跨文件身份/hash 校验；manifest 内三项资源摘要与 canonical signer SHA-256 allowlist
   也须复核。生成/验证还强制传入候选目录之外的、由 GitHub-hosted attestor 独立下载的
@@ -84,6 +84,10 @@
   `hqa_keyring/rqa_keyring` 都受 payload root 绑定；QR 只可由 P 内 `rqa_keyring` 验签，固定完整
   P binding、依赖/许可证摘要、私有 Phase-A E3/Windows/payload evidence descriptor 及精确 pair，
   但不是普通 API、Worker、Compose 或用户可提交的契约，更不是 E3/E4、Setup 通过或发布结论。
+- `windows-release-manifest.v1.schema.json`：最终 Windows 安装清单的 `1.4` 精确形状。它将
+  固定候选身份、Compose/镜像/ACL 摘要以及随候选制品只读携带的 P、QR 文件字节和识别摘要绑定到
+  Launcher；这一层只校验资源路径和字节完整性，**不**解析或验签 QR，也不会授予普通 API、Worker
+  或用户任何插件执行权。QR 的语义 reader、同一 F 的 E4 和公开晋级仍是后续发布门禁。
 - `datax_studio.qualification.private_harness_loader`（J0c-1）是**内部 E1 实现，不是新 JSON
   Schema、公开 API 或普通配置格式**。它仅接受未来受保护基础设施显式注入的 trusted private
   filesystem root、hash-pinned P/QH 文件、独立 P root 与固定 harness identity；返回不含 raw QH/raw

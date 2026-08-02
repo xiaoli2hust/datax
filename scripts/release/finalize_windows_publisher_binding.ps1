@@ -12,6 +12,10 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$BuildOutputDirectory,
     [Parameter(Mandatory = $true)]
+    [string]$ReleasePayloadFile,
+    [Parameter(Mandatory = $true)]
+    [string]$ReleaseQualificationFile,
+    [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9A-Fa-f]{40}$')]
     [string]$SigningCertificateThumbprint,
     [Parameter(Mandatory = $true)]
@@ -263,6 +267,47 @@ function Read-CanonicalSignerAllowlist {
     return [string[]]$values
 }
 
+function Read-PhaseBResourceMetadata {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("RELEASE_PAYLOAD", "RELEASE_QUALIFICATION")]
+        [string]$Kind
+    )
+
+    $resolved = Resolve-ExistingFile -Path $Path -Description $Kind
+    $item = Get-Item -LiteralPath $resolved
+    if ($item.Length -le 0 -or $item.Length -gt 1048576) {
+        throw "$Kind has an invalid size."
+    }
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    try {
+        $text = [IO.File]::ReadAllText($resolved, $strictUtf8)
+        $document = $text | ConvertFrom-Json
+    }
+    catch {
+        throw "$Kind must be UTF-8 JSON."
+    }
+    if ($text.Length -eq 0 -or $text[0] -eq [char]0xFEFF -or
+        $null -eq $document -or $document -isnot [pscustomobject] -or
+        [string]$document.artifact_kind -cne $Kind) {
+        throw "$Kind metadata is invalid."
+    }
+    if ($Kind -ceq "RELEASE_PAYLOAD") {
+        $root = [string]$document.payload_root_sha256
+        if ($root -cnotmatch '^[0-9a-f]{64}$') {
+            throw "RELEASE_PAYLOAD payload_root_sha256 is invalid."
+        }
+        return [pscustomobject]@{ payload_root_sha256 = $root }
+    }
+    $issuerKeyId = [string]$document.issuer_key_id
+    if ($issuerKeyId -cnotmatch '^[A-Za-z0-9._-]{8,128}$') {
+        throw "RELEASE_QUALIFICATION issuer_key_id is invalid."
+    }
+    return [pscustomobject]@{ issuer_key_id = $issuerKeyId }
+}
+
 function Test-OrdinalContains {
     param(
         [Parameter(Mandatory = $true)]
@@ -351,11 +396,17 @@ $imagesStaged = Resolve-ExistingFile `
 $aclScriptStaged = Resolve-ExistingFile `
     -Path (Join-Path $resourceDirectory "secure-acl.ps1") `
     -Description "staged ACL helper"
+$payloadStaged = Join-Path $resourceDirectory "release-payload.json"
+$qualificationStaged = Join-Path $resourceDirectory "release-qualification.json"
 $manifestStaged = Resolve-ExistingFile `
     -Path (Join-Path $resourceDirectory "release-manifest.json") `
     -Description "staged release manifest"
 
 $allowedSigners = Read-CanonicalSignerAllowlist -Path $AllowedSignerFile
+$payloadSource = Resolve-ExistingFile -Path $ReleasePayloadFile -Description "RELEASE_PAYLOAD"
+$qualificationSource = Resolve-ExistingFile -Path $ReleaseQualificationFile -Description "RELEASE_QUALIFICATION"
+$payloadMetadata = Read-PhaseBResourceMetadata -Path $payloadSource -Kind "RELEASE_PAYLOAD"
+$qualificationMetadata = Read-PhaseBResourceMetadata -Path $qualificationSource -Kind "RELEASE_QUALIFICATION"
 $expectedSha1 = $SigningCertificateThumbprint.Replace(" ", "").ToUpperInvariant()
 $certificatePath = "Cert:\CurrentUser\My\$expectedSha1"
 $certificate = Get-Item -LiteralPath $certificatePath -ErrorAction Stop
@@ -402,8 +453,10 @@ if ($ReleaseCandidate -cnotmatch $releaseCandidatePattern -or
     throw "ReleaseCandidate must bind the exact ProductVersion and CandidateCommit prefix."
 }
 
+Copy-Item -LiteralPath $payloadSource -Destination $payloadStaged -Force
+Copy-Item -LiteralPath $qualificationSource -Destination $qualificationStaged -Force
 $releaseManifest = [ordered]@{
-    schema_version = "1.3"
+    schema_version = "1.4"
     product_version = $ProductVersion
     release_candidate = $ReleaseCandidate
     candidate_commit = $CandidateCommit
@@ -416,6 +469,16 @@ $releaseManifest = [ordered]@{
     acl_script_sha256 = (
         Get-FileHash -LiteralPath $aclScriptStaged -Algorithm SHA256
     ).Hash.ToLowerInvariant()
+    release_payload = [ordered]@{
+        path = "release-payload.json"
+        sha256 = (Get-FileHash -LiteralPath $payloadStaged -Algorithm SHA256).Hash.ToLowerInvariant()
+        payload_root_sha256 = [string]$payloadMetadata.payload_root_sha256
+    }
+    release_qualification = [ordered]@{
+        path = "release-qualification.json"
+        sha256 = (Get-FileHash -LiteralPath $qualificationStaged -Algorithm SHA256).Hash.ToLowerInvariant()
+        issuer_key_id = [string]$qualificationMetadata.issuer_key_id
+    }
     allowed_authenticode_signer_certificate_sha256 = @($allowedSigners)
 }
 $manifestJson = $releaseManifest | ConvertTo-Json -Compress
@@ -511,6 +574,8 @@ Invoke-Checked -Program $makensis -Arguments @(
     "/DCOMPOSE_FILE=$composeStaged",
     "/DIMAGE_ENV_FILE=$imagesStaged",
     "/DACL_SCRIPT=$aclScriptStaged",
+    "/DRELEASE_PAYLOAD=$payloadStaged",
+    "/DRELEASE_QUALIFICATION=$qualificationStaged",
     "/DRELEASE_MANIFEST=$manifestStaged",
     "/DOUTPUT_FILE=$setupPath",
     $nsiSource

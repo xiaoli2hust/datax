@@ -29,7 +29,8 @@
 > `LOCK_RESERVED` receipt。2026-08-02 的 disposable PostgreSQL 15 E2 已取得 `32 passed`，但不代表
 > private runner、普通 API/Worker/Compose/Launcher 接线、DataX E3 或 Windows E4。
 > 仍没有 protected harness credential provisioning、私有 Execution rerun、private API/Worker/Compose
-> override、四检查点、受保护 harness、manifest-hash-pinned QR reader 或真实 E3/E4；普通产品路径继续 deny-all。
+> override、四检查点、受保护 harness、QR 语义 reader 或真实 E3/E4；安装器/Launcher 已有 P/QR
+> 资源哈希绑定的 E1 基础，但普通产品路径继续 deny-all。
 
 ## 1. 安全目标与非目标
 
@@ -109,7 +110,9 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
   payload/runtime/job binding、nonce/grant/PEA/checkpoint 账本及其 0021/0022 role/function/adapter、0023 lock/fence
   与 0024 原子创建数据库原语已是 E1 基础件加受限 PostgreSQL E2；P 的 `rqa_keyring` 仅让 parser 验证
   canonical QR 的 Ed25519 签名、时窗、P/依赖许可证/pair binding，不能授予 E4 或普通执行。HQA/RQA、protected harness credential provisioning、私有 Execution rerun、
-  private override、四检查点、harness、manifest-hash-pinned QR reader 与真实外部证据均未实现。QH 未来只能跨越至受保护 harness；QR 未来只能作为被安装包
+  private override、四检查点、harness、QR 语义 reader 与真实外部证据均未实现。最终 `release-manifest 1.4`
+  已把 P/QR 的固定路径、字节摘要和非秘密识别摘要接到 Launcher 的 E1 资源完整性检查，但不解析/验签 QR、
+  不产生 E4 或普通执行权。QH 未来只能跨越至受保护 harness；QR 只能作为被安装包
   哈希约束的只读资源进入私有最终候选；GitHub OIDC provenance 只跨越候选根来源边界，不能
   替代 Windows/数据库行为边界。不得由普通用户设置或产品运行时网络调用替代。
 
@@ -255,13 +258,23 @@ E4 的对应负例闭合。
 
 ### TM-19 更新（2026-08-03）
 
-本更新取代 TM-19 中关于“清单 1.1”的实现描述：最终发布清单现为 1.3，包含
-`release_candidate=<semver>-<commit12>` 和完整 40 位 `candidate_commit`；两者同时编译期绑定到 Launcher，
-其中完整提交还由 hosted candidate root 复核，短候选必须等于该提交前缀。安装器继续写入产品和卸载
-注册表的候选标识；同版本 repair 必须读取现有候选标识，缺失或同 semver 不同 candidate 均要求先卸载，
-不能覆盖。这只降低混合候选风险；签名私钥、工具来源和 TOCTOU 仍未关闭。相应源码负例覆盖
-缺失候选标识、同 semver 不同 candidate 与清单/Launcher 候选错绑；它们当前均为 E1，须由干净
-Windows E4 复验。
+本更新取代 TM-19 中关于“清单 1.1”的实现描述：最终发布清单现为 `1.4`，包含
+`release_candidate=<semver>-<commit12>`、完整 40 位 `candidate_commit`、固定 P/QR 路径、文件
+SHA-256 与非秘密识别摘要；这些字段同时编译期绑定到 Launcher，其中完整提交还由 hosted candidate
+root 复核，短候选必须等于该提交前缀。P/QR 绑定只验证候选资源字节，不能替代 canonical QR parser、
+RQA 验签、E4 或普通插件权限。安装器继续写入产品和卸载注册表的候选标识；同版本 repair 必须读取
+现有候选标识，缺失或同 semver 不同 candidate 均要求先卸载，不能覆盖。这只降低混合候选风险；签名
+私钥、工具来源和 TOCTOU 仍未关闭。相应源码负例覆盖缺失候选标识、同 semver 不同 candidate、
+P/QR 资源被替换及清单/Launcher 候选错绑；它们当前均为 E1，须由干净 Windows E4 复验。
+
+### TM-13 更新（2026-08-03）
+
+上表中“最终清单 1.3”的历史描述由 `1.4` 取代：除完整提交、候选短标识和发布签名者允许集外，
+Windows handoff/candidate root 还必须交叉核对安装包内 P/QR 的固定相对路径、文件 SHA-256 与
+`payload_root_sha256` / `issuer_key_id`。签名工作流中的 P/QR 路径是受保护
+`windows-candidate-signing` environment 的 runner-local 配置，缺失时必须失败关闭；它们不是仓库变量、
+用户可提交输入或普通产品运行时配置。此处只缩小候选制品被替换的面，尚未对 QR 作 canonical JSON
+解析、RQA 验签或权限派生，仍只是 E1。
 
 ## 5. 一次复制的强制安全序列
 

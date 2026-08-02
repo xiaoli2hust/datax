@@ -193,12 +193,16 @@ jobs:
           [IO.Directory]::CreateDirectory($resources) | Out-Null
           $utf8WithoutBom = [Text.UTF8Encoding]::new($false)
           $imageLock = Join-Path $resources "images.release.env"
+          $payload = Join-Path $resources "release-payload.json"
+          $qualification = Join-Path $resources "release-qualification.json"
           $manifest = Join-Path $resources "release-manifest.json"
           [IO.File]::WriteAllText(
             $imageLock,
             "# deliberately non-release preflight input`n",
             $utf8WithoutBom
           )
+          [IO.File]::WriteAllText($payload, "{}", $utf8WithoutBom)
+          [IO.File]::WriteAllText($qualification, "{}", $utf8WithoutBom)
           [IO.File]::WriteAllText($manifest, "{}", $utf8WithoutBom)
           $launcher = Join-Path `
             $env:DATAX_HOSTED_PREFLIGHT_ROOT `
@@ -221,6 +225,8 @@ jobs:
             "/DCOMPOSE_FILE=$compose",
             "/DIMAGE_ENV_FILE=$imageLock",
             "/DACL_SCRIPT=$aclScript",
+            "/DRELEASE_PAYLOAD=$payload",
+            "/DRELEASE_QUALIFICATION=$qualification",
             "/DRELEASE_MANIFEST=$manifest",
             "/DOUTPUT_FILE=$output",
             $installer

@@ -93,10 +93,28 @@ class CandidateFixture:
         shutil.copyfile(images, embedded_images)
         acl_helper = resources / "secure-acl.ps1"
         acl_helper.write_text('$ErrorActionPreference = "Stop"\n', encoding="utf-8")
+        payload = resources / "release-payload.json"
+        self._write_json(
+            payload,
+            {
+                "schema_version": "1.0",
+                "artifact_kind": "RELEASE_PAYLOAD",
+                "payload_root_sha256": "6" * 64,
+            },
+        )
+        qualification = resources / "release-qualification.json"
+        self._write_json(
+            qualification,
+            {
+                "schema_version": "1.0",
+                "artifact_kind": "RELEASE_QUALIFICATION",
+                "issuer_key_id": "release-key-001",
+            },
+        )
         self._write_json(
             resources / "release-manifest.json",
             {
-                "schema_version": "1.3",
+                "schema_version": "1.4",
                 "product_version": VERSION,
                 "release_candidate": CANDIDATE,
                 "candidate_commit": COMMIT,
@@ -105,6 +123,16 @@ class CandidateFixture:
                 "acl_script_sha256": hashlib.sha256(
                     acl_helper.read_bytes()
                 ).hexdigest(),
+                "release_payload": {
+                    "path": "release-payload.json",
+                    "sha256": hashlib.sha256(payload.read_bytes()).hexdigest(),
+                    "payload_root_sha256": "6" * 64,
+                },
+                "release_qualification": {
+                    "path": "release-qualification.json",
+                    "sha256": hashlib.sha256(qualification.read_bytes()).hexdigest(),
+                    "issuer_key_id": "release-key-001",
+                },
                 "allowed_authenticode_signer_certificate_sha256": ["8" * 64],
             },
         )
@@ -351,8 +379,16 @@ class CandidateRootTests(unittest.TestCase):
                 ):
                     validate_candidate_root(**fixture.arguments())
 
-    def test_final_release_manifest_13_full_candidate_resources_and_signers_are_required(self) -> None:
-        cases = ("old-schema", "candidate", "commit", "resource-hash", "signer-order")
+    def test_final_release_manifest_14_full_candidate_resources_and_signers_are_required(self) -> None:
+        cases = (
+            "old-schema",
+            "candidate",
+            "commit",
+            "resource-hash",
+            "payload-hash",
+            "qualification-issuer",
+            "signer-order",
+        )
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 fixture = CandidateFixture(Path(directory))
@@ -362,6 +398,10 @@ class CandidateRootTests(unittest.TestCase):
                     manifest["schema_version"] = "1.0"
                 elif case == "resource-hash":
                     manifest["compose_sha256"] = "f" * 64
+                elif case == "payload-hash":
+                    manifest["release_payload"]["sha256"] = "f" * 64
+                elif case == "qualification-issuer":
+                    manifest["release_qualification"]["issuer_key_id"] = "short"
                 elif case == "candidate":
                     manifest["release_candidate"] = f"{VERSION}-{'b' * 12}"
                 elif case == "commit":
@@ -372,7 +412,7 @@ class CandidateRootTests(unittest.TestCase):
                         "8" * 64,
                     ]
                 self._write_manifest(manifest_path, manifest)
-                with self.assertRaisesRegex(ValueError, "release manifest 1.3"):
+                with self.assertRaisesRegex(ValueError, "release manifest 1.4"):
                     fixture.generate()
 
     def test_candidate_image_lock_must_come_from_linux_build_evidence(self) -> None:

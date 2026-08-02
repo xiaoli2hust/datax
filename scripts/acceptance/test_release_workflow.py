@@ -275,6 +275,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 "MakensisPath",
                 "SigntoolPath",
                 "AllowedSignerFile",
+                "ReleasePayloadFile",
+                "ReleaseQualificationFile",
             ),
             "scripts/release/finalize_windows_publisher_binding.ps1": (
                 "ReleaseCandidate",
@@ -283,6 +285,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 "RustcPath",
                 "MakensisPath",
                 "SigntoolPath",
+                "ReleasePayloadFile",
+                "ReleaseQualificationFile",
             ),
             "scripts/windows/validate-release.ps1": (
                 "ExpectedReleaseCandidate",
@@ -365,6 +369,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
             ("RustcPath", "RUSTC_PATH"),
             ("MakensisPath", "MAKENSIS_PATH"),
             ("SigntoolPath", "SIGNTOOL_PATH"),
+            ("ReleasePayloadFile", "RELEASE_PAYLOAD_PATH"),
+            ("ReleaseQualificationFile", "RELEASE_QUALIFICATION_PATH"),
         ):
             self.assertEqual(build.count(f"{parameter} = $env:{variable}"), 2)
         self.assertIn("AllowedSignerFile = $env:SIGNER_ALLOWLIST_PATH", build)
@@ -405,7 +411,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "The selected signing certificate is absent from the protected SHA-256 allowlist.",
             builder,
         )
-        self.assertIn('schema_version = "1.3"', builder)
+        self.assertIn('schema_version = "1.4"', builder)
         self.assertIn('release_candidate = $ReleaseCandidate', builder)
         self.assertIn('candidate_commit = $CandidateCommit', builder)
         self.assertIn('"DES_RELEASE_CANDIDATE_COMMIT"', builder)
@@ -416,11 +422,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
             builder,
         )
         self.assertNotIn('schema_version = "1.0"\n    product_version = $ProductVersion', builder)
-        self.assertIn('manifest.schema_version != "1.3"', launcher)
+        self.assertIn('manifest.schema_version != "1.4"', launcher)
         self.assertIn('option_env!("DES_RELEASE_CANDIDATE")', launcher)
         self.assertIn('option_env!("DES_RELEASE_CANDIDATE_COMMIT")', launcher)
         self.assertIn('RELEASE_CANDIDATE_BINDING_FAILED', launcher)
         self.assertIn("allowed_authenticode_signer_certificate_sha256", launcher)
+        self.assertIn("release_payload", launcher)
+        self.assertIn("release_qualification", launcher)
 
     def test_release_candidate_flows_from_preparation_to_hosted_candidate_root(self) -> None:
         linux_job = self.workflow["jobs"]["linux-images"]

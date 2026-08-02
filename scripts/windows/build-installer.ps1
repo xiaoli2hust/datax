@@ -10,6 +10,10 @@ param(
     [string]$ComposeFile,
     [Parameter(Mandatory = $true)]
     [string]$ReleaseImagesFile,
+    [Parameter(Mandatory = $true)]
+    [string]$ReleasePayloadFile,
+    [Parameter(Mandatory = $true)]
+    [string]$ReleaseQualificationFile,
     [string]$OutputDirectory,
     [Parameter(Mandatory = $true)]
     [string]$CargoPath,
@@ -272,6 +276,47 @@ function Read-CanonicalSignerAllowlist {
     return [string[]]$values
 }
 
+function Read-PhaseBResourceMetadata {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path,
+        [Parameter(Mandatory = $true)]
+        [ValidateSet("RELEASE_PAYLOAD", "RELEASE_QUALIFICATION")]
+        [string]$Kind
+    )
+
+    $resolved = Resolve-ExistingFile -Path $Path -Description $Kind
+    $item = Get-Item -LiteralPath $resolved
+    if ($item.Length -le 0 -or $item.Length -gt 1048576) {
+        throw "$Kind has an invalid size."
+    }
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    try {
+        $text = [IO.File]::ReadAllText($resolved, $strictUtf8)
+        $document = $text | ConvertFrom-Json
+    }
+    catch {
+        throw "$Kind must be UTF-8 JSON."
+    }
+    if ($text.Length -eq 0 -or $text[0] -eq [char]0xFEFF -or
+        $null -eq $document -or $document -isnot [pscustomobject] -or
+        [string]$document.artifact_kind -cne $Kind) {
+        throw "$Kind metadata is invalid."
+    }
+    if ($Kind -ceq "RELEASE_PAYLOAD") {
+        $root = [string]$document.payload_root_sha256
+        if ($root -cnotmatch '^[0-9a-f]{64}$') {
+            throw "RELEASE_PAYLOAD payload_root_sha256 is invalid."
+        }
+        return [pscustomobject]@{ payload_root_sha256 = $root }
+    }
+    $issuerKeyId = [string]$document.issuer_key_id
+    if ($issuerKeyId -cnotmatch '^[A-Za-z0-9._-]{8,128}$') {
+        throw "RELEASE_QUALIFICATION issuer_key_id is invalid."
+    }
+    return [pscustomobject]@{ issuer_key_id = $issuerKeyId }
+}
+
 function Get-CertificateSha256 {
     param(
         [Parameter(Mandatory = $true)]
@@ -375,10 +420,14 @@ $signtool = Resolve-RequiredExecutable -Name "signtool.exe" -ExplicitPath $Signt
 Assert-NoCargoCompilerOverrides
 $composeSource = Resolve-ExistingFile -Path $ComposeFile -Description "Windows Compose file"
 $imagesSource = Resolve-ExistingFile -Path $ReleaseImagesFile -Description "Release image lock"
+$payloadSource = Resolve-ExistingFile -Path $ReleasePayloadFile -Description "RELEASE_PAYLOAD"
+$qualificationSource = Resolve-ExistingFile -Path $ReleaseQualificationFile -Description "RELEASE_QUALIFICATION"
 $aclScriptSource = Resolve-ExistingFile -Path $aclScriptSource -Description "ACL helper"
 $nsiSource = Resolve-ExistingFile -Path $installerScript -Description "NSIS installer script"
 $launcherCargoManifest = Resolve-ExistingFile -Path $launcherCargoManifest -Description "Launcher Cargo manifest"
 Read-And-ValidateImageLock -Path $imagesSource
+$payloadMetadata = Read-PhaseBResourceMetadata -Path $payloadSource -Kind "RELEASE_PAYLOAD"
+$qualificationMetadata = Read-PhaseBResourceMetadata -Path $qualificationSource -Kind "RELEASE_QUALIFICATION"
 $allowedSigners = Read-CanonicalSignerAllowlist -Path $AllowedSignerFile
 $expectedSignerThumbprint = $SigningCertificateThumbprint.Replace(" ", "").ToUpperInvariant()
 $certificatePath = "Cert:\CurrentUser\My\$expectedSignerThumbprint"
@@ -455,22 +504,38 @@ $launcherStaged = Join-Path $stagingDirectory "launcher.exe"
 $composeStaged = Join-Path $resourceDirectory "compose.yaml"
 $imagesStaged = Join-Path $resourceDirectory "images.release.env"
 $aclScriptStaged = Join-Path $resourceDirectory "secure-acl.ps1"
+$payloadStaged = Join-Path $resourceDirectory "release-payload.json"
+$qualificationStaged = Join-Path $resourceDirectory "release-qualification.json"
 $manifestStaged = Join-Path $resourceDirectory "release-manifest.json"
 Copy-Item -LiteralPath $composeSource -Destination $composeStaged
 Copy-Item -LiteralPath $imagesSource -Destination $imagesStaged
 Copy-Item -LiteralPath $aclScriptSource -Destination $aclScriptStaged
+Copy-Item -LiteralPath $payloadSource -Destination $payloadStaged
+Copy-Item -LiteralPath $qualificationSource -Destination $qualificationStaged
 
 $composeHash = (Get-FileHash -LiteralPath $composeStaged -Algorithm SHA256).Hash.ToLowerInvariant()
 $imagesHash = (Get-FileHash -LiteralPath $imagesStaged -Algorithm SHA256).Hash.ToLowerInvariant()
 $aclScriptHash = (Get-FileHash -LiteralPath $aclScriptStaged -Algorithm SHA256).Hash.ToLowerInvariant()
+$payloadHash = (Get-FileHash -LiteralPath $payloadStaged -Algorithm SHA256).Hash.ToLowerInvariant()
+$qualificationHash = (Get-FileHash -LiteralPath $qualificationStaged -Algorithm SHA256).Hash.ToLowerInvariant()
 $releaseManifest = [ordered]@{
-    schema_version = "1.3"
+    schema_version = "1.4"
     product_version = $ProductVersion
     release_candidate = $ReleaseCandidate
     candidate_commit = $CandidateCommit
     compose_sha256 = $composeHash
     images_sha256 = $imagesHash
     acl_script_sha256 = $aclScriptHash
+    release_payload = [ordered]@{
+        path = "release-payload.json"
+        sha256 = $payloadHash
+        payload_root_sha256 = [string]$payloadMetadata.payload_root_sha256
+    }
+    release_qualification = [ordered]@{
+        path = "release-qualification.json"
+        sha256 = $qualificationHash
+        issuer_key_id = [string]$qualificationMetadata.issuer_key_id
+    }
     allowed_authenticode_signer_certificate_sha256 = @($allowedSigners)
 }
 $manifestJson = $releaseManifest | ConvertTo-Json -Compress
@@ -563,6 +628,8 @@ Invoke-Checked -Program $makensis -Arguments @(
     "/DCOMPOSE_FILE=$composeStaged",
     "/DIMAGE_ENV_FILE=$imagesStaged",
     "/DACL_SCRIPT=$aclScriptStaged",
+    "/DRELEASE_PAYLOAD=$payloadStaged",
+    "/DRELEASE_QUALIFICATION=$qualificationStaged",
     "/DRELEASE_MANIFEST=$manifestStaged",
     "/DOUTPUT_FILE=$setupPath",
     $nsiSource
@@ -589,3 +656,5 @@ Write-Output "Release manifest SHA256: $manifestHash"
 Write-Output "Compose SHA256: $composeHash"
 Write-Output "Image lock SHA256: $imagesHash"
 Write-Output "ACL helper SHA256: $aclScriptHash"
+Write-Output "Release payload SHA256: $payloadHash"
+Write-Output "Release qualification SHA256: $qualificationHash"

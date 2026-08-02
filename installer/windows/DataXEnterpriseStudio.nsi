@@ -27,6 +27,12 @@ ManifestDPIAware true
 !ifndef RELEASE_MANIFEST
   !error "RELEASE_MANIFEST is required"
 !endif
+!ifndef RELEASE_PAYLOAD
+  !error "RELEASE_PAYLOAD is required"
+!endif
+!ifndef RELEASE_QUALIFICATION
+  !error "RELEASE_QUALIFICATION is required"
+!endif
 !ifndef IMAGE_ENV_FILE
   !error "IMAGE_ENV_FILE is required"
 !endif
@@ -221,6 +227,8 @@ Section "DataX Enterprise Studio" SEC_MAIN
   File "/oname=compose.yaml" "${COMPOSE_FILE}"
   File "/oname=images.release.env" "${IMAGE_ENV_FILE}"
   File "/oname=secure-acl.ps1" "${ACL_SCRIPT}"
+  File "/oname=release-payload.json" "${RELEASE_PAYLOAD}"
+  File "/oname=release-qualification.json" "${RELEASE_QUALIFICATION}"
   File "/oname=release-manifest.json" "${RELEASE_MANIFEST}"
   ExecWait '"$PLUGINSDIR\release-check\launcher.exe" verify-release --installer "$EXEPATH"' $0
   ${If} $0 != 0
@@ -256,12 +264,16 @@ Section "DataX Enterprise Studio" SEC_MAIN
   File "/oname=compose.yaml" "${COMPOSE_FILE}"
   File "/oname=images.release.env" "${IMAGE_ENV_FILE}"
   File "/oname=secure-acl.ps1" "${ACL_SCRIPT}"
+  File "/oname=release-payload.json" "${RELEASE_PAYLOAD}"
+  File "/oname=release-qualification.json" "${RELEASE_QUALIFICATION}"
   File "/oname=release-manifest.json" "${RELEASE_MANIFEST}"
   Call AssertInstallationPathsNoReparse
   Call AssertInstalledLeavesNoReparse
   SetFileAttributes "$INSTDIR\resources\compose.yaml" READONLY
   SetFileAttributes "$INSTDIR\resources\images.release.env" READONLY
   SetFileAttributes "$INSTDIR\resources\secure-acl.ps1" READONLY
+  SetFileAttributes "$INSTDIR\resources\release-payload.json" READONLY
+  SetFileAttributes "$INSTDIR\resources\release-qualification.json" READONLY
   SetFileAttributes "$INSTDIR\resources\release-manifest.json" READONLY
 
   Call AssertInstallationPathsNoReparse
@@ -371,9 +383,21 @@ normalize_images:
   IfErrors normalize_failed
 
 normalize_acl:
-  IfFileExists "$INSTDIR\resources\secure-acl.ps1" 0 normalize_manifest
+  IfFileExists "$INSTDIR\resources\secure-acl.ps1" 0 normalize_payload
   ClearErrors
   SetFileAttributes "$INSTDIR\resources\secure-acl.ps1" NORMAL
+  IfErrors normalize_failed
+
+normalize_payload:
+  IfFileExists "$INSTDIR\resources\release-payload.json" 0 normalize_qualification
+  ClearErrors
+  SetFileAttributes "$INSTDIR\resources\release-payload.json" NORMAL
+  IfErrors normalize_failed
+
+normalize_qualification:
+  IfFileExists "$INSTDIR\resources\release-qualification.json" 0 normalize_manifest
+  ClearErrors
+  SetFileAttributes "$INSTDIR\resources\release-qualification.json" NORMAL
   IfErrors normalize_failed
 
 normalize_manifest:
@@ -462,6 +486,12 @@ Function AssertInstalledLeavesNoReparse
   Push "$INSTDIR\resources\secure-acl.ps1"
   Call AssertPathNotReparseOrMissing
   Pop $0
+  Push "$INSTDIR\resources\release-payload.json"
+  Call AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\resources\release-qualification.json"
+  Call AssertPathNotReparseOrMissing
+  Pop $0
   Push "$INSTDIR\resources\release-manifest.json"
   Call AssertPathNotReparseOrMissing
   Pop $0
@@ -542,6 +572,12 @@ Function un.AssertInstalledLeavesNoReparse
   Push "$INSTDIR\resources\secure-acl.ps1"
   Call un.AssertPathNotReparseOrMissing
   Pop $0
+  Push "$INSTDIR\resources\release-payload.json"
+  Call un.AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\resources\release-qualification.json"
+  Call un.AssertPathNotReparseOrMissing
+  Pop $0
   Push "$INSTDIR\resources\release-manifest.json"
   Call un.AssertPathNotReparseOrMissing
   Pop $0
@@ -566,10 +602,14 @@ Section "Uninstall"
   SetFileAttributes "$INSTDIR\resources\compose.yaml" NORMAL
   SetFileAttributes "$INSTDIR\resources\images.release.env" NORMAL
   SetFileAttributes "$INSTDIR\resources\secure-acl.ps1" NORMAL
+  SetFileAttributes "$INSTDIR\resources\release-payload.json" NORMAL
+  SetFileAttributes "$INSTDIR\resources\release-qualification.json" NORMAL
   SetFileAttributes "$INSTDIR\resources\release-manifest.json" NORMAL
   Delete "$INSTDIR\resources\compose.yaml"
   Delete "$INSTDIR\resources\images.release.env"
   Delete "$INSTDIR\resources\secure-acl.ps1"
+  Delete "$INSTDIR\resources\release-payload.json"
+  Delete "$INSTDIR\resources\release-qualification.json"
   Delete "$INSTDIR\resources\release-manifest.json"
   RMDir "$INSTDIR\resources"
   Delete "$INSTDIR\launcher.exe"

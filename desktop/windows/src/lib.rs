@@ -313,6 +313,8 @@ struct Installation {
     compose_file: PathBuf,
     image_env_file: PathBuf,
     acl_script: PathBuf,
+    release_payload: PathBuf,
+    release_qualification: PathBuf,
     release_manifest: PathBuf,
     local_app_data: PathBuf,
     app_data_root: PathBuf,
@@ -322,6 +324,22 @@ struct Installation {
     installation_id: PathBuf,
     runtime_generation: PathBuf,
     secret_dir: PathBuf,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleasePayloadResource {
+    path: String,
+    sha256: String,
+    payload_root_sha256: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReleaseQualificationResource {
+    path: String,
+    sha256: String,
+    issuer_key_id: String,
 }
 
 #[derive(Debug)]
@@ -371,6 +389,8 @@ struct ReleaseManifest {
     compose_sha256: String,
     images_sha256: String,
     acl_script_sha256: String,
+    release_payload: ReleasePayloadResource,
+    release_qualification: ReleaseQualificationResource,
     allowed_authenticode_signer_certificate_sha256: Vec<String>,
 }
 
@@ -1053,10 +1073,14 @@ impl Installation {
         let compose_file = resources.join("compose.yaml");
         let image_env_file = resources.join(IMAGE_ENV_FILE_NAME);
         let acl_script = resources.join("secure-acl.ps1");
+        let release_payload = resources.join("release-payload.json");
+        let release_qualification = resources.join("release-qualification.json");
         let release_manifest = resources.join("release-manifest.json");
         platform::ensure_regular_file(&compose_file)?;
         platform::ensure_regular_file(&image_env_file)?;
         platform::ensure_regular_file(&acl_script)?;
+        platform::ensure_regular_file(&release_payload)?;
+        platform::ensure_regular_file(&release_qualification)?;
         platform::ensure_regular_file(&release_manifest)?;
 
         let local_app_data = platform::local_app_data_directory()?;
@@ -1074,6 +1098,8 @@ impl Installation {
             compose_file,
             image_env_file,
             acl_script,
+            release_payload,
+            release_qualification,
             release_manifest,
             local_app_data,
             app_data_root,
@@ -1410,6 +1436,42 @@ fn verify_release_resources(installation: &Installation) -> Result<VerifiedRelea
             "受控 ACL helper 与发布资源清单不一致，已拒绝启动。",
         ));
     }
+    let payload_bytes = read_bounded_file(
+        &installation.release_payload,
+        1024 * 1024,
+        "RELEASE_PAYLOAD_UNAVAILABLE",
+    )?;
+    if manifest.release_payload.path != "release-payload.json"
+        || !is_sha256(&manifest.release_payload.sha256)
+        || !is_sha256(&manifest.release_payload.payload_root_sha256)
+        || !constant_time_ascii_equal(
+            &hex_lower(&Sha256::digest(&payload_bytes)),
+            &manifest.release_payload.sha256,
+        )
+    {
+        return Err(LauncherError::new(
+            "RELEASE_PAYLOAD_INTEGRITY_FAILED",
+            "不可变发布 payload 与发布资源清单不一致，已拒绝启动。",
+        ));
+    }
+    let qualification_bytes = read_bounded_file(
+        &installation.release_qualification,
+        1024 * 1024,
+        "RELEASE_QUALIFICATION_UNAVAILABLE",
+    )?;
+    if manifest.release_qualification.path != "release-qualification.json"
+        || !is_sha256(&manifest.release_qualification.sha256)
+        || !is_identifier(&manifest.release_qualification.issuer_key_id)
+        || !constant_time_ascii_equal(
+            &hex_lower(&Sha256::digest(&qualification_bytes)),
+            &manifest.release_qualification.sha256,
+        )
+    {
+        return Err(LauncherError::new(
+            "RELEASE_QUALIFICATION_INTEGRITY_FAILED",
+            "发布资格资源与发布资源清单不一致，已拒绝启动。",
+        ));
+    }
     Ok(VerifiedRelease {
         image_lock: parse_image_lock(&image_bytes)?,
         allowed_authenticode_signers: manifest.allowed_authenticode_signer_certificate_sha256,
@@ -1427,7 +1489,7 @@ fn parse_release_manifest(bytes: &[u8]) -> Result<ReleaseManifest, LauncherError
     let signer_set_is_canonical = (1..=8).contains(&signers.len())
         && signers.iter().all(|value| is_sha256(value))
         && signers.windows(2).all(|values| values[0] < values[1]);
-    if manifest.schema_version != "1.3"
+    if manifest.schema_version != "1.4"
         || manifest.product_version != env!("CARGO_PKG_VERSION")
         || !is_git_commit(&manifest.candidate_commit)
         || !is_release_candidate_for_commit(
@@ -1438,6 +1500,12 @@ fn parse_release_manifest(bytes: &[u8]) -> Result<ReleaseManifest, LauncherError
         || !is_sha256(&manifest.compose_sha256)
         || !is_sha256(&manifest.images_sha256)
         || !is_sha256(&manifest.acl_script_sha256)
+        || manifest.release_payload.path != "release-payload.json"
+        || !is_sha256(&manifest.release_payload.sha256)
+        || !is_sha256(&manifest.release_payload.payload_root_sha256)
+        || manifest.release_qualification.path != "release-qualification.json"
+        || !is_sha256(&manifest.release_qualification.sha256)
+        || !is_identifier(&manifest.release_qualification.issuer_key_id)
         || !signer_set_is_canonical
     {
         return Err(LauncherError::new(
@@ -1450,6 +1518,13 @@ fn parse_release_manifest(bytes: &[u8]) -> Result<ReleaseManifest, LauncherError
 
 fn is_git_commit(value: &str) -> bool {
     is_lower_hex_string(value, 40)
+}
+
+fn is_identifier(value: &str) -> bool {
+    (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn is_release_candidate_for_commit(candidate: &str, product_version: &str, commit: &str) -> bool {
@@ -9816,13 +9891,23 @@ mod tests {
     fn release_manifest_json(signers: serde_json::Value) -> Vec<u8> {
         let commit = "a".repeat(40);
         serde_json::json!({
-            "schema_version": "1.3",
+            "schema_version": "1.4",
             "product_version": env!("CARGO_PKG_VERSION"),
             "release_candidate": format!("{}-{}", env!("CARGO_PKG_VERSION"), &commit[..12]),
             "candidate_commit": commit,
             "compose_sha256": "1".repeat(64),
             "images_sha256": "2".repeat(64),
             "acl_script_sha256": "3".repeat(64),
+            "release_payload": {
+                "path": "release-payload.json",
+                "sha256": "4".repeat(64),
+                "payload_root_sha256": "5".repeat(64)
+            },
+            "release_qualification": {
+                "path": "release-qualification.json",
+                "sha256": "6".repeat(64),
+                "issuer_key_id": "release-key-001"
+            },
             "allowed_authenticode_signer_certificate_sha256": signers,
         })
         .to_string()
@@ -9953,6 +10038,48 @@ mod tests {
                 "RELEASE_MANIFEST_INVALID"
             );
         }
+    }
+
+    #[test]
+    fn release_manifest_rejects_missing_or_malformed_phase_b_resources() {
+        let mut missing: serde_json::Value =
+            serde_json::from_slice(&release_manifest_json(serde_json::json!(["a".repeat(64)])))
+                .unwrap();
+        missing.as_object_mut().unwrap().remove("release_payload");
+        assert_eq!(
+            parse_release_manifest(missing.to_string().as_bytes())
+                .unwrap_err()
+                .code(),
+            "RELEASE_MANIFEST_INVALID"
+        );
+
+        for (field, value) in [
+            ("path", serde_json::json!("payload.json")),
+            ("sha256", serde_json::json!("A".repeat(64))),
+            ("payload_root_sha256", serde_json::json!("a".repeat(63))),
+        ] {
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&release_manifest_json(serde_json::json!(["a".repeat(64)])))
+                    .unwrap();
+            manifest["release_payload"][field] = value;
+            assert_eq!(
+                parse_release_manifest(manifest.to_string().as_bytes())
+                    .unwrap_err()
+                    .code(),
+                "RELEASE_MANIFEST_INVALID"
+            );
+        }
+
+        let mut malformed_issuer: serde_json::Value =
+            serde_json::from_slice(&release_manifest_json(serde_json::json!(["a".repeat(64)])))
+                .unwrap();
+        malformed_issuer["release_qualification"]["issuer_key_id"] = serde_json::json!("short");
+        assert_eq!(
+            parse_release_manifest(malformed_issuer.to_string().as_bytes())
+                .unwrap_err()
+                .code(),
+            "RELEASE_MANIFEST_INVALID"
+        );
     }
 
     #[test]
@@ -10664,6 +10791,8 @@ mod tests {
             compose_file: root.join("compose.yaml"),
             image_env_file: root.join("images.release.env"),
             acl_script: root.join("secure-acl.ps1"),
+            release_payload: root.join("release-payload.json"),
+            release_qualification: root.join("release-qualification.json"),
             release_manifest: root.join("release-manifest.json"),
             local_app_data: root.clone(),
             app_data_root: root.clone(),
