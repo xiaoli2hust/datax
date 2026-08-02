@@ -71,6 +71,10 @@
   固定产品残留，并固定 `e4_result=NOT_RUN`、`release_approved=false`。当前仓库只对该
   脚本与契约做 E1 静态/结构测试；即使未来本机记录为 `READY`，也不是 E4、不是 golden-image
   或 runner 信任证明，不能写入 `candidate-root.v1` 或用于发布晋级。
+- `release-payload.v1.schema.json`、`harness-qualification.v1.schema.json` 与
+  `phase-a-qualification-grant.v1.schema.json`：ADR-0011 的不可变 P、短期 QH 与受保护私有
+  Phase-A 单 pair 授权记录。后者固定 P/harness/QH/Reader-Writer 的精确绑定和生命周期形状，
+  但不是普通 API、Worker、Compose 或用户可提交的契约，更不是 E3/E4 或发布结论。
 - `egress-guard-attestation.v1.schema.json`：共享网络命名空间内出口守卫的实时证明。
 - `egress-guard-lease.v1.schema.json`：精确 selected-IP `/32|/128 + TCP port` 短租约请求与响应。
 - `egress-guard.v1.md`：守卫只读数据库视图、loopback HTTP、nftables 和 fail-closed 边界。
@@ -85,9 +89,19 @@
   权限已生效或可直接生成迁移的证据。
 - `system-backup.v1.md`：Windows Launcher 调用备份 helper 的停机、加密、恢复 journal 与失败关闭边界。
 
-ADR-0011 的 Phase-A 源码基础件现包括 `release-payload.v1.schema.json` 与
-`harness-qualification.v1.schema.json`：前者定义不含 QH/QR/最终安装包的不可变 P 及其
-`payload_root_sha256`，后者定义最长 24 小时、一次性、域分隔 Ed25519 QH。对应的
+ADR-0011 的 Phase-A 契约基础件现包括 `release-payload.v1.schema.json`、
+`harness-qualification.v1.schema.json` 与 `phase-a-qualification-grant.v1.schema.json`：前者
+定义不含 QH/PAG/QR/最终安装包的不可变 P 及其 `payload_root_sha256`，第二者定义最长 24 小时、
+一次性、域分隔 Ed25519 QH；PAG 则只记录一个受保护私有 Phase-A 授权的 `grant_id`、精确
+P/harness binding、完整 P binding 的 `payload_binding_sha256`、QH
+`issuer_key_id/qualification_id/document_sha256/nonce_sha256`、一个 Reader/Writer pair、时间窗口
+和单调 state。
+`payload_binding_sha256` 是 `SHA-256(RFC8785(QH.payload_binding))`，`document_sha256` 是包含
+`signature` 的 canonical signed QH document 的 SHA-256（不是 raw nonce），`nonce_sha256`（即
+QH nonce hash）是 `SHA-256(UTF8(QH.nonce))`；三者均不得附加域前缀。PAG 不保存原始
+nonce、凭据、命令、测试结果或可配置公钥；其
+`ordinary_path_authorized=false` 与 `evidence_conclusion=NOT_E3_OR_E4` 是失败关闭边界，
+不是可由调用方删除的提示。对应的
 `datax_studio.release_qualification` 只接受 raw UTF-8/JCS、独立传入且与 P 自身 root 一致的
 预期 payload root；QH 的 signed binding 必须与 P 的 identity、平台、全部镜像、Runtime、
 插件和 artifacts 精确相等，且 root 同时承诺 P 内未重复的 HQA keyring。公钥只能从该 P 的
@@ -97,8 +111,37 @@ ADR-0011 的 Phase-A 源码基础件现包括 `release-payload.v1.schema.json` �
 source，因此仍不能产生 E3/E4、插件状态、普通执行能力或公开发布结论；仓库也尚无可用的
 HQA keyring/P/QH 实例。
 
+PAG 当前是**E1、进行中**的 private Phase-A payload/runtime/job binding 与 durable nonce/grant
+persistence 基础件；它仍不是可运行的 qualification 通道。受保护消费者必须先独立验证 P 和 QH，
+再精确比较 PAG 的所有 binding；原始 QH nonce 只可由独立 durable nonce ledger 原子消费，grant
+只允许 `ACTIVE -> REVOKED|EXPIRED` 的单调终态，且其有效窗口必须落在 QH 有效窗口内。当前 E1
+PAG ledger 刻意不含 `execution_id` linkage；未来精确 execution binding 必须由单独的 protected
+atomic issuer/function 纵向切片提供，不能事后把 grant 改为可变。当前没有
+专用 ledger database role/function、private API/Worker/Compose override、受保护 harness、QR reader
+或真实 E3/E4 证据。不得把 PAG 放入标准 Compose/Setup/Launcher、公开候选、备份/诊断包、环境
+变量、普通 API/UI、Plugin Manifest 或普通 Worker 检查点；它不得改变
+`ordinary_user_executable`、创建 E3/E4 PASS、`WINDOWS_E4_CERTIFIED`、QR 或公开发布批准。
+标准系统备份与诊断必须固定排除完整 `des_phase_a_qualification` schema；普通 restore 不得复制、
+恢复或重新激活任何 Phase-A nonce/grant authority。当前 dump 会保留 `alembic_version=0020` 却排除
+该 schema，因此真实 restore/bootstrap/start 不是现有能力且继续 `BLOCKED`。若未来需要继续资格化，
+只能由独立受保护 issuer 在新 restore epoch 后重新验证 P/QH 并重新签发。
+
+本轮已记录 `scripts/test-postgres-e2.sh` 在临时、一次性真实 PostgreSQL 15 容器上的结果为
+`12 passed`，其中包含 0020 migration 的 upgrade/downgrade/re-upgrade，并覆盖运行角色实际登录对
+private schema 的 SELECT/INSERT/UPDATE/DELETE/TRUNCATE 拒绝、nonce/grant 不可变性、nonce replay
+和 grant 生命周期；同一脚本还验证 nonce/grant sentinel 的 schema exclusion、TOC 与临时库 restore
+probe。这只是受限 PostgreSQL E2：它不启动产品 Compose、API/Worker/DataX/MySQL 或独立数据 oracle，
+也不验证 restore bootstrap/start，因而不是 DataX E3、Windows E4、私有 harness 验收或任何发布结论；
+测试/脚本文件存在本身仍不能代替该次 `12 passed` 加 dump probe 的运行记录。
+
+`ReleasePayload`、`PhaseAHarnessAuthorization` 与 `PhaseAExecutionBinding` 的进程内 provenance
+marker 只能捕获同一 Python 进程中的意外构造或篡改；Python 内存不是 protected issuer/consumer
+信任边界。跨进程消费者必须从受保护 durable grant lookup 重建绑定，并由未来专用 role/function
+和 private source 保护；不得反序列化调用方 dataclass、请求体或 marker 来授予资格。
+
 `release-qualification`、candidate-root.v2、受保护 qualification override、受信 reader、真实
-Phase-A/Phase-B harness、签名/OIDC 证据仍未实现。Windows E4 profile/result 的 E1 语义契约
+Phase-A/Phase-B harness、签名/OIDC 证据仍未实现；PAG 的专用 ledger role/function 与 private
+API/Worker/Compose 接线也仍未实现。Windows E4 profile/result 的 E1 语义契约
 不等于这些最终发布契约，也不提供其受信结果。现有 candidate-root.v1 继续只允许
 BLOCKED/release_approved=false；不得用新增可选字段、宽松 schema、测试注入、环境变量或自签
 公钥伪造资格。普通生产路径继续 deny-all。

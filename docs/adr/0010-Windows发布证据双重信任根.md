@@ -259,9 +259,13 @@ attestation 服务上运行，因而没有真实 bundle/反向验证证据；虽
 `validate_acceptance_manifest.py --require-pass`；正式发布仍稳定返回
 `TRUSTED_RELEASE_ATTESTATION_NOT_IMPLEMENTED`。
 
-ADR-0011 在 2026-08-02 只接受了两阶段资格/晋级的架构，不代表其中的 payload root、
-QH/QR、candidate-root.v2、受信 runtime reader、受保护 override 或 Phase A/Phase B
-workflow 已存在；这些项目及真实 Windows/签名/OIDC 证据继续为 BLOCKED。
+ADR-0011 在 2026-08-02 已落地 P/QH/PAG Schema、失败关闭 P/QH parser、私有
+payload/runtime/job binding 与 durable nonce/grant E1 基础件；PostgreSQL ledger 已撤销
+`datax_api`、`datax_worker` 的直接表权限。它不代表已有已签发 P/QH、专用 protected
+ledger role/function、protected issuer/consumer、private API/Worker/Compose override、受保护
+harness、QR schema/reader、candidate-root.v2 或 Phase A/Phase B workflow；也不能产生 E3/E4、
+改变 candidate-root.v1 的 BLOCKED 语义，或代替真实 Windows/签名/OIDC 证据。上述项目继续
+为 BLOCKED。
 
 ## 后果
 

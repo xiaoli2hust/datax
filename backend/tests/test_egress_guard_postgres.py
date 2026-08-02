@@ -26,7 +26,7 @@ def test_egress_guard_role_can_only_read_the_security_barrier_view() -> None:
         with owner.connect() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == "20260802_0019"
+            ).scalar_one() == "20260802_0020"
             reloptions = connection.execute(
                 text(
                     "SELECT reloptions FROM pg_class "

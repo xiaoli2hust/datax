@@ -31,8 +31,11 @@ journal 或 staging 文件存在都不能表述为“Windows 可恢复门禁已�
   RecoveryProbe，再停止 `web/api/worker/egress-guard`；PostgreSQL 只在生成逻辑备份时
   保持运行。
 - 数据库必须由固定 PostgreSQL 容器执行参数数组形式的
-  `pg_dump --format=custom --compress=0 --serializable-deferrable` 并取得单一一致性
-  快照；禁用 dump 压缩是为了让导出前的部署 secret 精确 byte 扫描可执行。helper 只接受
+  `pg_dump --format=custom --compress=0 --serializable-deferrable`
+  `--exclude-schema=des_phase_a_qualification` 并取得单一一致性快照；该排除项是
+  Launcher 固定字面量，不能由用户、环境变量或备份请求改写。该 schema 包含 Phase-A 的两张
+  ledger 表、触发器及 guard functions；使用 schema 排除而不是 `--exclude-table-data`，以避免
+  custom dump 留下私有 schema/function metadata。禁用 dump 压缩是为了让导出前的部署 secret 精确 byte 扫描可执行。helper 只接受
   以 `PGDMP` 开头的普通文件，不接受物理
   `des-postgres-data` volume 归档。
 - 逻辑 dump 的宿主 staging 文件必须位于 Launcher 创建的受限 ACL 随机目录；分包完成或
@@ -55,7 +58,7 @@ DATA 包只允许以下归档项：
 
 | 归档路径 | 来源 | 约束 |
 |---|---|---|
-| `database/postgres.dump` | 一致性 `pg_dump` custom-format 文件 | 普通文件、`PGDMP` magic、长度和 SHA-256 与清单一致 |
+| `database/postgres.dump` | 已排除完整 `des_phase_a_qualification` 私有 schema 的一致性 `pg_dump` custom-format 文件 | 普通文件、`PGDMP` magic、长度和 SHA-256 与清单一致 |
 | `logs/` | 只读活动 `RuntimeGeneration` 所指定的 log named volume（LEGACY 为 `des-log-data`） | 只允许 `<execution UUID>/<attempt UUID>.log` |
 | `metadata/compose.yaml` | 发布制品 | 固定文件、大小和 SHA-256 与清单一致 |
 | `metadata/images.release.env` | 发布制品 | 固定文件、大小和 SHA-256 与清单一致 |
@@ -67,6 +70,10 @@ DATA 包只允许以下归档项：
 - `des-postgres-data` 物理卷、数据库数据目录、WAL 或 Docker volume tar；
 - Launcher keyring、数据库密码、`egress_lease_creation_capability`、JWT 私钥、HMAC、
   KEK、数据源明文凭据；
+- `des_phase_a_qualification` 整个 schema（`phase_a_qualification_nonces`、
+  `phase_a_qualification_grants`、触发器、guard functions 及其记录），以及任何
+  QH/PAG/QR/private qualification source；标准 backup 与 diagnostics 均不得携带这些受保护
+  资格材料；
 - 未知元数据文件、链接、设备、FIFO、socket 或未声明归档路径。
 
 导出 DATA 前，helper 必须读取并校验固定 secret 集合但不得将其归档，用于：
@@ -92,7 +99,7 @@ DATA 包只允许以下归档项：
 
 | 包 | 后缀 | 内容 | 保管要求 |
 |---|---|---|---|
-| 数据包 | `.dxdata` | PostgreSQL 逻辑 dump、脱敏日志、固定发布/迁移元数据 | 可放入受控备份介质 |
+| 数据包 | `.dxdata` | 已排除完整 `des_phase_a_qualification` 私有 schema 的 PostgreSQL 逻辑 dump、脱敏日志、固定发布/迁移元数据 | 可放入受控备份介质 |
 | 密钥包 | `.dxkeys` | PostgreSQL 管理密码、egress-guard/API/Worker 独立数据库角色密码、`egress_lease_creation_capability`、JWT 密钥、HMAC、全部受支持 KEK | 与数据包分开保管 |
 
 两包必须使用不同的高熵恢复秘密。密钥包通过
@@ -126,6 +133,14 @@ DATA 包只允许以下归档项：
 4. 在空 PostgreSQL 目标上执行 `pg_restore`，重算数据库、审计链、日志与密钥证据；
 5. staging secrets、installation-id 和目标 volumes 的原子提交；
 6. 中断后只允许使用同一包对和秘密继续，或只清理由 journal 记录的 staging 对象。
+
+由于标准 DATA dump 特意不含整个 `des_phase_a_qualification` schema，任何未来完整恢复也**不得**
+复活备份时存在的 QH/PAG 或重放防护状态。恢复后的数据库仍会携带 `alembic_version=0020`，
+却不会有该 schema；所以当前真实 `pg_restore`、应用启动和迁移后的 ledger bootstrap 均保持
+`BLOCKED`，不得把空 probe restore 写成可恢复系统。未来完整恢复必须先在受保护的 restore
+bootstrap 中创建空 ledger、生成不随备份恢复的 issuance epoch，并只接受该 epoch 后重新验证
+P/QH、原子消费的新 nonce 与新 PAG。当前没有这种 issuer/source 或完整 restore，因此本规则
+只是失败关闭的设计约束，不是“已恢复资格”或 E3/E4 证据。
 
 以上门禁及干净 Windows 11 x64 异机演练完成前，恢复和覆盖升级必须保持失败关闭。普通
 `start` 不得把部分恢复当作全新安装，也不得生成替代 KEK。当前 Launcher 已在

@@ -39,9 +39,15 @@ Reader/Writer；当前生产证据源为 deny-all，普通用户实际开放能�
 2026-08-02 已通过 [ADR-0011](docs/adr/0011-两阶段插件运行时资格认证与发布晋级链.md)
 接受未来的“两阶段资格认证 + 最终发布晋级”设计：先固定不可变 Runtime payload，在
 受保护 harness 中以短期签名资格取得真实取证，再以 detached 签名资格构建私有最终候选，
-最后对精确安装包完成 Windows E4、候选根与 hosted provenance。当前仅实现 P/QH 的
-Schema 与失败关闭 parser（E1 源码基础件），没有受保护 source/override、QR、受信 reader、
-已签发资格或真实外部证据；它不改变当前行为。普通路径仍默认拒绝，发布仍为 BLOCKED。
+最后对精确安装包完成 Windows E4、候选根与 hosted provenance。当前已有 `P → QH → PAG → QR`
+设计中的 P/QH Schema 与失败关闭 parser、PAG Schema，以及 private Phase-A
+payload/runtime/job binding + durable nonce/grant persistence 的 **E1、进行中**基础件；尚无专用
+ledger database role/function、QH/PAG private source/override、受保护 harness、QR、受信 reader、
+已签发资格或真实外部 E3/E4 证据。它不改变当前行为。普通路径仍默认拒绝，发布仍为 BLOCKED。
+标准备份/诊断必须固定排除完整私有 schema `des_phase_a_qualification`（两张 ledger 表、触发器和
+guard functions）；普通恢复不得复活 Phase-A authority。当前真实 restore/start/ledger bootstrap
+仍阻断：dump 会保留 `alembic_version=0020` 而不会保留私有 schema。未来只能由在 restore epoch 后
+重新验证 P/QH 的受保护 issuer 重新签发，而当前不存在该 runtime issuer。
 
 ## V1 一句话范围
 

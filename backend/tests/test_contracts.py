@@ -210,6 +210,78 @@ def test_all_json_schemas_are_valid_draft_2020_12_schemas() -> None:
         Draft202012Validator.check_schema(schema)
 
 
+def test_phase_a_qualification_grant_contract_remains_private_and_binds_qh_document() -> None:
+    schema = json.loads(
+        (CONTRACT_ROOT / "phase-a-qualification-grant.v1.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    validator = Draft202012Validator(schema)
+    valid = {
+        "schema_version": "1.0",
+        "artifact_kind": "PHASE_A_QUALIFICATION_GRANT",
+        "purpose": "PRIVATE_PHASE_A_QUALIFICATION",
+        "visibility": "PROTECTED_PRIVATE",
+        "ordinary_path_authorized": False,
+        "evidence_conclusion": "NOT_E3_OR_E4",
+        "grant_id": "00000000-0000-4000-8000-000000000020",
+        "state": "ACTIVE",
+        "payload_binding": {
+            "payload_root_sha256": "a" * 64,
+            "payload_binding_sha256": "b" * 64,
+            "identity": {
+                "repository": "xiaoli2hust/datax",
+                "source_ref": "refs/heads/main",
+                "commit_sha": "c" * 40,
+                "product_version": "0.1.0",
+                "release_candidate": "0.1.0-cccccccccccc",
+            },
+        },
+        "harness_binding": {
+            "identity": "phase-a-harness-0001",
+            "environment_id": "win11-environment-0001",
+            "environment_manifest_sha256": "d" * 64,
+            "harness_version": "1.0.0",
+        },
+        "qh_binding": {
+            "issuer_key_id": "hqa-key-0001",
+            "qualification_id": "qh-qualification-0001",
+            "document_sha256": "e" * 64,
+            "nonce_sha256": "f" * 64,
+        },
+        "selected_pair": {
+            "reader_plugin": "mysqlreader",
+            "reader_plugin_sha256": "a" * 64,
+            "writer_plugin": "postgresqlwriter",
+            "writer_plugin_sha256": "b" * 64,
+        },
+        "issued_at": "2026-08-02T11:00:00Z",
+        "not_before": "2026-08-02T11:00:00Z",
+        "valid_until": "2026-08-02T13:00:00Z",
+    }
+    assert validator.is_valid(valid)
+
+    missing_document_hash = {
+        **valid,
+        "qh_binding": {
+            key: value
+            for key, value in valid["qh_binding"].items()
+            if key != "document_sha256"
+        },
+    }
+    legacy_nonce_hash = {
+        **valid,
+        "qh_binding": {
+            **valid["qh_binding"],
+            "nonce_hash": "0" * 64,
+        },
+    }
+    ordinary_path_unlock = {**valid, "ordinary_path_authorized": True}
+    assert not validator.is_valid(missing_document_hash)
+    assert not validator.is_valid(legacy_nonce_hash)
+    assert not validator.is_valid(ordinary_path_unlock)
+
+
 def test_runtime_generation_schema_separates_legacy_and_generation_objects() -> None:
     schema = json.loads(
         (CONTRACT_ROOT / "runtime-generation.v1.schema.json").read_text(encoding="utf-8")

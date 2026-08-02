@@ -11,12 +11,14 @@ from __future__ import annotations
 import base64
 import binascii
 import hashlib
+import hmac
 import json
 import re
+import secrets
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 import rfc8785
 from cryptography.exceptions import InvalidSignature
@@ -34,6 +36,7 @@ _RFC3339_UTC = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,6})?Z$
 _IMAGE_ROLES = ("api", "egress_guard", "postgres", "web", "worker")
 _PLUGIN_NAMES = ("mysqlreader", "mysqlwriter", "postgresqlreader", "postgresqlwriter")
 _PAYLOAD_PROVENANCE = object()
+_RELEASE_PAYLOAD_INTEGRITY_KEY = secrets.token_bytes(32)
 
 
 class QualificationVerificationError(ValueError):
@@ -260,19 +263,40 @@ class HqaPublicKey:
 
 
 @dataclass(frozen=True)
+class PayloadBinding:
+    """Non-secret P facts needed to bind a protected Phase-A runtime.
+
+    This value only becomes available through :func:`payload_binding`, which
+    first rechecks the provenance sentinel and canonical P root.  It is not a
+    release certification record and it cannot authorize an ordinary user.
+    """
+
+    payload_root_sha256: str
+    payload_binding_sha256: str
+    commit_sha: str
+    worker_image_digest: str
+    datax_release: str
+    runtime_sha256: str
+    plugin_sha256s: tuple[tuple[str, str], ...]
+
+
+@dataclass(frozen=True)
 class ReleasePayload:
-    """A P whose raw document and caller-supplied expected root were both verified."""
+    """A P whose raw document and caller-supplied expected root were both verified.
+
+    Derived binding/keyring data is rebuilt from canonical P at each use and a
+    process-local integrity tag rejects accidental dataclass field replacement.
+    This remains an in-process safeguard, not a protected trust boundary.
+    """
 
     payload_root_sha256: str
     _expected_payload_root_sha256: str = field(repr=False)
     _canonical_without_root: bytes = field(repr=False)
-    _binding_canonical: bytes = field(repr=False)
-    _hqa_keys: tuple[HqaPublicKey, ...] = field(repr=False)
     _provenance: object = field(repr=False, compare=False)
+    _integrity_tag: str = field(repr=False, compare=False)
 
 
-@dataclass(frozen=True)
-class ExpectedHarness:
+class ExpectedHarness(NamedTuple):
     """Identity independently fixed by the protected harness, never by QH input."""
 
     identity: str
@@ -281,8 +305,7 @@ class ExpectedHarness:
     harness_version: str
 
 
-@dataclass(frozen=True)
-class QualificationNonceUse:
+class QualificationNonceUse(NamedTuple):
     """Data needed by a durable, atomic HQA nonce ledger.
 
     The ledger must make ``(issuer_key_id, nonce)`` globally unique until at least
@@ -304,6 +327,8 @@ class VerifiedHarnessQualification:
     qualification_id: str
     payload_root_sha256: str
     issuer_key_id: str
+    issued_at: datetime
+    not_before: datetime
     valid_until: datetime
 
 
@@ -333,7 +358,7 @@ def parse_release_payload(
     self-authorizing.
     """
 
-    if not isinstance(expected_payload_root_sha256, str) or not _SHA256.fullmatch(
+    if type(expected_payload_root_sha256) is not str or not _SHA256.fullmatch(
         expected_payload_root_sha256
     ):
         raise QualificationVerificationError("EXPECTED_PAYLOAD_ROOT_INVALID")
@@ -354,15 +379,41 @@ def parse_release_payload(
         raise QualificationVerificationError("RELEASE_PAYLOAD_ROOT_MISMATCH")
     if parsed.payload_root_sha256 != expected_payload_root_sha256:
         raise QualificationVerificationError("RELEASE_PAYLOAD_EXPECTED_ROOT_MISMATCH")
-
+    # Validate all derived P facts now, but do not retain a replaceable copy of
+    # them in ReleasePayload. Consumers rebuild them from canonical P below.
     binding = _payload_binding(parsed)
-    return ReleasePayload(
+    _public_payload_binding(
+        parsed,
+        binding_sha256=hashlib.sha256(
+            _canonicalize(binding, code="RELEASE_PAYLOAD_CANONICAL_INVALID")
+        ).hexdigest(),
+    )
+    _hqa_keys(parsed.hqa_keyring)
+
+    payload = ReleasePayload(
         payload_root_sha256=parsed.payload_root_sha256,
         _expected_payload_root_sha256=expected_payload_root_sha256,
         _canonical_without_root=canonical_without_root,
-        _binding_canonical=_canonicalize(binding, code="RELEASE_PAYLOAD_CANONICAL_INVALID"),
-        _hqa_keys=_hqa_keys(parsed.hqa_keyring),
         _provenance=_PAYLOAD_PROVENANCE,
+        _integrity_tag="",
+    )
+    return replace(payload, _integrity_tag=_release_payload_integrity_tag(payload))
+
+
+def payload_binding(payload: ReleasePayload) -> PayloadBinding:
+    """Return immutable non-secret runtime binding facts from a verified P.
+
+    A caller cannot use an arbitrary similarly-shaped dataclass: this function
+    repeats the same provenance/root checks used before QH verification.
+    """
+
+    document = _verify_release_payload_provenance(payload)
+    binding = _payload_binding(document)
+    return _public_payload_binding(
+        document,
+        binding_sha256=hashlib.sha256(
+            _canonicalize(binding, code="RELEASE_PAYLOAD_CANONICAL_INVALID")
+        ).hexdigest(),
     )
 
 
@@ -381,13 +432,19 @@ def verify_harness_qualification(
     have succeeded.  A false return or ledger failure always rejects the QH.
     """
 
-    _verify_release_payload_provenance(release_payload)
-    _verify_expected_harness(expected_harness)
+    payload_document = _verify_release_payload_provenance(release_payload)
+    expected_harness_fields = _verified_harness_fields(expected_harness)
     current_time = _normalise_now(now)
     qualification = _parse_harness_qualification(raw)
 
+    expected_binding_canonical = _canonicalize(
+        _payload_binding(payload_document),
+        code="RELEASE_PAYLOAD_CANONICAL_INVALID",
+    )
+    hqa_keys = _hqa_keys(payload_document.hqa_keyring)
+
     key = next(
-        (item for item in release_payload._hqa_keys if item.key_id == qualification.issuer_key_id),
+        (item for item in hqa_keys if item.key_id == qualification.issuer_key_id),
         None,
     )
     if key is None:
@@ -404,9 +461,9 @@ def verify_harness_qualification(
     except (InvalidSignature, ValueError):
         raise QualificationVerificationError("QH_SIGNATURE_INVALID") from None
 
-    if qualification.payload_binding_canonical != release_payload._binding_canonical:
+    if qualification.payload_binding_canonical != expected_binding_canonical:
         raise QualificationVerificationError("QH_PAYLOAD_BINDING_MISMATCH")
-    if qualification.harness != expected_harness:
+    if _verified_harness_fields(qualification.harness) != expected_harness_fields:
         raise QualificationVerificationError("QH_HARNESS_IDENTITY_MISMATCH")
     if not (qualification.not_before <= current_time < qualification.valid_until):
         raise QualificationVerificationError("QH_NOT_CURRENTLY_VALID")
@@ -428,6 +485,8 @@ def verify_harness_qualification(
         qualification_id=qualification.qualification_id,
         payload_root_sha256=release_payload.payload_root_sha256,
         issuer_key_id=qualification.issuer_key_id,
+        issued_at=qualification.issued_at,
+        not_before=qualification.not_before,
         valid_until=qualification.valid_until,
     )
 
@@ -441,6 +500,39 @@ def _payload_binding(document: _ReleasePayloadDocument) -> dict[str, Any]:
         "worker_runtime": document.worker_runtime.model_dump(mode="json"),
         "artifacts": document.artifacts.model_dump(mode="json"),
     }
+
+
+def _public_payload_binding(
+    document: _ReleasePayloadDocument,
+    *,
+    binding_sha256: str,
+) -> PayloadBinding:
+    worker_reference = next(
+        (image.reference for image in document.images if image.role == "worker"),
+        None,
+    )
+    if worker_reference is None:
+        # The strict model already makes this unreachable, but do not construct
+        # a partial Phase-A binding if a future model changes unexpectedly.
+        raise QualificationVerificationError("RELEASE_PAYLOAD_FORMAT_INVALID")
+    _repository, separator, worker_digest = worker_reference.partition("@")
+    if separator != "@" or not re.fullmatch(r"sha256:[a-f0-9]{64}", worker_digest):
+        raise QualificationVerificationError("RELEASE_PAYLOAD_FORMAT_INVALID")
+    plugins = tuple(
+        (plugin.name, plugin.jar.sha256)
+        for plugin in document.worker_runtime.plugins
+    )
+    if tuple(name for name, _digest in plugins) != _PLUGIN_NAMES:
+        raise QualificationVerificationError("RELEASE_PAYLOAD_FORMAT_INVALID")
+    return PayloadBinding(
+        payload_root_sha256=document.payload_root_sha256,
+        payload_binding_sha256=binding_sha256,
+        commit_sha=document.identity.commit_sha,
+        worker_image_digest=worker_digest,
+        datax_release=document.worker_runtime.datax_release,
+        runtime_sha256=document.worker_runtime.runtime_tree_sha256,
+        plugin_sha256s=plugins,
+    )
 
 
 def _hqa_keys(keyring: _HqaKeyringModel) -> tuple[HqaPublicKey, ...]:
@@ -518,8 +610,21 @@ def _parse_harness_qualification(raw: bytes) -> _ParsedHarnessQualification:
     )
 
 
-def _verify_release_payload_provenance(payload: ReleasePayload) -> None:
-    if not isinstance(payload, ReleasePayload) or payload._provenance is not _PAYLOAD_PROVENANCE:
+def _verify_release_payload_provenance(payload: ReleasePayload) -> _ReleasePayloadDocument:
+    if type(payload) is not ReleasePayload or payload._provenance is not _PAYLOAD_PROVENANCE:
+        raise QualificationVerificationError("RELEASE_PAYLOAD_NOT_VERIFIED")
+    if (
+        not isinstance(payload._canonical_without_root, bytes)
+        or type(payload.payload_root_sha256) is not str
+        or _SHA256.fullmatch(payload.payload_root_sha256) is None
+        or type(payload._expected_payload_root_sha256) is not str
+        or _SHA256.fullmatch(payload._expected_payload_root_sha256) is None
+    ):
+        raise QualificationVerificationError("RELEASE_PAYLOAD_NOT_VERIFIED")
+    if not isinstance(payload._integrity_tag, str) or not hmac.compare_digest(
+        payload._integrity_tag,
+        _release_payload_integrity_tag(payload),
+    ):
         raise QualificationVerificationError("RELEASE_PAYLOAD_NOT_VERIFIED")
     computed_root = hashlib.sha256(
         _PAYLOAD_ROOT_DOMAIN + payload._canonical_without_root
@@ -528,24 +633,100 @@ def _verify_release_payload_provenance(payload: ReleasePayload) -> None:
         raise QualificationVerificationError("RELEASE_PAYLOAD_ROOT_MISMATCH")
     if payload.payload_root_sha256 != payload._expected_payload_root_sha256:
         raise QualificationVerificationError("RELEASE_PAYLOAD_EXPECTED_ROOT_MISMATCH")
+    try:
+        document_without_root = json.loads(
+            payload._canonical_without_root.decode("utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+            parse_constant=_reject_nonfinite,
+        )
+    except (
+        _DuplicateJsonKey,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+    ):
+        raise QualificationVerificationError("RELEASE_PAYLOAD_NOT_VERIFIED") from None
+    if not isinstance(document_without_root, dict):
+        raise QualificationVerificationError("RELEASE_PAYLOAD_NOT_VERIFIED")
+    _reject_excessive_json_nesting(document_without_root, kind="RELEASE_PAYLOAD")
+    if (
+        _canonicalize(
+            document_without_root,
+            code="RELEASE_PAYLOAD_NOT_VERIFIED",
+        )
+        != payload._canonical_without_root
+    ):
+        raise QualificationVerificationError("RELEASE_PAYLOAD_NOT_VERIFIED")
+    try:
+        document = _ReleasePayloadDocument.model_validate(
+            {
+                **document_without_root,
+                "payload_root_sha256": payload.payload_root_sha256,
+            }
+        )
+    except ValidationError:
+        raise QualificationVerificationError("RELEASE_PAYLOAD_NOT_VERIFIED") from None
+    if document.payload_root_sha256 != payload.payload_root_sha256:
+        raise QualificationVerificationError("RELEASE_PAYLOAD_NOT_VERIFIED")
+    return document
 
 
-def _verify_expected_harness(expected: ExpectedHarness) -> None:
-    if not isinstance(expected, ExpectedHarness):
+def _release_payload_integrity_tag(payload: ReleasePayload) -> str:
+    canonical = payload._canonical_without_root
+    if (
+        not isinstance(canonical, bytes)
+        or type(payload.payload_root_sha256) is not str
+        or type(payload._expected_payload_root_sha256) is not str
+    ):
+        return ""
+    try:
+        payload_root = payload.payload_root_sha256.encode("ascii")
+        expected_root = payload._expected_payload_root_sha256.encode("ascii")
+    except UnicodeEncodeError:
+        return ""
+    message = b"".join(
+        (
+            b"DES-RELEASE-PAYLOAD-IN-PROCESS-v1\n",
+            payload_root,
+            b"\n",
+            expected_root,
+            b"\n",
+            len(canonical).to_bytes(8, "big"),
+            canonical,
+        )
+    )
+    return hmac.new(
+        _RELEASE_PAYLOAD_INTEGRITY_KEY,
+        message,
+        hashlib.sha256,
+    ).hexdigest()
+
+
+def _verified_harness_fields(expected: ExpectedHarness) -> tuple[str, str, str, str]:
+    if type(expected) is not ExpectedHarness:
         raise QualificationVerificationError("QH_EXPECTED_HARNESS_INVALID")
     if (
-        _IDENTIFIER.fullmatch(expected.identity) is None
+        type(expected.identity) is not str
+        or _IDENTIFIER.fullmatch(expected.identity) is None
+        or type(expected.environment_id) is not str
         or _IDENTIFIER.fullmatch(expected.environment_id) is None
-        or not isinstance(expected.environment_manifest_sha256, str)
+        or type(expected.environment_manifest_sha256) is not str
         or _SHA256.fullmatch(expected.environment_manifest_sha256) is None
-        or not isinstance(expected.harness_version, str)
+        or type(expected.harness_version) is not str
         or not re.fullmatch(r"^[A-Za-z0-9._+-]{1,128}$", expected.harness_version)
     ):
         raise QualificationVerificationError("QH_EXPECTED_HARNESS_INVALID")
+    return (
+        expected.identity,
+        expected.environment_id,
+        expected.environment_manifest_sha256,
+        expected.harness_version,
+    )
 
 
 def _normalise_now(value: datetime) -> datetime:
-    if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
         raise QualificationVerificationError("QH_CURRENT_TIME_INVALID")
     return value.astimezone(UTC)
 

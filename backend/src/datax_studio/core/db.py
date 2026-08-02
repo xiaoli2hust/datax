@@ -13,15 +13,30 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    MetaData,
     SmallInteger,
     String,
     UniqueConstraint,
     Uuid,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from datax_studio.auth.db import Base
+
+PHASE_A_QUALIFICATION_SCHEMA = "des_phase_a_qualification"
+
+
+class PhaseAQualificationBase(DeclarativeBase):
+    """Metadata deliberately outside the ordinary product control-plane base.
+
+    Migration 0020 owns this PostgreSQL-only, closed-default schema. Keeping it
+    out of ``Base.metadata`` prevents normal API/Worker schema helpers and
+    SQLite test fixtures from accidentally creating or treating the protected
+    ledger as ordinary product state.
+    """
+
+    metadata = MetaData(schema=PHASE_A_QUALIFICATION_SCHEMA)
 
 
 class SystemControl(Base):
@@ -763,6 +778,146 @@ class Execution(Base):
     log_dropped_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     first_truncated_sequence: Mapped[int | None] = mapped_column(BigInteger)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PhaseAQualificationNonce(PhaseAQualificationBase):
+    """Append-only, non-secret replay ledger for one verified HQA nonce.
+
+    The protected Phase-A harness must SHA-256 the raw QH nonce before it
+    reaches this model.  Raw nonce material is deliberately not representable
+    by this table.  PostgreSQL migration 0020 additionally makes every row
+    append-only, so the global issuer/hash uniqueness remains durable.
+    """
+
+    __tablename__ = "phase_a_qualification_nonces"
+    __table_args__ = (
+        CheckConstraint(
+            "consumed_at >= created_at AND consumed_at < valid_until",
+            name="ck_phase_a_qualification_nonces_timestamps",
+        ),
+        UniqueConstraint(
+            "issuer_key_id",
+            "nonce_sha256",
+            name="uq_phase_a_qualification_nonces_issuer_nonce",
+        ),
+        UniqueConstraint(
+            "issuer_key_id",
+            "qualification_id",
+            name="uq_phase_a_qualification_nonces_issuer_qualification",
+        ),
+        Index(
+            "ix_phase_a_qualification_nonces_valid_until",
+            "valid_until",
+            "id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    issuer_key_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    # Hex-encoded SHA-256 of the raw QH nonce. Never persist the raw nonce.
+    nonce_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    qualification_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    payload_root_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    consumed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class PhaseAQualificationGrant(PhaseAQualificationBase):
+    """A protected-harness-only qualification grant, never a release verdict.
+
+    All payload and harness/QH binding fields are immutable. PostgreSQL
+    migration 0020 only permits the terminal lifecycle
+    transition ``ACTIVE -> REVOKED|EXPIRED``.  A future reader must still
+    compare ``qh_valid_until`` to its trusted current time; ``ACTIVE`` alone is
+    not a freshness conclusion. PostgreSQL-only format and 24-hour checks live
+    in that migration rather than this shared SQLite-compatible ORM metadata.
+    """
+
+    __tablename__ = "phase_a_qualification_grants"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ('ACTIVE', 'REVOKED', 'EXPIRED')",
+            name="ck_phase_a_qualification_grants_state",
+        ),
+        CheckConstraint(
+            "(state = 'ACTIVE' AND revoked_at IS NULL AND revocation_reason IS NULL "
+            "AND expired_at IS NULL) OR "
+            "(state = 'REVOKED' AND revoked_at IS NOT NULL "
+            "AND revocation_reason IS NOT NULL AND expired_at IS NULL) OR "
+            "(state = 'EXPIRED' AND revoked_at IS NULL AND revocation_reason IS NULL "
+            "AND expired_at IS NOT NULL)",
+            name="ck_phase_a_qualification_grants_lifecycle",
+        ),
+        CheckConstraint(
+            "qh_issued_at <= qh_not_before AND qh_not_before < qh_valid_until "
+            "AND created_at >= qh_not_before AND created_at < qh_valid_until",
+            name="ck_phase_a_qualification_grants_qh_window",
+        ),
+        CheckConstraint(
+            "state <> 'REVOKED' OR "
+            "(revoked_at >= created_at AND revoked_at < qh_valid_until)",
+            name="ck_phase_a_qualification_grants_revoked_at",
+        ),
+        CheckConstraint(
+            "state <> 'EXPIRED' OR "
+            "(expired_at >= created_at AND expired_at >= qh_valid_until)",
+            name="ck_phase_a_qualification_grants_expired_at",
+        ),
+        UniqueConstraint("nonce_id", name="uq_phase_a_qualification_grants_nonce"),
+        UniqueConstraint(
+            "qh_issuer_key_id",
+            "qh_qualification_id",
+            name="uq_phase_a_qualification_grants_issuer_qualification",
+        ),
+        Index(
+            "ix_phase_a_qualification_grants_state_valid_until",
+            "state",
+            "qh_valid_until",
+            "id",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    # This E1 foundation deliberately has no execution foreign key. A future
+    # protected issuer must introduce exact execution binding atomically rather
+    # than leaving a mutable NULL -> execution_id escape hatch in this ledger.
+    nonce_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey(
+            f"{PHASE_A_QUALIFICATION_SCHEMA}.phase_a_qualification_nonces.id",
+            ondelete="RESTRICT",
+        ),
+        nullable=False,
+    )
+    # Hash of the canonical QH payload_binding object. This commits to the
+    # complete P-derived binding beyond the typed fields retained below.
+    payload_binding_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_root_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_commit: Mapped[str] = mapped_column(String(40), nullable=False)
+    worker_image_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    datax_release: Mapped[str] = mapped_column(String(32), nullable=False)
+    runtime_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    reader_plugin_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    reader_plugin_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    writer_plugin_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    writer_plugin_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    harness_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    harness_environment_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    harness_environment_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    harness_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    # SHA-256 of the canonical signed QH document; its raw nonce is not stored.
+    qh_document_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    qh_qualification_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    qh_issuer_key_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    qh_issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    qh_not_before: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    qh_valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    state: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    revocation_reason: Mapped[str | None] = mapped_column(String(64))
+    expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class ExecutionAttempt(Base):

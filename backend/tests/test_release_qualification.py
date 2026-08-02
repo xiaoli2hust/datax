@@ -5,9 +5,11 @@ import copy
 import hashlib
 import json
 from collections.abc import Callable
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 import rfc8785
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -18,6 +20,7 @@ from datax_studio.release_qualification import (
     QualificationNonceUse,
     QualificationVerificationError,
     parse_release_payload,
+    payload_binding,
     verify_harness_qualification,
 )
 
@@ -43,6 +46,19 @@ class _NonceLedger:
             return False
         self._used.add(key)
         return True
+
+
+class _AlwaysEqualHarness(ExpectedHarness):
+    def __eq__(self, _other: object) -> bool:
+        return True
+
+
+class _AlwaysEqualString(str):
+    def __eq__(self, _other: object) -> bool:
+        return True
+
+    def __ne__(self, _other: object) -> bool:
+        return False
 
 
 def _hash(value: str) -> str:
@@ -244,6 +260,91 @@ def test_canonical_payload_and_qh_verify_against_only_payload_keyring() -> None:
     assert verified.payload_root_sha256 == payload["payload_root_sha256"]
     assert verified.issuer_key_id == "hqa-key-0001"
     assert len(ledger.calls) == 1
+
+
+def test_qh_rejects_an_always_equal_expected_harness_subclass() -> None:
+    private_key = Ed25519PrivateKey.generate()
+    payload = _payload(private_key)
+    malicious_harness = _AlwaysEqualHarness(
+        identity="forged-phase-a-harness",
+        environment_id="win11-qualification-01",
+        environment_manifest_sha256=_hash("windows-environment"),
+        harness_version="1.0.0",
+    )
+
+    _assert_code(
+        lambda: verify_harness_qualification(
+            _canonical(_signed_qualification(_qualification_unsigned(payload), private_key)),
+            release_payload=_parsed_payload(payload),
+            expected_harness=malicious_harness,
+            now=NOW,
+            consume_nonce=_NonceLedger().consume,
+        ),
+        "QH_EXPECTED_HARNESS_INVALID",
+    )
+
+
+def test_qh_rejects_an_always_equal_harness_string_subclass() -> None:
+    private_key = Ed25519PrivateKey.generate()
+    payload = _payload(private_key)
+    malicious_harness = ExpectedHarness(
+        identity=_AlwaysEqualString("forged-phase-a-harness"),
+        environment_id="win11-qualification-01",
+        environment_manifest_sha256=_hash("windows-environment"),
+        harness_version="1.0.0",
+    )
+
+    _assert_code(
+        lambda: verify_harness_qualification(
+            _canonical(_signed_qualification(_qualification_unsigned(payload), private_key)),
+            release_payload=_parsed_payload(payload),
+            expected_harness=malicious_harness,
+            now=NOW,
+            consume_nonce=_NonceLedger().consume,
+        ),
+        "QH_EXPECTED_HARNESS_INVALID",
+    )
+
+def test_verified_payload_exposes_a_canonical_complete_binding_digest() -> None:
+    private_key = Ed25519PrivateKey.generate()
+    payload = _payload(private_key)
+
+    binding = payload_binding(_parsed_payload(payload))
+
+    assert binding.payload_root_sha256 == payload["payload_root_sha256"]
+    assert binding.payload_binding_sha256 == hashlib.sha256(
+        _canonical(_binding(payload))
+    ).hexdigest()
+    assert binding.worker_image_digest == f"sha256:{_hash('worker')}"
+    assert binding.plugin_sha256s == tuple(
+        (name, _hash(f"{name}-jar")) for name in PLUGIN_NAMES
+    )
+
+
+def test_verified_payload_does_not_retain_replaceable_binding_or_keyring_facts() -> None:
+    private_key = Ed25519PrivateKey.generate()
+    parsed = _parsed_payload(_payload(private_key))
+
+    _assert_code(
+        lambda: payload_binding(
+            replace(parsed, _canonical_without_root=b'{"artifact_kind":"RELEASE_PAYLOAD"}')
+        ),
+        "RELEASE_PAYLOAD_NOT_VERIFIED",
+    )
+    _assert_code(
+        lambda: payload_binding(
+            replace(parsed, _canonical_without_root="not-bytes", _integrity_tag="")
+        ),
+        "RELEASE_PAYLOAD_NOT_VERIFIED",
+    )
+    with pytest.raises(TypeError):
+        replace(parsed, _payload_binding=object())
+    with pytest.raises(TypeError):
+        replace(parsed, _hqa_keys=())
+
+    assert not hasattr(parsed, "_payload_binding")
+    assert not hasattr(parsed, "_binding_canonical")
+    assert not hasattr(parsed, "_hqa_keys")
 
 
 def test_payload_requires_own_root_and_independent_expected_root() -> None:

@@ -48,8 +48,11 @@
 > 先在受保护 Windows harness 中取得 Phase A 私有 qualification（不是 E4 或 Plugin Manifest
 > 状态），独立签发 detached QR 后才构建私有最终候选；再在无 QH 的 Phase B 中验证精确
 > 安装包，才可派生 Windows E4 插件状态并交给 ADR-0010 hosted attestor/PR 公开晋级。
-> 当前 workflow 没有 payload root、QH/QR、candidate-root.v2、受信 reader 或真实
-> Windows/签名/OIDC 证据，仍只能生成显式 BLOCKED 候选。
+> 当前已有 P/QH/PAG Schema、失败关闭 P/QH parser、私有 payload/runtime/job binding 与
+> PostgreSQL nonce/grant E1 基础账本；它们不等于已签发 P/QH、可运行的 qualification workflow
+> 或 release approval。仍没有专用 protected ledger role/function、protected issuer/consumer、
+> private API/Worker/Compose override、受保护 harness、QR reader、candidate-root.v2 或真实
+> Windows/签名/OIDC 证据，发布仍只能生成显式 BLOCKED 候选。
 
 ## 1. 仓库目标
 
@@ -214,6 +217,10 @@ Windows release runner 或签名结果已经在线验证。Java 源码也没有�
 - 前端格式化、lint、类型检查、单元测试和构建。
 - 后端格式化、lint、类型检查、单元和 API 集成测试。
 - Alembic 从空库升级、前后版本兼容与恢复测试。
+- 改动 ADR-0011 Phase-A 基础件时，必须验证 P/QH/PAG Schema、失败关闭 parser/binding，及
+  PostgreSQL nonce/grant 的重放、不可变、生命周期和 API/Worker direct-table-denial。
+  该临时 PostgreSQL 容器检查最多是数据库 E2；未启动产品 Compose、API、Worker、DataX、
+  MySQL 或独立 oracle 时，绝不能称为 Phase-A E3、Windows E4 或发布证据。
 - Docker 镜像构建、健康检查、非 root 和制品摘要检查。
 - 真实 DataX E2E 由隔离测试环境执行；必须包含源静默确认、空目标复检、目标外部独占
   `statement_version='1.0'`/`valid_until`/`ACTIVE|REVOKED|EXPIRED` 生命周期、已知窗口破坏的
@@ -302,6 +309,11 @@ ADR-0011 要求把未来 release workflow 拆成以下不可互相替代的阶�
 任何阶段缺少真实外部 TCB、签名、场景/证据或负向验证时只生成 BLOCKED 候选。不得通过
 把 QR 写进 Worker 镜像、让 QR 绑定包含它的 Setup/manifest、使用环境变量放行，或把
 self-hosted runner 的自述 JSON 当作公开 release 证明。
+
+当前的 E1 状态止于 P/QH parser、私有 payload/runtime/job binding 与 durable nonce/grant
+账本；`datax_api`、`datax_worker` 对两张 ledger 表的直接权限已撤销，但没有专用 protected
+ledger role/function、issuer/consumer 或 private override。它不能产生 QH、PAG 消费路径、QR、
+E3/E4、普通用户能力或可发布候选。
 
 ## 7. Issue 规范
 

@@ -35,7 +35,7 @@ const COMPOSE_TIMEOUT: Duration = Duration::from_secs(180);
 const SYSTEM_BACKUP_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
-const SUPPORTED_MIGRATION_REVISION: &str = "20260802_0017";
+const SUPPORTED_MIGRATION_REVISION: &str = "20260802_0020";
 const IMAGE_ENV_FILE_NAME: &str = "images.release.env";
 const DOCKER_CLI_CONFIG_DIRECTORY_NAME: &str = "docker-cli-config";
 const DOCKER_CLI_CONFIG_FILE_NAME: &str = "config.json";
@@ -131,6 +131,12 @@ const HELPER_CONTAINER_ROLE_LABEL: &str = "com.xiaoli.datax.helper-role";
 const HELPER_CONTAINER_ID_LABEL: &str = "com.xiaoli.datax.helper-id";
 const BACKUP_DATA_HELPER_ROLE: &str = "backup-data";
 const BACKUP_SECRETS_HELPER_ROLE: &str = "backup-secrets";
+// Phase-A QH/PAG records are deliberately outside the standard DATA backup
+// trust domain. Excluding the complete private schema keeps its tables,
+// trigger functions, and schema metadata out of the dump. A future protected
+// issuer must invalidate all pre-restore authority and reissue fresh QH/PAG;
+// this fixed value must never become a caller-configurable pg_dump pattern.
+const BACKUP_EXCLUDED_PHASE_A_QUALIFICATION_SCHEMA: &str = "des_phase_a_qualification";
 const RESTORE_STAGE_HELPER_ROLE: &str = "restore-stage";
 const DOCKER_STORAGE_PROBE_HELPER_ROLE: &str = "storage-probe";
 const HELPER_CONTAINER_INSPECT_FORMAT: &str = r#"{{ index .Config.Labels "com.xiaoli.datax.helper-role" }}|{{ index .Config.Labels "com.xiaoli.datax.helper-id" }}"#;
@@ -5052,22 +5058,7 @@ fn run_postgres_dump(
     )?;
     require_authenticated_compose_services(&inventory, &["postgres"], true)?;
     require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
-    let arguments = [
-        "exec",
-        "-T",
-        "postgres",
-        "pg_dump",
-        "--format=custom",
-        "--compress=0",
-        "--no-owner",
-        "--no-privileges",
-        "--serializable-deferrable",
-        "--username=datax_studio",
-        "--dbname=datax_studio",
-    ]
-    .into_iter()
-    .map(OsString::from)
-    .collect::<Vec<_>>();
+    let arguments = postgres_dump_arguments();
     let result = compose_os_to_new_file_for_runtime(
         tools,
         installation,
@@ -5084,6 +5075,32 @@ fn run_postgres_dump(
         ));
     }
     Ok(())
+}
+
+fn postgres_dump_arguments() -> Vec<OsString> {
+    let mut arguments = [
+        "exec",
+        "-T",
+        "postgres",
+        "pg_dump",
+        "--format=custom",
+        "--compress=0",
+        "--no-owner",
+        "--no-privileges",
+        "--serializable-deferrable",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
+    arguments.push(OsString::from(format!(
+        "--exclude-schema={BACKUP_EXCLUDED_PHASE_A_QUALIFICATION_SCHEMA}"
+    )));
+    arguments.extend(
+        ["--username=datax_studio", "--dbname=datax_studio"]
+            .into_iter()
+            .map(OsString::from),
+    );
+    arguments
 }
 
 fn validate_postgres_dump_file(path: &Path) -> Result<(), LauncherError> {
@@ -8331,6 +8348,39 @@ mod tests {
         assert_ne!(
             backup_helper_container(BACKUP_DATA_HELPER_ROLE, &first).name,
             backup_helper_container(BACKUP_DATA_HELPER_ROLE, &second).name
+        );
+    }
+
+    #[test]
+    fn standard_backup_dump_excludes_the_complete_private_phase_a_schema() {
+        let arguments = postgres_dump_arguments()
+            .into_iter()
+            .map(|value| value.into_string().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            arguments,
+            vec![
+                "exec",
+                "-T",
+                "postgres",
+                "pg_dump",
+                "--format=custom",
+                "--compress=0",
+                "--no-owner",
+                "--no-privileges",
+                "--serializable-deferrable",
+                "--exclude-schema=des_phase_a_qualification",
+                "--username=datax_studio",
+                "--dbname=datax_studio",
+            ]
+        );
+        assert!(arguments.contains(&format!(
+            "--exclude-schema={BACKUP_EXCLUDED_PHASE_A_QUALIFICATION_SCHEMA}"
+        )));
+        assert!(
+            !arguments
+                .iter()
+                .any(|value| value.starts_with("--exclude-table"))
         );
     }
 

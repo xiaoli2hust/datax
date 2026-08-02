@@ -122,11 +122,95 @@ DATAX_AUTH_POSTGRES_TEST_URL="$owner_url" \
 PYTHONDONTWRITEBYTECODE=1 \
   "$python" -m pytest -q -p no:cacheprovider \
     backend/tests/test_runtime_database_roles_postgres.py \
+    backend/tests/test_phase_a_qualification_postgres.py \
     backend/tests/test_egress_guard_postgres.py \
     backend/tests/test_audit_append_only_postgres.py \
     backend/tests/test_audit_readiness_postgres.py \
     backend/tests/test_credentials_postgres.py \
     backend/tests/test_auth_postgres_concurrency.py
 
+# The standard Launcher uses this exact fixed schema exclusion. Prove on a
+# disposable real PostgreSQL database that the protected ledger tables, their
+# sentinel rows, and their trigger-function/schema metadata are absent from
+# the custom dump/restore, while ordinary product tables remain. This only
+# qualifies the dump boundary as E2; it is neither a full system restore nor a
+# Phase-A/E3/E4 execution.
+docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
+  psql --no-psqlrc --set ON_ERROR_STOP=1 \
+  --username=datax_migration_test --dbname=datax_e2_test \
+  --command "
+    WITH database_clock AS (
+      SELECT clock_timestamp() AS now
+    ), nonce AS (
+      INSERT INTO des_phase_a_qualification.phase_a_qualification_nonces
+        (id, issuer_key_id, nonce_sha256, qualification_id, payload_root_sha256,
+         valid_until, consumed_at, created_at)
+      SELECT
+        '00000000-0000-4000-8000-000000000020', 'hqa-dump-key-0001', repeat('d', 64),
+         'qh-dump-qualification-0001', repeat('e', 64),
+         database_clock.now + INTERVAL '15 minutes',
+         database_clock.now - INTERVAL '1 second',
+         database_clock.now - INTERVAL '1 second'
+      FROM database_clock
+      RETURNING id, issuer_key_id, qualification_id, payload_root_sha256, valid_until
+    )
+    INSERT INTO des_phase_a_qualification.phase_a_qualification_grants
+      (id, nonce_id, payload_binding_sha256, payload_root_sha256, candidate_commit,
+       worker_image_digest, datax_release, runtime_sha256, reader_plugin_name,
+       reader_plugin_sha256, writer_plugin_name, writer_plugin_sha256,
+       harness_identity, harness_environment_id, harness_environment_manifest_sha256,
+       harness_version, qh_document_sha256, qh_qualification_id, qh_issuer_key_id,
+       qh_issued_at, qh_not_before, qh_valid_until, state, created_at, revoked_at,
+       revocation_reason, expired_at)
+    SELECT
+      '00000000-0000-4000-8000-000000000021', nonce.id, repeat('f', 64),
+      nonce.payload_root_sha256, repeat('a', 40), 'sha256:' || repeat('b', 64),
+      'datax_v202309', repeat('c', 64), 'mysqlreader', repeat('d', 64),
+      'postgresqlwriter', repeat('e', 64), 'phase-a-e2-harness',
+      'phase-a-e2-environment', repeat('f', 64), '1.0.0+e2', repeat('a', 64),
+      nonce.qualification_id, nonce.issuer_key_id,
+      database_clock.now - INTERVAL '1 minute',
+      database_clock.now - INTERVAL '30 seconds', nonce.valid_until,
+      'ACTIVE', database_clock.now, NULL, NULL, NULL
+    FROM nonce CROSS JOIN database_clock;
+  " >/dev/null
+
+phase_a_dump="$temporary_directory/phase-a-qualification-excluded.dump"
+docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
+  pg_dump --format=custom --compress=0 --no-owner --no-privileges \
+  --serializable-deferrable \
+  --exclude-schema=des_phase_a_qualification \
+  --username=datax_migration_test --dbname=datax_e2_test > "$phase_a_dump"
+[ -s "$phase_a_dump" ] || fail "Phase-A exclusion pg_dump was empty"
+docker cp "$phase_a_dump" "$container_name:/tmp/phase-a-qualification-excluded.dump" >/dev/null
+docker exec "$container_name" \
+  pg_restore --list /tmp/phase-a-qualification-excluded.dump \
+  > "$temporary_directory/phase-a-qualification-excluded.toc"
+if grep -Eq 'des_phase_a_qualification|phase_a_qualification_' \
+  "$temporary_directory/phase-a-qualification-excluded.toc"
+then
+  fail "Phase-A qualification ledger appeared in standard pg_dump TOC"
+fi
+grep -Eq '[[:space:]]TABLE[[:space:]].*organizations' \
+  "$temporary_directory/phase-a-qualification-excluded.toc" \
+  || fail "ordinary product table was missing from standard pg_dump TOC"
+
+restore_probe_database="datax_e2_restore_probe"
+docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
+  createdb --username=datax_migration_test "$restore_probe_database"
+docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
+  pg_restore --exit-on-error --no-owner --no-privileges \
+  --username=datax_migration_test --dbname="$restore_probe_database" \
+  /tmp/phase-a-qualification-excluded.dump >/dev/null
+restored_phase_a_schema=$(docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
+  psql --no-psqlrc --tuples-only --no-align --set ON_ERROR_STOP=1 \
+  --username=datax_migration_test --dbname="$restore_probe_database" \
+  --command "SELECT to_regnamespace('des_phase_a_qualification') IS NULL
+                    AND to_regclass('public.organizations') IS NOT NULL;")
+[ "$(printf '%s' "$restored_phase_a_schema" | tr -d '[:space:]')" = "t" ] \
+  || fail "standard pg_dump restore did not exclude the Phase-A private schema"
+docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
+  dropdb --username=datax_migration_test "$restore_probe_database"
+
 printf '%s\n' \
-  'POSTGRES_E2_SUBSET_PASSED: real disposable PostgreSQL migrations, role boundaries, audit append-only/readiness replay, credential concurrency, and auth concurrency passed. This is E2 subset evidence only; it is not DataX E3, Windows E4, or product-Compose acceptance.'
+  'POSTGRES_E2_SUBSET_PASSED: real disposable PostgreSQL migrations, runtime-role boundaries, Phase-A qualification ledger guards and standard-backup complete-private-schema exclusion, audit append-only/readiness replay, credential concurrency, and auth concurrency passed. This is E2 subset evidence only; it is not full restore, DataX E3, Windows E4, or product-Compose acceptance.'

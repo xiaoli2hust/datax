@@ -18,6 +18,10 @@
 > 已新增的 Windows E4 scenario profile/result Schema 只是在 source 层精确规定 23 个
 > test/profile ID、25 个 requirement/test 对和 candidate/commit/environment/harness/assertion-hash
 > 绑定；没有受保护 harness 产生的 result catalog，故它是 E1 反伪造语义控制，不是 E4 证据。
+> 同轮新增的 P/QH parser、私有 payload/runtime/job binding 与 PostgreSQL Phase-A nonce/grant
+> 账本同样仅是 E1：它们没有专用 protected ledger role/function、protected issuer/consumer、
+> private API/Worker/Compose override、受保护 harness、QR reader 或真实 E3/E4；普通产品路径
+> 继续 deny-all。
 
 ## 1. 安全目标与非目标
 
@@ -44,6 +48,7 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
 | JobVersion、Execution、核验证据 | Integrity critical | 不可变版本、哈希、围栏、追加事件 |
 | 审计事件；未来公钥 keyring 与外部锚点 | Integrity critical | 当前为精确事件前像/同库哈希链；双签轮换、外部锚定和双人恢复仍是发布门禁 |
 | Runtime、插件与镜像 | Supply-chain critical | digest/SHA-256、SBOM、签名/来源验证 |
+| P binding/PAG 私有 qualification 元数据；原始 QH 与 nonce | Integrity critical；原始 QH/nonce 为 Secret | 原始 QH/nonce 不进入普通产品、公开制品、日志或数据库；ledger 只保存 nonce SHA-256 与不可变 binding 元数据，位于 closed-default `des_phase_a_qualification` schema，API/Worker 无 schema/table/function 直接权限，且标准 backup/diagnostics/restore 不得携带该 schema |
 | `Setup.exe`、`launcher.exe`、升级清单 | Supply-chain critical | Authenticode 信任链、固定发布证书 DER SHA-256、离线 SHA-256、版本/降级策略、发布 SBOM |
 | Windows 配置/导出备份与 `des-postgres-data`/`des-log-data`/`des-workspace-data` | Confidential / Integrity critical | 用户 ACL、named volume 隔离、卸载默认保留、备份加密、异机恢复演练 |
 
@@ -66,15 +71,24 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
   细粒度状态权限主要由应用层执行，不能声称数据库已强制职责隔离。Worker 只拥有一个
   pool=4/无 overflow/5 秒超时的 Engine；角色 cap=12 和 30 秒空闲/15 秒空闲事务超时是
   对异常重启残留的服务器端有界回收，不是高可用或无限重试保证。
+- Phase-A qualification ledger（仅 E1）：`20260802_0020` 的 closed-default
+  `des_phase_a_qualification` schema 中两表只记录 QH nonce hash 和精确
+  P/harness/Reader-Writer binding。迁移撤销 `PUBLIC`、`datax_api`、`datax_worker` 对 schema/table/
+  guard functions 的直接权限；guard functions 固定 `search_path=pg_catalog` 并使用
+  schema-qualified lookup。它们没有标准 API/Worker/Compose 路径，也不影响普通执行门禁。当前没有
+  专用 protected issuer role/function 或 protected issuer/consumer，故 migration owner/数据库管理员
+  不是 HQA/RQA 的替代信任根。
 - 外部 MySQL/PostgreSQL、DNS、镜像仓库和备份系统均跨越信任边界。
 - Windows 11 宿主、当前登录用户、浏览器、`launcher.exe`、Docker Desktop/WSL2 与
   Linux 容器之间均是独立信任边界。Docker Desktop 管理权限等价于本机高权限，不授予
   Web/API/Worker 容器访问 Docker Socket、Windows 命名管道或宿主敏感目录。
-- 未来 ADR-0011 的 HQA、RQA、受保护 Windows qualification harness、Authenticode
-  签名服务与 hosted candidate-root attestor 是彼此分离的发布 TCB。QH 只能跨越至受保护
-  harness；QR 只能作为被安装包哈希约束的只读资源进入私有最终候选；GitHub OIDC
-  provenance 只跨越候选根来源边界，不能替代 Windows/数据库行为边界。当前这些角色和
-  资源均未实现，不得由普通用户设置或产品运行时网络调用替代。
+- ADR-0011 的 HQA、RQA、受保护 Windows qualification harness、Authenticode 签名服务与
+  hosted candidate-root attestor 是彼此分离的发布 TCB。当前 P/QH parser、私有
+  payload/runtime/job binding 和 nonce/grant 账本已经是 E1 代码/迁移基础件，但 HQA/RQA、
+  专用 ledger role/function、protected issuer/consumer、private override、harness、QR reader
+  与真实外部证据均未实现。QH 未来只能跨越至受保护 harness；QR 未来只能作为被安装包
+  哈希约束的只读资源进入私有最终候选；GitHub OIDC provenance 只跨越候选根来源边界，不能
+  替代 Windows/数据库行为边界。不得由普通用户设置或产品运行时网络调用替代。
 
 ## 4. 主要威胁与控制
 
@@ -106,8 +120,16 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
 | TM-23 | 卸载、Docker 重置、首次初始化中断或磁盘故障导致数据丢失 | 卸载误删 named volumes/密钥/备份；先建卷后生成密钥时崩溃导致不可恢复；Docker 重置后静默创建空卷；卷部分丢失；磁盘不足时迁移或日志写入半完成 | 当前：程序/三卷分离；ACL 受控初始化日志；先完整 secret、后卷、提交旧 installation-id，再以不可覆盖的单一 `LEGACY` 指针整组绑定身份/secret/卷并清除日志；仅在无产品/数据卷容器且日志/secret/卷标签一致时补齐；既有卷缺密钥、指针篡改或状态矛盾 fail closed，绝不自动删卷；DATA/SECRETS 导出、双包认证 journal 与空 staging 已达到 E1。异机恢复、新空卷 `pg_restore`、证据重算、`RESTORE` 代际提交与覆盖升级仍是发布缺口 | 初始化各提交点断电/进程终止、容器存在、缺 secret、部分卷、错标签、Docker reset 负例；journal/staging/代际指针中断与篡改负例；发布前补安装→数据→卸载→重装、磁盘不足、真实 Windows 导出和异机恢复证据 |
 | TM-24 | 出口租约伪造、未授权创建、重放或守卫死亡后残留 | 客户端自报 lease ID、token 被记录/重放；普通调用者复用 API/Worker 共享 netns 对 `POST /v1/leases` 申请 ACTIVE 策略内任意 IP+port；API/Worker 不在守卫 netns；守卫死亡后旧 allow 无限存活，或 nft 原子替换的无语义 runtime metadata 触发错误漂移 | lease ID 与 32-byte bearer 均由守卫生成；`POST /v1/leases` 必须恰好携带 Launcher 由 32 个 OS CSPRNG 原始字节生成的 64 字符小写十六进制 Docker-secret 能力，guard 在 body/策略/controller/nftables 前用常量时间比较；能力只挂载给 guard/API/Worker，缺失/重复/错误统一 `401 LEASE_CREATION_AUTH_INVALID` 且不得记录/回显/传给 Job 或 DataX 环境。它阻断不能读 secret 的普通同 netns 调用者，不是同 UID Worker/DataX RCE sandbox。token 仅首次响应且内存只存域分离摘要；create/renew 重读 ACTIVE view；逻辑 30 秒、5 秒续租、nft 元素最多 15 秒；ruleset hash 只排除内核重新分配的 `handle` 与 `expires` 倒计时，仍绑定 timeout、地址、端口、表达式、hook 和 policy；真实规则漂移锁存 base-deny；Launcher 实测三容器 netns 相等 | 缺失/错误/重复能力头在 body/策略读取前统一 401；secret mount target、响应/日志/Job/DataX 环境泄漏负例；普通 netns 调用者不得创建租约；有效 API/Worker 正例；错误 token、token 日志扫描、netns 不等、guard kill 15 秒、DB 失败、nft `handle`/expires 变化不误降级、timeout/规则变化和撤策故障注入；同 UID RCE 只记录为残余风险，不能宣称被此控制消除 |
 
-| TM-26 | 资格自举、签名替代或发布哈希循环 | 将测试注入/环境变量/自申报 JSON 作为生产资格；让 QH 进入普通包；让 QR 回写 Worker 镜像，或让 QR 与 Setup/manifest 互相绑定后仍宣称同一候选 | ADR-0011 固定 P → 受保护 QH → 独立 QR → 精确 F Phase B → hosted final root 的单向链。HQA 只能签短期 QH，RQA 才能签 QR；固定 keyring 不接受 envelope 公钥；标准 Compose 拒绝 QH；QR 为 detached 资源且不绑定包含自身的 F；普通 reader 对签名、purpose、有效期和 P/commit/image/runtime/JAR/依赖/许可证逐项失败关闭；公开发布还须 ADR-0010 provenance | QH/QR 篡改、未知 key/purpose、过期、nonce 重放、所有 payload 错配、标准 Compose 注入、资源替换、自引用、同版本不同候选、self-hosted provenance 混淆和真实 Phase A/B 证据；当前全部 BLOCKED |
+| TM-26 | 资格自举、签名替代、ledger 越权或发布哈希循环 | 将测试注入/环境变量/自申报 JSON 作为生产资格；重放 QH nonce、篡改/删除 PAG，或让 QH 进入普通包；让 QR 回写 Worker 镜像，或让 QR 与 Setup/manifest 互相绑定后仍宣称同一候选 | ADR-0011 固定 `P → QH → PAG → QR → F → PR` 的单向链。当前 E1 parser 先核对 P/QH，再以 `nonce_sha256` 与不可变 grant binding 记录资格；0020 账本拒绝 nonce 重放、修改/删除/截断与非单调 lifecycle，并撤销 API/Worker 对两表的直接权限。**这些只是基础约束**：没有专用 protected ledger role/function、issuer/consumer、private override、harness 或 QR reader，标准产品也没有 QH/PAG 入口且仍 deny-all。未来 HQA 只能签短期 QH，RQA 才能签 QR；标准 Compose 必须拒绝 QH/PAG 资源，QR 必须是 detached 资源且不绑定包含自身的 F；受信 reader 对签名、purpose、有效期和 P/commit/image/runtime/JAR/依赖/许可证逐项失败关闭；公开发布还须 ADR-0010 provenance。标准 backup/diagnostics/restore 必须排除 ledger，恢复后的 protected issuer/consumer 还须以非恢复的 post-restore issuance epoch 拒绝旧 grant | 当前：parser/binding 与真实 PostgreSQL E2 的 nonce/grant 约束、API/Worker table denial、候选 dump exclusion/TOC 检查。关闭前：QH/QR 篡改、未知 key/purpose、过期、nonce 重放、所有 payload 错配、标准 Compose 注入、资源替换、自引用、同版本不同候选、私有 role/function/issuer 旁路、backup/diagnostic 泄露或 restore authority revival、self-hosted provenance 混淆和真实 Phase A/B 证据；当前 E3/E4/发布全部 BLOCKED |
 | TM-27 | 数据源外部操作持锁造成控制面 DoS 与陈旧结果 | 获授权用户让允许端点缓慢响应，或高并发执行 datasource create/update probe、test、metadata、job validation；外部 DNS/JDBC/schema I/O 若持有 Organization/Project/Datasource/Job 锁，会阻塞取消、凭据 revoke、目标独占撤回；I/O 后变更 revision/secret/grant/policy 时旧结果又可能覆盖/泄露 | **候选源码/E1 与局部 PostgreSQL E2 已实施，未关闭：** ADR-0014 五入口 A/B/C。A 只短事务授权并绑定 immutable datasource/policy/secret/envelope/grant/job/transfer/namespace/runtime/AuthSession snapshot；已有凭据的 B 先以极短 barrier 锁定、复制、提交，随后无产品 DB 锁做 resolve/egress/解密/connector（创建使用候选请求凭据），受总 deadline；C 重新授权并比较全部 security binding，漂移统一 409 stale、无旧 metadata/evidence/audit/last-test 副作用。PUBLISHED/ARCHIVED Job 在外部 I/O 前拒绝。已有 datasource/job 仅在 A 验证后才进入单 API 进程非阻塞 admission（global=4、organization/datasource=1、TEST 60 秒），未知 UUID 不得污染 retained state；429 在外部 I/O/audit 前返回，deadline 503 不持久化 B 结果。隔离 PostgreSQL E2 已证明阻塞 B probe 不持有同一 Organization 行锁；完整并发矩阵与真实 E3 未验证，`ASR-013=IN_PROGRESS`，不得声称连接测试限速已关闭 | 关闭前：五入口 source/contract 回归；AuthSession/revision/secret/envelope/grant/policy/job/project/scope/namespace/runtime 漂移负例；429 无 connector/DNS/decrypt/audit；真实 PostgreSQL `pg_locks`/时间界限证明阻塞 connector 不持有 Organization lock，并发 cancel/revoke/update 成功；真实 MySQL/PostgreSQL E3 deadline、DNS/egress、分页和恢复 |
+
+**TM-14/TM-26 Phase-A backup 与恢复边界。** 标准系统 backup、诊断包和 restore 输入必须
+固定排除完整 `des_phase_a_qualification` schema；不得只依赖“包已加密”或“普通 API/Worker 无表权限”
+来保留或转移 qualification authority。当前 dump 会恢复 `alembic_version=0020` 却排除该 schema，
+所以真实 restore/bootstrap/start 必须失败关闭。恢复目标必须从无 Phase-A authority 的状态开始，未来
+protected issuer/consumer 要生成并强制检查一个不随备份恢复的 issuance epoch，旧 QH/PAG/grant 一律
+不能复活。候选 schema exclusion、TOC 与临时库 probe 最多是 E2；没有完整 `pg_restore`、bootstrap/
+原子提交、实际 issuer/consumer 和干净 Windows 证据时，这一边界仍为 `BLOCKED`。
 
 **Windows E4 证据语义（TM-13/TM-19/TM-25）。** 权威 profile 防止发布候选删减、替换或把一个
 Windows 测试的断言借给另一个：它精确枚举 23 个 test/profile ID、25 个 requirement/test 对。未来
@@ -277,9 +299,10 @@ ACTIVE/SUPERSEDED，业务 ciphertext/nonce/AAD 不变。部署注入只读版�
 - `DXAUDITCHECKPOINTv1` 前像、公钥 keyring/双签轮换、外部锚点和篡改恢复；
 - 200 GiB 组合容量公式、绿黄红 admission、队列 SLO及重启后跨项目公平性。
 
-- ADR-0011 的 P/QH/QR/F/PR 链真实可验证：QH 未泄露至普通路径且已清理、QR 由独立
-  RQA 为精确 P 签发、无 QH 的精确 F 已完成 Phase B、最终候选根来自 hosted attestor；
-  任何缺少 Windows/数据库/签名/OIDC 外部 TCB 的状态均为 BLOCKED。
+- ADR-0011 的 `P/QH/PAG/QR/F/PR` 链真实可验证：当前 parser、binding 与 nonce/grant
+  ledger 只构成 E1，不能替代 protected issuer/consumer；QH 必须未泄露至普通路径且已清理，
+  QR 必须由独立 RQA 为精确 P 签发，无 QH/PAG 的精确 F 必须完成 Phase B，最终候选根必须
+  来自 hosted attestor；任何缺少 Windows/数据库/签名/OIDC 外部 TCB 的状态均为 BLOCKED。
 
 保留风险：源静默与目标外部独占都依赖系统所有者的外部变更冻结流程。平台无法仅靠 JDBC
 证明源扫描期间绝无写入，也无法靠 TargetCopyLock 阻止或完整发现第三方对目标执行的
