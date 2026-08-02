@@ -101,6 +101,7 @@ jobs:
           Set-StrictMode -Version Latest
           $overrideNames = @(
             "DES_RELEASE_MANIFEST_SHA256",
+            "DES_RELEASE_CANDIDATE",
             "RUSTC",
             "RUSTC_WRAPPER",
             "RUSTC_WORKSPACE_WRAPPER",
@@ -214,6 +215,7 @@ jobs:
             "nonrelease-installer-preflight.exe"
           $arguments = @(
             "/DPRODUCT_VERSION=0.1.0",
+            "/DRELEASE_CANDIDATE=0.1.0-000000000000",
             "/DFILE_VERSION=0.1.0.0",
             "/DLAUNCHER_EXE=$launcher",
             "/DCOMPOSE_FILE=$compose",

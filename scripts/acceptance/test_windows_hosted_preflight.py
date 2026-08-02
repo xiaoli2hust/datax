@@ -85,6 +85,7 @@ class WindowsHostedPreflightTests(unittest.TestCase):
         self.assertIn("cargo test --locked", self.raw)
         self.assertIn("cargo build --locked --release", self.raw)
         self.assertIn('"DES_RELEASE_MANIFEST_SHA256"', self.raw)
+        self.assertIn('"DES_RELEASE_CANDIDATE"', self.raw)
         self.assertIn('Remove-Item -LiteralPath "Env:$name"', self.raw)
         self.assertIn(NSIS_ARCHIVE_URL, self.raw)
         self.assertIn(NSIS_ARCHIVE_SHA256, self.raw)
@@ -106,6 +107,7 @@ class WindowsHostedPreflightTests(unittest.TestCase):
         self.assertIn("nsis-3.11\\makensis.exe", self.raw)
         self.assertIn("nonrelease-installer-preflight.exe", self.raw)
         self.assertIn("deliberately non-release preflight input", self.raw)
+        self.assertIn('"/DRELEASE_CANDIDATE=0.1.0-000000000000"', self.raw)
         self.assertIn("Remove all generated non-release inputs and output", self.raw)
         self.assertIn(
             "Remove-Item -LiteralPath $preflightRoot -Recurse -Force",
