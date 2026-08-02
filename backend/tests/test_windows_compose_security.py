@@ -55,6 +55,7 @@ def test_database_owner_secret_is_not_mounted_into_runtime_services() -> None:
     services = compose["services"]
 
     assert services["migrate"]["environment"]["DES_DATABASE_USER"] == "datax_studio"
+    assert services["keyring-bootstrap"]["environment"]["DES_DATABASE_USER"] == "datax_api"
     assert services["api"]["environment"]["DES_DATABASE_USER"] == "datax_api"
     assert services["worker"]["environment"]["DES_DATABASE_USER"] == "datax_worker"
     assert services["api"]["environment"]["DES_DATABASE_PASSWORD_FILE"] == (
@@ -73,10 +74,53 @@ def test_database_owner_secret_is_not_mounted_into_runtime_services() -> None:
     assert "postgres_password" in sources("migrate")
     assert "postgres_password" not in sources("api")
     assert "postgres_password" not in sources("worker")
+    assert "postgres_password" not in sources("keyring-bootstrap")
     assert "api_database_password" in sources("api")
+    assert "api_database_password" in sources("keyring-bootstrap")
     assert "worker_database_password" in sources("worker")
     assert "api_database_password" not in sources("worker")
     assert "worker_database_password" not in sources("api")
+
+
+def test_keyring_bootstrap_has_only_the_first_launch_secret_and_resource_closure() -> None:
+    compose = yaml.safe_load(
+        (REPOSITORY_ROOT / "deploy/windows/compose.yaml").read_text(encoding="utf-8")
+    )
+    bootstrap = compose["services"]["keyring-bootstrap"]
+    sources = {
+        entry if isinstance(entry, str) else entry["source"]
+        for entry in bootstrap["secrets"]
+    }
+
+    assert bootstrap["command"] == [
+        "python",
+        "-m",
+        "datax_studio.credentials.bootstrap_cli",
+        "--json",
+    ]
+    assert bootstrap["restart"] == "no"
+    assert sources == {
+        "api_database_password",
+        "idempotency_hmac_key",
+        "credential_kek_v1",
+    }
+    assert "volumes" not in bootstrap
+    assert bootstrap["read_only"] is True
+    assert bootstrap["tmpfs"] == ["/tmp:rw,noexec,nosuid,size=8m"]
+    assert bootstrap["pids_limit"] == 64
+    assert bootstrap["cap_drop"] == ["ALL"]
+    assert bootstrap["security_opt"] == ["no-new-privileges:true"]
+    assert bootstrap["depends_on"] == {
+        "migrate": {"condition": "service_completed_successfully"},
+        "egress-guard": {"condition": "service_healthy"},
+    }
+    assert bootstrap["network_mode"] == "service:egress-guard"
+    assert "networks" not in bootstrap
+    services = compose["services"]
+    for service in ("api", "worker"):
+        assert services[service]["depends_on"]["keyring-bootstrap"] == {
+            "condition": "service_completed_successfully"
+        }
 
 
 def test_worker_has_the_complete_minimum_secret_closure() -> None:

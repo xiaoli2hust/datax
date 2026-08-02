@@ -78,6 +78,38 @@ services:
     networks:
       - control
 
+  # The Worker must only validate a pre-registered KEK, but a fresh database
+  # has no registry row yet.  Run this narrowly scoped, idempotent bootstrap
+  # after migrations so first launch cannot deadlock waiting for a browser/API
+  # request that the Launcher deliberately postpones until readiness.
+  keyring-bootstrap:
+    image: ${DES_API_IMAGE:?DES_API_IMAGE must be a release-locked digest}
+    command: ["python", "-m", "datax_studio.credentials.bootstrap_cli", "--json"]
+    restart: "no"
+    environment:
+      <<: *backend-environment
+      DES_DATABASE_USER: datax_api
+    secrets:
+      - source: api_database_password
+        target: database_password
+      - idempotency_hmac_key
+      - source: credential_kek_v1
+        target: credential-kek-v1.key
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=8m
+    pids_limit: 64
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      egress-guard:
+        condition: service_healthy
+    network_mode: "service:egress-guard"
+
   egress-guard:
     image: ${DES_EGRESS_GUARD_IMAGE:?DES_EGRESS_GUARD_IMAGE must be a release-locked digest}
     restart: unless-stopped
@@ -145,6 +177,8 @@ services:
     depends_on:
       migrate:
         condition: service_completed_successfully
+      keyring-bootstrap:
+        condition: service_completed_successfully
       egress-guard:
         condition: service_healthy
     healthcheck:
@@ -198,6 +232,8 @@ services:
       - no-new-privileges:true
     depends_on:
       migrate:
+        condition: service_completed_successfully
+      keyring-bootstrap:
         condition: service_completed_successfully
       egress-guard:
         condition: service_healthy

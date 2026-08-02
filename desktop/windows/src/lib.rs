@@ -112,9 +112,10 @@ const CHILD_ENVIRONMENT_REMOVALS: &[&str] = &[
     "DES_LOG_VOLUME_NAME",
     "DES_WORKSPACE_VOLUME_NAME",
 ];
-const EXPECTED_SERVICES: [&str; 6] = [
+const EXPECTED_SERVICES: [&str; 7] = [
     "api",
     "egress-guard",
+    "keyring-bootstrap",
     "migrate",
     "postgres",
     "web",
@@ -390,7 +391,7 @@ impl ImageLock {
     fn for_service(&self, service: &str) -> Option<&str> {
         match service {
             "postgres" => Some(&self.postgres),
-            "api" | "migrate" => Some(&self.api),
+            "api" | "keyring-bootstrap" | "migrate" => Some(&self.api),
             "egress-guard" => Some(&self.egress_guard),
             "worker" => Some(&self.worker),
             "web" => Some(&self.web),
@@ -7129,7 +7130,7 @@ fn expected_runtime_volume_mounts(
                 String::from("/var/lib/datax-studio/runs"),
             ),
         ]),
-        "migrate" | "egress-guard" | "web" => BTreeSet::new(),
+        "keyring-bootstrap" | "migrate" | "egress-guard" | "web" => BTreeSet::new(),
         _ => BTreeSet::from([(String::from("invalid"), String::from("invalid"))]),
     }
 }
@@ -7677,7 +7678,7 @@ fn validate_rendered_storage_contract(
             ("log-data", "/var/lib/datax-studio/logs"),
             ("workspace-data", "/var/lib/datax-studio/runs"),
         ],
-        "migrate" | "egress-guard" | "web" => &[],
+        "keyring-bootstrap" | "migrate" | "egress-guard" | "web" => &[],
         _ => {
             return Err(LauncherError::new(
                 "COMPOSE_STORAGE_CONTRACT_REJECTED",
@@ -7802,6 +7803,11 @@ fn validate_rendered_service_secrets(
                 "egress_lease_creation_capability",
             ),
         ],
+        "keyring-bootstrap" => &[
+            ("api_database_password", "database_password"),
+            ("idempotency_hmac_key", "idempotency_hmac_key"),
+            ("credential_kek_v1", "credential-kek-v1.key"),
+        ],
         "postgres" => &[("postgres_password", "postgres_password")],
         "migrate" => &[
             ("postgres_password", "database_password"),
@@ -7905,11 +7911,11 @@ fn validate_rendered_network_security(
         .get("network_mode")
         .and_then(serde_json::Value::as_str);
     let networks = rendered_string_keys(definition.get("networks"), "COMPOSE_NETWORK_REJECTED")?;
-    if matches!(service, "api" | "worker") {
+    if matches!(service, "api" | "worker" | "keyring-bootstrap") {
         if network_mode != Some("service:egress-guard") || !networks.is_empty() {
             return Err(LauncherError::new(
                 "COMPOSE_NETWORK_REJECTED",
-                "API/Worker 必须且只能共享 egress-guard 的网络命名空间。",
+                "API、Worker 与密钥登记必须且只能共享 egress-guard 的网络命名空间。",
             ));
         }
     } else if network_mode.is_some() || networks != BTreeSet::from([String::from("control")]) {
@@ -7936,12 +7942,12 @@ fn validate_rendered_network_security(
             ));
         }
     } else if !cap_add.is_empty()
-        || (matches!(service, "api" | "worker" | "migrate")
+        || (matches!(service, "api" | "worker" | "keyring-bootstrap" | "migrate")
             && cap_drop != BTreeSet::from([String::from("ALL")]))
     {
         return Err(LauncherError::new(
             "COMPOSE_CAPABILITY_REJECTED",
-            "除 egress-guard 外不得增加 capability；API、Worker 与迁移服务必须 cap_drop=ALL。",
+            "除 egress-guard 外不得增加 capability；API、Worker、密钥登记与迁移服务必须 cap_drop=ALL。",
         ));
     }
 
@@ -7954,7 +7960,7 @@ fn validate_rendered_network_security(
             "不得使用可由环境变量伪造的出口执行已验证布尔值。",
         ));
     }
-    if matches!(service, "api" | "worker" | "migrate") {
+    if matches!(service, "api" | "worker" | "keyring-bootstrap" | "migrate") {
         let environment = environment.ok_or_else(|| {
             LauncherError::new(
                 "COMPOSE_EGRESS_CONTRACT_REJECTED",
@@ -7979,6 +7985,7 @@ fn validate_rendered_network_security(
         let expected_database_user = match service {
             "api" => "datax_api",
             "worker" => "datax_worker",
+            "keyring-bootstrap" => "datax_api",
             "migrate" => "datax_studio",
             _ => unreachable!(),
         };
@@ -8074,6 +8081,59 @@ fn validate_rendered_network_security(
             "COMPOSE_EGRESS_CONTRACT_REJECTED",
             "API/Worker 必须等待 egress-guard 通过健康检查。",
         ));
+    }
+    if matches!(service, "api" | "worker")
+        && rendered_dependency_condition(definition, "keyring-bootstrap")
+            != Some("service_completed_successfully")
+    {
+        return Err(LauncherError::new(
+            "COMPOSE_KEYRING_BOOTSTRAP_REJECTED",
+            "API/Worker 必须等待一次性密钥登记成功完成。",
+        ));
+    }
+    if service == "keyring-bootstrap" {
+        let command = definition
+            .get("command")
+            .and_then(serde_json::Value::as_array)
+            .and_then(|values| {
+                values
+                    .iter()
+                    .map(serde_json::Value::as_str)
+                    .collect::<Option<Vec<_>>>()
+            });
+        let tmpfs = rendered_string_values(
+            definition.get("tmpfs"),
+            "COMPOSE_KEYRING_BOOTSTRAP_REJECTED",
+        )?;
+        if command
+            != Some(vec![
+                "python",
+                "-m",
+                "datax_studio.credentials.bootstrap_cli",
+                "--json",
+            ])
+            || definition
+                .get("restart")
+                .and_then(serde_json::Value::as_str)
+                != Some("no")
+            || definition
+                .get("read_only")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+            || definition
+                .get("pids_limit")
+                .and_then(serde_json::Value::as_u64)
+                != Some(64)
+            || tmpfs != BTreeSet::from([String::from("/tmp:rw,noexec,nosuid,size=8m")])
+            || rendered_dependency_condition(definition, "migrate")
+                != Some("service_completed_successfully")
+            || rendered_dependency_condition(definition, "egress-guard") != Some("service_healthy")
+        {
+            return Err(LauncherError::new(
+                "COMPOSE_KEYRING_BOOTSTRAP_REJECTED",
+                "密钥登记服务必须保持固定的一次性命令、最小资源/只读契约，并等待迁移和出口守卫。",
+            ));
+        }
     }
     if service == "egress-guard" {
         let health_test = definition
@@ -8914,7 +8974,7 @@ mod tests {
     fn compose_inventory_requires_exact_owned_service_set_images_and_runtime_mounts() {
         let lock = compose_inventory_test_image_lock();
         let volume_names = legacy_test_runtime_volume_names();
-        let identifiers = ['a', 'b', 'c', 'd', 'e', 'f'];
+        let identifiers = ['a', 'b', 'c', 'd', 'e', 'f', 'g'];
         let containers = EXPECTED_SERVICES
             .iter()
             .zip(identifiers)
@@ -8990,7 +9050,7 @@ mod tests {
             logs: format!("des-log-{generation_id}"),
             workspace: format!("des-workspace-{generation_id}"),
         };
-        let identifiers = ['a', 'b', 'c', 'd', 'e', 'f'];
+        let identifiers = ['a', 'b', 'c', 'd', 'e', 'f', 'g'];
         let containers = EXPECTED_SERVICES
             .iter()
             .zip(identifiers)
@@ -9999,6 +10059,37 @@ mod tests {
                     },
                     "networks": {"control": null}
                 },
+                "keyring-bootstrap": {
+                    "image": lock.api,
+                    "command": [
+                        "python",
+                        "-m",
+                        "datax_studio.credentials.bootstrap_cli",
+                        "--json"
+                    ],
+                    "restart": "no",
+                    "secrets": [
+                        {"source": "api_database_password", "target": "database_password"},
+                        "idempotency_hmac_key",
+                        {"source": "credential_kek_v1", "target": "credential-kek-v1.key"}
+                    ],
+                    "read_only": true,
+                    "tmpfs": ["/tmp:rw,noexec,nosuid,size=8m"],
+                    "pids_limit": 64,
+                    "cap_drop": ["ALL"],
+                    "depends_on": {
+                        "migrate": {"condition": "service_completed_successfully"},
+                        "egress-guard": {"condition": "service_healthy"}
+                    },
+                    "environment": {
+                        "DES_EGRESS_POLICY_VERSION": "des-nftables-egress-v1",
+                        "DES_RESOLVER_POLICY_VERSION": "des-system-dns-v1",
+                        "DES_EGRESS_ATTESTATION_URL": "http://127.0.0.1:17990/v1/attestation",
+                        "DES_DATABASE_USER": "datax_api",
+                        "DES_DATABASE_PASSWORD_FILE": "/run/secrets/database_password"
+                    },
+                    "network_mode": "service:egress-guard"
+                },
                 "egress-guard": {
                     "image": lock.egress_guard,
                     "secrets": [
@@ -10035,6 +10126,7 @@ mod tests {
                     }],
                     "cap_drop": ["ALL"],
                     "depends_on": {
+                        "keyring-bootstrap": {"condition": "service_completed_successfully"},
                         "egress-guard": {"condition": "service_healthy"}
                     },
                     "environment": {
@@ -10057,6 +10149,7 @@ mod tests {
                     ],
                     "cap_drop": ["ALL"],
                     "depends_on": {
+                        "keyring-bootstrap": {"condition": "service_completed_successfully"},
                         "egress-guard": {"condition": "service_healthy"}
                     },
                     "environment": {

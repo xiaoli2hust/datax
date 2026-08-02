@@ -46,9 +46,13 @@ PostgreSQL、脱敏日志和无秘密、受限的 oracle 产物只落在三个�
 `nofile=4096/8192` 上限；tmpfs 上限为 256 MiB，耗尽时执行失败关闭。
 
 Launcher 生成的 `credential-kek-v1.key` 是独立 32-byte OS CSPRNG 原始密钥，不能与
-refresh-token/idempotency HMAC key 复用；Compose 将 KEK 和控制面完整性所需的
-`idempotency_hmac_key` 只读挂载给 API 和 Worker。Worker 不获得 JWT 私钥、公钥或 refresh
-token HMAC key。Launcher
+refresh-token/idempotency HMAC key 复用。迁移后，固定的一次性 `keyring-bootstrap` 容器以
+`datax_api` 幂等登记并核验 KEK 指纹后退出；它只获得 API 数据库密码、KEK 和
+`idempotency_hmac_key`，固定为只读根、8 MiB tmpfs、64 PID、`cap_drop: ALL`，没有 owner 密码、
+JWT/refresh key、egress lease capability、持久卷或宿主端口；它与 API/Worker 共享
+`egress-guard` 的默认拒绝网络命名空间。API 和 Worker 必须等待它成功。
+Compose 再将 KEK 和控制面完整性所需的 `idempotency_hmac_key` 只读挂载给 API 和 Worker；
+Worker 只读核验已登记的 KEK，不获得 JWT 私钥、公钥或 refresh token HMAC key。Launcher
 另行生成与 PostgreSQL 管理密码不同的
 `egress_guard_database_password.txt`，仅迁移任务和 `egress-guard` 可读取。
 
