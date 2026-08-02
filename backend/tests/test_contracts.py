@@ -132,6 +132,30 @@ def test_runtime_generation_schema_separates_legacy_and_generation_objects() -> 
     assert not validator.is_valid(legacy_with_generation_objects)
 
 
+def test_runtime_db_write_matrix_remains_explicitly_not_grant_ready() -> None:
+    """Keep a planning inventory from being mistaken for an applied grant script."""
+    matrix = json.loads(
+        (CONTRACT_ROOT / "runtime-db-write-matrix.v1.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert matrix["schema_version"] == "1.0"
+    assert matrix["status"] == "ACCEPTED_BASELINE_NOT_GRANT_READY"
+    assert matrix["grant_ready"] is False
+    assert matrix["default_policy"]["public_table_dml"] == "DENY_UNLESS_LISTED"
+    assert matrix["default_policy"]["future_table_dml"] == "DENY_UNLESS_LISTED"
+    assert {
+        item["id"] for item in matrix["preimplementation_blockers"]
+    } >= {
+        "P1-003A-KEK-WORKER-WRITE",
+        "P1-003A-SCHEDULER-API-WRITE",
+        "P1-003A-LIFECYCLE-SYSTEM-CONTROL",
+        "P1-003A-MAINTENANCE-DELETE",
+        "P1-003A-MATRIX-COMPLETENESS",
+    }
+
+
 def test_literal_audit_actions_are_declared_by_the_machine_contract() -> None:
     schema = json.loads(
         (CONTRACT_ROOT / "audit-event.v1.schema.json").read_text(encoding="utf-8")

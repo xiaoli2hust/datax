@@ -64,6 +64,10 @@
   状态和事件结构；不包含最终卷提交成功状态。
 - `runtime-generation.v1.schema.json`：Launcher 原子选择 installation-id、secret 目录和
   三个 Docker named volume 的活动运行代际指针。
+- `runtime-db-write-matrix.v1.json`：ADR-0013 的 API/Worker 最小写权限矩阵。当前是
+  `ACCEPTED_BASELINE_NOT_GRANT_READY`；它记录 003A 的显式 grant/trigger/function 目标和
+  pre-implementation blockers，管理面分组仍须展开为逐表/逐列 grant，不能被当作 PostgreSQL
+  权限已生效或可直接生成迁移的证据。
 - `system-backup.v1.md`：Windows Launcher 调用备份 helper 的停机、加密、恢复 journal 与失败关闭边界。
 
 ADR-0011 已规定未来需要独立的 release-payload、harness-qualification、
