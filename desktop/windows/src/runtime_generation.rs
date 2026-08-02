@@ -58,6 +58,56 @@ impl RuntimeGeneration {
         Ok(value)
     }
 
+    pub fn fresh(
+        generation_id: String,
+        installation_id: String,
+        committed_at: String,
+    ) -> Result<Self, LauncherError> {
+        Self::generated(generation_id, installation_id, "FRESH", None, committed_at)
+    }
+
+    pub fn restore(
+        generation_id: String,
+        installation_id: String,
+        restore_journal_id: String,
+        committed_at: String,
+    ) -> Result<Self, LauncherError> {
+        Self::generated(
+            generation_id,
+            installation_id,
+            "RESTORE",
+            Some(restore_journal_id),
+            committed_at,
+        )
+    }
+
+    fn generated(
+        generation_id: String,
+        installation_id: String,
+        source: &'static str,
+        restore_journal_id: Option<String>,
+        committed_at: String,
+    ) -> Result<Self, LauncherError> {
+        let mut value = Self {
+            schema_version: "1.0".to_owned(),
+            secret_directory: format!("generations/{generation_id}/secrets"),
+            volumes: RuntimeVolumes {
+                postgres: format!("des-postgres-{generation_id}"),
+                logs: format!("des-log-{generation_id}"),
+                workspace: format!("des-workspace-{generation_id}"),
+            },
+            generation_id,
+            installation_id,
+            source: source.to_owned(),
+            restore_journal_id,
+            committed_at,
+            state_sha256: String::new(),
+        };
+        value.state_sha256 = value.calculated_state_sha256()?;
+        value.validate()?;
+        Ok(value)
+    }
+
     pub fn to_bytes(&self) -> Result<Vec<u8>, LauncherError> {
         self.validate()?;
         serde_json::to_vec(self).map_err(|_| invalid("无法编码运行代际指针。"))
@@ -267,23 +317,102 @@ mod tests {
 
     fn generation(source: &str) -> RuntimeGeneration {
         let generation_id = "a".repeat(32);
-        let mut value = RuntimeGeneration {
-            schema_version: "1.0".to_owned(),
-            generation_id: generation_id.clone(),
-            installation_id: "b".repeat(64),
-            source: source.to_owned(),
-            restore_journal_id: (source == "RESTORE").then(|| "c".repeat(32)),
-            secret_directory: format!("generations/{generation_id}/secrets"),
-            volumes: RuntimeVolumes {
-                postgres: format!("des-postgres-{generation_id}"),
-                logs: format!("des-log-{generation_id}"),
-                workspace: format!("des-workspace-{generation_id}"),
-            },
-            committed_at: "2026-08-01T09:30:00.123456Z".to_owned(),
-            state_sha256: "0".repeat(64),
-        };
-        value.state_sha256 = value.calculated_state_sha256().unwrap();
-        value
+        let installation_id = "b".repeat(64);
+        let committed_at = "2026-08-01T09:30:00.123456Z".to_owned();
+        match source {
+            "FRESH" => RuntimeGeneration::fresh(generation_id, installation_id, committed_at),
+            "RESTORE" => RuntimeGeneration::restore(
+                generation_id,
+                installation_id,
+                "c".repeat(32),
+                committed_at,
+            ),
+            _ => panic!("test helper only constructs FRESH or RESTORE generations"),
+        }
+        .unwrap()
+    }
+
+    #[test]
+    fn fresh_constructor_binds_the_exact_generated_object_set() {
+        let value = RuntimeGeneration::fresh(
+            "a".repeat(32),
+            "b".repeat(64),
+            "2026-08-01T09:30:00.123456Z".to_owned(),
+        )
+        .unwrap();
+
+        assert_eq!(value.source, "FRESH");
+        assert_eq!(value.restore_journal_id, None);
+        assert_eq!(
+            value.secret_directory,
+            format!("generations/{}/secrets", "a".repeat(32))
+        );
+        assert_eq!(
+            value.volumes.postgres,
+            format!("des-postgres-{}", "a".repeat(32))
+        );
+        assert_eq!(value.volumes.logs, format!("des-log-{}", "a".repeat(32)));
+        assert_eq!(
+            value.volumes.workspace,
+            format!("des-workspace-{}", "a".repeat(32))
+        );
+        assert_eq!(value.state_sha256, value.calculated_state_sha256().unwrap());
+        assert_eq!(
+            RuntimeGeneration::parse(&value.to_bytes().unwrap()).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn restore_constructor_binds_a_valid_journal_to_the_generated_object_set() {
+        let restore_journal_id = "c".repeat(32);
+        let value = RuntimeGeneration::restore(
+            "a".repeat(32),
+            "b".repeat(64),
+            restore_journal_id.clone(),
+            "2026-08-01T09:30:00.123456Z".to_owned(),
+        )
+        .unwrap();
+
+        assert_eq!(value.source, "RESTORE");
+        assert_eq!(
+            value.restore_journal_id.as_deref(),
+            Some(restore_journal_id.as_str())
+        );
+        assert_eq!(
+            value.secret_directory,
+            format!("generations/{}/secrets", "a".repeat(32))
+        );
+        assert_eq!(value.state_sha256, value.calculated_state_sha256().unwrap());
+        assert_eq!(
+            RuntimeGeneration::parse(&value.to_bytes().unwrap()).unwrap(),
+            value
+        );
+    }
+
+    #[test]
+    fn generated_constructors_reject_invalid_identity_or_restore_journal() {
+        assert_eq!(
+            RuntimeGeneration::fresh(
+                "not-a-generation".to_owned(),
+                "b".repeat(64),
+                "2026-08-01T09:30:00Z".to_owned(),
+            )
+            .unwrap_err()
+            .code(),
+            "RUNTIME_GENERATION_INVALID"
+        );
+        assert_eq!(
+            RuntimeGeneration::restore(
+                "a".repeat(32),
+                "b".repeat(64),
+                "not-a-journal".to_owned(),
+                "2026-08-01T09:30:00Z".to_owned(),
+            )
+            .unwrap_err()
+            .code(),
+            "RUNTIME_GENERATION_INVALID"
+        );
     }
 
     #[test]

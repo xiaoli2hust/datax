@@ -427,6 +427,96 @@ struct RuntimeVolumeNames {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeSecretPaths {
+    directory: PathBuf,
+    postgres: PathBuf,
+    egress_guard_database: PathBuf,
+    egress_lease_creation_capability: PathBuf,
+    api_database: PathBuf,
+    worker_database: PathBuf,
+    jwt_private_key: PathBuf,
+    jwt_public_key: PathBuf,
+    refresh_token_hmac_key: PathBuf,
+    idempotency_hmac_key: PathBuf,
+    credential_kek: PathBuf,
+}
+
+impl RuntimeSecretPaths {
+    fn from_directory(directory: PathBuf) -> Self {
+        Self {
+            postgres: directory.join("postgres_password.txt"),
+            egress_guard_database: directory.join("egress_guard_database_password.txt"),
+            egress_lease_creation_capability: directory.join("egress_lease_creation_capability"),
+            api_database: directory.join("api_database_password.txt"),
+            worker_database: directory.join("worker_database_password.txt"),
+            jwt_private_key: directory.join("jwt_private_key.pem"),
+            jwt_public_key: directory.join("jwt_public_key.pem"),
+            refresh_token_hmac_key: directory.join("refresh_token_hmac_key"),
+            idempotency_hmac_key: directory.join("idempotency_hmac_key"),
+            credential_kek: directory.join("credential-kek-v1.key"),
+            directory,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveRuntimeSnapshot {
+    generation: RuntimeGeneration,
+    secrets: RuntimeSecretPaths,
+    volumes: RuntimeVolumeNames,
+}
+
+impl ActiveRuntimeSnapshot {
+    fn from_generation(
+        app_data_root: &Path,
+        generation: RuntimeGeneration,
+    ) -> Result<Self, LauncherError> {
+        generation.validate()?;
+        let secret_directory = generation.secret_path(app_data_root);
+        if !secret_directory.starts_with(app_data_root) {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_INVALID",
+                "活动运行代际的 secret 目录超出固定应用数据根。",
+            ));
+        }
+        let volumes = RuntimeVolumeNames {
+            postgres: generation.volumes.postgres.clone(),
+            logs: generation.volumes.logs.clone(),
+            workspace: generation.volumes.workspace.clone(),
+        };
+        let distinct = [
+            volumes.postgres.as_str(),
+            volumes.logs.as_str(),
+            volumes.workspace.as_str(),
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        if distinct.len() != 3 {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_INVALID",
+                "活动运行代际引用了重复的运行数据卷名称。",
+            ));
+        }
+        Ok(Self {
+            generation,
+            secrets: RuntimeSecretPaths::from_directory(secret_directory),
+            volumes,
+        })
+    }
+
+    fn compose_environment(&self, app_data_root: &Path) -> Vec<(OsString, OsString)> {
+        self.generation.compose_environment(app_data_root)
+    }
+
+    fn volume_contract(&self) -> ActiveRuntimeVolumeContract {
+        ActiveRuntimeVolumeContract {
+            installation_id: self.generation.installation_id.clone(),
+            names: self.volumes.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ActiveRuntimeVolumeContract {
     installation_id: String,
     names: RuntimeVolumeNames,
@@ -882,17 +972,15 @@ impl Installation {
     }
 
     fn compose_environment(&self) -> Result<Vec<(OsString, OsString)>, LauncherError> {
-        let generation = read_runtime_generation(&self.runtime_generation)?;
-        if generation.source == "LEGACY" {
-            let legacy_installation_id = read_installation_id(&self.installation_id)?;
-            if !constant_time_ascii_equal(&generation.installation_id, &legacy_installation_id) {
-                return Err(LauncherError::new(
-                    "RUNTIME_GENERATION_IDENTITY_MISMATCH",
-                    "活动运行代际与旧式 installation-id 不一致；Launcher 已安全阻断。",
-                ));
-            }
-        }
-        Ok(generation.compose_environment(&self.app_data_root))
+        let active_runtime = load_active_runtime_snapshot(self)?;
+        Ok(self.compose_environment_for(&active_runtime))
+    }
+
+    fn compose_environment_for(
+        &self,
+        active_runtime: &ActiveRuntimeSnapshot,
+    ) -> Vec<(OsString, OsString)> {
+        active_runtime.compose_environment(&self.app_data_root)
     }
 }
 
@@ -2224,6 +2312,26 @@ fn read_runtime_generation(path: &Path) -> Result<RuntimeGeneration, LauncherErr
     RuntimeGeneration::parse(&bytes)
 }
 
+// The active pointer is the only source of runtime identity after initialization.
+// The root installation-id remains an input solely for an existing LEGACY object
+// set, which is intentionally migrated without copying or renaming it. FRESH and
+// RESTORE must never read a second, root-level "current" identity.
+fn load_active_runtime_snapshot(
+    installation: &Installation,
+) -> Result<ActiveRuntimeSnapshot, LauncherError> {
+    let generation = read_runtime_generation(&installation.runtime_generation)?;
+    if generation.source == "LEGACY" {
+        let legacy_installation_id = read_installation_id(&installation.installation_id)?;
+        if !constant_time_ascii_equal(&generation.installation_id, &legacy_installation_id) {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_IDENTITY_MISMATCH",
+                "活动 LEGACY 运行代际与旧式 installation-id 不一致；Launcher 已安全阻断。",
+            ));
+        }
+    }
+    ActiveRuntimeSnapshot::from_generation(&installation.app_data_root, generation)
+}
+
 fn ensure_legacy_runtime_generation(
     start_tools: &StartTools,
     installation: &Installation,
@@ -2770,36 +2878,7 @@ fn validate_runtime_volume_identity(
 fn active_runtime_volume_contract(
     installation: &Installation,
 ) -> Result<ActiveRuntimeVolumeContract, LauncherError> {
-    let generation = read_runtime_generation(&installation.runtime_generation)?;
-    let installation_id = read_installation_id(&installation.installation_id)?;
-    if !constant_time_ascii_equal(&generation.installation_id, &installation_id) {
-        return Err(LauncherError::new(
-            "RUNTIME_GENERATION_IDENTITY_MISMATCH",
-            "活动运行代际与本机 installation-id 不一致；无法认证现有 Compose 容器。",
-        ));
-    }
-    let names = RuntimeVolumeNames {
-        postgres: generation.volumes.postgres,
-        logs: generation.volumes.logs,
-        workspace: generation.volumes.workspace,
-    };
-    let unique_names = [
-        names.postgres.as_str(),
-        names.logs.as_str(),
-        names.workspace.as_str(),
-    ]
-    .into_iter()
-    .collect::<BTreeSet<_>>();
-    if unique_names.len() != 3 {
-        return Err(LauncherError::new(
-            "RUNTIME_GENERATION_INVALID",
-            "活动运行代际引用了重复的运行数据卷名称。",
-        ));
-    }
-    Ok(ActiveRuntimeVolumeContract {
-        installation_id,
-        names,
-    })
+    Ok(load_active_runtime_snapshot(installation)?.volume_contract())
 }
 
 fn validate_active_runtime_volume_contract(
@@ -8497,6 +8576,46 @@ mod tests {
         fs::remove_file(pointer).unwrap();
         fs::remove_file(target).unwrap();
         fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn active_runtime_snapshot_derives_all_runtime_identity_from_one_fresh_pointer() {
+        let generation_id = "a".repeat(32);
+        let installation_id = "b".repeat(64);
+        let generation = RuntimeGeneration::fresh(
+            generation_id.clone(),
+            installation_id.clone(),
+            "2026-08-02T02:30:00Z".to_owned(),
+        )
+        .unwrap();
+        let root = Path::new("/datax-app");
+        let snapshot = ActiveRuntimeSnapshot::from_generation(root, generation.clone()).unwrap();
+
+        assert_eq!(snapshot.generation, generation);
+        assert_eq!(
+            snapshot.secrets.directory,
+            root.join(format!("generations/{generation_id}/secrets"))
+        );
+        assert_eq!(
+            snapshot.secrets.postgres,
+            root.join(format!(
+                "generations/{generation_id}/secrets/postgres_password.txt"
+            ))
+        );
+        assert_eq!(
+            snapshot.volumes.postgres,
+            format!("des-postgres-{generation_id}")
+        );
+        assert_eq!(snapshot.volumes.logs, format!("des-log-{generation_id}"));
+        assert_eq!(
+            snapshot.volumes.workspace,
+            format!("des-workspace-{generation_id}")
+        );
+        assert_eq!(snapshot.volume_contract().installation_id, installation_id);
+        assert!(snapshot.compose_environment(root).contains(&(
+            OsString::from("DES_SECRET_DIR"),
+            snapshot.secrets.directory.clone().into(),
+        )));
     }
 
     #[test]
