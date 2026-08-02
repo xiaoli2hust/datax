@@ -100,6 +100,10 @@ def _payload(
         serialization.Encoding.Raw,
         serialization.PublicFormat.Raw,
     )
+    rqa_public_key = Ed25519PrivateKey.generate().public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
     commit = "a" * 40
     document: dict[str, object] = {
         "schema_version": "1.0",
@@ -147,6 +151,18 @@ def _payload(
                     "key_id": "hqa-key-0001",
                     "algorithm": "Ed25519",
                     "public_key_base64": base64.b64encode(public_key).decode("ascii"),
+                    "not_before": key_not_before,
+                    "valid_until": key_valid_until,
+                }
+            ],
+        },
+        "rqa_keyring": {
+            "keyring_id": "rqa-keyring-0001",
+            "keys": [
+                {
+                    "key_id": "rqa-key-0001",
+                    "algorithm": "Ed25519",
+                    "public_key_base64": base64.b64encode(rqa_public_key).decode("ascii"),
                     "not_before": key_not_before,
                     "valid_until": key_valid_until,
                 }

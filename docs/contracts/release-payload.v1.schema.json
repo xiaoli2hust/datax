@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://datax-enterprise-studio.local/schemas/release-payload.v1.schema.json",
   "title": "DataX Enterprise Studio Immutable Release Payload V1",
-  "description": "ADR-0011 的 P：在任何 QH、QR、最终 release manifest、Setup 或 Launcher 之前固定的不可变构建集合。它不是 E3/E4 结果、普通用户能力或公开发布批准。payload_root_sha256 必须为 SHA-256(UTF8(\"DES-RELEASE-PAYLOAD-v1\\n\") || RFC8785(payload_without_root))。",
+  "description": "ADR-0011 的 P：在任何 QH、QR、最终 release manifest、Setup 或 Launcher 之前固定的不可变构建集合。它不是 E3/E4 结果、普通用户能力或公开发布批准。P 内的 HQA/RQA 公钥 keyring 只是受 payload root 约束的离线验证信任策略；它们不包含 QH/QR 签名或任何执行许可。payload_root_sha256 必须为 SHA-256(UTF8(\"DES-RELEASE-PAYLOAD-v1\\n\") || RFC8785(payload_without_root))。",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -13,6 +13,7 @@
     "images",
     "worker_runtime",
     "hqa_keyring",
+    "rqa_keyring",
     "artifacts",
     "payload_root_sha256"
   ],
@@ -24,6 +25,7 @@
     "images": { "$ref": "#/$defs/orderedImages" },
     "worker_runtime": { "$ref": "#/$defs/workerRuntime" },
     "hqa_keyring": { "$ref": "#/$defs/hqaKeyring" },
+    "rqa_keyring": { "$ref": "#/$defs/rqaKeyring" },
     "artifacts": { "$ref": "#/$defs/artifacts" },
     "payload_root_sha256": { "$ref": "#/$defs/sha256" }
   },
@@ -236,6 +238,57 @@
           "maxItems": 16,
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/hqaKey" }
+        }
+      }
+    },
+    "rqaKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key_id",
+        "algorithm",
+        "public_key_base64",
+        "not_before",
+        "valid_until"
+      ],
+      "properties": {
+        "key_id": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        },
+        "algorithm": { "const": "Ed25519" },
+        "public_key_base64": {
+          "type": "string",
+          "minLength": 44,
+          "maxLength": 44,
+          "pattern": "^[A-Za-z0-9+/]{43}=$"
+        },
+        "not_before": { "$ref": "#/$defs/rfc3339Utc" },
+        "valid_until": { "$ref": "#/$defs/rfc3339Utc" }
+      }
+    },
+    "rqaKeyring": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keyring_id", "keys"],
+      "properties": {
+        "keyring_id": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        },
+        "keys": {
+          "description": "最多 16 个 RQA key。JSON Schema 负责形状与完整对象去重；release_qualification parser 还失败关闭要求 key_id 严格升序且唯一。RQA key 仅能验证 QR，不能签发 QH 或公开发布晋级。",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/rqaKey" }
         }
       }
     },

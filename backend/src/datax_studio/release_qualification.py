@@ -1,9 +1,10 @@
-"""Fail-closed parsing and verification primitives for ADR-0011 Phase A.
+"""Fail-closed parsing and verification primitives for ADR-0011 qualification.
 
 This module intentionally has no Settings, Compose, API, Worker, or plugin-certification
 integration.  It only lets a protected qualification harness verify a short-lived HQA-signed
-permission for an independently pinned immutable release payload.  It cannot create E3/E4
-facts, change ordinary-user execution, or supply a production certification source.
+Phase-A permission or a RQA-signed private Phase-B qualification for an independently pinned
+immutable release payload.  It cannot create E3/E4 facts, change ordinary-user execution, or
+supply a production certification source.
 """
 
 from __future__ import annotations
@@ -27,6 +28,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 _PAYLOAD_ROOT_DOMAIN = b"DES-RELEASE-PAYLOAD-v1\n"
 _HARNESS_QUALIFICATION_DOMAIN = b"DES-HARNESS-QUALIFICATION-v1\n"
+_RELEASE_QUALIFICATION_DOMAIN = b"DES-RELEASE-QUALIFICATION-v1\n"
 _MAX_DOCUMENT_BYTES = 1024 * 1024
 _MAX_JSON_NESTING = 64
 _SHA256 = re.compile(r"^[a-f0-9]{64}$")
@@ -171,6 +173,26 @@ class _HqaKeyringModel(_StrictModel):
         return self
 
 
+class _RqaKeyModel(_StrictModel):
+    key_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+    algorithm: Literal["Ed25519"]
+    public_key_base64: str = Field(pattern=r"^[A-Za-z0-9+/]{43}=$")
+    not_before: str = Field(pattern=r"Z$")
+    valid_until: str = Field(pattern=r"Z$")
+
+
+class _RqaKeyringModel(_StrictModel):
+    keyring_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+    keys: list[_RqaKeyModel] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _ordered_unique_keys(self) -> _RqaKeyringModel:
+        key_ids = tuple(key.key_id for key in self.keys)
+        if not key_ids or key_ids != tuple(sorted(key_ids)) or len(key_ids) != len(set(key_ids)):
+            raise ValueError("RQA keys must be sorted and unique")
+        return self
+
+
 class _ImageSbomModel(_StrictModel):
     role: Literal["api", "egress_guard", "postgres", "web", "worker"]
     artifact: _ArtifactModel
@@ -198,6 +220,7 @@ class _ReleasePayloadDocument(_StrictModel):
     images: list[_ImageModel]
     worker_runtime: _WorkerRuntimeModel
     hqa_keyring: _HqaKeyringModel
+    rqa_keyring: _RqaKeyringModel
     artifacts: _ArtifactsModel
     payload_root_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
 
@@ -254,8 +277,137 @@ class _HarnessQualificationDocument(_StrictModel):
     signature: _SignatureModel
 
 
+class _ReleaseBindingPluginModel(_StrictModel):
+    name: Literal["mysqlreader", "mysqlwriter", "postgresqlreader", "postgresqlwriter"]
+    jar_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    parameter_boundary_contract_version: str = Field(pattern=r"^[1-9][0-9]*\.[0-9]+$")
+    dependency_inventory_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    license_review_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class _ReleaseBindingModel(_StrictModel):
+    payload_root_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    payload_binding_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    commit_sha: str = Field(pattern=r"^[a-f0-9]{40}$")
+    release_candidate: str = Field(
+        pattern=(
+            r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\."
+            r"(0|[1-9][0-9]*)-[0-9a-f]{12}$"
+        )
+    )
+    build_identity_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    image_lock_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    worker_image_digest: str = Field(pattern=r"^sha256:[a-f0-9]{64}$")
+    runtime_tree_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    plugins: list[_ReleaseBindingPluginModel]
+
+    @model_validator(mode="after")
+    def _exact_plugins(self) -> _ReleaseBindingModel:
+        if tuple(plugin.name for plugin in self.plugins) != _PLUGIN_NAMES:
+            raise ValueError("release binding plugins must be the exact ordered V1 set")
+        return self
+
+
+class _EvidenceDescriptorModel(_StrictModel):
+    evidence_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+    description: str = Field(min_length=1, max_length=240, pattern=r"^[^\x00-\x1f\x7f]+$")
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+    @field_validator("description")
+    @classmethod
+    def _trimmed_description(cls, value: str) -> str:
+        if value != value.strip():
+            raise ValueError("evidence description must be trimmed")
+        return value
+
+
+class _QualificationPluginModel(_StrictModel):
+    name: Literal["mysqlreader", "postgresqlreader", "mysqlwriter", "postgresqlwriter"]
+    jar_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    parameter_boundary_contract_version: str = Field(pattern=r"^[1-9][0-9]*\.[0-9]+$")
+
+
+class _QualificationEvidenceModel(_StrictModel):
+    phase_a_e3_evidence: _EvidenceDescriptorModel
+    phase_a_private_windows_evidence: _EvidenceDescriptorModel
+    payload_qualification_evidence: _EvidenceDescriptorModel
+
+    @model_validator(mode="after")
+    def _unique_evidence_ids(self) -> _QualificationEvidenceModel:
+        evidence_ids = (
+            self.phase_a_e3_evidence.evidence_id,
+            self.phase_a_private_windows_evidence.evidence_id,
+            self.payload_qualification_evidence.evidence_id,
+        )
+        if len(evidence_ids) != len(set(evidence_ids)):
+            raise ValueError("qualification evidence IDs must be unique")
+        return self
+
+
+class _PluginQualificationRowModel(_StrictModel):
+    reader: _QualificationPluginModel
+    writer: _QualificationPluginModel
+    evidence: _QualificationEvidenceModel
+
+    @model_validator(mode="after")
+    def _reader_writer_roles(self) -> _PluginQualificationRowModel:
+        if not self.reader.name.endswith("reader") or not self.writer.name.endswith("writer"):
+            raise ValueError("qualification row must bind one reader and one writer")
+        return self
+
+
+class _ImageSbomHashModel(_StrictModel):
+    role: Literal["api", "egress_guard", "postgres", "web", "worker"]
+    sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class _DependencyLicenseReviewModel(_StrictModel):
+    source_sbom_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    image_sboms: list[_ImageSbomHashModel]
+    license_inventory_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    conclusion: Literal["ACCEPTED_FOR_PRIVATE_PHASE_B"]
+
+    @model_validator(mode="after")
+    def _exact_image_sboms(self) -> _DependencyLicenseReviewModel:
+        if tuple(item.role for item in self.image_sboms) != _IMAGE_ROLES:
+            raise ValueError("dependency/license image SBOMs must be the exact ordered image set")
+        return self
+
+
+class _ReleaseQualificationDocument(_StrictModel):
+    schema_version: Literal["1.0"]
+    artifact_kind: Literal["RELEASE_QUALIFICATION"]
+    authorization_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+    purpose: Literal["PRIVATE_PHASE_B_QUALIFICATION"]
+    issuer_key_id: str = Field(min_length=8, max_length=128, pattern=r"^[A-Za-z0-9._-]+$")
+    issued_at: str = Field(pattern=r"Z$")
+    not_before: str = Field(pattern=r"Z$")
+    valid_until: str = Field(pattern=r"Z$")
+    release_binding: _ReleaseBindingModel
+    dependency_license_review: _DependencyLicenseReviewModel
+    qualification_rows: list[_PluginQualificationRowModel] = Field(min_length=1, max_length=4)
+    signature: _SignatureModel
+
+    @model_validator(mode="after")
+    def _ordered_unique_pairs(self) -> _ReleaseQualificationDocument:
+        pairs = tuple((row.reader.name, row.writer.name) for row in self.qualification_rows)
+        if pairs != tuple(sorted(pairs)) or len(pairs) != len(set(pairs)):
+            raise ValueError("qualification rows must be sorted and unique")
+        return self
+
+
 @dataclass(frozen=True)
 class HqaPublicKey:
+    key_id: str
+    public_key: bytes = field(repr=False)
+    not_before: datetime
+    valid_until: datetime
+
+
+@dataclass(frozen=True)
+class RqaPublicKey:
+    """A Release Qualification Authority public key pinned by verified P."""
+
     key_id: str
     public_key: bytes = field(repr=False)
     not_before: datetime
@@ -305,6 +457,27 @@ class ExpectedHarness(NamedTuple):
     harness_version: str
 
 
+class ExpectedPluginPair(NamedTuple):
+    """One exact Reader/Writer pair independently selected by a private Phase-B reader."""
+
+    reader_name: str
+    writer_name: str
+
+
+@dataclass(frozen=True)
+class VerifiedReleaseQualification:
+    """A private Phase-B test authorization, explicitly not E4 or public release approval."""
+
+    authorization_id: str
+    payload_root_sha256: str
+    issuer_key_id: str
+    reader_name: str
+    writer_name: str
+    issued_at: datetime
+    not_before: datetime
+    valid_until: datetime
+
+
 class QualificationNonceUse(NamedTuple):
     """Data needed by a durable, atomic HQA nonce ledger.
 
@@ -342,6 +515,28 @@ class _ParsedHarnessQualification:
     nonce: str
     payload_binding_canonical: bytes
     harness: ExpectedHarness
+    signature: bytes = field(repr=False)
+    signature_input: bytes = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _ParsedPluginQualificationRow:
+    reader_name: str
+    reader_binding: tuple[str, str]
+    writer_name: str
+    writer_binding: tuple[str, str]
+
+
+@dataclass(frozen=True)
+class _ParsedReleaseQualification:
+    authorization_id: str
+    issuer_key_id: str
+    issued_at: datetime
+    not_before: datetime
+    valid_until: datetime
+    release_binding_canonical: bytes = field(repr=False)
+    dependency_license_review_canonical: bytes = field(repr=False)
+    rows: tuple[_ParsedPluginQualificationRow, ...]
     signature: bytes = field(repr=False)
     signature_input: bytes = field(repr=False)
 
@@ -388,7 +583,10 @@ def parse_release_payload(
             _canonicalize(binding, code="RELEASE_PAYLOAD_CANONICAL_INVALID")
         ).hexdigest(),
     )
-    _hqa_keys(parsed.hqa_keyring)
+    _assert_distinct_authority_keyrings(
+        _hqa_keys(parsed.hqa_keyring),
+        _rqa_keys(parsed.rqa_keyring),
+    )
 
     payload = ReleasePayload(
         payload_root_sha256=parsed.payload_root_sha256,
@@ -475,6 +673,97 @@ def inspect_harness_qualification_evidence(
         now=now,
     )
     return verified
+
+
+def verify_release_qualification(
+    raw: bytes,
+    *,
+    release_payload: ReleasePayload,
+    expected_pair: ExpectedPluginPair,
+    now: datetime,
+) -> VerifiedReleaseQualification:
+    """Verify a RQA-signed QR for one protected private Phase-B pair.
+
+    This is a parser/verification primitive only.  It neither starts DataX nor
+    changes a plugin manifest, derives E4, grants ordinary-user execution, or
+    reads a configurable filesystem path.  A future protected Phase-B reader
+    must independently pin the QR resource through the final release manifest
+    before calling this function.
+    """
+
+    payload_document = _verify_release_payload_provenance(release_payload)
+    pair = _verified_plugin_pair(expected_pair)
+    current_time = _normalise_release_qualification_now(now)
+    qualification = _parse_release_qualification(raw)
+
+    key = next(
+        (
+            item
+            for item in _rqa_keys(payload_document.rqa_keyring)
+            if item.key_id == qualification.issuer_key_id
+        ),
+        None,
+    )
+    if key is None:
+        raise QualificationVerificationError("QR_ISSUER_KEY_UNKNOWN")
+    if not (key.not_before <= qualification.issued_at <= qualification.not_before):
+        raise QualificationVerificationError("QR_ISSUER_KEY_TIME_INVALID")
+    if qualification.valid_until > key.valid_until:
+        raise QualificationVerificationError("QR_ISSUER_KEY_TIME_INVALID")
+    try:
+        Ed25519PublicKey.from_public_bytes(key.public_key).verify(
+            qualification.signature,
+            qualification.signature_input,
+        )
+    except (InvalidSignature, ValueError):
+        raise QualificationVerificationError("QR_SIGNATURE_INVALID") from None
+
+    expected_binding = _release_qualification_binding(payload_document)
+    if qualification.release_binding_canonical != _canonicalize(
+        expected_binding,
+        code="RELEASE_PAYLOAD_CANONICAL_INVALID",
+    ):
+        raise QualificationVerificationError("QR_RELEASE_BINDING_MISMATCH")
+    if qualification.dependency_license_review_canonical != _canonicalize(
+        _dependency_license_review(payload_document),
+        code="RELEASE_PAYLOAD_CANONICAL_INVALID",
+    ):
+        raise QualificationVerificationError("QR_DEPENDENCY_LICENSE_MISMATCH")
+    row = next(
+        (
+            item
+            for item in qualification.rows
+            if (item.reader_name, item.writer_name) == pair
+        ),
+        None,
+    )
+    if row is None:
+        raise QualificationVerificationError("QR_PLUGIN_PAIR_NOT_QUALIFIED")
+    expected_plugins = {
+        plugin.name: (
+            plugin.jar.sha256,
+            plugin.parameter_boundary_contract_version,
+        )
+        for plugin in payload_document.worker_runtime.plugins
+    }
+    if (
+        expected_plugins.get(row.reader_name) != row.reader_binding
+        or expected_plugins.get(row.writer_name) != row.writer_binding
+    ):
+        raise QualificationVerificationError("QR_PLUGIN_BINDING_MISMATCH")
+    if not (qualification.not_before <= current_time < qualification.valid_until):
+        raise QualificationVerificationError("QR_NOT_CURRENTLY_VALID")
+
+    return VerifiedReleaseQualification(
+        authorization_id=qualification.authorization_id,
+        payload_root_sha256=release_payload.payload_root_sha256,
+        issuer_key_id=qualification.issuer_key_id,
+        reader_name=row.reader_name,
+        writer_name=row.writer_name,
+        issued_at=qualification.issued_at,
+        not_before=qualification.not_before,
+        valid_until=qualification.valid_until,
+    )
 
 
 def verify_harness_qualification_with_recorder[RecordedQualification](
@@ -622,6 +911,51 @@ def _public_payload_binding(
     )
 
 
+def _release_qualification_binding(document: _ReleasePayloadDocument) -> dict[str, Any]:
+    """Return the complete non-secret P facts that QR must repeat exactly."""
+
+    public_binding = _public_payload_binding(
+        document,
+        binding_sha256=hashlib.sha256(
+            _canonicalize(_payload_binding(document), code="RELEASE_PAYLOAD_CANONICAL_INVALID")
+        ).hexdigest(),
+    )
+    return {
+        "payload_root_sha256": document.payload_root_sha256,
+        "payload_binding_sha256": public_binding.payload_binding_sha256,
+        "commit_sha": document.identity.commit_sha,
+        "release_candidate": document.identity.release_candidate,
+        "build_identity_sha256": document.artifacts.build_identity.sha256,
+        "image_lock_sha256": document.artifacts.image_lock.sha256,
+        "worker_image_digest": public_binding.worker_image_digest,
+        "runtime_tree_sha256": document.worker_runtime.runtime_tree_sha256,
+        "plugins": [
+            {
+                "name": plugin.name,
+                "jar_sha256": plugin.jar.sha256,
+                "parameter_boundary_contract_version": plugin.parameter_boundary_contract_version,
+                "dependency_inventory_sha256": plugin.dependency_inventory.sha256,
+                "license_review_sha256": plugin.license_review.sha256,
+            }
+            for plugin in document.worker_runtime.plugins
+        ],
+    }
+
+
+def _dependency_license_review(document: _ReleasePayloadDocument) -> dict[str, Any]:
+    """Return the P-bound dependency and licence facts QR must not self-assert."""
+
+    return {
+        "source_sbom_sha256": document.artifacts.source_sbom.sha256,
+        "image_sboms": [
+            {"role": item.role, "sha256": item.artifact.sha256}
+            for item in document.artifacts.image_sboms
+        ],
+        "license_inventory_sha256": document.artifacts.license_inventory.sha256,
+        "conclusion": "ACCEPTED_FOR_PRIVATE_PHASE_B",
+    }
+
+
 def _hqa_keys(keyring: _HqaKeyringModel) -> tuple[HqaPublicKey, ...]:
     parsed_keys: list[HqaPublicKey] = []
     for key in keyring.keys:
@@ -644,6 +978,43 @@ def _hqa_keys(keyring: _HqaKeyringModel) -> tuple[HqaPublicKey, ...]:
             )
         )
     return tuple(parsed_keys)
+
+
+def _rqa_keys(keyring: _RqaKeyringModel) -> tuple[RqaPublicKey, ...]:
+    parsed_keys: list[RqaPublicKey] = []
+    for key in keyring.keys:
+        not_before = _parse_utc_timestamp(key.not_before, code="RELEASE_PAYLOAD_KEY_TIME_INVALID")
+        valid_until = _parse_utc_timestamp(key.valid_until, code="RELEASE_PAYLOAD_KEY_TIME_INVALID")
+        if not_before >= valid_until:
+            raise QualificationVerificationError("RELEASE_PAYLOAD_KEY_TIME_INVALID")
+        try:
+            material = base64.b64decode(key.public_key_base64, validate=True)
+        except (binascii.Error, ValueError):
+            raise QualificationVerificationError("RELEASE_PAYLOAD_KEY_MATERIAL_INVALID") from None
+        if len(material) != 32:
+            raise QualificationVerificationError("RELEASE_PAYLOAD_KEY_MATERIAL_INVALID")
+        parsed_keys.append(
+            RqaPublicKey(
+                key_id=key.key_id,
+                public_key=material,
+                not_before=not_before,
+                valid_until=valid_until,
+            )
+        )
+    return tuple(parsed_keys)
+
+
+def _assert_distinct_authority_keyrings(
+    hqa_keys: tuple[HqaPublicKey, ...],
+    rqa_keys: tuple[RqaPublicKey, ...],
+) -> None:
+    """Reject a payload that silently makes the HQA and RQA the same authority."""
+
+    if (
+        {key.key_id for key in hqa_keys} & {key.key_id for key in rqa_keys}
+        or {key.public_key for key in hqa_keys} & {key.public_key for key in rqa_keys}
+    ):
+        raise QualificationVerificationError("RELEASE_PAYLOAD_KEYRING_SEPARATION_INVALID")
 
 
 def _parse_harness_qualification(raw: bytes) -> _ParsedHarnessQualification:
@@ -694,6 +1065,66 @@ def _parse_harness_qualification(raw: bytes) -> _ParsedHarnessQualification:
         signature=signature,
         signature_input=_HARNESS_QUALIFICATION_DOMAIN
         + _canonicalize(unsigned, code="QH_CANONICAL_INVALID"),
+    )
+
+
+def _parse_release_qualification(raw: bytes) -> _ParsedReleaseQualification:
+    document = _load_canonical_json(raw, kind="RELEASE_QUALIFICATION")
+    try:
+        parsed = _ReleaseQualificationDocument.model_validate(document)
+    except ValidationError as error:
+        raise QualificationVerificationError("QR_FORMAT_INVALID") from error
+    if _IDENTIFIER.fullmatch(parsed.authorization_id) is None:
+        raise QualificationVerificationError("QR_FORMAT_INVALID")
+
+    issued_at = _parse_utc_timestamp(parsed.issued_at, code="QR_TIMESTAMP_INVALID")
+    not_before = _parse_utc_timestamp(parsed.not_before, code="QR_TIMESTAMP_INVALID")
+    valid_until = _parse_utc_timestamp(parsed.valid_until, code="QR_TIMESTAMP_INVALID")
+    if issued_at > not_before or not_before >= valid_until:
+        raise QualificationVerificationError("QR_VALIDITY_WINDOW_INVALID")
+    if valid_until - issued_at > timedelta(days=30):
+        raise QualificationVerificationError("QR_VALIDITY_WINDOW_TOO_LONG")
+    try:
+        signature = base64.b64decode(parsed.signature.value_base64, validate=True)
+    except (binascii.Error, ValueError):
+        raise QualificationVerificationError("QR_SIGNATURE_FORMAT_INVALID") from None
+    if len(signature) != 64:
+        raise QualificationVerificationError("QR_SIGNATURE_FORMAT_INVALID")
+
+    unsigned = dict(document)
+    unsigned.pop("signature", None)
+    return _ParsedReleaseQualification(
+        authorization_id=parsed.authorization_id,
+        issuer_key_id=parsed.issuer_key_id,
+        issued_at=issued_at,
+        not_before=not_before,
+        valid_until=valid_until,
+        release_binding_canonical=_canonicalize(
+            parsed.release_binding.model_dump(mode="json"),
+            code="QR_RELEASE_BINDING_INVALID",
+        ),
+        dependency_license_review_canonical=_canonicalize(
+            parsed.dependency_license_review.model_dump(mode="json"),
+            code="QR_DEPENDENCY_LICENSE_INVALID",
+        ),
+        rows=tuple(
+            _ParsedPluginQualificationRow(
+                reader_name=row.reader.name,
+                reader_binding=(
+                    row.reader.jar_sha256,
+                    row.reader.parameter_boundary_contract_version,
+                ),
+                writer_name=row.writer.name,
+                writer_binding=(
+                    row.writer.jar_sha256,
+                    row.writer.parameter_boundary_contract_version,
+                ),
+            )
+            for row in parsed.qualification_rows
+        ),
+        signature=signature,
+        signature_input=_RELEASE_QUALIFICATION_DOMAIN
+        + _canonicalize(unsigned, code="QR_CANONICAL_INVALID"),
     )
 
 
@@ -756,6 +1187,13 @@ def _verify_release_payload_provenance(payload: ReleasePayload) -> _ReleasePaylo
         raise QualificationVerificationError("RELEASE_PAYLOAD_NOT_VERIFIED") from None
     if document.payload_root_sha256 != payload.payload_root_sha256:
         raise QualificationVerificationError("RELEASE_PAYLOAD_NOT_VERIFIED")
+    try:
+        _assert_distinct_authority_keyrings(
+            _hqa_keys(document.hqa_keyring),
+            _rqa_keys(document.rqa_keyring),
+        )
+    except QualificationVerificationError:
+        raise QualificationVerificationError("RELEASE_PAYLOAD_NOT_VERIFIED") from None
     return document
 
 
@@ -812,9 +1250,28 @@ def _verified_harness_fields(expected: ExpectedHarness) -> tuple[str, str, str, 
     )
 
 
+def _verified_plugin_pair(expected: ExpectedPluginPair) -> tuple[str, str]:
+    if type(expected) is not ExpectedPluginPair:
+        raise QualificationVerificationError("QR_EXPECTED_PLUGIN_PAIR_INVALID")
+    if (
+        type(expected.reader_name) is not str
+        or expected.reader_name not in {"mysqlreader", "postgresqlreader"}
+        or type(expected.writer_name) is not str
+        or expected.writer_name not in {"mysqlwriter", "postgresqlwriter"}
+    ):
+        raise QualificationVerificationError("QR_EXPECTED_PLUGIN_PAIR_INVALID")
+    return (expected.reader_name, expected.writer_name)
+
+
 def _normalise_now(value: datetime) -> datetime:
     if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
         raise QualificationVerificationError("QH_CURRENT_TIME_INVALID")
+    return value.astimezone(UTC)
+
+
+def _normalise_release_qualification_now(value: datetime) -> datetime:
+    if type(value) is not datetime or value.tzinfo is None or value.utcoffset() is None:
+        raise QualificationVerificationError("QR_CURRENT_TIME_INVALID")
     return value.astimezone(UTC)
 
 

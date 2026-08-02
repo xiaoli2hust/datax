@@ -1,0 +1,260 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/release-qualification.v1.schema.json",
+  "title": "DataX Enterprise Studio Release Qualification V1",
+  "description": "ADR-0011 的 QR：RQA 对精确 P 的 detached、Ed25519 签名的私有 Phase-B 测试资格。它不是 Windows E4、普通用户执行许可、Plugin Manifest 认证状态、Setup 通过证明或公开发布晋级。签名输入为 UTF8(\"DES-RELEASE-QUALIFICATION-v1\\n\") || RFC8785(document_without_signature)。RQA 公钥只能按 issuer_key_id 从已独立验证的 release-payload.v1 内 rqa_keyring 取得；QR 不得自带或引用可配置公钥。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "authorization_id",
+    "purpose",
+    "issuer_key_id",
+    "issued_at",
+    "not_before",
+    "valid_until",
+    "release_binding",
+    "dependency_license_review",
+    "qualification_rows",
+    "signature"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_kind": { "const": "RELEASE_QUALIFICATION" },
+    "authorization_id": { "$ref": "#/$defs/identifier" },
+    "purpose": { "const": "PRIVATE_PHASE_B_QUALIFICATION" },
+    "issuer_key_id": { "$ref": "#/$defs/identifier" },
+    "issued_at": { "$ref": "#/$defs/rfc3339Utc" },
+    "not_before": { "$ref": "#/$defs/rfc3339Utc" },
+    "valid_until": { "$ref": "#/$defs/rfc3339Utc" },
+    "release_binding": { "$ref": "#/$defs/releaseBinding" },
+    "dependency_license_review": { "$ref": "#/$defs/dependencyLicenseReview" },
+    "qualification_rows": {
+      "description": "每行只证明一个精确 Reader/Writer pair 的私有 Phase-B 测试资格。数组排序和 pair 唯一性由失败关闭 parser 强制。",
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "items": { "$ref": "#/$defs/qualificationRow" }
+    },
+    "signature": { "$ref": "#/$defs/signature" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+    },
+    "rfc3339Utc": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$",
+      "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "value_base64"],
+      "properties": {
+        "algorithm": { "const": "Ed25519" },
+        "value_base64": {
+          "type": "string",
+          "minLength": 88,
+          "maxLength": 88,
+          "pattern": "^[A-Za-z0-9+/]{86}==$"
+        }
+      }
+    },
+    "releaseBindingPlugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "jar_sha256",
+        "parameter_boundary_contract_version",
+        "dependency_inventory_sha256",
+        "license_review_sha256"
+      ],
+      "properties": {
+        "name": {
+          "enum": ["mysqlreader", "mysqlwriter", "postgresqlreader", "postgresqlwriter"]
+        },
+        "jar_sha256": { "$ref": "#/$defs/sha256" },
+        "parameter_boundary_contract_version": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*\\.[0-9]+$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        },
+        "dependency_inventory_sha256": { "$ref": "#/$defs/sha256" },
+        "license_review_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "orderedReleaseBindingPlugins": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/releaseBindingPlugin" }, { "properties": { "name": { "const": "mysqlreader" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/releaseBindingPlugin" }, { "properties": { "name": { "const": "mysqlwriter" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/releaseBindingPlugin" }, { "properties": { "name": { "const": "postgresqlreader" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/releaseBindingPlugin" }, { "properties": { "name": { "const": "postgresqlwriter" } } }] }
+      ],
+      "items": false
+    },
+    "releaseBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "payload_root_sha256",
+        "payload_binding_sha256",
+        "commit_sha",
+        "release_candidate",
+        "build_identity_sha256",
+        "image_lock_sha256",
+        "worker_image_digest",
+        "runtime_tree_sha256",
+        "plugins"
+      ],
+      "properties": {
+        "payload_root_sha256": { "$ref": "#/$defs/sha256" },
+        "payload_binding_sha256": { "$ref": "#/$defs/sha256" },
+        "commit_sha": {
+          "type": "string",
+          "minLength": 40,
+          "maxLength": 40,
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "release_candidate": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-[0-9a-f]{12}$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        },
+        "build_identity_sha256": { "$ref": "#/$defs/sha256" },
+        "image_lock_sha256": { "$ref": "#/$defs/sha256" },
+        "worker_image_digest": {
+          "type": "string",
+          "minLength": 71,
+          "maxLength": 71,
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "runtime_tree_sha256": { "$ref": "#/$defs/sha256" },
+        "plugins": { "$ref": "#/$defs/orderedReleaseBindingPlugins" }
+      }
+    },
+    "imageSbom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "sha256"],
+      "properties": {
+        "role": {
+          "enum": ["api", "egress_guard", "postgres", "web", "worker"]
+        },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "orderedImageSboms": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/imageSbom" }, { "properties": { "role": { "const": "api" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/imageSbom" }, { "properties": { "role": { "const": "egress_guard" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/imageSbom" }, { "properties": { "role": { "const": "postgres" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/imageSbom" }, { "properties": { "role": { "const": "web" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/imageSbom" }, { "properties": { "role": { "const": "worker" } } }] }
+      ],
+      "items": false
+    },
+    "dependencyLicenseReview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_sbom_sha256",
+        "image_sboms",
+        "license_inventory_sha256",
+        "conclusion"
+      ],
+      "properties": {
+        "source_sbom_sha256": { "$ref": "#/$defs/sha256" },
+        "image_sboms": { "$ref": "#/$defs/orderedImageSboms" },
+        "license_inventory_sha256": { "$ref": "#/$defs/sha256" },
+        "conclusion": { "const": "ACCEPTED_FOR_PRIVATE_PHASE_B" }
+      }
+    },
+    "evidenceDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["evidence_id", "description", "sha256"],
+      "properties": {
+        "evidence_id": { "$ref": "#/$defs/identifier" },
+        "description": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 240,
+          "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+        },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "qualificationEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "phase_a_e3_evidence",
+        "phase_a_private_windows_evidence",
+        "payload_qualification_evidence"
+      ],
+      "properties": {
+        "phase_a_e3_evidence": { "$ref": "#/$defs/evidenceDescriptor" },
+        "phase_a_private_windows_evidence": { "$ref": "#/$defs/evidenceDescriptor" },
+        "payload_qualification_evidence": { "$ref": "#/$defs/evidenceDescriptor" }
+      }
+    },
+    "qualificationPlugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "jar_sha256", "parameter_boundary_contract_version"],
+      "properties": {
+        "name": {
+          "enum": ["mysqlreader", "postgresqlreader", "mysqlwriter", "postgresqlwriter"]
+        },
+        "jar_sha256": { "$ref": "#/$defs/sha256" },
+        "parameter_boundary_contract_version": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*\\.[0-9]+$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        }
+      }
+    },
+    "readerPlugin": {
+      "allOf": [
+        { "$ref": "#/$defs/qualificationPlugin" },
+        { "properties": { "name": { "enum": ["mysqlreader", "postgresqlreader"] } } }
+      ]
+    },
+    "writerPlugin": {
+      "allOf": [
+        { "$ref": "#/$defs/qualificationPlugin" },
+        { "properties": { "name": { "enum": ["mysqlwriter", "postgresqlwriter"] } } }
+      ]
+    },
+    "qualificationRow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reader", "writer", "evidence"],
+      "properties": {
+        "reader": { "$ref": "#/$defs/readerPlugin" },
+        "writer": { "$ref": "#/$defs/writerPlugin" },
+        "evidence": { "$ref": "#/$defs/qualificationEvidence" }
+      }
+    }
+  }
+}

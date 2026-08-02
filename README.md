@@ -54,13 +54,18 @@ E3/E4 test ID；当前全体仍为 `SOURCE_PRESENT`、普通用户可执行数�
 接受未来的“两阶段资格认证 + 最终发布晋级”设计：先固定不可变 Runtime payload，在
 受保护 harness 中以短期签名资格取得真实取证，再以 detached 签名资格构建私有最终候选，
 最后对精确安装包完成 Windows E4、候选根与 hosted provenance。当前已有 `P → QH → PAG → QR`
-设计中的 P/QH Schema 与失败关闭 parser、PAG Schema，以及 private Phase-A
+设计中的 P/QH/QR Schema 与失败关闭 parser、PAG Schema，以及 private Phase-A
 payload/runtime/job binding + durable nonce/grant/PEA persistence 的 **E1、进行中**基础件。`20260802_0021`
 新增了只供未来私有 harness 使用的 PostgreSQL ledger 边界：无登录的 ledger owner / issuer /
 consumer 角色、仅精确授权的 `SECURITY DEFINER` 签发/撤回/读取函数，以及不接入标准路径的
 private Engine adapter。签发函数在一个数据库事务中同时写 nonce 消费事实和不可变 PAG；读取函数
 只返回当前 `ACTIVE` grant，并不把它变成 Execution 授权。若私有角色名或成员关系预先存在，
 迁移失败关闭；ledger owner 后续新建函数默认没有 `PUBLIC EXECUTE`。
+
+QR 当前仅有 `release-qualification.v1` 和离线 parser：它从 P 内 root-bound `rqa_keyring` 验证
+canonical Ed25519 签名、时窗、完整 P/依赖许可证/插件 pair binding，拒绝自带公钥或任何错配。它不读
+安装包路径、不接 Settings/API/Worker/Compose/Launcher，不能产生 Windows E4 或普通用户执行权限；
+manifest-hash-pinned reader、真实 QR、私有 Phase B 与最终 Windows 验收仍未完成。
 
 J0b.1 的机器可读
 [`phase-a-execution-authorization.v1`](docs/contracts/phase-a-execution-authorization.v1.schema.json)

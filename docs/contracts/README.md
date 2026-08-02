@@ -77,10 +77,12 @@
   固定产品残留，并固定 `e4_result=NOT_RUN`、`release_approved=false`。当前仓库只对该
   脚本与契约做 E1 静态/结构测试；即使未来本机记录为 `READY`，也不是 E4、不是 golden-image
   或 runner 信任证明，不能写入 `candidate-root.v1` 或用于发布晋级。
-- `release-payload.v1.schema.json`、`harness-qualification.v1.schema.json` 与
-  `phase-a-qualification-grant.v1.schema.json`：ADR-0011 的不可变 P、短期 QH 与受保护私有
-  Phase-A 单 pair 授权记录。后者固定 P/harness/QH/Reader-Writer 的精确绑定和生命周期形状，
-  但不是普通 API、Worker、Compose 或用户可提交的契约，更不是 E3/E4 或发布结论。
+- `release-payload.v1.schema.json`、`harness-qualification.v1.schema.json`、
+  `release-qualification.v1.schema.json` 与 `phase-a-qualification-grant.v1.schema.json`：ADR-0011
+  的不可变 P、短期 QH、RQA-signed 私有 Phase-B QR 和受保护私有 Phase-A 单 pair 授权记录。P 的
+  `hqa_keyring/rqa_keyring` 都受 payload root 绑定；QR 只可由 P 内 `rqa_keyring` 验签，固定完整
+  P binding、依赖/许可证摘要、私有 Phase-A E3/Windows/payload evidence descriptor 及精确 pair，
+  但不是普通 API、Worker、Compose 或用户可提交的契约，更不是 E3/E4、Setup 通过或发布结论。
 - `datax_studio.qualification.private_harness_loader`（J0c-1）是**内部 E1 实现，不是新 JSON
   Schema、公开 API 或普通配置格式**。它仅接受未来受保护基础设施显式注入的 trusted private
   filesystem root、hash-pinned P/QH 文件、独立 P root 与固定 harness identity；返回不含 raw QH/raw
@@ -129,10 +131,10 @@ harness source provisioning。
   权限已生效或可直接生成迁移的证据。
 - `system-backup.v1.md`：Windows Launcher 调用备份 helper 的停机、加密、恢复 journal 与失败关闭边界；0022/0024 后标准 backup 会在 `pg_dump` 前后重验无任何 `PHASE_A_HARNESS` public Execution，存在/非 `t` 输出或 psql 非零均拒绝导出，受保护 Phase-A backup/restore 未实现。
 
-ADR-0011 的 Phase-A 契约基础件现包括 `release-payload.v1.schema.json`、
+ADR-0011 的 Phase-A/Phase-B 契约基础件现包括 `release-payload.v1.schema.json`、
 `harness-qualification.v1.schema.json`、`phase-a-qualification-grant.v1.schema.json`、
 `phase-a-execution-authorization.v1.schema.json`、`phase-a-execution-lock.v1.schema.json` 与
-`phase-a-execution-lifecycle.v1.schema.json`：前者
+`phase-a-execution-lifecycle.v1.schema.json`，以及 `release-qualification.v1.schema.json`：前者
 定义不含 QH/PAG/QR/最终安装包的不可变 P 及其 `payload_root_sha256`，第二者定义最长 24 小时、
 一次性、域分隔 Ed25519 QH；PAG 则只记录一个受保护私有 Phase-A 授权的 `grant_id`、精确
 P/harness binding、完整 P binding 的 `payload_binding_sha256`、QH
@@ -151,7 +153,14 @@ nonce、凭据、命令、测试结果或可配置公钥；其
 一次性 ledger 语义、最大 JSON 深度和跨字段时间窗口由 parser 失败关闭，nonce 只能在所有
 签名/绑定检查后原子消费。它没有设置项、环境变量、Compose/API/Worker 接线或普通用户认证
 source，因此仍不能产生 E3/E4、插件状态、普通执行能力或公开发布结论；仓库也尚无可用的
-HQA keyring/P/QH 实例。
+HQA/RQA keyring/P/QH/QR 实例。
+
+QR 的 parser 只接受由调用方独立钉住的已验证 P、精确 Reader/Writer pair、UTC 当前时间和
+canonical signed QR bytes。它从 P 的 `rqa_keyring` 验证 Ed25519 域分隔签名、key validity、最长 30 天
+窗口、完整 release binding、P 的 dependency/license hash 和 pair 的 jar/parameter-boundary binding；未知 key、
+自带公钥、签名/时间/绑定/证据形状错误均失败关闭。它不接受 Settings/env/HTTP/filesystem path，
+不返回 E4 或普通执行字段，也没有 manifest/resource hash pin、Phase-B reader、API/Worker/Launcher/Compose
+接线；因此仅为 E1 验证基础，真实 QR、Phase B、E4 与发布继续 `BLOCKED`。
 
 PAG 当前是**E1、进行中**的 private Phase-A payload/runtime/job binding 与 durable nonce/grant
 persistence 基础件；它仍不是可运行的 qualification 通道。受保护消费者必须先独立验证 P 和 QH，

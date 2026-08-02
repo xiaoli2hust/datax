@@ -18,7 +18,7 @@
 > 已新增的 Windows E4 scenario profile/result Schema 只是在 source 层精确规定 23 个
 > test/profile ID、25 个 requirement/test 对和 candidate/commit/environment/harness/assertion-hash
 > 绑定；没有受保护 harness 产生的 result catalog，故它是 E1 反伪造语义控制，不是 E4 证据。
-> 同轮新增的 P/QH parser、私有 payload/runtime/job binding 与 PostgreSQL Phase-A nonce/grant/PEA
+> 同轮新增的 P/QH/QR parser、私有 payload/runtime/job binding 与 PostgreSQL Phase-A nonce/grant/PEA
 > 账本属于 E1 基础件：`20260802_0021` 已有无登录 ledger owner / issuer / consumer、最小
 > `SECURITY DEFINER` issue/revoke/read 函数与未接入标准路径的 private adapter；`20260802_0022`
 > 已有 private PEA table、issuer authorize/consumer read 及普通 API/Worker/recovery 仅处理 `STANDARD` 的边界。
@@ -29,7 +29,7 @@
 > `LOCK_RESERVED` receipt。2026-08-02 的 disposable PostgreSQL 15 E2 已取得 `32 passed`，但不代表
 > private runner、普通 API/Worker/Compose/Launcher 接线、DataX E3 或 Windows E4。
 > 仍没有 protected harness credential provisioning、私有 Execution rerun、private API/Worker/Compose
-> override、四检查点、受保护 harness、QR reader 或真实 E3/E4；普通产品路径继续 deny-all。
+> override、四检查点、受保护 harness、manifest-hash-pinned QR reader 或真实 E3/E4；普通产品路径继续 deny-all。
 
 ## 1. 安全目标与非目标
 
@@ -105,10 +105,11 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
   Linux 容器之间均是独立信任边界。Docker Desktop 管理权限等价于本机高权限，不授予
   Web/API/Worker 容器访问 Docker Socket、Windows 命名管道或宿主敏感目录。
 - ADR-0011 的 HQA、RQA、受保护 Windows qualification harness、Authenticode 签名服务与
-  hosted candidate-root attestor 是彼此分离的发布 TCB。当前 P/QH parser、私有
+  hosted candidate-root attestor 是彼此分离的发布 TCB。当前 P/QH/QR parser、私有
   payload/runtime/job binding、nonce/grant/PEA/checkpoint 账本及其 0021/0022 role/function/adapter、0023 lock/fence
-  与 0024 原子创建数据库原语已是 E1 基础件加受限 PostgreSQL E2；HQA/RQA、protected harness credential provisioning、私有 Execution rerun、
-  private override、四检查点、harness、QR reader 与真实外部证据均未实现。QH 未来只能跨越至受保护 harness；QR 未来只能作为被安装包
+  与 0024 原子创建数据库原语已是 E1 基础件加受限 PostgreSQL E2；P 的 `rqa_keyring` 仅让 parser 验证
+  canonical QR 的 Ed25519 签名、时窗、P/依赖许可证/pair binding，不能授予 E4 或普通执行。HQA/RQA、protected harness credential provisioning、私有 Execution rerun、
+  private override、四检查点、harness、manifest-hash-pinned QR reader 与真实外部证据均未实现。QH 未来只能跨越至受保护 harness；QR 未来只能作为被安装包
   哈希约束的只读资源进入私有最终候选；GitHub OIDC provenance 只跨越候选根来源边界，不能
   替代 Windows/数据库行为边界。不得由普通用户设置或产品运行时网络调用替代。
 
@@ -167,6 +168,13 @@ DataX E3、Windows E4 或 runner 接线。
 更新线性化，避免 drain 与创建分别依据陈旧 admission 事实提交。PostgreSQL 行锁所需的窄
 `UPDATE(singleton_id)` 只授予无登录 ledger owner；issuer 和普通/runtime role 均无直接权限，只能经固定
 `SECURITY DEFINER` 函数使用这一串行点。
+
+**TM-26 QR 输入边界（E1，不是 Phase-B reader）。** `release-qualification.v1` 的 RQA 公钥只能从
+已独立钉住并验证 root 的 P 内 `rqa_keyring` 取得；parser 拒绝 QR 自带公钥、unknown key、非 canonical JSON、
+错误域签名、过期/过长窗口、P/依赖许可证/插件 binding 漂移和未获资格的 Reader/Writer pair。它没有
+Settings/env/HTTP/filesystem path、manifest hash 或 API/Worker/Launcher/Compose 接线，不返回 E4/普通能力，
+所以既不能成为普通路径旁路，也不能证明 QR 文件来自受保护安装包。最终 release manifest 资源绑定、
+protected Phase-B reader 与真实 E4 仍是独立门槛。
 
 **TM-26 downgrade 保护。** 0024 downgrade 在检查前以 `ACCESS EXCLUSIVE` 锁定 public `executions`、
 `execution_attempts`、`target_copy_locks` 及私有 grant、PEA、create-checkpoint 表；任一 protected
