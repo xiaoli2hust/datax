@@ -50,7 +50,7 @@
   `scripts/acceptance/candidate_root.py` 以外部 CI 身份参数绑定固定仓库、release workflow、
   run/attempt、保护环境、source ref、commit、tag、candidate，并把候选目录中除候选根自身
   以外的全部普通文件按安全相对路径、大小和 SHA-256 进行完整有序盘点；Setup、Launcher、
-  final release manifest 1.2（精确绑定 `release_candidate`）、Compose、顶层/内嵌镜像 lock、Linux build evidence 中生成的
+  final release manifest 1.3（精确绑定 `release_candidate` 与完整 `candidate_commit`）、Compose、顶层/内嵌镜像 lock、Linux build evidence 中生成的
   image lock、ACL helper、SPDX SBOM index、
   acceptance/environment/catalog 和 Windows build environment 还必须映射到该完整盘点并
   通过跨文件身份/hash 校验；manifest 内三项资源摘要与 canonical signer SHA-256 allowlist

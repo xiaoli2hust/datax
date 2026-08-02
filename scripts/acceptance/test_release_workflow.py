@@ -269,6 +269,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         expected = {
             "scripts/windows/build-installer.ps1": (
                 "ReleaseCandidate",
+                "CandidateCommit",
                 "CargoPath",
                 "RustcPath",
                 "MakensisPath",
@@ -277,6 +278,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             ),
             "scripts/release/finalize_windows_publisher_binding.ps1": (
                 "ReleaseCandidate",
+                "CandidateCommit",
                 "CargoPath",
                 "RustcPath",
                 "MakensisPath",
@@ -313,6 +315,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 if parameter in {"ReleaseCandidate", "ExpectedReleaseCandidate"}:
                     self.assertIn(
                         "[ValidatePattern('^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-[0-9a-f]{12}$')]"
+                        f"\n    [string]${parameter}",
+                        source,
+                    )
+                elif parameter in {"CandidateCommit", "ExpectedCommit"}:
+                    self.assertIn(
+                        "[ValidatePattern('^[0-9a-f]{40}$')]"
                         f"\n    [string]${parameter}",
                         source,
                     )
@@ -397,8 +405,10 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "The selected signing certificate is absent from the protected SHA-256 allowlist.",
             builder,
         )
-        self.assertIn('schema_version = "1.2"', builder)
+        self.assertIn('schema_version = "1.3"', builder)
         self.assertIn('release_candidate = $ReleaseCandidate', builder)
+        self.assertIn('candidate_commit = $CandidateCommit', builder)
+        self.assertIn('"DES_RELEASE_CANDIDATE_COMMIT"', builder)
         self.assertIn('"DES_RELEASE_CANDIDATE"', builder)
         self.assertIn('"/DRELEASE_CANDIDATE=$ReleaseCandidate"', builder)
         self.assertIn(
@@ -406,8 +416,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
             builder,
         )
         self.assertNotIn('schema_version = "1.0"\n    product_version = $ProductVersion', builder)
-        self.assertIn('manifest.schema_version != "1.2"', launcher)
+        self.assertIn('manifest.schema_version != "1.3"', launcher)
         self.assertIn('option_env!("DES_RELEASE_CANDIDATE")', launcher)
+        self.assertIn('option_env!("DES_RELEASE_CANDIDATE_COMMIT")', launcher)
         self.assertIn('RELEASE_CANDIDATE_BINDING_FAILED', launcher)
         self.assertIn("allowed_authenticode_signer_certificate_sha256", launcher)
 
@@ -431,7 +442,9 @@ class ReleaseWorkflowTests(unittest.TestCase):
         )["run"]
         self.assertIn("RELEASE_CANDIDATE", build)
         self.assertIn("ReleaseCandidate = $env:RELEASE_CANDIDATE", build)
+        self.assertIn("CandidateCommit = $env:GITHUB_SHA", build)
         self.assertIn("ExpectedReleaseCandidate = $env:RELEASE_CANDIDATE", evidence)
+        self.assertIn("ExpectedCommit = $env:GITHUB_SHA", evidence)
 
         hosted_job = self.workflow["jobs"]["hosted-candidate-attestor"]
         root = next(

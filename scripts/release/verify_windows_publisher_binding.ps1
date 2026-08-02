@@ -13,6 +13,9 @@ param(
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9a-f]{12}$')]
     [string]$ExpectedReleaseCandidate,
     [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$ExpectedCommit,
+    [Parameter(Mandatory = $true)]
     [string]$ExpectedAllowlistFile
 )
 
@@ -156,6 +159,7 @@ $manifestProperties = [string[]]@(
     "schema_version",
     "product_version",
     "release_candidate",
+    "candidate_commit",
     "compose_sha256",
     "images_sha256",
     "acl_script_sha256",
@@ -164,11 +168,13 @@ $manifestProperties = [string[]]@(
 $manifestSigners = Get-CanonicalAllowlist `
     -Document $manifest `
     -ExpectedProperties $manifestProperties `
-    -SchemaVersion "1.2"
+    -SchemaVersion "1.3"
 $releaseCandidatePattern = "^$([Regex]::Escape($ExpectedVersion))-[0-9a-f]{12}$"
 if ($ExpectedReleaseCandidate -cnotmatch $releaseCandidatePattern -or
+    $ExpectedReleaseCandidate -cne "$ExpectedVersion-$($ExpectedCommit.Substring(0, 12))" -or
     $manifest.product_version -cne $ExpectedVersion -or
     $manifest.release_candidate -cne $ExpectedReleaseCandidate -or
+    $manifest.candidate_commit -cne $ExpectedCommit -or
     $manifest.compose_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
     $manifest.images_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
     $manifest.acl_script_sha256 -cnotmatch '^[0-9a-f]{64}$') {

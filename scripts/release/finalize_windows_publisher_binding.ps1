@@ -7,6 +7,9 @@ param(
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9a-f]{12}$')]
     [string]$ReleaseCandidate,
     [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$CandidateCommit,
+    [Parameter(Mandatory = $true)]
     [string]$BuildOutputDirectory,
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9A-Fa-f]{40}$')]
@@ -394,14 +397,16 @@ if ($null -eq $package -or [string]$package.version -cne $ProductVersion) {
     throw "ProductVersion must match the Launcher Cargo package version."
 }
 $releaseCandidatePattern = "^$([Regex]::Escape($ProductVersion))-[0-9a-f]{12}$"
-if ($ReleaseCandidate -cnotmatch $releaseCandidatePattern) {
-    throw "ReleaseCandidate must bind the exact ProductVersion and a lowercase commit prefix."
+if ($ReleaseCandidate -cnotmatch $releaseCandidatePattern -or
+    $ReleaseCandidate -cne "$ProductVersion-$($CandidateCommit.Substring(0, 12))") {
+    throw "ReleaseCandidate must bind the exact ProductVersion and CandidateCommit prefix."
 }
 
 $releaseManifest = [ordered]@{
-    schema_version = "1.2"
+    schema_version = "1.3"
     product_version = $ProductVersion
     release_candidate = $ReleaseCandidate
+    candidate_commit = $CandidateCommit
     compose_sha256 = (
         Get-FileHash -LiteralPath $composeStaged -Algorithm SHA256
     ).Hash.ToLowerInvariant()
@@ -429,6 +434,10 @@ $previousCandidateBinding = [Environment]::GetEnvironmentVariable(
     "DES_RELEASE_CANDIDATE",
     [EnvironmentVariableTarget]::Process
 )
+$previousCandidateCommitBinding = [Environment]::GetEnvironmentVariable(
+    "DES_RELEASE_CANDIDATE_COMMIT",
+    [EnvironmentVariableTarget]::Process
+)
 try {
     [Environment]::SetEnvironmentVariable(
         "DES_RELEASE_MANIFEST_SHA256",
@@ -438,6 +447,11 @@ try {
     [Environment]::SetEnvironmentVariable(
         "DES_RELEASE_CANDIDATE",
         $ReleaseCandidate,
+        [EnvironmentVariableTarget]::Process
+    )
+    [Environment]::SetEnvironmentVariable(
+        "DES_RELEASE_CANDIDATE_COMMIT",
+        $CandidateCommit,
         [EnvironmentVariableTarget]::Process
     )
     Invoke-ConfiguredCargo -Cargo $cargo -Rustc $rustc -Arguments @(
@@ -456,6 +470,11 @@ finally {
     [Environment]::SetEnvironmentVariable(
         "DES_RELEASE_CANDIDATE",
         $previousCandidateBinding,
+        [EnvironmentVariableTarget]::Process
+    )
+    [Environment]::SetEnvironmentVariable(
+        "DES_RELEASE_CANDIDATE_COMMIT",
+        $previousCandidateCommitBinding,
         [EnvironmentVariableTarget]::Process
     )
 }

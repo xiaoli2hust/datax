@@ -53,8 +53,8 @@ Setup 变成可信程序；用户/组织在首次执行前仍必须通过 Window
 
 流水线先核验实际 PFX 证书 DER SHA-256 属于该受保护、严格排序去重的允许集；
 `scripts/windows/build-installer.ps1` 必须显式接收同一份 `-AllowedSignerFile`，并只会生成
-包含该 allowlist 和精确 `release_candidate` 的清单 `1.2`、由同一证书签名的 Launcher/Setup。Launcher
-还把候选标识编译期绑定；随后
+包含该 allowlist、精确 `release_candidate` 和完整 40 位 `candidate_commit` 的清单 `1.3`、由同一证书签名的 Launcher/Setup。Launcher
+还把这两个候选身份字段编译期绑定；随后
 `scripts/release/finalize_windows_publisher_binding.ps1` 再次校验该 allowlist，并重建、重签
 最终发布绑定。Linux 阶段还必须先以全新空 `DOCKER_CONFIG`、不继承 registry 凭据的方式
 匿名拉取五个固定 digest，并生成与镜像锁一致的 `anonymous-image-pulls.json`；任一镜像只能

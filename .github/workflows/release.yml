@@ -926,6 +926,7 @@ jobs:
           $parameters = @{
               ProductVersion = $env:VERSION
               ReleaseCandidate = $env:RELEASE_CANDIDATE
+              CandidateCommit = $env:GITHUB_SHA
               ReleaseImagesFile = (
                   Join-Path `
                     "${env:RUNNER_TEMP}\linux-candidate-evidence" `
@@ -944,6 +945,7 @@ jobs:
           $bindingParameters = @{
               ProductVersion = $env:VERSION
               ReleaseCandidate = $env:RELEASE_CANDIDATE
+              CandidateCommit = $env:GITHUB_SHA
               BuildOutputDirectory = $outputDirectory
               CargoPath = $env:CARGO_PATH
               RustcPath = $env:RUSTC_PATH
@@ -1024,6 +1026,7 @@ jobs:
             -ResourcesDirectory $resources `
             -ExpectedVersion $env:VERSION `
             -ExpectedReleaseCandidate $env:RELEASE_CANDIDATE `
+            -ExpectedCommit $env:GITHUB_SHA `
             -ExpectedAllowlistFile $env:SIGNER_ALLOWLIST_PATH
           $parameters = @{
               CandidateDirectory = $candidateDirectory

@@ -222,6 +222,7 @@ const IMAGE_RULES: [(&str, &str); 5] = [
 ];
 const RELEASE_MANIFEST_BOUND_SHA256: Option<&str> = option_env!("DES_RELEASE_MANIFEST_SHA256");
 const RELEASE_CANDIDATE_BOUND: Option<&str> = option_env!("DES_RELEASE_CANDIDATE");
+const RELEASE_CANDIDATE_COMMIT_BOUND: Option<&str> = option_env!("DES_RELEASE_CANDIDATE_COMMIT");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LauncherError {
@@ -366,6 +367,7 @@ struct ReleaseManifest {
     schema_version: String,
     product_version: String,
     release_candidate: String,
+    candidate_commit: String,
     compose_sha256: String,
     images_sha256: String,
     acl_script_sha256: String,
@@ -1344,8 +1346,20 @@ fn verify_release_resources(installation: &Installation) -> Result<VerifiedRelea
             "Launcher 构建未绑定发布候选标识；该构建不得用于 Windows 发布。",
         )
     })?;
-    if !is_release_candidate_for_version(expected_release_candidate, env!("CARGO_PKG_VERSION"))
+    let expected_candidate_commit = RELEASE_CANDIDATE_COMMIT_BOUND.ok_or_else(|| {
+        LauncherError::new(
+            "RELEASE_BINDING_MISSING",
+            "Launcher 构建未绑定发布候选的完整提交；该构建不得用于 Windows 发布。",
+        )
+    })?;
+    if !is_git_commit(expected_candidate_commit)
+        || !is_release_candidate_for_commit(
+            expected_release_candidate,
+            env!("CARGO_PKG_VERSION"),
+            expected_candidate_commit,
+        )
         || !constant_time_ascii_equal(&manifest.release_candidate, expected_release_candidate)
+        || !constant_time_ascii_equal(&manifest.candidate_commit, expected_candidate_commit)
     {
         return Err(LauncherError::new(
             "RELEASE_CANDIDATE_BINDING_FAILED",
@@ -1413,9 +1427,14 @@ fn parse_release_manifest(bytes: &[u8]) -> Result<ReleaseManifest, LauncherError
     let signer_set_is_canonical = (1..=8).contains(&signers.len())
         && signers.iter().all(|value| is_sha256(value))
         && signers.windows(2).all(|values| values[0] < values[1]);
-    if manifest.schema_version != "1.2"
+    if manifest.schema_version != "1.3"
         || manifest.product_version != env!("CARGO_PKG_VERSION")
-        || !is_release_candidate_for_version(&manifest.release_candidate, &manifest.product_version)
+        || !is_git_commit(&manifest.candidate_commit)
+        || !is_release_candidate_for_commit(
+            &manifest.release_candidate,
+            &manifest.product_version,
+            &manifest.candidate_commit,
+        )
         || !is_sha256(&manifest.compose_sha256)
         || !is_sha256(&manifest.images_sha256)
         || !is_sha256(&manifest.acl_script_sha256)
@@ -1429,11 +1448,12 @@ fn parse_release_manifest(bytes: &[u8]) -> Result<ReleaseManifest, LauncherError
     Ok(manifest)
 }
 
-fn is_release_candidate_for_version(candidate: &str, product_version: &str) -> bool {
-    candidate
-        .strip_prefix(product_version)
-        .and_then(|suffix| suffix.strip_prefix('-'))
-        .is_some_and(|suffix| is_lower_hex_string(suffix, 12))
+fn is_git_commit(value: &str) -> bool {
+    is_lower_hex_string(value, 40)
+}
+
+fn is_release_candidate_for_commit(candidate: &str, product_version: &str, commit: &str) -> bool {
+    is_git_commit(commit) && candidate == format!("{product_version}-{}", &commit[..12])
 }
 
 fn verify_prerequisites(
@@ -9794,10 +9814,12 @@ mod tests {
     }
 
     fn release_manifest_json(signers: serde_json::Value) -> Vec<u8> {
+        let commit = "a".repeat(40);
         serde_json::json!({
-            "schema_version": "1.2",
+            "schema_version": "1.3",
             "product_version": env!("CARGO_PKG_VERSION"),
-            "release_candidate": format!("{}-{}", env!("CARGO_PKG_VERSION"), "a".repeat(12)),
+            "release_candidate": format!("{}-{}", env!("CARGO_PKG_VERSION"), &commit[..12]),
+            "candidate_commit": commit,
             "compose_sha256": "1".repeat(64),
             "images_sha256": "2".repeat(64),
             "acl_script_sha256": "3".repeat(64),
@@ -9861,13 +9883,27 @@ mod tests {
     }
 
     #[test]
-    fn release_manifest_rejects_missing_or_mismatched_release_candidate() {
+    fn release_manifest_rejects_missing_or_mismatched_candidate_identity() {
         let mut missing: serde_json::Value =
             serde_json::from_slice(&release_manifest_json(serde_json::json!(["a".repeat(64)])))
                 .unwrap();
         missing.as_object_mut().unwrap().remove("release_candidate");
         assert_eq!(
             parse_release_manifest(missing.to_string().as_bytes())
+                .unwrap_err()
+                .code(),
+            "RELEASE_MANIFEST_INVALID"
+        );
+
+        let mut missing_commit: serde_json::Value =
+            serde_json::from_slice(&release_manifest_json(serde_json::json!(["a".repeat(64)])))
+                .unwrap();
+        missing_commit
+            .as_object_mut()
+            .unwrap()
+            .remove("candidate_commit");
+        assert_eq!(
+            parse_release_manifest(missing_commit.to_string().as_bytes())
                 .unwrap_err()
                 .code(),
             "RELEASE_MANIFEST_INVALID"
@@ -9882,6 +9918,19 @@ mod tests {
                 serde_json::from_slice(&release_manifest_json(serde_json::json!(["a".repeat(64)])))
                     .unwrap();
             manifest["release_candidate"] = serde_json::Value::String(candidate);
+            assert_eq!(
+                parse_release_manifest(manifest.to_string().as_bytes())
+                    .unwrap_err()
+                    .code(),
+                "RELEASE_MANIFEST_INVALID"
+            );
+        }
+
+        for commit in ["A".repeat(40), "a".repeat(39)] {
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&release_manifest_json(serde_json::json!(["a".repeat(64)])))
+                    .unwrap();
+            manifest["candidate_commit"] = serde_json::Value::String(commit);
             assert_eq!(
                 parse_release_manifest(manifest.to_string().as_bytes())
                     .unwrap_err()

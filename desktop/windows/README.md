@@ -20,8 +20,8 @@
    env-file/project/profile/行为/输出覆盖；只接收 Launcher 派生的值、匿名 CLI config 和
    已验证 local pipe。Docker Desktop daemon 的组织代理属于独立前置。此项目前是 E1 代码
    契约，尚未由 Windows Docker Desktop 实测。
-5. Launcher 自身必须有有效 Authenticode；其编译期摘要和 `release_candidate=<semver>-<commit12>`
-   同时绑定 `resources/release-manifest.json`。清单 `schema_version=1.2` 除锁定
+5. Launcher 自身必须有有效 Authenticode；其编译期摘要、完整 40 位 `candidate_commit` 和
+   `release_candidate=<semver>-<commit12>` 同时绑定 `resources/release-manifest.json`。清单 `schema_version=1.3` 除锁定
    `compose.yaml`、`images.release.env` 和 `secure-acl.ps1` 外，还包含 1–8 个严格排序、
    去重的小写发布证书 DER SHA-256。Launcher 要求恰好一个主 Authenticode 签名者，
    同时验证 Windows 信任链和证书 SHA-256 允许集；仅由任意其他受信证书签名仍会拒绝。

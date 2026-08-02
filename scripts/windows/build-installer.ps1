@@ -4,6 +4,9 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9a-f]{12}$')]
     [string]$ReleaseCandidate,
+    [Parameter(Mandatory = $true)]
+    [ValidatePattern('^[0-9a-f]{40}$')]
+    [string]$CandidateCommit,
     [string]$ComposeFile,
     [Parameter(Mandatory = $true)]
     [string]$ReleaseImagesFile,
@@ -423,8 +426,9 @@ if ($ProductVersion -notmatch '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*
     throw "ProductVersion must be a three-part numeric version, for example 0.1.0."
 }
 $releaseCandidatePattern = "^$([Regex]::Escape($ProductVersion))-[0-9a-f]{12}$"
-if ($ReleaseCandidate -cnotmatch $releaseCandidatePattern) {
-    throw "ReleaseCandidate must bind the exact ProductVersion and a lowercase commit prefix."
+if ($ReleaseCandidate -cnotmatch $releaseCandidatePattern -or
+    $ReleaseCandidate -cne "$ProductVersion-$($CandidateCommit.Substring(0, 12))") {
+    throw "ReleaseCandidate must bind the exact ProductVersion and CandidateCommit prefix."
 }
 $fileVersion = "$ProductVersion.0"
 
@@ -460,9 +464,10 @@ $composeHash = (Get-FileHash -LiteralPath $composeStaged -Algorithm SHA256).Hash
 $imagesHash = (Get-FileHash -LiteralPath $imagesStaged -Algorithm SHA256).Hash.ToLowerInvariant()
 $aclScriptHash = (Get-FileHash -LiteralPath $aclScriptStaged -Algorithm SHA256).Hash.ToLowerInvariant()
 $releaseManifest = [ordered]@{
-    schema_version = "1.2"
+    schema_version = "1.3"
     product_version = $ProductVersion
     release_candidate = $ReleaseCandidate
+    candidate_commit = $CandidateCommit
     compose_sha256 = $composeHash
     images_sha256 = $imagesHash
     acl_script_sha256 = $aclScriptHash
@@ -485,6 +490,10 @@ $previousCandidateBinding = [Environment]::GetEnvironmentVariable(
     "DES_RELEASE_CANDIDATE",
     [EnvironmentVariableTarget]::Process
 )
+$previousCandidateCommitBinding = [Environment]::GetEnvironmentVariable(
+    "DES_RELEASE_CANDIDATE_COMMIT",
+    [EnvironmentVariableTarget]::Process
+)
 try {
     [Environment]::SetEnvironmentVariable(
         "DES_RELEASE_MANIFEST_SHA256",
@@ -494,6 +503,11 @@ try {
     [Environment]::SetEnvironmentVariable(
         "DES_RELEASE_CANDIDATE",
         $ReleaseCandidate,
+        [EnvironmentVariableTarget]::Process
+    )
+    [Environment]::SetEnvironmentVariable(
+        "DES_RELEASE_CANDIDATE_COMMIT",
+        $CandidateCommit,
         [EnvironmentVariableTarget]::Process
     )
     Invoke-ConfiguredCargo -Cargo $cargo -Rustc $rustc -Arguments @(
@@ -512,6 +526,11 @@ finally {
     [Environment]::SetEnvironmentVariable(
         "DES_RELEASE_CANDIDATE",
         $previousCandidateBinding,
+        [EnvironmentVariableTarget]::Process
+    )
+    [Environment]::SetEnvironmentVariable(
+        "DES_RELEASE_CANDIDATE_COMMIT",
+        $previousCandidateCommitBinding,
         [EnvironmentVariableTarget]::Process
     )
 }
