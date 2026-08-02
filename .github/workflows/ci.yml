@@ -71,6 +71,7 @@ jobs:
             --output docs/contracts/requirements-catalog.v1.json \
             --check
           python -m unittest scripts.acceptance.test_acceptance_manifest -v
+          python -m unittest scripts.acceptance.test_windows_e4_scenarios -v
           python -m unittest scripts.acceptance.test_candidate_root -v
           python -m unittest scripts.acceptance.test_trusted_gh_cli -v
           python -m unittest scripts.acceptance.test_release_workflow -v

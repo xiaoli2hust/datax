@@ -21,6 +21,9 @@ REPOSITORY = Path(__file__).resolve().parents[2]
 MATRIX = REPOSITORY / "docs/12_需求追踪矩阵.md"
 CATALOG = REPOSITORY / "docs/contracts/requirements-catalog.v1.json"
 SCHEMA = REPOSITORY / "docs/contracts/acceptance-manifest.v1.schema.json"
+SCENARIO_PROFILE = (
+    REPOSITORY / "docs/contracts/windows-e4-scenario-profile.v1.json"
+)
 
 
 class AcceptanceManifestTests(unittest.TestCase):
@@ -512,8 +515,22 @@ class AcceptanceManifestTests(unittest.TestCase):
             self._build_blocked_manifest(environment, manifest_path)
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             entry = self._entry(manifest, "PRD-FR-WS-001", "E2E-WIN-001")
+            listener_report = root / "reports/listeners.json"
+            listener_report.parent.mkdir()
+            listener_report.write_text('{"loopback_only":true}\n', encoding="utf-8")
+            listener_artifact = self._artifact(root, listener_report)
+            assertions = self._profile_assertions(
+                profile_id="E2E-WIN-001",
+                evidence=listener_artifact,
+            )
+            manifest["windows_scenario_catalogs"], _scenario = self._scenario_catalogs(
+                root=root,
+                manifest=manifest,
+                profile_id="E2E-WIN-001",
+                assertions=assertions,
+            )
             fake_windows = root / "reports/fake-windows.txt"
-            fake_windows.parent.mkdir()
+            fake_windows.parent.mkdir(exist_ok=True)
             fake_windows.write_text("PASSED\n", encoding="utf-8")
             artifact = self._artifact(root, fake_windows)
             self._promote_entry(entry, artifact, "E4")
@@ -542,6 +559,16 @@ class AcceptanceManifestTests(unittest.TestCase):
             listener_report.parent.mkdir()
             listener_report.write_text('{"loopback_only":true}\n', encoding="utf-8")
             listener_artifact = self._artifact(root, listener_report)
+            assertions = self._profile_assertions(
+                profile_id="E2E-WIN-001",
+                evidence=listener_artifact,
+            )
+            manifest["windows_scenario_catalogs"], scenario = self._scenario_catalogs(
+                root=root,
+                manifest=manifest,
+                profile_id="E2E-WIN-001",
+                assertions=assertions,
+            )
             release_directory = root / "release"
             release_directory.mkdir()
             setup = release_directory / "Setup.exe"
@@ -580,13 +607,8 @@ class AcceptanceManifestTests(unittest.TestCase):
                     "launcher_signature_status": "VALID",
                     "timestamp_status": "VALID",
                 },
-                "assertions": [
-                    {
-                        "assertion_id": "E2E-WIN-001",
-                        "result": "PASS",
-                        "evidence": [listener_artifact],
-                    }
-                ],
+                "scenario": scenario,
+                "assertions": assertions,
             }
             windows_path = root / "reports/windows-e4.json"
             self._write_manifest(windows_path, windows_document)
@@ -754,6 +776,96 @@ class AcceptanceManifestTests(unittest.TestCase):
             "environment_manifest_sha256": manifest["environment_manifest_sha256"],
             "execution_ids": [],
         }
+
+    @staticmethod
+    def _profile_assertions(
+        *, profile_id: str, evidence: dict[str, str]
+    ) -> list[dict[str, object]]:
+        profile = json.loads(SCENARIO_PROFILE.read_text(encoding="utf-8"))
+        selected = next(
+            item for item in profile["profiles"] if item["profile_id"] == profile_id
+        )
+        return [
+            {
+                "assertion_id": assertion_id,
+                "result": "PASS",
+                "evidence": [evidence],
+            }
+            for assertion_id in selected["required_assertion_ids"]
+        ]
+
+    @classmethod
+    def _scenario_catalogs(
+        cls,
+        *,
+        root: Path,
+        manifest: dict[str, object],
+        profile_id: str,
+        assertions: list[dict[str, object]],
+    ) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+        profile_path = root / "reports/windows-e4-scenario-profile.v1.json"
+        profile_path.parent.mkdir(exist_ok=True)
+        profile_path.write_bytes(SCENARIO_PROFILE.read_bytes())
+        profile = json.loads(profile_path.read_text(encoding="utf-8"))
+        selected = next(
+            item for item in profile["profiles"] if item["profile_id"] == profile_id
+        )
+        profile_artifact = cls._artifact(root, profile_path)
+        profile_sha256 = profile_artifact["sha256"]
+        assertions_sha256 = hashlib.sha256(rfc8785.dumps(assertions)).hexdigest()
+        results = []
+        for item in profile["profiles"]:
+            if item["profile_id"] == profile_id:
+                results.append(
+                    {
+                        "profile_id": profile_id,
+                        "result": "PASSED",
+                        "executed_at": "2026-07-30T12:00:00Z",
+                        "environment_id": "win11-clean-001",
+                        "environment_manifest_sha256": manifest[
+                            "environment_manifest_sha256"
+                        ],
+                        "windows_baseline_id": "windows11-clean-golden-v1",
+                        "harness_version": "windows-e4-harness/v1",
+                        "assertion_ids": selected["required_assertion_ids"],
+                        "assertions_sha256": assertions_sha256,
+                    }
+                )
+            else:
+                results.append(
+                    {
+                        "profile_id": item["profile_id"],
+                        "result": "NOT_RUN",
+                        "executed_at": None,
+                        "environment_id": None,
+                        "environment_manifest_sha256": None,
+                        "windows_baseline_id": None,
+                        "harness_version": None,
+                        "assertion_ids": [],
+                        "assertions_sha256": None,
+                    }
+                )
+        result_path = root / "reports/windows-e4-scenario-results.v1.json"
+        cls._write_manifest(
+            result_path,
+            {
+                "schema_version": "1.0",
+                "artifact_kind": "WINDOWS_E4_SCENARIO_RESULT_CATALOG",
+                "profile_catalog_sha256": profile_sha256,
+                "release_candidate": manifest["release_candidate"],
+                "commit_sha": manifest["commit_sha"],
+                "results": results,
+            },
+        )
+        result_artifact = cls._artifact(root, result_path)
+        return (
+            {"profile": profile_artifact, "result": result_artifact},
+            {
+                "profile_id": profile_id,
+                "profile_catalog_sha256": profile_sha256,
+                "result_catalog_sha256": result_artifact["sha256"],
+            },
+        )
 
     @staticmethod
     def _oracle_document() -> dict[str, object]:

@@ -97,6 +97,14 @@ jobs:
           cp \
             docs/contracts/requirements-catalog.v1.json \
             "${EVIDENCE_DIRECTORY}/requirements-catalog.v1.json"
+          cp \
+            docs/contracts/windows-e4-scenario-profile.v1.json \
+            "${EVIDENCE_DIRECTORY}/windows-e4-scenario-profile.v1.json"
+          python scripts/acceptance/windows_e4_scenarios.py \
+            profile \
+            --profile "${EVIDENCE_DIRECTORY}/windows-e4-scenario-profile.v1.json" \
+            --catalog "${EVIDENCE_DIRECTORY}/requirements-catalog.v1.json" \
+            --require-authoritative
           python scripts/acceptance/build_blocked_manifest.py \
             --catalog "${EVIDENCE_DIRECTORY}/requirements-catalog.v1.json" \
             --environment-manifest "${EVIDENCE_DIRECTORY}/release-context.json" \
@@ -1081,7 +1089,7 @@ jobs:
             --product-version "${VERSION}" \
             --release-candidate "${release_candidate}" \
             --scenario-blocked-reason \
-              "Machine-readable scenario profile and result catalogs are absent." \
+              "Candidate-bound Windows E4 result catalog is absent." \
             --scenario-blocked-reason \
               "Protected Windows E4 harness evidence is absent."
           python scripts/acceptance/candidate_root.py \

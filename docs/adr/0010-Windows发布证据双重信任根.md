@@ -5,6 +5,8 @@
 - 决策者：仓库所有者
 - 关联：`docs/14_第一性原理问题台账与开发修复计划.md`、
   `docs/contracts/acceptance-manifest.v1.schema.json`、
+  `docs/contracts/windows-e4-scenario-profile.v1.schema.json`、
+  `docs/contracts/windows-e4-scenario-result.v1.schema.json`、
   `docs/contracts/candidate-root.v1.schema.json`、`.github/workflows/release.yml`
 
 ## 背景
@@ -131,8 +133,9 @@ GitHub artifact attestation 能证明候选根由指定 workflow/commit 产生�
 也不能替代代码签名证书和 RFC 3161 时间戳验证。因此 E4 runner 还必须：
 
 - 每次从登记的 golden image 还原，使用一次性 runner 注册和一次性工作目录；
-- 记录 Windows edition/build/架构、Secure Boot/virtualization、Docker/WSL 版本、runner
-  image ID 和运维审批；
+- 记录 Windows edition/build/架构、Secure Boot/virtualization、`wsl --status`、Docker/WSL
+  版本、runner image ID 和运维审批；`DefaultVersion=1` 只作诊断，若 `wsl --status` 与实际
+  Docker Linux/amd64 backend 都健康，不能阻断 READY 或把该主机判为失败；
 - 在测试后销毁工作目录、runner token 和临时凭据；失败或无法证明基线时不生成 PASS；
 - 由与代码作者分离的 Release/QA 责任人复核关键物理场景。
 
@@ -162,7 +165,9 @@ release qualification、最终安装包和公开晋级拆开。这里的双重�
 
 ## 实施门禁
 
-1. 先固化机器场景 profile 和 candidate-root Schema/生成器/验证器及负向测试。
+1. 先固化机器场景 profile 和 candidate-root Schema/生成器/验证器及负向测试。当前已在 E1
+   固化 source profile（23 个唯一 test/profile ID、25 个 requirement/test 对）和 result Schema；
+   这不等于 harness 已执行或存在可用结果。
 2. 再把受保护 Windows E4 harness 输出接入候选根，保持未执行项为 `BLOCKED`。
 3. 在 GitHub 托管 job 中使用完整 commit SHA 锁定 attestation action，签发并立即反向验证
    bundle；发布 job 不接受浮动 action tag。
@@ -180,6 +185,12 @@ release qualification、最终安装包和公开晋级拆开。这里的双重�
 
 已完成仅限 E1 可审查基础件：
 
+- `windows-e4-scenario-profile.v1.json` 已作为权威 source profile 固定 requirements catalog 中
+  全部 `WINDOWS_E4` 条目：23 个唯一 test/profile ID、25 个 requirement/test 对及每 profile 的
+  assertion 集。`windows-e4-scenario-result.v1.schema.json` 与 acceptance 语义验证要求未来结果
+  全量覆盖 profile，并不可变绑定 profile SHA、candidate、commit、environment、Windows baseline、
+  harness、执行时间和 RFC 8785 assertion hash。此项仅防止候选临时缩减或错绑场景；当前没有
+  受保护 harness 生成的 result catalog，因而没有 E4 PASS 或 release approval。
 - `candidate-root.v1.schema.json` 固定候选身份和十二项必需制品，并要求候选目录中除
   `candidate-root.v1.json` 自身外的全部文件进入安全相对路径、大小、SHA-256 的 canonical
   有序清单；生成器/验证器拒绝重复 JSON key、路径逃逸、大小写冲突、symlink/reparse、
@@ -226,9 +237,10 @@ release qualification、最终安装包和公开晋级拆开。这里的双重�
   runner、工具 hash/ACL、TOCTOU 防护、不可导出证书或 Windows E4 证据。
 
 尚未完成：上述 workflow 尚未在受保护 Windows runner、真实签名 secrets 和 GitHub
-attestation 服务上运行，因而没有真实 bundle/反向验证证据；机器场景 profile/result 契约、
-受保护 Windows E4 harness、把固定 verifier TCB 变成 wrapper 可独立验证的权威 descriptor，
-以及 attestation 后的完整 acceptance/oracle/E4/P0-P1 聚合门禁也均未完成。本切片没有放开
+attestation 服务上运行，因而没有真实 bundle/反向验证证据；虽已有 source profile/result Schema
+的 E1 语义契约，但没有受保护 Windows E4 harness、真实 result catalog、把固定 verifier TCB
+变成 wrapper 可独立验证的权威 descriptor，以及 attestation 后的完整 acceptance/oracle/E4/P0-P1
+聚合门禁。本切片没有放开
 `validate_acceptance_manifest.py --require-pass`；正式发布仍稳定返回
 `TRUSTED_RELEASE_ATTESTATION_NOT_IMPLEMENTED`。
 

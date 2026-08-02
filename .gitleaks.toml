@@ -13,7 +13,7 @@ paths = ['''^docs/05_API接口与前后端契约\.md$''']
 regexes = ['''^(?:01J43MRE4Q3W8FNF4PMY90M4W4|01J43MRF4Q3W8FNF4PMY90M4W5)$''']
 
 [[allowlists]]
-description = "Ten fixed test-only idempotency identifiers are not credentials."
+description = "Thirteen fixed test-only idempotency identifiers are not credentials."
 condition = "AND"
 targetRules = ["generic-api-key"]
 regexTarget = "secret"
@@ -22,7 +22,7 @@ paths = [
   '''^backend/tests/test_governance\.py$''',
   '''^backend/tests/test_recovery_control_plane\.py$''',
 ]
-regexes = ['''^(?:no-gate-execution-001|approve-policy-self-001|approve-policy-sensitive-001|approve-policy-sensitive-002|approve-policy-revise-001|revoke-target-001|execution-draining-001|execution-revoked-001|execution-verify-cancel-001|cancel-verifying-001)$''']
+regexes = ['''^(?:no-gate-execution-001|approve-policy-self-001|approve-policy-sensitive-001|approve-policy-sensitive-002|approve-policy-revise-001|revoke-target-001|execution-draining-001|execution-revoked-001|execution-verify-cancel-001|cancel-verifying-001|cancel-idempotency-execution-first-001|cancel-idempotency-execution-second-001|cancel-idempotency-cross-execution-001)$''']
 
 [[allowlists]]
 description = "Pinned upstream TDengine integration fixture uses its documented test credential."

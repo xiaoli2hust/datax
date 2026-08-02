@@ -121,6 +121,19 @@ class ValidateWindowsE4PreflightTests(unittest.TestCase):
             SIGNER_SHA256,
         )
 
+    def test_accepts_ready_observation_when_default_wsl_version_is_one(
+        self,
+    ) -> None:
+        document = ready_document()
+        document["docker"]["wsl_default_version"] = 1
+
+        result = validate_windows_e4_preflight(document=document, schema=self.schema)
+
+        self.assertEqual(result["local_preflight_result"], "READY")
+        self.assertEqual(result["docker"]["wsl_default_version"], 1)
+        self.assertEqual(result["e4_result"], "NOT_RUN")
+        self.assertFalse(result["release_approved"])
+
     def test_accepts_blocked_observation(self) -> None:
         document = ready_document()
         document["local_preflight_result"] = "BLOCKED"
@@ -134,6 +147,19 @@ class ValidateWindowsE4PreflightTests(unittest.TestCase):
         self.assertEqual(result["local_preflight_result"], "BLOCKED")
         self.assertEqual(result["e4_result"], "NOT_RUN")
         self.assertFalse(result["release_approved"])
+
+    def test_accepts_blocked_observation_when_backend_is_not_linux_amd64(
+        self,
+    ) -> None:
+        document = ready_document()
+        document["local_preflight_result"] = "BLOCKED"
+        document["docker"]["server_os"] = "windows"
+        document["checks"] = _checks(blocked={"DOCKER_DESKTOP_LINUX_AMD64"})
+
+        result = validate_windows_e4_preflight(document=document, schema=self.schema)
+
+        self.assertEqual(result["local_preflight_result"], "BLOCKED")
+        self.assertEqual(result["e4_result"], "NOT_RUN")
 
     def test_rejects_tampered_signer_observation(self) -> None:
         document = ready_document()
@@ -206,12 +232,17 @@ class ValidateWindowsE4PreflightTests(unittest.TestCase):
             properties["harness_version"], {"const": "windows-e4-preflight/v1"}
         )
         self.assertFalse(self.schema["additionalProperties"])
+        ready_docker = self.schema["allOf"][0]["then"]["properties"]["docker"][
+            "properties"
+        ]
+        self.assertNotIn("wsl_default_version", ready_docker)
+        self.assertEqual(ready_docker["wsl_status_available"], {"const": True})
         self.assertEqual(
             EXPECTED_CHECK_IDS,
             {
                 "WIN11_X64_CLIENT",
                 "VIRTUALIZATION",
-                "WSL2_DEFAULT",
+                "WSL2_STATUS",
                 "DOCKER_AMBIENT_CONTEXT",
                 "DOCKER_DESKTOP_LINUX_AMD64",
                 "DOCKER_COMPOSE_V2",
@@ -236,6 +267,8 @@ class ValidateWindowsE4PreflightTests(unittest.TestCase):
         self.assertIn("[io.filemode]::createnew", executable_lines)
         self.assertIn('"version", "--format", "{{.server.os}}|{{.server.arch}}"', executable_lines)
         self.assertIn('"volume", "ls", "--quiet", "--filter",', executable_lines)
+        self.assertIn('-id "wsl2_status"', executable_lines)
+        self.assertNotIn("wsl_default_version -eq 2", executable_lines)
 
         for forbidden in (
             "start-process",

@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xiaoli2hust/datax/blob/main/docs/contracts/windows-e4-scenario-profile.v1.schema.json",
+  "title": "DataX Enterprise Studio Windows E4 Scenario Profile Catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "profile_catalog_id",
+    "requirements_catalog_sha256",
+    "profiles"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_kind": { "const": "WINDOWS_E4_SCENARIO_PROFILE_CATALOG" },
+    "profile_catalog_id": {
+      "type": "string",
+      "pattern": "^windows-e4-v[1-9][0-9]*$"
+    },
+    "requirements_catalog_sha256": { "$ref": "#/$defs/sha256" },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/profile" }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "requirementId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$"
+    },
+    "testId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$"
+    },
+    "requirementBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requirement_id", "test_id"],
+      "properties": {
+        "requirement_id": { "$ref": "#/$defs/requirementId" },
+        "test_id": { "$ref": "#/$defs/testId" }
+      }
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_id",
+        "category",
+        "title",
+        "requirement_bindings",
+        "required_assertion_ids"
+      ],
+      "properties": {
+        "profile_id": { "$ref": "#/$defs/testId" },
+        "category": {
+          "type": "string",
+          "enum": ["PRODUCT", "RELEASE", "OPERATIONS", "RECOVERY", "SECURITY"]
+        },
+        "title": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "requirement_bindings": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/requirementBinding" }
+        },
+        "required_assertion_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/testId" }
+        }
+      }
+    }
+  }
+}

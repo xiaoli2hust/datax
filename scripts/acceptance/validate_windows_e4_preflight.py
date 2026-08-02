@@ -26,7 +26,7 @@ EXPECTED_CHECK_IDS = frozenset(
     {
         "WIN11_X64_CLIENT",
         "VIRTUALIZATION",
-        "WSL2_DEFAULT",
+        "WSL2_STATUS",
         "DOCKER_AMBIENT_CONTEXT",
         "DOCKER_DESKTOP_LINUX_AMD64",
         "DOCKER_COMPOSE_V2",
@@ -106,10 +106,7 @@ def _observed_check_results(document: dict[str, Any]) -> dict[str, bool]:
         ),
         "VIRTUALIZATION": windows["virtualization_firmware_enabled"] is True,
         "DOCKER_AMBIENT_CONTEXT": docker["ambient_context_absent"] is True,
-        "WSL2_DEFAULT": (
-            docker["wsl_status_available"] is True
-            and docker["wsl_default_version"] == 2
-        ),
+        "WSL2_STATUS": docker["wsl_status_available"] is True,
         "DOCKER_DESKTOP_LINUX_AMD64": (
             docker["desktop_install_detected"] is True
             and docker["engine_available"] is True

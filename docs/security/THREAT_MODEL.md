@@ -15,6 +15,9 @@
 > 恢复或 Windows 证据。当前 Mac 只用于开发验证，最终证据必须来自另一台 Windows 11
 > x64 目标机；未闭合门禁保持 `BLOCKED_NOT_IMPLEMENTED`、
 > `BLOCKED_NOT_VERIFIED` 或 `NOT_RUN`。
+> 已新增的 Windows E4 scenario profile/result Schema 只是在 source 层精确规定 23 个
+> test/profile ID、25 个 requirement/test 对和 candidate/commit/environment/harness/assertion-hash
+> 绑定；没有受保护 harness 产生的 result catalog，故它是 E1 反伪造语义控制，不是 E4 证据。
 
 ## 1. 安全目标与非目标
 
@@ -105,6 +108,14 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
 
 | TM-26 | 资格自举、签名替代或发布哈希循环 | 将测试注入/环境变量/自申报 JSON 作为生产资格；让 QH 进入普通包；让 QR 回写 Worker 镜像，或让 QR 与 Setup/manifest 互相绑定后仍宣称同一候选 | ADR-0011 固定 P → 受保护 QH → 独立 QR → 精确 F Phase B → hosted final root 的单向链。HQA 只能签短期 QH，RQA 才能签 QR；固定 keyring 不接受 envelope 公钥；标准 Compose 拒绝 QH；QR 为 detached 资源且不绑定包含自身的 F；普通 reader 对签名、purpose、有效期和 P/commit/image/runtime/JAR/依赖/许可证逐项失败关闭；公开发布还须 ADR-0010 provenance | QH/QR 篡改、未知 key/purpose、过期、nonce 重放、所有 payload 错配、标准 Compose 注入、资源替换、自引用、同版本不同候选、self-hosted provenance 混淆和真实 Phase A/B 证据；当前全部 BLOCKED |
 | TM-27 | 数据源外部操作持锁造成控制面 DoS 与陈旧结果 | 获授权用户让允许端点缓慢响应，或高并发执行 datasource create/update probe、test、metadata、job validation；外部 DNS/JDBC/schema I/O 若持有 Organization/Project/Datasource/Job 锁，会阻塞取消、凭据 revoke、目标独占撤回；I/O 后变更 revision/secret/grant/policy 时旧结果又可能覆盖/泄露 | **候选源码/E1 与局部 PostgreSQL E2 已实施，未关闭：** ADR-0014 五入口 A/B/C。A 只短事务授权并绑定 immutable datasource/policy/secret/envelope/grant/job/transfer/namespace/runtime/AuthSession snapshot；已有凭据的 B 先以极短 barrier 锁定、复制、提交，随后无产品 DB 锁做 resolve/egress/解密/connector（创建使用候选请求凭据），受总 deadline；C 重新授权并比较全部 security binding，漂移统一 409 stale、无旧 metadata/evidence/audit/last-test 副作用。PUBLISHED/ARCHIVED Job 在外部 I/O 前拒绝。已有 datasource/job 仅在 A 验证后才进入单 API 进程非阻塞 admission（global=4、organization/datasource=1、TEST 60 秒），未知 UUID 不得污染 retained state；429 在外部 I/O/audit 前返回，deadline 503 不持久化 B 结果。隔离 PostgreSQL E2 已证明阻塞 B probe 不持有同一 Organization 行锁；完整并发矩阵与真实 E3 未验证，`ASR-013=IN_PROGRESS`，不得声称连接测试限速已关闭 | 关闭前：五入口 source/contract 回归；AuthSession/revision/secret/envelope/grant/policy/job/project/scope/namespace/runtime 漂移负例；429 无 connector/DNS/decrypt/audit；真实 PostgreSQL `pg_locks`/时间界限证明阻塞 connector 不持有 Organization lock，并发 cancel/revoke/update 成功；真实 MySQL/PostgreSQL E3 deadline、DNS/egress、分页和恢复 |
+
+**Windows E4 证据语义（TM-13/TM-19/TM-25）。** 权威 profile 防止发布候选删减、替换或把一个
+Windows 测试的断言借给另一个：它精确枚举 23 个 test/profile ID、25 个 requirement/test 对。未来
+result catalog 必须与 profile SHA、精确 candidate/commit、environment manifest、Windows baseline、
+harness version、执行时间及 RFC 8785 assertion hash 共同不可变绑定，并全量覆盖 profile；任何
+`NOT_RUN`、缺失、额外或错绑结果都必须失败关闭。该 source/validator 控制只能检测 JSON 语义
+伪造，不能认证运行它的机器、签名、Docker Desktop/WSL2、DataX 或安装行为；直到受保护 Windows
+harness 产出真实结果并由 ADR-0010 的独立 attestor 聚合前，发布仍为 `BLOCKED`。
 
 **TM-27 范围与审查补充。** 表中“五个入口”只指 Credential Service 的五个直接外部操作；
 `POST /projects/{project_id}/transfer-policies` 与会重算范围的

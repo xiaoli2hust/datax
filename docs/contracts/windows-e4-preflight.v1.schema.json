@@ -171,10 +171,12 @@
           "type": [
             "integer",
             "null"
-          ]
+          ],
+          "description": "仅诊断新 WSL 发行版的默认版本；不得用作 Docker Linux/amd64 backend 准入或 READY 判定。"
         },
         "wsl_status_available": {
-          "type": "boolean"
+          "type": "boolean",
+          "description": "本机 wsl --status 观察结果；这是 WSL2 前置条件的独立观察，不由 DefaultVersion 推断。"
         },
         "desktop_install_detected": {
           "type": "boolean"
@@ -331,7 +333,7 @@
           "enum": [
             "WIN11_X64_CLIENT",
             "VIRTUALIZATION",
-            "WSL2_DEFAULT",
+            "WSL2_STATUS",
             "DOCKER_AMBIENT_CONTEXT",
             "DOCKER_DESKTOP_LINUX_AMD64",
             "DOCKER_COMPOSE_V2",
@@ -388,9 +390,6 @@
             "properties": {
               "ambient_context_absent": {
                 "const": true
-              },
-              "wsl_default_version": {
-                "const": 2
               },
               "wsl_status_available": {
                 "const": true

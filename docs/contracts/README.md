@@ -23,9 +23,23 @@
   证据文件清单；同一可复核执行可显式覆盖多个需求，但每个需求必须独立绑定结果与证据；
   E3 数据 oracle 和 E4 Windows 证据必须以结构化 JSON 绑定候选版本、commit、需求、测试、
   环境及执行身份，普通文本、截图或自声明 `PASS` 不能通过发布 validator。
+  只要 manifest 含有 Windows E4 evidence，就必须同时声明 scenario profile/result catalog；每个
+  E4 artifact 必须引用其精确 profile ID、profile/result 的 SHA-256 和结果中的断言集合，不能让
+  某个测试的 PASS 借给另一个测试。
   该兼容修复把 manifest 与 requirements catalog 的 `schema_version` 提升为 `1.1`；旧
   `1.0` 清单缺少 `evidence_requirements/windows_evidence` 及 oracle binding，必须重新生成，
   不允许原样晋级。
+- `windows-e4-scenario-profile.v1.schema.json` 与
+  `windows-e4-scenario-profile.v1.json`：Windows E4 的权威场景语义目录。当前 `windows-e4-v1`
+  将权威 requirements catalog 中全部 `WINDOWS_E4` 条目精确覆盖为 **23 个唯一 test/profile
+  ID、25 个 requirement/test 对**；每个 profile 固定类别、需求绑定和必需断言 ID。profile
+  的原始字节也必须与仓库中的权威文件相同，不能在候选目录中临时删减场景。
+- `windows-e4-scenario-result.v1.schema.json`：某一精确候选的完整 Windows 场景结果目录。它必须
+  绑定 profile SHA-256、release candidate 与完整 commit SHA，并为全部 23 个 profile 给出恰好一项
+  结果。已执行的 `PASSED/FAILED` 项必须固定执行时间、environment ID/manifest SHA、Windows
+  baseline、harness version、精确 assertion IDs 及其 RFC 8785 SHA-256；`NOT_RUN` 不得伪造上述
+  执行数据。该 Schema 和 source profile 只提供 E1 语义/校验基础，当前没有受信 harness 产生的
+  result catalog，更没有 E4 结论。
 - `candidate-root.v1.schema.json`：ADR-0010 的 canonical Windows 候选证据根基础契约。
   `scripts/acceptance/candidate_root.py` 以外部 CI 身份参数绑定固定仓库、release workflow、
   run/attempt、保护环境、source ref、commit、tag、candidate，并把候选目录中除候选根自身
@@ -42,8 +56,9 @@
   冲突、符号链接/Windows reparse point、额外/缺失/被改文件、重复 JSON key 和非 canonical
   JSON 均失败关闭。校验器只接受当前 checkout 中固定权威 Schema，并在 Schema 外再次硬
   断言 BLOCKED 语义，调用方不能用宽松 `--schema` 放开。当前 `1.0` 只允许 `root_status=BLOCKED`、
-  `release_approved=false`，机器场景 profile/result、Windows baseline、harness 边界和 E3/E4
-  证据包必须显式为 `null` 并给出阻塞原因；它不能表达可发布 PASS。Release workflow
+  `release_approved=false`；虽然仓库已有 E1 的权威 scenario profile 与 result Schema，但 v1
+  candidate root 内的机器场景 profile/result、Windows baseline、harness 边界和 E3/E4 证据包仍必须
+  显式为 `null` 并给出阻塞原因；它不能表达可发布 PASS。Release workflow
   中 Windows job 生成的顶层 `SHA256SUMS` 只负责 self-hosted → GitHub-hosted 的交接完整性；
   托管 job 还会独立下载并验证 Linux build artifact 的 `SHA256SUMS`，再验证候选内
   `linux-evidence/` 与该来源完全一致；成功后删除候选顶层的瞬时清单，再生成 candidate root。
@@ -72,6 +87,7 @@
 
 ADR-0011 已规定未来需要独立的 release-payload、harness-qualification、
 release-qualification 与 candidate-root.v2 契约，但它们尚未创建或被任何运行时代码消费。
+Windows E4 profile/result 的 E1 语义契约不等于这些最终发布契约，也不提供其受信结果。
 现有 candidate-root.v1 继续只允许 BLOCKED/release_approved=false；不得用新增可选字段、
 宽松 schema、测试注入、环境变量或自签公钥伪造资格。实现这些新契约前，普通生产路径
 继续 deny-all。
@@ -153,8 +169,10 @@ staging 的 E1 候选实现；`LEGACY` 指针原子提交与 Compose 消费也�
    manifest entry 间重放。`WINDOWS_E4` 条目必须引用结构化 Windows E4 JSON，绑定同一
    candidate/commit/requirement/test/environment，证明干净 Win11 x64、签名制品、唯一
    loopback 端口和逐项断言；`assertions` 必须包含 binding 中的精确 `test_id`，不能借用
-   另一个测试的 PASS；Setup/Launcher 必须是 evidence-root 中可读取并重算 SHA-256 的实际
-   文件，不能只填裸摘要，其嵌套证据也必须重算 SHA-256。
+   另一个测试的 PASS；同时必须落入权威 profile 的精确 assertion 集，并与同一候选的完整
+   result catalog（profile SHA、candidate、commit、environment、baseline、harness 和 assertion
+   hash）一致。Setup/Launcher 必须是 evidence-root 中可读取并重算 SHA-256 的实际文件，不能
+   只填裸摘要，其嵌套证据也必须重算 SHA-256。
    `--require-pass` 还必须由可信发布编排从 Git checkout/tag 上下文分别传入
    `--expected-commit` 与 `--expected-release-candidate`；缺失或与 manifest 不同即失败。
    这些检查只证明证据包结构、身份引用和内部一致性，不证明 JSON 由可信 Windows harness
@@ -176,8 +194,9 @@ staging 的 E1 候选实现；`LEGACY` 指针原子提交与 Compose 消费也�
    `actions/attest` 签发 provenance，并通过 `trusted_gh_cli.py` 将 GitHub CLI 2.97.0 的
    release URL、archive SHA-256 和解包后二进制 SHA-256 固定后执行低层反向验证；随后必须
    精确得到上述 TCB blocker 才允许上传名称含 `blocked` 的候选/证明制品。该 workflow 尚未
-   在受保护 Windows runner 与真实签名 secrets 上执行，也没有机器场景 catalog、受保护
-   Windows E4 harness、真实 bundle 证据或完整发布语义编排。因此
+   在受保护 Windows runner 与真实签名 secrets 上执行；现有机器场景 profile/result Schema 仅是
+   E1 语义基础，尚无受保护 Windows E4 harness、真实 result catalog/bundle 证据或完整发布语义
+   编排。因此
    `--require-pass` 仍无条件返回 `TRUSTED_RELEASE_ATTESTATION_NOT_IMPLEMENTED`；非发布校验
    即使得到结构 `gate_result=PASS`，也固定返回 `release_approved=false`。
 10. `data_effect=CONFIRMED` 只表示目标影响已测得，测得值可以是 0 行，不代表内容正确；

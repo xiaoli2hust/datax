@@ -386,6 +386,11 @@ try {
         -Description "wsl.exe"
     $null = @(& $wslPath.FullName --status 2>&1)
     $docker.wsl_status_available = $LASTEXITCODE -eq 0
+}
+catch {
+    $docker.wsl_status_available = $false
+}
+try {
     $defaultVersion = Get-ItemPropertyValue `
         -LiteralPath "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss" `
         -Name "DefaultVersion" `
@@ -393,13 +398,12 @@ try {
     $docker.wsl_default_version = [int]$defaultVersion
 }
 catch {
-    $docker.wsl_status_available = $false
     $docker.wsl_default_version = $null
 }
 Add-PreflightCheck `
-    -Id "WSL2_DEFAULT" `
-    -Passed ($docker.wsl_status_available -and $docker.wsl_default_version -eq 2) `
-    -Detail "WSL was observed only; this preflight never calls wsl --install or changes the default version."
+    -Id "WSL2_STATUS" `
+    -Passed $docker.wsl_status_available `
+    -Detail "WSL status was observed only. DefaultVersion is diagnostic and cannot block a healthy local Docker Linux/amd64 backend."
 
 $dockerPath = $null
 $composePath = $null

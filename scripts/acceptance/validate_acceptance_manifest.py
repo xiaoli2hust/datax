@@ -23,6 +23,12 @@ if __package__:
         validate_oracle_artifact,
         validate_windows_evidence_artifact,
     )
+    from .windows_e4_scenarios import (
+        result_by_profile,
+        validate_evidence_scenario,
+        validate_profile_catalog,
+        validate_result_catalog,
+    )
 else:
     from catalog import build_catalog_bytes, load_catalog, sha256_bytes
     from semantic_evidence import (
@@ -30,6 +36,12 @@ else:
         validate_environment_manifest,
         validate_oracle_artifact,
         validate_windows_evidence_artifact,
+    )
+    from windows_e4_scenarios import (
+        result_by_profile,
+        validate_evidence_scenario,
+        validate_profile_catalog,
+        validate_result_catalog,
     )
 
 
@@ -89,6 +101,14 @@ def _validate_artifacts(manifest: dict[str, object], root: Path) -> None:
         windows_evidence = entry["windows_evidence"]
         if windows_evidence is not None:
             artifacts.append(windows_evidence["artifact"])
+    scenario_catalogs = manifest.get("windows_scenario_catalogs")
+    if scenario_catalogs is not None:
+        artifacts.extend(
+            [
+                scenario_catalogs["profile"],
+                scenario_catalogs["result"],
+            ]
+        )
     for artifact in artifacts:
         path = _artifact_path(root, artifact["path"])
         if _file_sha256(path) != artifact["sha256"]:
@@ -122,6 +142,7 @@ def _validate_semantic_evidence(
     manifest: dict[str, object],
     acceptance_schema: dict[str, object],
     oracle_schema: dict[str, object],
+    catalog_path: Path,
     environment_manifest_path: Path,
     evidence_root: Path,
 ) -> None:
@@ -140,6 +161,36 @@ def _validate_semantic_evidence(
             release_candidate=manifest["release_candidate"],  # type: ignore[arg-type]
             commit_sha=manifest["commit_sha"],  # type: ignore[arg-type]
             expected_sha256=manifest["environment_manifest_sha256"],  # type: ignore[arg-type]
+        )
+
+    scenario_catalogs = manifest.get("windows_scenario_catalogs")
+    has_windows_evidence = any(
+        entry["windows_evidence"] is not None
+        for entry in manifest["entries"]  # type: ignore[index]
+    )
+    scenario_profile = None
+    scenario_profile_raw = None
+    scenario_results = None
+    scenario_results_raw = None
+    if scenario_catalogs is None:
+        if has_windows_evidence:
+            raise ValueError(
+                "Windows E4 evidence requires scenario profile and result catalogs"
+            )
+    else:
+        profile_path = _artifact_path(evidence_root, scenario_catalogs["profile"]["path"])
+        scenario_profile, scenario_profile_raw = validate_profile_catalog(
+            profile_path=profile_path,
+            catalog_path=catalog_path,
+            require_authoritative=True,
+        )
+        result_path = _artifact_path(evidence_root, scenario_catalogs["result"]["path"])
+        scenario_results, scenario_results_raw = validate_result_catalog(
+            results_path=result_path,
+            profile_document=scenario_profile,
+            profile_raw=scenario_profile_raw,
+            release_candidate=manifest["release_candidate"],  # type: ignore[arg-type]
+            commit_sha=manifest["commit_sha"],  # type: ignore[arg-type]
         )
 
     oracle_artifacts: dict[tuple[str, str], tuple[str, str]] = {}
@@ -216,6 +267,15 @@ def _validate_semantic_evidence(
                 raise ValueError("entry executed_at is earlier than oracle finished_at")
 
         if windows_evidence is not None:
+            if (
+                scenario_profile is None
+                or scenario_profile_raw is None
+                or scenario_results is None
+                or scenario_results_raw is None
+            ):
+                raise ValueError(
+                    "Windows E4 evidence requires scenario profile and result catalogs"
+                )
             artifact_path = _artifact_path(
                 evidence_root, windows_evidence["artifact"]["path"]
             )
@@ -244,6 +304,13 @@ def _validate_semantic_evidence(
                 or artifact["windows"]["build"] != environment["system"]["os_version"]
             ):
                 raise ValueError("Windows evidence environment binding does not match")
+            validate_evidence_scenario(
+                artifact=artifact,
+                profile_document=scenario_profile,
+                profile_raw=scenario_profile_raw,
+                result_document=scenario_results,
+                result_raw=scenario_results_raw,
+            )
             nested = [
                 artifact["release_artifacts"]["setup"],
                 artifact["release_artifacts"]["launcher"],
@@ -257,6 +324,46 @@ def _validate_semantic_evidence(
                 artifacts=nested,
                 evidence_root=evidence_root,
             )
+
+    if scenario_profile is not None and scenario_results is not None:
+        entries_by_pair = {
+            (entry["requirement_id"], entry["test_id"]): entry
+            for entry in manifest["entries"]  # type: ignore[index]
+        }
+        results_by_profile = result_by_profile(scenario_results)
+        for profile in scenario_profile["profiles"]:
+            profile_id = profile["profile_id"]
+            result = results_by_profile[profile_id]
+            bindings = [
+                (binding["requirement_id"], binding["test_id"])
+                for binding in profile["requirement_bindings"]
+            ]
+            matching_entries = [entries_by_pair[pair] for pair in bindings]
+            if result["result"] == "PASSED":
+                if any(
+                    entry["result"] != "PASS"
+                    or entry["windows_evidence"] is None
+                    for entry in matching_entries
+                ):
+                    raise ValueError(
+                        "PASSED Windows E4 scenario is not fully represented by acceptance entries"
+                    )
+            elif result["result"] == "FAILED":
+                if any(
+                    entry["result"] != "FAIL"
+                    or entry["windows_evidence"] is None
+                    for entry in matching_entries
+                ):
+                    raise ValueError(
+                        "FAILED Windows E4 scenario is not fully represented by acceptance entries"
+                    )
+            elif any(
+                entry["result"] not in {"BLOCKED", "NOT_RUN"}
+                for entry in matching_entries
+            ):
+                raise ValueError(
+                    "NOT_RUN Windows E4 scenario conflicts with acceptance entries"
+                )
 
 
 def validate(
@@ -412,6 +519,7 @@ def validate(
         manifest=manifest,
         acceptance_schema=schema,
         oracle_schema=oracle_schema,
+        catalog_path=catalog_path,
         environment_manifest_path=environment_manifest_path,
         evidence_root=evidence_root,
     )

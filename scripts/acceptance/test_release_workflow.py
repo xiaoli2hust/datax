@@ -71,9 +71,21 @@ class ReleaseWorkflowTests(unittest.TestCase):
             root_script.count("--trusted-linux-evidence-directory"),
             2,
         )
+        self.assertIn("Candidate-bound Windows E4 result catalog is absent.", root_script)
         self.assertIn("Protected Windows E4 harness evidence is absent.", root_script)
         policy_script = job["steps"][policy_index]["run"]
         self.assertIn("--trusted-linux-evidence-directory", policy_script)
+
+        linux_job = self.workflow["jobs"]["linux-images"]
+        manifest_step = next(
+            step
+            for step in linux_job["steps"]
+            if step["name"] == "Bind an explicit blocked acceptance manifest to this candidate"
+        )
+        manifest_script = manifest_step["run"]
+        self.assertIn("windows_e4_scenarios.py", manifest_script)
+        self.assertIn("windows-e4-scenario-profile.v1.json", manifest_script)
+        self.assertIn("--require-authoritative", manifest_script)
 
     def test_all_candidate_artifacts_and_the_policy_remain_explicitly_blocked(
         self,
