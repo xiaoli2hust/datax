@@ -457,6 +457,21 @@ impl RuntimeSecretPaths {
             directory,
         }
     }
+
+    fn all(&self) -> [&Path; RUNTIME_SECRET_COUNT] {
+        [
+            self.postgres.as_path(),
+            self.egress_guard_database.as_path(),
+            self.egress_lease_creation_capability.as_path(),
+            self.api_database.as_path(),
+            self.worker_database.as_path(),
+            self.jwt_private_key.as_path(),
+            self.jwt_public_key.as_path(),
+            self.refresh_token_hmac_key.as_path(),
+            self.idempotency_hmac_key.as_path(),
+            self.credential_kek.as_path(),
+        ]
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -618,6 +633,7 @@ struct PreparedBackup {
     secrets_output: PathBuf,
     data_key: Zeroizing<Vec<u8>>,
     secrets_key: Zeroizing<Vec<u8>>,
+    active_runtime: ActiveRuntimeSnapshot,
     installation_id: String,
     current_user_sid: String,
 }
@@ -1523,6 +1539,31 @@ fn verify_compose_config(
     Ok(())
 }
 
+fn verify_compose_config_for_runtime(
+    tools: &Tools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+    active_runtime: &ActiveRuntimeSnapshot,
+) -> Result<(), LauncherError> {
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+    let config = compose_for_runtime(
+        tools,
+        installation,
+        active_runtime,
+        &["config", "--format", "json"],
+        PROCESS_TIMEOUT,
+    )?;
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+    if !config.status.success() {
+        return Err(LauncherError::new(
+            "COMPOSE_CONFIG_INVALID",
+            "固定 Compose 清单无法通过 Docker Compose 校验。",
+        ));
+    }
+    validate_rendered_compose(&config.stdout, image_lock)?;
+    Ok(())
+}
+
 fn configure_local_docker_endpoint(
     tools: &mut Tools,
     installation: &Installation,
@@ -2011,23 +2052,31 @@ fn ensure_runtime_database_secret(
 fn validate_database_secret_domain_separation(
     installation: &Installation,
 ) -> Result<(), LauncherError> {
+    validate_database_secret_domain_separation_paths(&RuntimeSecretPaths::from_directory(
+        installation.secret_dir.clone(),
+    ))
+}
+
+fn validate_database_secret_domain_separation_paths(
+    secrets: &RuntimeSecretPaths,
+) -> Result<(), LauncherError> {
     let postgres = Zeroizing::new(read_bounded_file(
-        &installation.postgres_secret,
+        &secrets.postgres,
         64,
         "DATABASE_SECRET_DOMAIN_SEPARATION_FAILED",
     )?);
     let guard = Zeroizing::new(read_bounded_file(
-        &installation.egress_guard_database_secret,
+        &secrets.egress_guard_database,
         64,
         "DATABASE_SECRET_DOMAIN_SEPARATION_FAILED",
     )?);
     let api = Zeroizing::new(read_bounded_file(
-        &installation.api_database_secret,
+        &secrets.api_database,
         64,
         "DATABASE_SECRET_DOMAIN_SEPARATION_FAILED",
     )?);
     let worker = Zeroizing::new(read_bounded_file(
-        &installation.worker_database_secret,
+        &secrets.worker_database,
         64,
         "DATABASE_SECRET_DOMAIN_SEPARATION_FAILED",
     )?);
@@ -2073,28 +2122,36 @@ fn ensure_egress_lease_creation_capability(
 fn validate_egress_lease_creation_capability_domain_separation(
     installation: &Installation,
 ) -> Result<(), LauncherError> {
+    validate_egress_lease_creation_capability_domain_separation_paths(
+        &RuntimeSecretPaths::from_directory(installation.secret_dir.clone()),
+    )
+}
+
+fn validate_egress_lease_creation_capability_domain_separation_paths(
+    secrets: &RuntimeSecretPaths,
+) -> Result<(), LauncherError> {
     let postgres = Zeroizing::new(read_bounded_file(
-        &installation.postgres_secret,
+        &secrets.postgres,
         64,
         "EGRESS_LEASE_CREATION_CAPABILITY_DOMAIN_SEPARATION_FAILED",
     )?);
     let guard = Zeroizing::new(read_bounded_file(
-        &installation.egress_guard_database_secret,
+        &secrets.egress_guard_database,
         64,
         "EGRESS_LEASE_CREATION_CAPABILITY_DOMAIN_SEPARATION_FAILED",
     )?);
     let api = Zeroizing::new(read_bounded_file(
-        &installation.api_database_secret,
+        &secrets.api_database,
         64,
         "EGRESS_LEASE_CREATION_CAPABILITY_DOMAIN_SEPARATION_FAILED",
     )?);
     let worker = Zeroizing::new(read_bounded_file(
-        &installation.worker_database_secret,
+        &secrets.worker_database,
         64,
         "EGRESS_LEASE_CREATION_CAPABILITY_DOMAIN_SEPARATION_FAILED",
     )?);
     let capability = Zeroizing::new(read_bounded_file(
-        &installation.egress_lease_creation_capability,
+        &secrets.egress_lease_creation_capability,
         64,
         "EGRESS_LEASE_CREATION_CAPABILITY_DOMAIN_SEPARATION_FAILED",
     )?);
@@ -2319,6 +2376,12 @@ fn read_runtime_generation(path: &Path) -> Result<RuntimeGeneration, LauncherErr
 fn load_active_runtime_snapshot(
     installation: &Installation,
 ) -> Result<ActiveRuntimeSnapshot, LauncherError> {
+    platform::ensure_tree_no_reparse(&installation.app_data_root).map_err(|_| {
+        LauncherError::new(
+            "RUNTIME_GENERATION_INVALID",
+            "无法验证活动运行代际根目录；检测到缺失目录、非本地路径或 reparse point。",
+        )
+    })?;
     let generation = read_runtime_generation(&installation.runtime_generation)?;
     if generation.source == "LEGACY" {
         let legacy_installation_id = read_installation_id(&installation.installation_id)?;
@@ -2330,6 +2393,53 @@ fn load_active_runtime_snapshot(
         }
     }
     ActiveRuntimeSnapshot::from_generation(&installation.app_data_root, generation)
+}
+
+fn require_active_runtime_snapshot_unchanged(
+    installation: &Installation,
+    expected: &ActiveRuntimeSnapshot,
+) -> Result<(), LauncherError> {
+    let actual = load_active_runtime_snapshot(installation)?;
+    if actual != *expected {
+        return Err(LauncherError::new(
+            "RUNTIME_GENERATION_CHANGED_DURING_ACTION",
+            "活动运行代际在操作期间发生变化；Launcher 已拒绝拼接 secret、数据卷或 Compose 身份。",
+        ));
+    }
+    Ok(())
+}
+
+fn load_verified_active_runtime_snapshot(
+    start_tools: &StartTools,
+    installation: &Installation,
+    sid: &str,
+) -> Result<ActiveRuntimeSnapshot, LauncherError> {
+    platform::ensure_tree_no_reparse(&installation.app_data_root).map_err(|_| {
+        LauncherError::new(
+            "RUNTIME_GENERATION_INVALID",
+            "无法验证活动运行代际根目录；检测到缺失目录、非本地路径或 reparse point。",
+        )
+    })?;
+    restrict_directory_acl(start_tools, installation, &installation.app_data_root, sid)?;
+    platform::ensure_tree_no_reparse(&installation.app_data_root).map_err(|_| {
+        LauncherError::new(
+            "RUNTIME_GENERATION_INVALID",
+            "活动运行代际根目录在 ACL 复核期间发生变化。",
+        )
+    })?;
+    platform::ensure_regular_file(&installation.runtime_generation).map_err(|_| {
+        LauncherError::new(
+            "RUNTIME_GENERATION_INVALID",
+            "活动运行代际指针不是受控普通文件。",
+        )
+    })?;
+    restrict_file_acl(
+        start_tools,
+        installation,
+        &installation.runtime_generation,
+        sid,
+    )?;
+    load_active_runtime_snapshot(installation)
 }
 
 fn ensure_legacy_runtime_generation(
@@ -2473,23 +2583,28 @@ fn civil_date_from_unix_days(days: i64) -> (i64, i64, i64) {
 }
 
 fn validate_existing_auth_secret_bundle(installation: &Installation) -> Result<(), LauncherError> {
+    validate_existing_auth_secret_bundle_paths(&RuntimeSecretPaths::from_directory(
+        installation.secret_dir.clone(),
+    ))
+}
+
+fn validate_existing_auth_secret_bundle_paths(
+    secrets: &RuntimeSecretPaths,
+) -> Result<(), LauncherError> {
     let private_bytes = Zeroizing::new(read_bounded_file(
-        &installation.jwt_private_key,
+        &secrets.jwt_private_key,
         4096,
         "AUTH_SECRET_BUNDLE_INVALID",
     )?);
-    let public_bytes = read_bounded_file(
-        &installation.jwt_public_key,
-        4096,
-        "AUTH_SECRET_BUNDLE_INVALID",
-    )?;
+    let public_bytes =
+        read_bounded_file(&secrets.jwt_public_key, 4096, "AUTH_SECRET_BUNDLE_INVALID")?;
     let refresh_hmac_bytes = Zeroizing::new(read_bounded_file(
-        &installation.refresh_token_hmac_key,
+        &secrets.refresh_token_hmac_key,
         32,
         "AUTH_SECRET_BUNDLE_INVALID",
     )?);
     let idempotency_hmac_bytes = Zeroizing::new(read_bounded_file(
-        &installation.idempotency_hmac_key,
+        &secrets.idempotency_hmac_key,
         32,
         "AUTH_SECRET_BUNDLE_INVALID",
     )?);
@@ -2573,18 +2688,26 @@ fn ensure_credential_kek(
 }
 
 fn validate_existing_credential_kek(installation: &Installation) -> Result<(), LauncherError> {
+    validate_existing_credential_kek_paths(&RuntimeSecretPaths::from_directory(
+        installation.secret_dir.clone(),
+    ))
+}
+
+fn validate_existing_credential_kek_paths(
+    secrets: &RuntimeSecretPaths,
+) -> Result<(), LauncherError> {
     let credential_kek = Zeroizing::new(read_bounded_file(
-        &installation.credential_kek,
+        &secrets.credential_kek,
         32,
         "CREDENTIAL_KEK_INVALID",
     )?);
     let refresh_hmac = Zeroizing::new(read_bounded_file(
-        &installation.refresh_token_hmac_key,
+        &secrets.refresh_token_hmac_key,
         32,
         "CREDENTIAL_KEK_INVALID",
     )?);
     let idempotency_hmac = Zeroizing::new(read_bounded_file(
-        &installation.idempotency_hmac_key,
+        &secrets.idempotency_hmac_key,
         32,
         "CREDENTIAL_KEK_INVALID",
     )?);
@@ -2595,6 +2718,66 @@ fn validate_existing_credential_kek(installation: &Installation) -> Result<(), L
         ));
     }
     Ok(())
+}
+
+fn validate_active_runtime_secret_set(
+    active_runtime: &ActiveRuntimeSnapshot,
+) -> Result<(), LauncherError> {
+    platform::ensure_tree_no_reparse(&active_runtime.secrets.directory)?;
+    platform::ensure_directory(&active_runtime.secrets.directory)?;
+    for path in active_runtime.secrets.all() {
+        platform::ensure_regular_file(path)?;
+    }
+    validate_existing_hex_secret(
+        &active_runtime.secrets.postgres,
+        "POSTGRES_SECRET_INVALID",
+        "PostgreSQL 密码",
+    )?;
+    validate_existing_hex_secret(
+        &active_runtime.secrets.egress_guard_database,
+        "EGRESS_GUARD_DATABASE_SECRET_INVALID",
+        "出口守卫数据库密码",
+    )?;
+    validate_existing_hex_secret(
+        &active_runtime.secrets.api_database,
+        "API_DATABASE_SECRET_INVALID",
+        "API 运行数据库密码",
+    )?;
+    validate_existing_hex_secret(
+        &active_runtime.secrets.worker_database,
+        "WORKER_DATABASE_SECRET_INVALID",
+        "Worker 运行数据库密码",
+    )?;
+    validate_existing_hex_secret(
+        &active_runtime.secrets.egress_lease_creation_capability,
+        "EGRESS_LEASE_CREATION_CAPABILITY_INVALID",
+        "出口租约创建能力密钥",
+    )?;
+    validate_database_secret_domain_separation_paths(&active_runtime.secrets)?;
+    validate_egress_lease_creation_capability_domain_separation_paths(&active_runtime.secrets)?;
+    validate_existing_auth_secret_bundle_paths(&active_runtime.secrets)?;
+    validate_existing_credential_kek_paths(&active_runtime.secrets)
+}
+
+fn verify_active_runtime_secret_set(
+    start_tools: &StartTools,
+    installation: &Installation,
+    sid: &str,
+    active_runtime: &ActiveRuntimeSnapshot,
+) -> Result<(), LauncherError> {
+    platform::ensure_tree_no_reparse(&active_runtime.secrets.directory)?;
+    platform::ensure_directory(&active_runtime.secrets.directory)?;
+    restrict_directory_acl(
+        start_tools,
+        installation,
+        &active_runtime.secrets.directory,
+        sid,
+    )?;
+    for path in active_runtime.secrets.all() {
+        platform::ensure_regular_file(path)?;
+        restrict_file_acl(start_tools, installation, path, sid)?;
+    }
+    validate_active_runtime_secret_set(active_runtime)
 }
 
 fn create_controlled_directory(path: &Path) -> Result<(), LauncherError> {
@@ -3471,6 +3654,78 @@ fn verify_container_secret_targets(
     Ok(())
 }
 
+fn verify_container_secret_targets_for_runtime(
+    tools: &Tools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+    active_runtime: &ActiveRuntimeSnapshot,
+) -> Result<(), LauncherError> {
+    let api_output = compose_owned_for_runtime(
+        tools,
+        installation,
+        image_lock,
+        active_runtime,
+        &["api"],
+        true,
+        &[
+            "exec",
+            "-T",
+            "api",
+            "python",
+            "-c",
+            VERIFY_CONTAINER_SECRETS_SCRIPT,
+        ],
+        PROCESS_TIMEOUT,
+    )?;
+    let worker_output = compose_owned_for_runtime(
+        tools,
+        installation,
+        image_lock,
+        active_runtime,
+        &["worker"],
+        true,
+        &[
+            "exec",
+            "-T",
+            "worker",
+            "python",
+            "-c",
+            VERIFY_WORKER_SECRETS_SCRIPT,
+        ],
+        PROCESS_TIMEOUT,
+    )?;
+    let guard_output = compose_owned_for_runtime(
+        tools,
+        installation,
+        image_lock,
+        active_runtime,
+        &["egress-guard"],
+        true,
+        &[
+            "exec",
+            "-T",
+            "egress-guard",
+            "python3",
+            "-c",
+            VERIFY_EGRESS_GUARD_SECRET_SCRIPT,
+        ],
+        PROCESS_TIMEOUT,
+    )?;
+    if !api_output.status.success()
+        || !api_output.stdout.is_empty()
+        || !worker_output.status.success()
+        || !worker_output.stdout.is_empty()
+        || !guard_output.status.success()
+        || !guard_output.stdout.is_empty()
+    {
+        return Err(LauncherError::new(
+            "CONTAINER_SECRET_TARGET_INVALID",
+            "API/Worker/egress-guard 容器内 secret 的实际 target、文件类型或长度不符合固定契约。",
+        ));
+    }
+    Ok(())
+}
+
 fn verify_shared_network_namespace(
     tools: &Tools,
     installation: &Installation,
@@ -3486,6 +3741,56 @@ fn verify_shared_network_namespace(
             tools,
             installation,
             image_lock,
+            &[service],
+            true,
+            &[
+                "exec",
+                "-T",
+                service,
+                interpreter,
+                "-c",
+                NETWORK_NAMESPACE_SCRIPT,
+            ],
+            PROCESS_TIMEOUT,
+        )?;
+        let namespace = std::str::from_utf8(&output.stdout).ok();
+        if !output.status.success()
+            || !output.stderr.is_empty()
+            || namespace.is_none_or(|value| !is_network_namespace_id(value))
+        {
+            return Err(LauncherError::new(
+                "EGRESS_NETWORK_NAMESPACE_UNVERIFIED",
+                "无法核验 API、Worker 与 egress-guard 的实际 Linux 网络命名空间。",
+            ));
+        }
+        namespaces.insert(namespace.unwrap().to_owned());
+    }
+    if namespaces.len() != 1 {
+        return Err(LauncherError::new(
+            "EGRESS_NETWORK_NAMESPACE_MISMATCH",
+            "API、Worker 与 egress-guard 未共享同一个实际 Linux 网络命名空间。",
+        ));
+    }
+    Ok(())
+}
+
+fn verify_shared_network_namespace_for_runtime(
+    tools: &Tools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+    active_runtime: &ActiveRuntimeSnapshot,
+) -> Result<(), LauncherError> {
+    let mut namespaces = BTreeSet::new();
+    for (service, interpreter) in [
+        ("egress-guard", "python3"),
+        ("api", "python"),
+        ("worker", "python"),
+    ] {
+        let output = compose_owned_for_runtime(
+            tools,
+            installation,
+            image_lock,
+            active_runtime,
             &[service],
             true,
             &[
@@ -4137,8 +4442,15 @@ fn create_system_backup(
         request.data_key,
         request.secrets_key,
     )?;
-    verify_compose_config(tools, installation, image_lock)?;
-    let inventory = inspect_compose_project_inventory(tools, installation, image_lock)?;
+    require_active_runtime_snapshot_unchanged(installation, &prepared.active_runtime)?;
+    verify_compose_config_for_runtime(tools, installation, image_lock, &prepared.active_runtime)?;
+    let inventory = inspect_compose_project_inventory_for_runtime(
+        tools,
+        installation,
+        image_lock,
+        &prepared.active_runtime,
+    )?;
+    require_active_runtime_snapshot_unchanged(installation, &prepared.active_runtime)?;
     if !inventory.is_complete() || !inventory.service_is_running("web") {
         return Err(LauncherError::new(
             "BACKUP_RUNNING_SERVICE_REQUIRED",
@@ -4147,17 +4459,37 @@ fn create_system_backup(
     }
     let staging = prepare_backup_staging(start_tools, installation, &prepared.current_user_sid)?;
 
-    let preflight = match lifecycle(tools, installation, image_lock, "preflight-stop") {
+    let preflight = match lifecycle_for_runtime(
+        tools,
+        installation,
+        image_lock,
+        &prepared.active_runtime,
+        "preflight-stop",
+    ) {
         Ok(value) => value,
         Err(error) => {
-            let _ = cleanup_backup_staging(&staging);
-            let _ = lifecycle(tools, installation, image_lock, "resume");
+            cleanup_staging_and_resume_after_backup_abort(
+                tools,
+                start_tools,
+                installation,
+                image_lock,
+                &prepared,
+                &staging,
+                error.code(),
+            )?;
             return Err(error);
         }
     };
     if !preflight.safe_to_stop {
-        let _ = cleanup_backup_staging(&staging);
-        let _ = lifecycle(tools, installation, image_lock, "resume");
+        cleanup_staging_and_resume_after_backup_abort(
+            tools,
+            start_tools,
+            installation,
+            image_lock,
+            &prepared,
+            &staging,
+            "ACTIVE_ATTEMPTS_PRESENT",
+        )?;
         return Err(LauncherError::new(
             "ACTIVE_ATTEMPTS_PRESENT",
             format!(
@@ -4176,27 +4508,42 @@ fn create_system_backup(
         &staging,
     );
     let cleanup = cleanup_backup_staging(&staging);
-    let resume = resume_services_after_system_backup(
-        tools,
-        start_tools,
-        installation,
-        image_lock,
-        &prepared.installation_id,
-    );
+
+    if let Err(cleanup_error) = cleanup {
+        return match operation {
+            Ok((data_package, secrets_package)) => Err(LauncherError::new(
+                "BACKUP_STAGING_CLEANUP_FAILED",
+                format!(
+                    "加密备份包已生成（DATA={}，SECRETS={}），但明文 pg_dump staging 清理失败：{}。Launcher 不会执行 resume；请先核验当前服务状态并人工处置。",
+                    data_package.display(),
+                    secrets_package.display(),
+                    cleanup_error.code(),
+                ),
+            )),
+            Err(operation_error) => Err(LauncherError::new(
+                "BACKUP_STAGING_CLEANUP_FAILED",
+                format!(
+                    "系统备份失败（{}），且明文 pg_dump staging 清理失败（{}）。Launcher 不会执行 resume；请先核验当前服务状态并人工处置。",
+                    operation_error.code(),
+                    cleanup_error.code(),
+                ),
+            )),
+        };
+    }
+
+    let resume = require_active_runtime_snapshot_unchanged(installation, &prepared.active_runtime)
+        .and_then(|_| {
+            resume_services_after_system_backup(
+                tools,
+                start_tools,
+                installation,
+                image_lock,
+                &prepared.active_runtime,
+            )
+        });
 
     match operation {
         Ok((data_package, secrets_package)) => {
-            if let Err(error) = cleanup {
-                return Err(LauncherError::new(
-                    "BACKUP_STAGING_CLEANUP_FAILED",
-                    format!(
-                        "加密备份包已生成（DATA={}，SECRETS={}），但明文 pg_dump staging 清理失败：{}。请停止使用本机并人工处置。",
-                        data_package.display(),
-                        secrets_package.display(),
-                        error.code(),
-                    ),
-                ));
-            }
             if let Err(error) = resume {
                 return Err(LauncherError::new(
                     "BACKUP_CREATED_RESUME_FAILED",
@@ -4211,16 +4558,6 @@ fn create_system_backup(
             Ok((data_package, secrets_package))
         }
         Err(operation_error) => {
-            if let Err(cleanup_error) = cleanup {
-                return Err(LauncherError::new(
-                    "BACKUP_STAGING_CLEANUP_FAILED",
-                    format!(
-                        "系统备份失败（{}），且明文 pg_dump staging 清理失败（{}）。请停止使用本机并人工处置。",
-                        operation_error.code(),
-                        cleanup_error.code(),
-                    ),
-                ));
-            }
             if let Err(resume_error) = resume {
                 return Err(LauncherError::new(
                     "BACKUP_FAILED_RESUME_FAILED",
@@ -4234,6 +4571,45 @@ fn create_system_backup(
             Err(operation_error)
         }
     }
+}
+
+fn cleanup_staging_and_resume_after_backup_abort(
+    tools: &Tools,
+    start_tools: &StartTools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+    prepared: &PreparedBackup,
+    staging: &BackupStaging,
+    primary_code: &str,
+) -> Result<(), LauncherError> {
+    if let Err(cleanup_error) = cleanup_backup_staging(staging) {
+        return Err(LauncherError::new(
+            "BACKUP_STAGING_CLEANUP_FAILED",
+            format!(
+                "系统备份预检被中止（{}），且 staging 清理失败（{}）。Launcher 不会执行 resume；请先核验当前服务状态并人工处置。",
+                primary_code,
+                cleanup_error.code(),
+            ),
+        ));
+    }
+    require_active_runtime_snapshot_unchanged(installation, &prepared.active_runtime)?;
+    resume_services_after_system_backup(
+        tools,
+        start_tools,
+        installation,
+        image_lock,
+        &prepared.active_runtime,
+    )
+    .map_err(|error| {
+        LauncherError::new(
+            "BACKUP_PREFLIGHT_RESUME_FAILED",
+            format!(
+                "系统备份预检被中止（{}），随后本机服务恢复失败（{}）。",
+                primary_code,
+                error.code(),
+            ),
+        )
+    })
 }
 
 fn prepare_system_backup(
@@ -4251,23 +4627,18 @@ fn prepare_system_backup(
             "首次初始化日志仍存在；系统身份尚未完整提交，已拒绝备份。",
         ));
     }
-    let presence = runtime_volume_presence(tools, installation)?;
-    if presence != [true; 3] {
-        return Err(LauncherError::new(
-            "RUNTIME_VOLUME_SET_INCOMPLETE",
-            "三个运行数据卷未完整存在；系统备份不会创建替代卷。",
-        ));
-    }
     let current_user_sid = current_user_sid(start_tools, installation)?;
-    ensure_storage_identity(tools, start_tools, installation, &current_user_sid)?;
-    ensure_existing_runtime_secrets(start_tools, installation, &current_user_sid, true)?;
-    let installation_id = read_installation_id(&installation.installation_id)?;
-    ensure_legacy_runtime_generation(
+    let active_runtime =
+        load_verified_active_runtime_snapshot(start_tools, installation, &current_user_sid)?;
+    let volume_contract = active_runtime.volume_contract();
+    validate_active_runtime_volume_contract(tools, installation, &volume_contract)?;
+    verify_active_runtime_secret_set(
         start_tools,
         installation,
         &current_user_sid,
-        &installation_id,
+        &active_runtime,
     )?;
+    let installation_id = active_runtime.generation.installation_id.clone();
 
     let data_output =
         prepare_backup_output_directory(start_tools, installation, data_output, &current_user_sid)?;
@@ -4280,9 +4651,10 @@ fn prepare_system_backup(
     let data_key_path = validate_backup_key_file(data_key)?;
     let secrets_key_path = validate_backup_key_file(secrets_key)?;
 
-    let canonical_secret_dir = fs::canonicalize(&installation.secret_dir).map_err(|_| {
-        LauncherError::new("BACKUP_PATH_INVALID", "无法规范化 Launcher secret 目录。")
-    })?;
+    let canonical_secret_dir =
+        fs::canonicalize(&active_runtime.secrets.directory).map_err(|_| {
+            LauncherError::new("BACKUP_PATH_INVALID", "无法规范化 Launcher secret 目录。")
+        })?;
     let canonical_install_dir = fs::canonicalize(&installation.install_dir)
         .map_err(|_| LauncherError::new("BACKUP_PATH_INVALID", "无法规范化安装目录。"))?;
     let canonical_app_data = fs::canonicalize(&installation.app_data_root)
@@ -4324,12 +4696,13 @@ fn prepare_system_backup(
             "DATA 与 SECRETS 必须使用不同恢复 key。",
         ));
     }
-    validate_backup_key_domain_separation(installation, &data_key, &secrets_key)?;
+    validate_backup_key_domain_separation(&active_runtime.secrets, &data_key, &secrets_key)?;
     Ok(PreparedBackup {
         data_output,
         secrets_output,
         data_key,
         secrets_key,
+        active_runtime,
         installation_id,
         current_user_sid,
     })
@@ -4403,11 +4776,11 @@ fn read_backup_key(path: &Path) -> Result<Zeroizing<Vec<u8>>, LauncherError> {
 }
 
 fn validate_backup_key_domain_separation(
-    installation: &Installation,
+    secrets: &RuntimeSecretPaths,
     data_key: &[u8],
     secrets_key: &[u8],
 ) -> Result<(), LauncherError> {
-    for path in runtime_secret_paths(installation) {
+    for path in secrets.all() {
         let runtime_secret = Zeroizing::new(read_bounded_file(
             path,
             MAX_RUNTIME_SECRET_BYTES,
@@ -4525,10 +4898,12 @@ fn perform_system_backup(
     prepared: &PreparedBackup,
     staging: &BackupStaging,
 ) -> Result<(PathBuf, PathBuf), LauncherError> {
-    let stop_app = compose_owned(
+    require_active_runtime_snapshot_unchanged(installation, &prepared.active_runtime)?;
+    let stop_app = compose_owned_for_runtime(
         tools,
         installation,
         image_lock,
+        &prepared.active_runtime,
         &["web", "api", "worker", "egress-guard"],
         true,
         &[
@@ -4548,8 +4923,14 @@ fn perform_system_backup(
             "无法停止全部应用写入组件；尚未生成数据库备份。",
         ));
     }
-    ensure_backup_migration_revision(tools, installation, image_lock)?;
-    run_postgres_dump(tools, installation, image_lock, &staging.postgres_dump)?;
+    ensure_backup_migration_revision(tools, installation, image_lock, &prepared.active_runtime)?;
+    run_postgres_dump(
+        tools,
+        installation,
+        image_lock,
+        &prepared.active_runtime,
+        &staging.postgres_dump,
+    )?;
     platform::ensure_regular_file(&staging.postgres_dump)?;
     restrict_file_acl(
         start_tools,
@@ -4559,10 +4940,11 @@ fn perform_system_backup(
     )?;
     validate_postgres_dump_file(&staging.postgres_dump)?;
 
-    let stop_postgres = compose_owned(
+    let stop_postgres = compose_owned_for_runtime(
         tools,
         installation,
         image_lock,
+        &prepared.active_runtime,
         &["postgres"],
         true,
         &["stop", "--timeout", "30", "postgres"],
@@ -4575,6 +4957,8 @@ fn perform_system_backup(
         ));
     }
 
+    require_active_runtime_snapshot_unchanged(installation, &prepared.active_runtime)?;
+
     let (data_package, data_backup_id) = export_data_package(
         tools,
         start_tools,
@@ -4583,6 +4967,7 @@ fn perform_system_backup(
         prepared,
         staging,
     )?;
+    require_active_runtime_snapshot_unchanged(installation, &prepared.active_runtime)?;
     match export_secrets_package(
         tools,
         start_tools,
@@ -4612,11 +4997,13 @@ fn ensure_backup_migration_revision(
     tools: &Tools,
     installation: &Installation,
     image_lock: &ImageLock,
+    active_runtime: &ActiveRuntimeSnapshot,
 ) -> Result<(), LauncherError> {
-    let output = compose_owned(
+    let output = compose_owned_for_runtime(
         tools,
         installation,
         image_lock,
+        active_runtime,
         &["postgres"],
         true,
         &[
@@ -4653,10 +5040,18 @@ fn run_postgres_dump(
     tools: &Tools,
     installation: &Installation,
     image_lock: &ImageLock,
+    active_runtime: &ActiveRuntimeSnapshot,
     output: &Path,
 ) -> Result<(), LauncherError> {
-    let inventory = inspect_compose_project_inventory(tools, installation, image_lock)?;
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+    let inventory = inspect_compose_project_inventory_for_runtime(
+        tools,
+        installation,
+        image_lock,
+        active_runtime,
+    )?;
     require_authenticated_compose_services(&inventory, &["postgres"], true)?;
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
     let arguments = [
         "exec",
         "-T",
@@ -4673,13 +5068,15 @@ fn run_postgres_dump(
     .into_iter()
     .map(OsString::from)
     .collect::<Vec<_>>();
-    let result = compose_os_to_new_file(
+    let result = compose_os_to_new_file_for_runtime(
         tools,
         installation,
+        active_runtime,
         &arguments,
         output,
         SYSTEM_BACKUP_TIMEOUT,
     )?;
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
     if !result.status.success() {
         return Err(LauncherError::new(
             "BACKUP_PG_DUMP_FAILED",
@@ -4714,6 +5111,13 @@ fn validate_postgres_dump_file(path: &Path) -> Result<(), LauncherError> {
     Ok(())
 }
 
+fn backup_log_volume_mount(prepared: &PreparedBackup) -> OsString {
+    OsString::from(format!(
+        "type=volume,source={},target=/backup/logs,readonly,volume-nocopy",
+        prepared.active_runtime.volumes.logs
+    ))
+}
+
 fn export_data_package(
     tools: &Tools,
     start_tools: &StartTools,
@@ -4729,9 +5133,7 @@ fn export_data_package(
             })?,
             "/backup/database/postgres.dump",
         )?,
-        OsString::from(
-            "type=volume,source=des-log-data,target=/backup/logs,readonly,volume-nocopy",
-        ),
+        backup_log_volume_mount(prepared),
         docker_bind_mount(
             &fs::canonicalize(installation.install_dir.join("resources")).map_err(|_| {
                 LauncherError::new("BACKUP_PATH_INVALID", "无法规范化发布元数据目录。")
@@ -4739,7 +5141,7 @@ fn export_data_package(
             "/backup/metadata",
         )?,
         docker_bind_mount(
-            &fs::canonicalize(&installation.secret_dir).map_err(|_| {
+            &fs::canonicalize(&prepared.active_runtime.secrets.directory).map_err(|_| {
                 LauncherError::new("BACKUP_PATH_INVALID", "无法规范化运行 secret 目录。")
             })?,
             "/backup/secrets",
@@ -4798,7 +5200,7 @@ fn export_secrets_package(
 ) -> Result<PathBuf, LauncherError> {
     let mounts = vec![
         docker_bind_mount(
-            &fs::canonicalize(&installation.secret_dir).map_err(|_| {
+            &fs::canonicalize(&prepared.active_runtime.secrets.directory).map_err(|_| {
                 LauncherError::new("BACKUP_PATH_INVALID", "无法规范化运行 secret 目录。")
             })?,
             "/backup/secrets",
@@ -4847,7 +5249,12 @@ fn export_secrets_package(
 fn backup_helper_container(role: &'static str, prepared: &PreparedBackup) -> HelperContainer {
     helper_container_identity(
         role,
-        &[&prepared.installation_id, &prepared.current_user_sid],
+        &[
+            &prepared.installation_id,
+            &prepared.active_runtime.generation.generation_id,
+            &prepared.active_runtime.generation.state_sha256,
+            &prepared.current_user_sid,
+        ],
     )
 }
 
@@ -5304,12 +5711,14 @@ fn resume_services_after_system_backup(
     start_tools: &StartTools,
     installation: &Installation,
     image_lock: &ImageLock,
-    installation_id: &str,
+    active_runtime: &ActiveRuntimeSnapshot,
 ) -> Result<(), LauncherError> {
-    let up = compose_owned(
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+    let up = compose_owned_for_runtime(
         tools,
         installation,
         image_lock,
+        active_runtime,
         &[],
         false,
         &COMPOSE_UP_WITHOUT_PULL,
@@ -5321,25 +5730,27 @@ fn resume_services_after_system_backup(
             "备份后 Docker Compose 无法重新启动。",
         ));
     }
-    let volume_contract = active_runtime_volume_contract(installation)?;
-    if !constant_time_ascii_equal(&volume_contract.installation_id, installation_id) {
-        return Err(LauncherError::new(
-            "RUNTIME_GENERATION_IDENTITY_MISMATCH",
-            "备份开始与恢复之间活动运行代际的 installation-id 发生变化；未继续启动服务。",
-        ));
-    }
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+    let volume_contract = active_runtime.volume_contract();
     validate_active_runtime_volume_contract(tools, installation, &volume_contract)?;
-    validate_actual_compose_ports(tools, start_tools, installation, image_lock)?;
-    verify_shared_network_namespace(tools, installation, image_lock)?;
+    validate_actual_compose_ports_for_runtime(
+        tools,
+        start_tools,
+        installation,
+        image_lock,
+        active_runtime,
+    )?;
+    verify_shared_network_namespace_for_runtime(tools, installation, image_lock, active_runtime)?;
     wait_for_http(LIVE_PATH, LIVE_TIMEOUT, "BACKUP_RESUME_LIVE_TIMEOUT")?;
-    verify_container_secret_targets(tools, installation, image_lock)?;
-    let resume = lifecycle(tools, installation, image_lock, "resume")?;
+    verify_container_secret_targets_for_runtime(tools, installation, image_lock, active_runtime)?;
+    let resume = lifecycle_for_runtime(tools, installation, image_lock, active_runtime, "resume")?;
     if !resume.safe_to_stop {
         return Err(LauncherError::new(
             "BACKUP_RECONCILIATION_REQUIRED",
             "备份后恢复对账尚未完成，系统保持 draining。",
         ));
     }
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
     wait_for_http(READY_PATH, READY_TIMEOUT, "BACKUP_RESUME_READY_TIMEOUT")
 }
 
@@ -5402,13 +5813,22 @@ fn inspect_compose_project_inventory(
     installation: &Installation,
     image_lock: &ImageLock,
 ) -> Result<ComposeProjectInventory, LauncherError> {
+    let active_runtime = load_active_runtime_snapshot(installation)?;
+    inspect_compose_project_inventory_for_runtime(tools, installation, image_lock, &active_runtime)
+}
+
+fn inspect_compose_project_inventory_for_runtime(
+    tools: &Tools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+    active_runtime: &ActiveRuntimeSnapshot,
+) -> Result<ComposeProjectInventory, LauncherError> {
     let ids = list_compose_project_container_ids(tools, installation)?;
     if ids.is_empty() {
         return Ok(ComposeProjectInventory::Empty);
     }
 
-    let volume_contract = active_runtime_volume_contract(installation)
-        .map_err(|_| compose_project_ownership_unverified())?;
+    let volume_contract = active_runtime.volume_contract();
     validate_active_runtime_volume_contract(tools, installation, &volume_contract)
         .map_err(|_| compose_project_ownership_unverified())?;
     let containers = inspect_compose_project_containers(tools, installation, &ids)?;
@@ -5655,6 +6075,37 @@ fn compose_owned(
     compose(tools, installation, arguments, timeout)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn compose_owned_for_runtime(
+    tools: &Tools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+    active_runtime: &ActiveRuntimeSnapshot,
+    required_services: &[&str],
+    require_complete: bool,
+    arguments: &[&str],
+    timeout: Duration,
+) -> Result<ProcessOutput, LauncherError> {
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+    let inventory = inspect_compose_project_inventory_for_runtime(
+        tools,
+        installation,
+        image_lock,
+        active_runtime,
+    )?;
+    if inventory.is_empty() && required_services.is_empty() && !require_complete {
+        require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+        let output = compose_for_runtime(tools, installation, active_runtime, arguments, timeout)?;
+        require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+        return Ok(output);
+    }
+    require_authenticated_compose_services(&inventory, required_services, require_complete)?;
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+    let output = compose_for_runtime(tools, installation, active_runtime, arguments, timeout)?;
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+    Ok(output)
+}
+
 fn lifecycle(
     tools: &Tools,
     installation: &Installation,
@@ -5665,6 +6116,52 @@ fn lifecycle(
         tools,
         installation,
         image_lock,
+        &["api"],
+        true,
+        &[
+            "exec",
+            "-T",
+            "api",
+            "python",
+            "-m",
+            "datax_studio.lifecycle",
+            command,
+            "--json",
+        ],
+        COMPOSE_TIMEOUT,
+    )?;
+    let parsed: StopPreflight = serde_json::from_slice(&output.stdout).map_err(|_| {
+        LauncherError::new(
+            "LIFECYCLE_RESPONSE_INVALID",
+            "容器 lifecycle helper 未返回有效 JSON；已安全阻断。",
+        )
+    })?;
+    match (
+        output.status.code(),
+        parsed.safe_to_stop,
+        parsed.code.as_str(),
+    ) {
+        (Some(0), true, "SAFE_TO_STOP") => Ok(parsed),
+        (Some(3), false, "ACTIVE_ATTEMPTS_PRESENT") => Ok(parsed),
+        _ => Err(LauncherError::new(
+            "LIFECYCLE_HELPER_FAILED",
+            "容器 lifecycle helper 执行失败或返回矛盾状态；已安全阻断。",
+        )),
+    }
+}
+
+fn lifecycle_for_runtime(
+    tools: &Tools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+    active_runtime: &ActiveRuntimeSnapshot,
+    command: &str,
+) -> Result<StopPreflight, LauncherError> {
+    let output = compose_owned_for_runtime(
+        tools,
+        installation,
+        image_lock,
+        active_runtime,
         &["api"],
         true,
         &[
@@ -5726,6 +6223,17 @@ fn compose(
     compose_os(tools, installation, &arguments, timeout)
 }
 
+fn compose_for_runtime(
+    tools: &Tools,
+    installation: &Installation,
+    active_runtime: &ActiveRuntimeSnapshot,
+    arguments: &[&str],
+    timeout: Duration,
+) -> Result<ProcessOutput, LauncherError> {
+    let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
+    compose_os_for_runtime(tools, installation, active_runtime, &arguments, timeout)
+}
+
 fn compose_os(
     tools: &Tools,
     installation: &Installation,
@@ -5752,9 +6260,37 @@ fn compose_os(
     )
 }
 
-fn compose_os_to_new_file(
+fn compose_os_for_runtime(
     tools: &Tools,
     installation: &Installation,
+    active_runtime: &ActiveRuntimeSnapshot,
+    arguments: &[OsString],
+    timeout: Duration,
+) -> Result<ProcessOutput, LauncherError> {
+    let mut all = vec![
+        OsString::from("--env-file"),
+        installation.image_env_file.as_os_str().to_os_string(),
+        OsString::from("--project-name"),
+        OsString::from(COMPOSE_PROJECT),
+        OsString::from("--file"),
+        installation.compose_file.as_os_str().to_os_string(),
+    ];
+    all.extend(arguments.iter().cloned());
+    let mut environment = installation.compose_environment_for(active_runtime);
+    environment.extend(tools.docker_environment());
+    run_process(
+        &tools.compose,
+        &all,
+        &environment,
+        &installation.install_dir,
+        timeout,
+    )
+}
+
+fn compose_os_to_new_file_for_runtime(
+    tools: &Tools,
+    installation: &Installation,
+    active_runtime: &ActiveRuntimeSnapshot,
     arguments: &[OsString],
     output: &Path,
     timeout: Duration,
@@ -5768,7 +6304,7 @@ fn compose_os_to_new_file(
         installation.compose_file.as_os_str().to_os_string(),
     ];
     all.extend(arguments.iter().cloned());
-    let mut environment = installation.compose_environment()?;
+    let mut environment = installation.compose_environment_for(active_runtime);
     environment.extend(tools.docker_environment());
     run_process_to_new_file(
         &tools.compose,
@@ -6542,7 +7078,37 @@ fn validate_actual_compose_ports(
     image_lock: &ImageLock,
 ) -> Result<(), LauncherError> {
     let inventory = inspect_compose_project_inventory(tools, installation, image_lock)?;
-    require_authenticated_compose_services(&inventory, &[], true)?;
+    validate_actual_compose_ports_for_inventory(tools, start_tools, installation, &inventory)
+}
+
+fn validate_actual_compose_ports_for_runtime(
+    tools: &Tools,
+    start_tools: &StartTools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+    active_runtime: &ActiveRuntimeSnapshot,
+) -> Result<(), LauncherError> {
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+    let inventory = inspect_compose_project_inventory_for_runtime(
+        tools,
+        installation,
+        image_lock,
+        active_runtime,
+    )?;
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+    let result =
+        validate_actual_compose_ports_for_inventory(tools, start_tools, installation, &inventory);
+    require_active_runtime_snapshot_unchanged(installation, active_runtime)?;
+    result
+}
+
+fn validate_actual_compose_ports_for_inventory(
+    tools: &Tools,
+    start_tools: &StartTools,
+    installation: &Installation,
+    inventory: &ComposeProjectInventory,
+) -> Result<(), LauncherError> {
+    require_authenticated_compose_services(inventory, &[], true)?;
     let ids = inventory.container_ids();
 
     let mut arguments = vec![
@@ -7716,6 +8282,56 @@ mod tests {
         assert!(text.contains("source=des-log-data"));
         assert!(!text.contains("workspace"));
         assert!(!text.contains("des-postgres-data"));
+    }
+
+    #[test]
+    fn backup_mount_and_helper_identity_bind_the_active_generation() {
+        fn prepared(generation_id: char) -> PreparedBackup {
+            let generation_id = generation_id.to_string().repeat(32);
+            let active_runtime = ActiveRuntimeSnapshot::from_generation(
+                Path::new("/datax-app"),
+                RuntimeGeneration::fresh(
+                    generation_id.clone(),
+                    "b".repeat(64),
+                    "2026-08-02T02:30:00Z".to_owned(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            PreparedBackup {
+                data_output: PathBuf::from("/backup/data"),
+                secrets_output: PathBuf::from("/backup/secrets"),
+                data_key: Zeroizing::new(vec![b'a'; 64]),
+                secrets_key: Zeroizing::new(vec![b'b'; 64]),
+                installation_id: active_runtime.generation.installation_id.clone(),
+                active_runtime,
+                current_user_sid: String::from("S-1-5-21-test"),
+            }
+        }
+
+        let first = prepared('a');
+        let second = prepared('c');
+        assert_eq!(
+            backup_log_volume_mount(&first),
+            OsString::from(
+                "type=volume,source=des-log-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa,target=/backup/logs,readonly,volume-nocopy"
+            )
+        );
+        let first_environment = first
+            .active_runtime
+            .compose_environment(Path::new("/datax-app"));
+        let second_environment = second
+            .active_runtime
+            .compose_environment(Path::new("/datax-app"));
+        assert!(first_environment.contains(&(
+            OsString::from("DES_POSTGRES_VOLUME_NAME"),
+            OsString::from("des-postgres-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        )));
+        assert_ne!(first_environment, second_environment);
+        assert_ne!(
+            backup_helper_container(BACKUP_DATA_HELPER_ROLE, &first).name,
+            backup_helper_container(BACKUP_DATA_HELPER_ROLE, &second).name
+        );
     }
 
     #[test]

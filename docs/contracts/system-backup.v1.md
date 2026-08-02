@@ -11,7 +11,9 @@ RecoveryGate 与这里的系统灾难恢复不是同一概念。
 两把恢复秘密共同认证的 restore journal；该能力只达到 E1
 `IMPLEMENTED_STAGING_ONLY`。ADR-0008、运行代际机器契约、严格 Rust 解析/摘要/对象集合
 校验、旧式完整集合到 `LEGACY` 活动指针的不覆盖原子提交，以及 Compose 从单一指针整组
-注入 secret/installation-id/三个 volume name 已落地为工程候选。新空
+注入 secret/installation-id/三个 volume name 已落地为工程候选。`FRESH/RESTORE` 的严格
+构造器与活动快照也已用于 Compose 卷归属和本机备份的卷/secret/helper identity；这不等于
+FRESH 初始化或 RESTORE 提交已实现。新空
 PostgreSQL named volume、`pg_restore`、数据库/审计链证据重算、日志与 secrets 的原子
 提交、签名安装包集成、实际 Docker named volume 演练、异机 Windows 11 x64 恢复与
 RPO/RTO 仍为 `NOT_RUN/BLOCKED`。
@@ -34,8 +36,9 @@ journal 或 staging 文件存在都不能表述为“Windows 可恢复门禁已�
   以 `PGDMP` 开头的普通文件，不接受物理
   `des-postgres-data` volume 归档。
 - 逻辑 dump 的宿主 staging 文件必须位于 Launcher 创建的受限 ACL 随机目录；分包完成或
-  失败后都必须清理。该短暂明文 staging 是尚待真实 Windows 验收的残余风险，不得伪装为
-  “从不落明文”。
+  失败后都必须清理。若清理失败，Launcher 不得执行 `resume`，而是返回稳定错误并要求
+  Operator 先核验当前服务状态、人工处置；不得把可能遗留的明文 staging 与恢复运行同时
+  伪装成成功。该短暂明文 staging 是尚待真实 Windows 验收的残余风险，不得伪装为“从不落明文”。
 - DATA/SECRETS 输出路径必须是父目录已存在但自身尚不存在的新叶子目录，由 Launcher
   创建后收紧 ACL；不得为备份改写用户已有目录的权限。
 - helper 只能来自发布锁定的 Worker `repository@sha256:<64 hex>` 镜像，使用参数数组，
@@ -53,7 +56,7 @@ DATA 包只允许以下归档项：
 | 归档路径 | 来源 | 约束 |
 |---|---|---|
 | `database/postgres.dump` | 一致性 `pg_dump` custom-format 文件 | 普通文件、`PGDMP` magic、长度和 SHA-256 与清单一致 |
-| `logs/` | 只读 `des-log-data` | 只允许 `<execution UUID>/<attempt UUID>.log` |
+| `logs/` | 只读活动 `RuntimeGeneration` 所指定的 log named volume（LEGACY 为 `des-log-data`） | 只允许 `<execution UUID>/<attempt UUID>.log` |
 | `metadata/compose.yaml` | 发布制品 | 固定文件、大小和 SHA-256 与清单一致 |
 | `metadata/images.release.env` | 发布制品 | 固定文件、大小和 SHA-256 与清单一致 |
 | `metadata/release-manifest.json` | 发布制品 | 固定文件、大小和 SHA-256 与清单一致 |
@@ -176,16 +179,22 @@ installation-id、独立 secret 目录和三个随机 named volume；Compose 的
 rename/compare-and-swap，因此 V1 restore 只允许无旧 installation-id、无活动代际、无
 产品容器和产品卷的干净目标，不覆盖已有安装。
 
-当前代码已有运行代际 JSON Schema、域分离摘要、严格来源/路径/卷集合/UTC 时间校验；
-Launcher 只在固定卷、固定 secret 集和旧 installation-id 全部通过原有身份检查后，才为
-首次初始化或既有工程候选安装创建 `LEGACY` 指针。pending 文件先刷盘并限制 ACL，再以同
-目录、`MOVEFILE_WRITE_THROUGH` 且不含 replace flag 的 rename 提交；目标已存在、链接、摘要
-篡改、身份或对象集合不一致时均拒绝覆盖。所有 Compose 子进程先移除宿主同名环境变量，
-再从已验证指针整组注入五个值。
+当前代码已有运行代际 JSON Schema、域分离摘要、严格来源/路径/卷集合/UTC 时间校验，以及
+`FRESH/RESTORE` 的受限构造器。系统备份先在无 reparse 的应用根目录中复核 ACL 受控的
+pointer，再冻结一个活动快照；config、preflight、停应用、`pg_dump`、停 PostgreSQL、包导出
+和 resume 的 Compose 环境/容器归属均显式使用该快照的 installation-id、三卷和 secret 目录，
+并在 Compose 命令前后重读 pointer 作精确等值复核。pointer 变化时不得用新身份继续或 resume；
+DATA/SECRETS helper identity 也包含 generation ID/状态摘要。当前首次初始化或既有工程候选
+安装**仍只**在固定卷、固定 secret 集和旧 installation-id 全部通过原有身份检查后创建
+`LEGACY` 指针。pending 文件先刷盘并限制 ACL，再以同目录、`MOVEFILE_WRITE_THROUGH` 且不含
+replace flag 的 rename 提交；目标已存在、链接、摘要篡改、身份或对象集合不一致时均拒绝覆盖。
+所有 Compose 子进程先移除宿主同名环境变量，再从已验证指针整组注入五个值。
 
-restore journal、新随机 volume、代际 secret 目录和 Docker staging 尚未消费或提交
-`RESTORE` 指针。现有失败关闭的 `restore` 分支仍位于 secrets/volume 初始化之前，不会
-读取恢复 key、生成替代 KEK/密码或创建固定卷。
+FRESH pending journal、新随机 volume 的创建、代际 secret 目录的生成与 Docker staging 尚未
+消费或提交活动 `FRESH/RESTORE` 指针。备份 package manifest 也尚未记录 generation identity，
+因此不能把当前 helper identity 或 snapshot 重读表述为完整包对/恢复绑定。现有失败关闭的
+`restore` 分支仍位于 secrets/volume 初始化之前，不会读取恢复 key、生成替代 KEK/密码或
+创建固定卷。
 
 后续实现至少必须在产品服务和出站网络完全停止的隔离阶段：
 
