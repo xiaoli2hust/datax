@@ -234,6 +234,8 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 "MAKENSIS_PATH": "${{ vars.MAKENSIS_PATH }}",
                 "RUSTC_PATH": "${{ vars.RUSTC_PATH }}",
                 "SIGNTOOL_PATH": "${{ vars.SIGNTOOL_PATH }}",
+                "RELEASE_PAYLOAD_PATH": "${{ vars.RELEASE_PAYLOAD_PATH }}",
+                "RELEASE_QUALIFICATION_PATH": "${{ vars.RELEASE_QUALIFICATION_PATH }}",
             },
         )
         script = preflight["run"]
@@ -242,7 +244,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "git status --porcelain=v1 --untracked-files=all",
             script,
         )
-        self.assertIn("Assert-ConfiguredLocalExecutable", script)
+        self.assertIn("Assert-ConfiguredLocalFile", script)
         self.assertIn("Get-CimInstance", script)
         self.assertIn("Win32_LogicalDisk", script)
         self.assertIn("ReparsePoint", script)
@@ -374,6 +376,27 @@ class ReleaseWorkflowTests(unittest.TestCase):
         ):
             self.assertEqual(build.count(f"{parameter} = $env:{variable}"), 2)
         self.assertIn("AllowedSignerFile = $env:SIGNER_ALLOWLIST_PATH", build)
+
+        preflight = next(
+            step
+            for step in job["steps"]
+            if step["name"] == "Require a clean checkout and configured local signing tools"
+        )
+        self.assertEqual(
+            preflight["env"]["RELEASE_PAYLOAD_PATH"],
+            "${{ vars.RELEASE_PAYLOAD_PATH }}",
+        )
+        self.assertEqual(
+            preflight["env"]["RELEASE_QUALIFICATION_PATH"],
+            "${{ vars.RELEASE_QUALIFICATION_PATH }}",
+        )
+        self.assertIn("function Assert-ConfiguredLocalFile", preflight["run"])
+        self.assertIn('"release-payload.json" = $env:RELEASE_PAYLOAD_PATH', preflight["run"])
+        self.assertIn(
+            '"release-qualification.json" = $env:RELEASE_QUALIFICATION_PATH',
+            preflight["run"],
+        )
+        self.assertIn("-MaximumBytes 1048576", preflight["run"])
 
         candidate = next(
             step

@@ -565,6 +565,8 @@ jobs:
           MAKENSIS_PATH: ${{ vars.MAKENSIS_PATH }}
           RUSTC_PATH: ${{ vars.RUSTC_PATH }}
           SIGNTOOL_PATH: ${{ vars.SIGNTOOL_PATH }}
+          RELEASE_PAYLOAD_PATH: ${{ vars.RELEASE_PAYLOAD_PATH }}
+          RELEASE_QUALIFICATION_PATH: ${{ vars.RELEASE_QUALIFICATION_PATH }}
         run: |
           $ErrorActionPreference = "Stop"
           Set-StrictMode -Version Latest
@@ -578,17 +580,18 @@ jobs:
           if ($status.Count -ne 0) {
               throw "The signing checkout has staged or untracked files."
           }
-          function Assert-ConfiguredLocalExecutable {
+          function Assert-ConfiguredLocalFile {
               param(
                   [Parameter(Mandatory = $true)]
-                  [string]$Name,
+                  [string]$ExpectedLeafName,
                   [Parameter(Mandatory = $true)]
-                  [string]$Candidate
+                  [string]$Candidate,
+                  [int64]$MaximumBytes = 0
               )
 
               if ([string]::IsNullOrWhiteSpace($Candidate) -or
                   $Candidate -notmatch '^[A-Za-z]:\\') {
-                  throw "Configured path for $Name is missing or not local."
+                  throw "Configured path for $ExpectedLeafName is missing or not local."
               }
               try {
                   $fullPath = [IO.Path]::GetFullPath($Candidate)
@@ -598,17 +601,17 @@ jobs:
                       -ErrorAction Stop
               }
               catch {
-                  throw "Configured path for $Name is not on a local fixed volume."
+                  throw "Configured path for $ExpectedLeafName is not on a local fixed volume."
               }
               if ($null -eq $disk -or [int]$disk.DriveType -ne 3) {
-                  throw "Configured path for $Name is not on a local fixed volume."
+                  throw "Configured path for $ExpectedLeafName is not on a local fixed volume."
               }
               $root = [IO.Path]::GetPathRoot($fullPath)
               if ([string]::IsNullOrWhiteSpace($root)) {
-                  throw "Configured path for $Name is invalid."
+                  throw "Configured path for $ExpectedLeafName is invalid."
               }
               if ($fullPath.Length -le $root.Length) {
-                  throw "Configured path for $Name is not a regular executable."
+                  throw "Configured path for $ExpectedLeafName is not a regular file."
               }
               $current = $root
               foreach ($segment in ($fullPath.Substring($root.Length) -split '[\\/]')) {
@@ -623,19 +626,22 @@ jobs:
                           -ErrorAction Stop
                   }
                   catch {
-                      throw "Configured path for $Name cannot be accessed."
+                      throw "Configured path for $ExpectedLeafName cannot be accessed."
                   }
                   if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
-                      throw "Configured path for $Name contains a reparse point."
+                      throw "Configured path for $ExpectedLeafName contains a reparse point."
                   }
               }
               if ($item.PSIsContainer -or
                   $item.Length -le 0 -or
                   -not [IO.Path]::GetFileName($item.FullName).Equals(
-                      $Name,
+                      $ExpectedLeafName,
                       [StringComparison]::OrdinalIgnoreCase
                   )) {
-                  throw "Configured path for $Name is not a regular executable."
+                  throw "Configured path for $ExpectedLeafName is not a regular file."
+              }
+              if ($MaximumBytes -gt 0 -and $item.Length -gt $MaximumBytes) {
+                  throw "Configured path for $ExpectedLeafName exceeds the permitted size."
               }
           }
           function Assert-NoCargoCompilerOverrides {
@@ -682,9 +688,19 @@ jobs:
               "signtool.exe" = $env:SIGNTOOL_PATH
           }
           foreach ($entry in $requiredTools.GetEnumerator()) {
-              Assert-ConfiguredLocalExecutable `
-                  -Name $entry.Key `
+              Assert-ConfiguredLocalFile `
+                  -ExpectedLeafName $entry.Key `
                   -Candidate ([string]$entry.Value)
+          }
+          $requiredResources = [ordered]@{
+              "release-payload.json" = $env:RELEASE_PAYLOAD_PATH
+              "release-qualification.json" = $env:RELEASE_QUALIFICATION_PATH
+          }
+          foreach ($entry in $requiredResources.GetEnumerator()) {
+              Assert-ConfiguredLocalFile `
+                  -ExpectedLeafName $entry.Key `
+                  -Candidate ([string]$entry.Value) `
+                  -MaximumBytes 1048576
           }
           Assert-NoCargoCompilerOverrides
 

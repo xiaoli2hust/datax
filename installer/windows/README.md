@@ -45,7 +45,9 @@ Setup 变成可信程序；用户/组织在首次执行前仍必须通过 Window
 
 签名 job 还必须只使用 `datax-release-signing` runner group 中带精确 Windows 标签的机器，
 并显式提供本机固定盘、非重解析的 `CARGO_PATH`、`RUSTC_PATH`、`MAKENSIS_PATH` 与
-`SIGNTOOL_PATH`。导入 PFX 前会拒绝 dirty/untracked checkout、Cargo wrapper/flags/target/home
+`SIGNTOOL_PATH`，以及同类受保护本机固定盘、非重解析、最多 1 MiB 的
+`RELEASE_PAYLOAD_PATH`/`RELEASE_QUALIFICATION_PATH`（叶文件名固定）。导入 PFX 前会拒绝
+dirty/untracked checkout、缺失或异常的工具/资格资源路径、Cargo wrapper/flags/target/home
 环境覆盖；Cargo 进程把 `RUSTC` 固定为 `RUSTC_PATH`。这只是 PATH 和常见环境注入的 E1
 失败关闭：拒绝环境 `CARGO_HOME` 仍会回落到 runner profile 的默认 Cargo home，工具字节/
 目录 ACL、链接器、TOCTOU 和私钥不可导出性必须由受控 runner provisioning 与 Windows E3/E4
