@@ -220,6 +220,7 @@ const IMAGE_RULES: [(&str, &str); 5] = [
     ("DES_WEB_IMAGE", "ghcr.io/xiaoli2hust/datax-studio-web"),
 ];
 const RELEASE_MANIFEST_BOUND_SHA256: Option<&str> = option_env!("DES_RELEASE_MANIFEST_SHA256");
+const RELEASE_CANDIDATE_BOUND: Option<&str> = option_env!("DES_RELEASE_CANDIDATE");
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LauncherError {
@@ -363,6 +364,7 @@ enum CaptureFailure {
 struct ReleaseManifest {
     schema_version: String,
     product_version: String,
+    release_candidate: String,
     compose_sha256: String,
     images_sha256: String,
     acl_script_sha256: String,
@@ -1335,6 +1337,20 @@ fn verify_release_resources(installation: &Installation) -> Result<VerifiedRelea
         ));
     }
     let manifest = parse_release_manifest(&manifest_bytes)?;
+    let expected_release_candidate = RELEASE_CANDIDATE_BOUND.ok_or_else(|| {
+        LauncherError::new(
+            "RELEASE_BINDING_MISSING",
+            "Launcher 构建未绑定发布候选标识；该构建不得用于 Windows 发布。",
+        )
+    })?;
+    if !is_release_candidate_for_version(expected_release_candidate, env!("CARGO_PKG_VERSION"))
+        || !constant_time_ascii_equal(&manifest.release_candidate, expected_release_candidate)
+    {
+        return Err(LauncherError::new(
+            "RELEASE_CANDIDATE_BINDING_FAILED",
+            "发布资源清单与已签名 Launcher 的候选标识不一致。",
+        ));
+    }
 
     let compose_metadata = fs::metadata(&installation.compose_file).map_err(|_| {
         LauncherError::new("COMPOSE_FILE_UNAVAILABLE", "无法读取固定 Compose 清单。")
@@ -1396,8 +1412,9 @@ fn parse_release_manifest(bytes: &[u8]) -> Result<ReleaseManifest, LauncherError
     let signer_set_is_canonical = (1..=8).contains(&signers.len())
         && signers.iter().all(|value| is_sha256(value))
         && signers.windows(2).all(|values| values[0] < values[1]);
-    if manifest.schema_version != "1.1"
+    if manifest.schema_version != "1.2"
         || manifest.product_version != env!("CARGO_PKG_VERSION")
+        || !is_release_candidate_for_version(&manifest.release_candidate, &manifest.product_version)
         || !is_sha256(&manifest.compose_sha256)
         || !is_sha256(&manifest.images_sha256)
         || !is_sha256(&manifest.acl_script_sha256)
@@ -1409,6 +1426,13 @@ fn parse_release_manifest(bytes: &[u8]) -> Result<ReleaseManifest, LauncherError
         ));
     }
     Ok(manifest)
+}
+
+fn is_release_candidate_for_version(candidate: &str, product_version: &str) -> bool {
+    candidate
+        .strip_prefix(product_version)
+        .and_then(|suffix| suffix.strip_prefix('-'))
+        .is_some_and(|suffix| is_lower_hex_string(suffix, 12))
 }
 
 fn verify_prerequisites(
@@ -9711,8 +9735,9 @@ mod tests {
 
     fn release_manifest_json(signers: serde_json::Value) -> Vec<u8> {
         serde_json::json!({
-            "schema_version": "1.1",
+            "schema_version": "1.2",
             "product_version": env!("CARGO_PKG_VERSION"),
+            "release_candidate": format!("{}-{}", env!("CARGO_PKG_VERSION"), "a".repeat(12)),
             "compose_sha256": "1".repeat(64),
             "images_sha256": "2".repeat(64),
             "acl_script_sha256": "3".repeat(64),
@@ -9768,6 +9793,37 @@ mod tests {
         ] {
             assert_eq!(
                 parse_release_manifest(&release_manifest_json(signers))
+                    .unwrap_err()
+                    .code(),
+                "RELEASE_MANIFEST_INVALID"
+            );
+        }
+    }
+
+    #[test]
+    fn release_manifest_rejects_missing_or_mismatched_release_candidate() {
+        let mut missing: serde_json::Value =
+            serde_json::from_slice(&release_manifest_json(serde_json::json!(["a".repeat(64)])))
+                .unwrap();
+        missing.as_object_mut().unwrap().remove("release_candidate");
+        assert_eq!(
+            parse_release_manifest(missing.to_string().as_bytes())
+                .unwrap_err()
+                .code(),
+            "RELEASE_MANIFEST_INVALID"
+        );
+
+        for candidate in [
+            format!("{}-{}", env!("CARGO_PKG_VERSION"), "A".repeat(12)),
+            format!("{}-{}", env!("CARGO_PKG_VERSION"), "a".repeat(11)),
+            format!("0.0.0-{}", "a".repeat(12)),
+        ] {
+            let mut manifest: serde_json::Value =
+                serde_json::from_slice(&release_manifest_json(serde_json::json!(["a".repeat(64)])))
+                    .unwrap();
+            manifest["release_candidate"] = serde_json::Value::String(candidate);
+            assert_eq!(
+                parse_release_manifest(manifest.to_string().as_bytes())
                     .unwrap_err()
                     .code(),
                 "RELEASE_MANIFEST_INVALID"

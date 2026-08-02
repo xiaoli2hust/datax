@@ -12,7 +12,9 @@
   允许证书签名；缺失、无效、证书不匹配或资源被替换时不写入程序目录；
 - 创建桌面启动快捷方式、开始菜单启动/安全停止/卸载快捷方式；
 - 安装前拒绝 Windows Server、Windows on Arm、Windows 10、安装卷空间不足和降级覆盖；
-- 当前自动升级前备份/迁移尚未完成，因此旧版本覆盖升级会 fail closed；同版本修复先在
+- 当前自动升级前备份/迁移尚未完成，因此旧版本覆盖升级会 fail closed；同版本修复还必须先从
+  当前用户注册表读出与候选相同的 `ReleaseCandidate=<semver>-<commit12>`；旧安装没有该绑定或
+  候选不同均必须先卸载，不能把两个相同语义版本的字节混合。随后才在
   临时目录完成候选 Setup/Launcher/资源核验，再仅用该已验证的候选 Launcher 安全停止旧
   服务（不执行旧安装目录的 `launcher.exe`），并用 no-skip、显式解除受控资源只读属性的
   方式修复，任一步失败都中止；
@@ -51,7 +53,8 @@ Setup 变成可信程序；用户/组织在首次执行前仍必须通过 Window
 
 流水线先核验实际 PFX 证书 DER SHA-256 属于该受保护、严格排序去重的允许集；
 `scripts/windows/build-installer.ps1` 必须显式接收同一份 `-AllowedSignerFile`，并只会生成
-包含该 allowlist 的清单 `1.1`、由同一证书签名的 Launcher/Setup。随后
+包含该 allowlist 和精确 `release_candidate` 的清单 `1.2`、由同一证书签名的 Launcher/Setup。Launcher
+还把候选标识编译期绑定；随后
 `scripts/release/finalize_windows_publisher_binding.ps1` 再次校验该 allowlist，并重建、重签
 最终发布绑定。Linux 阶段还必须先以全新空 `DOCKER_CONFIG`、不继承 registry 凭据的方式
 匿名拉取五个固定 digest，并生成与镜像锁一致的 `anonymous-image-pulls.json`；任一镜像只能

@@ -485,6 +485,7 @@ def _validate_cross_file_bindings(
         or release_context.get("workflow_run_attempt")
         != str(identity["workflow_run_attempt"])
         or release_context.get("version") != identity["product_version"]
+        or release_context.get("release_candidate") != identity["release_candidate"]
         or context_source_ref != identity["source_ref"]
         or release_context.get("candidate_only") is not True
         or release_context.get("public_release_created") is not False
@@ -498,6 +499,7 @@ def _validate_cross_file_bindings(
     release_manifest_keys = {
         "schema_version",
         "product_version",
+        "release_candidate",
         "compose_sha256",
         "images_sha256",
         "acl_script_sha256",
@@ -508,8 +510,10 @@ def _validate_cross_file_bindings(
     )
     if (
         set(release_manifest) != release_manifest_keys
-        or release_manifest.get("schema_version") != "1.1"
+        or release_manifest.get("schema_version") != "1.2"
         or release_manifest.get("product_version") != identity["product_version"]
+        or release_manifest.get("release_candidate")
+        != identity["release_candidate"]
         or release_manifest.get("compose_sha256") != artifacts["compose"]["sha256"]
         or release_manifest.get("images_sha256")
         != artifacts["embedded_images_lock"]["sha256"]
@@ -524,7 +528,7 @@ def _validate_cross_file_bindings(
         or allowed_signers != sorted(set(allowed_signers))
     ):
         raise ValueError(
-            "final release manifest 1.1 does not bind resources and signer allowlist"
+            "final release manifest 1.2 does not bind candidate, resources and signer allowlist"
         )
 
     if (

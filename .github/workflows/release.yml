@@ -29,6 +29,7 @@ jobs:
       packages: write
     outputs:
       version: ${{ steps.prepare.outputs.version }}
+      release_candidate: ${{ steps.prepare.outputs.release_candidate }}
       artifact_suffix: ${{ steps.prepare.outputs.artifact_suffix }}
       evidence_artifact: ${{ steps.artifact-name.outputs.name }}
     steps:
@@ -112,6 +113,7 @@ jobs:
         shell: bash
         env:
           VERSION: ${{ steps.prepare.outputs.version }}
+          RELEASE_CANDIDATE: ${{ steps.prepare.outputs.release_candidate }}
           EVIDENCE_DIRECTORY: ${{ steps.prepare.outputs.evidence_directory }}
         run: |
           set -euo pipefail
@@ -133,7 +135,7 @@ jobs:
           python scripts/acceptance/build_blocked_manifest.py \
             --catalog "${EVIDENCE_DIRECTORY}/requirements-catalog.v1.json" \
             --environment-manifest "${EVIDENCE_DIRECTORY}/release-context.json" \
-            --release-candidate "${VERSION}-${GITHUB_SHA:0:12}" \
+            --release-candidate "${RELEASE_CANDIDATE}" \
             --commit "${GITHUB_SHA}" \
             --output "${EVIDENCE_DIRECTORY}/acceptance-manifest.json"
           python scripts/acceptance/validate_acceptance_manifest.py \
@@ -905,6 +907,7 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ needs.linux-images.outputs.version }}
+          RELEASE_CANDIDATE: ${{ needs.linux-images.outputs.release_candidate }}
           SIGNER_THUMBPRINT: ${{ steps.signing-certificate.outputs.thumbprint }}
           SIGNER_ALLOWLIST_PATH: ${{ steps.signing-certificate.outputs.allowlist_path }}
           CARGO_PATH: ${{ vars.CARGO_PATH }}
@@ -922,6 +925,7 @@ jobs:
           }
           $parameters = @{
               ProductVersion = $env:VERSION
+              ReleaseCandidate = $env:RELEASE_CANDIDATE
               ReleaseImagesFile = (
                   Join-Path `
                     "${env:RUNNER_TEMP}\linux-candidate-evidence" `
@@ -939,6 +943,7 @@ jobs:
           & .\scripts\windows\build-installer.ps1 @parameters
           $bindingParameters = @{
               ProductVersion = $env:VERSION
+              ReleaseCandidate = $env:RELEASE_CANDIDATE
               BuildOutputDirectory = $outputDirectory
               CargoPath = $env:CARGO_PATH
               RustcPath = $env:RUSTC_PATH
@@ -967,6 +972,7 @@ jobs:
         shell: pwsh
         env:
           VERSION: ${{ needs.linux-images.outputs.version }}
+          RELEASE_CANDIDATE: ${{ needs.linux-images.outputs.release_candidate }}
           SIGNER_THUMBPRINT: ${{ steps.signing-certificate.outputs.thumbprint }}
           BUILD_OUTPUT: ${{ steps.build.outputs.output_directory }}
           SIGNER_ALLOWLIST_PATH: ${{ steps.signing-certificate.outputs.allowlist_path }}
@@ -1017,6 +1023,7 @@ jobs:
             -SetupPath $setup `
             -ResourcesDirectory $resources `
             -ExpectedVersion $env:VERSION `
+            -ExpectedReleaseCandidate $env:RELEASE_CANDIDATE `
             -ExpectedAllowlistFile $env:SIGNER_ALLOWLIST_PATH
           $parameters = @{
               CandidateDirectory = $candidateDirectory
@@ -1030,6 +1037,7 @@ jobs:
               )
               ExpectedSignerThumbprint = $env:SIGNER_THUMBPRINT
               ExpectedVersion = $env:VERSION
+              ExpectedReleaseCandidate = $env:RELEASE_CANDIDATE
               ExpectedCommit = $env:GITHUB_SHA
               CargoPath = $env:CARGO_PATH
               RustcPath = $env:RUSTC_PATH
@@ -1155,6 +1163,7 @@ jobs:
           CANDIDATE_DIRECTORY: ${{ runner.temp }}/blocked-windows-handoff-candidate
           TRUSTED_LINUX_EVIDENCE_DIRECTORY: ${{ runner.temp }}/trusted-linux-candidate-evidence
           VERSION: ${{ needs.linux-images.outputs.version }}
+          RELEASE_CANDIDATE: ${{ needs.linux-images.outputs.release_candidate }}
         run: |
           set -euo pipefail
           test "$(git rev-parse HEAD)" = "${GITHUB_SHA}"
@@ -1167,7 +1176,7 @@ jobs:
             --root "${CANDIDATE_DIRECTORY}"
           unlink "${CANDIDATE_DIRECTORY}/SHA256SUMS"
           test ! -e "${CANDIDATE_DIRECTORY}/SHA256SUMS"
-          release_candidate="${VERSION}-${GITHUB_SHA:0:12}"
+          release_candidate="${RELEASE_CANDIDATE}"
           python scripts/acceptance/candidate_root.py \
             generate \
             --candidate-directory "${CANDIDATE_DIRECTORY}" \
@@ -1244,9 +1253,10 @@ jobs:
           TRUSTED_LINUX_EVIDENCE_DIRECTORY: ${{ runner.temp }}/trusted-linux-candidate-evidence
           TRUSTED_GH_PATH: ${{ steps.trusted-gh.outputs.path }}
           VERSION: ${{ needs.linux-images.outputs.version }}
+          RELEASE_CANDIDATE: ${{ needs.linux-images.outputs.release_candidate }}
         run: |
           set -euo pipefail
-          release_candidate="${VERSION}-${GITHUB_SHA:0:12}"
+          release_candidate="${RELEASE_CANDIDATE}"
           evidence_directory="${RUNNER_TEMP}/blocked-candidate-root-attestation"
           test ! -e "${evidence_directory}"
           mkdir "${evidence_directory}"

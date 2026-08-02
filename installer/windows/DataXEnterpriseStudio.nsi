@@ -15,6 +15,9 @@ ManifestDPIAware true
 !ifndef FILE_VERSION
   !error "FILE_VERSION is required"
 !endif
+!ifndef RELEASE_CANDIDATE
+  !error "RELEASE_CANDIDATE is required"
+!endif
 !ifndef LAUNCHER_EXE
   !error "LAUNCHER_EXE is required"
 !endif
@@ -58,6 +61,7 @@ VIAddVersionKey /LANG=2052 "ProductName" "${PRODUCT_NAME}"
 VIAddVersionKey /LANG=2052 "FileDescription" "${PRODUCT_NAME} 每用户安装程序"
 VIAddVersionKey /LANG=2052 "ProductVersion" "${PRODUCT_VERSION}"
 VIAddVersionKey /LANG=2052 "FileVersion" "${PRODUCT_VERSION}"
+VIAddVersionKey /LANG=2052 "ReleaseCandidate" "${RELEASE_CANDIDATE}"
 VIAddVersionKey /LANG=2052 "LegalCopyright" "Copyright (c) DataX Enterprise Studio contributors"
 
 !define MUI_ABORTWARNING
@@ -165,6 +169,16 @@ install_disk_ok:
     ${ElseIf} $5 == 2
       MessageBox MB_OK|MB_ICONSTOP "检测到旧版本 $4。当前骨架尚未交付升级前备份/迁移闭环，已安全阻断覆盖升级；请等待兼容升级程序。"
       Abort
+    ${ElseIf} $5 == 0
+      ReadRegStr $6 HKCU "${PRODUCT_KEY}" "ReleaseCandidate"
+      ${If} $6 == ""
+        MessageBox MB_OK|MB_ICONSTOP "无法证明现有同版本安装属于一个受持久化绑定的候选，已拒绝覆盖。请先卸载旧安装。"
+        Abort
+      ${EndIf}
+      ${If} $6 != "${RELEASE_CANDIDATE}"
+        MessageBox MB_OK|MB_ICONSTOP "检测到同版本但不同发布候选。为避免混合候选覆盖，安装已终止；请先卸载旧安装。"
+        Abort
+      ${EndIf}
     ${EndIf}
   ${EndIf}
 FunctionEnd
@@ -268,8 +282,10 @@ Section "DataX Enterprise Studio" SEC_MAIN
     "$INSTDIR\Uninstall.exe"
 
   WriteRegStr HKCU "${PRODUCT_KEY}" "InstallDir" "$INSTDIR"
+  WriteRegStr HKCU "${PRODUCT_KEY}" "ReleaseCandidate" "${RELEASE_CANDIDATE}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayName" "${PRODUCT_NAME}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayVersion" "${PRODUCT_VERSION}"
+  WriteRegStr HKCU "${UNINSTALL_KEY}" "ReleaseCandidate" "${RELEASE_CANDIDATE}"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "DisplayIcon" "$INSTDIR\launcher.exe"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "Publisher" "DataX Enterprise Studio"
   WriteRegStr HKCU "${UNINSTALL_KEY}" "InstallLocation" "$INSTDIR"

@@ -96,6 +96,7 @@ def main() -> int:
         f"{version}-{args.commit[:12]}"
         f"-run-{args.run_id}-attempt-{args.run_attempt}"
     )
+    release_candidate = f"{version}-{args.commit[:12]}"
     context = {
         "schema_version": "1.0",
         "artifact_kind": "WINDOWS_LOCAL_CANDIDATE",
@@ -107,6 +108,7 @@ def main() -> int:
         "git_ref_type": args.ref_type,
         "trigger": args.event_name,
         "version": version,
+        "release_candidate": release_candidate,
         "image_tag": f"candidate-{version}-{args.commit[:12]}",
         "workflow_run_id": args.run_id,
         "workflow_run_attempt": args.run_attempt,
@@ -125,6 +127,7 @@ def main() -> int:
     )
     with args.github_output.open("a", encoding="utf-8") as stream:
         stream.write(f"version={version}\n")
+        stream.write(f"release_candidate={release_candidate}\n")
         stream.write(f"image_tag={context['image_tag']}\n")
         stream.write(f"artifact_suffix={artifact_suffix}\n")
         stream.write(f"evidence_directory={args.output_directory}\n")

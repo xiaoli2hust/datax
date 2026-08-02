@@ -17,6 +17,9 @@ param(
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
     [string]$ExpectedVersion,
     [Parameter(Mandatory = $true)]
+    [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9a-f]{12}$')]
+    [string]$ExpectedReleaseCandidate,
+    [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9a-f]{40}$')]
     [string]$ExpectedCommit,
     [Parameter(Mandatory = $true)]
@@ -497,6 +500,8 @@ function Assert-BlockedAcceptanceEvidence {
         [Parameter(Mandatory = $true)]
         [string]$Version,
         [Parameter(Mandatory = $true)]
+        [string]$ReleaseCandidate,
+        [Parameter(Mandatory = $true)]
         [string]$Commit
     )
 
@@ -545,6 +550,7 @@ function Assert-BlockedAcceptanceEvidence {
 
     $expectedCandidate = "$Version-$($Commit.Substring(0, 12))"
     if ($manifest.schema_version -cne "1.1" -or
+        $ReleaseCandidate -cne $expectedCandidate -or
         $manifest.release_candidate -cne $expectedCandidate -or
         $manifest.commit_sha -cne $Commit -or
         $manifest.gate_result -cne "BLOCKED" -or
@@ -741,6 +747,7 @@ Assert-BlockedAcceptanceEvidence `
     -CatalogFile $requirementsCatalog `
     -EnvironmentFile $linuxReleaseContext `
     -Version $ExpectedVersion `
+    -ReleaseCandidate $ExpectedReleaseCandidate `
     -Commit $ExpectedCommit
 
 $context = [IO.File]::ReadAllText($contextFile.FullName) | ConvertFrom-Json
@@ -750,6 +757,7 @@ if ($context.schema_version -ne "1.0" -or
     $context.public_release_created -ne $false -or
     $context.repository -ne "xiaoli2hust/datax" -or
     $context.version -ne $ExpectedVersion -or
+    $context.release_candidate -ne $ExpectedReleaseCandidate -or
     $context.git_commit -ne $ExpectedCommit) {
     throw "Release context does not match this candidate."
 }
@@ -790,6 +798,7 @@ $authenticodeEvidence = [ordered]@{
     candidate_only = $true
     public_release_created = $false
     version = $ExpectedVersion
+    release_candidate = $ExpectedReleaseCandidate
     git_commit = $ExpectedCommit
     verified_at = [DateTime]::UtcNow.ToString("o")
     setup = $setupEvidence

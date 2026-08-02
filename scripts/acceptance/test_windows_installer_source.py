@@ -82,6 +82,31 @@ class WindowsInstallerSourceTests(unittest.TestCase):
         self.assertLess(section.index(verification), section.index(stop))
         self.assertLess(section.index(stop), section.index(normalize))
 
+    def test_same_semver_repair_requires_the_same_persisted_release_candidate(self) -> None:
+        self.assertIn('!ifndef RELEASE_CANDIDATE', self.source)
+        self.assertIn('!error "RELEASE_CANDIDATE is required"', self.source)
+        self.assertIn(
+            'VIAddVersionKey /LANG=2052 "ReleaseCandidate" "${RELEASE_CANDIDATE}"',
+            self.source,
+        )
+
+        on_init = function_body(self.source, ".onInit")
+        version_compare = '${VersionCompare} $4 "${PRODUCT_VERSION}" $5'
+        candidate_read = 'ReadRegStr $6 HKCU "${PRODUCT_KEY}" "ReleaseCandidate"'
+        mismatch = '${If} $6 != "${RELEASE_CANDIDATE}"'
+        self.assertIn(version_compare, on_init)
+        self.assertIn(candidate_read, on_init)
+        self.assertIn(mismatch, on_init)
+        self.assertIn("同版本但不同发布候选", on_init)
+        self.assertLess(on_init.index(version_compare), on_init.index(candidate_read))
+
+        section = section_body(self.source, "DataX Enterprise Studio")
+        for product_key in ("${PRODUCT_KEY}", "${UNINSTALL_KEY}"):
+            self.assertIn(
+                f'WriteRegStr HKCU "{product_key}" "ReleaseCandidate" "${{RELEASE_CANDIDATE}}"',
+                section,
+            )
+
     def test_repair_and_uninstall_bind_deletion_to_the_fixed_registry_root(self) -> None:
         normalize = function_body(self.source, "NormalizeExistingResourceAttributes")
         for resource in [

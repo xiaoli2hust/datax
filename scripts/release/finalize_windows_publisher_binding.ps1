@@ -4,6 +4,9 @@ param(
     [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$')]
     [string]$ProductVersion,
     [Parameter(Mandatory = $true)]
+    [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[0-9a-f]{12}$')]
+    [string]$ReleaseCandidate,
+    [Parameter(Mandatory = $true)]
     [string]$BuildOutputDirectory,
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9A-Fa-f]{40}$')]
@@ -390,10 +393,15 @@ $package = @($metadata.packages) |
 if ($null -eq $package -or [string]$package.version -cne $ProductVersion) {
     throw "ProductVersion must match the Launcher Cargo package version."
 }
+$releaseCandidatePattern = "^$([Regex]::Escape($ProductVersion))-[0-9a-f]{12}$"
+if ($ReleaseCandidate -cnotmatch $releaseCandidatePattern) {
+    throw "ReleaseCandidate must bind the exact ProductVersion and a lowercase commit prefix."
+}
 
 $releaseManifest = [ordered]@{
-    schema_version = "1.1"
+    schema_version = "1.2"
     product_version = $ProductVersion
+    release_candidate = $ReleaseCandidate
     compose_sha256 = (
         Get-FileHash -LiteralPath $composeStaged -Algorithm SHA256
     ).Hash.ToLowerInvariant()
@@ -417,10 +425,19 @@ $previousBinding = [Environment]::GetEnvironmentVariable(
     "DES_RELEASE_MANIFEST_SHA256",
     [EnvironmentVariableTarget]::Process
 )
+$previousCandidateBinding = [Environment]::GetEnvironmentVariable(
+    "DES_RELEASE_CANDIDATE",
+    [EnvironmentVariableTarget]::Process
+)
 try {
     [Environment]::SetEnvironmentVariable(
         "DES_RELEASE_MANIFEST_SHA256",
         $manifestHash,
+        [EnvironmentVariableTarget]::Process
+    )
+    [Environment]::SetEnvironmentVariable(
+        "DES_RELEASE_CANDIDATE",
+        $ReleaseCandidate,
         [EnvironmentVariableTarget]::Process
     )
     Invoke-ConfiguredCargo -Cargo $cargo -Rustc $rustc -Arguments @(
@@ -434,6 +451,11 @@ finally {
     [Environment]::SetEnvironmentVariable(
         "DES_RELEASE_MANIFEST_SHA256",
         $previousBinding,
+        [EnvironmentVariableTarget]::Process
+    )
+    [Environment]::SetEnvironmentVariable(
+        "DES_RELEASE_CANDIDATE",
+        $previousCandidateBinding,
         [EnvironmentVariableTarget]::Process
     )
 }
@@ -464,6 +486,7 @@ Remove-Item -LiteralPath $setupPath -Force
 $fileVersion = "$ProductVersion.0"
 Invoke-Checked -Program $makensis -Arguments @(
     "/DPRODUCT_VERSION=$ProductVersion",
+    "/DRELEASE_CANDIDATE=$ReleaseCandidate",
     "/DFILE_VERSION=$fileVersion",
     "/DLAUNCHER_EXE=$launcherStaged",
     "/DCOMPOSE_FILE=$composeStaged",

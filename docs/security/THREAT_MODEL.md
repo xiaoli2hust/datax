@@ -253,6 +253,15 @@ probe 容器；任何 Docker/协议异常或任一卷少于 200 GiB 均失败关
 增长、不同 VHD/临界容量或 Docker API cleanup TOCTOU 的真实行为；目前仅 E1，必须由签名 Windows
 E4 的对应负例闭合。
 
+### TM-19 更新（2026-08-03）
+
+本更新取代 TM-19 中关于“清单 1.1”的实现描述：最终发布清单现为 1.2，包含
+`release_candidate=<semver>-<commit12>`；该标识同时编译期绑定到 Launcher，并写入产品和卸载
+注册表。同版本 repair 必须读取现有候选标识，缺失或同 semver 不同 candidate 均要求先卸载，
+不能覆盖。这只降低混合候选风险；签名私钥、工具来源和 TOCTOU 仍未关闭。相应源码负例覆盖
+缺失候选标识、同 semver 不同 candidate 与清单/Launcher 候选错绑；它们当前均为 E1，须由干净
+Windows E4 复验。
+
 ## 5. 一次复制的强制安全序列
 
 1. Admin 已批准不可变 EndpointPolicyRevision、两个 DatasourceRevision/

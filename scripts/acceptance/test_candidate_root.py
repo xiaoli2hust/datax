@@ -96,8 +96,9 @@ class CandidateFixture:
         self._write_json(
             resources / "release-manifest.json",
             {
-                "schema_version": "1.1",
+                "schema_version": "1.2",
                 "product_version": VERSION,
+                "release_candidate": CANDIDATE,
                 "compose_sha256": hashlib.sha256(compose.read_bytes()).hexdigest(),
                 "images_sha256": images_sha256,
                 "acl_script_sha256": hashlib.sha256(
@@ -122,6 +123,7 @@ class CandidateFixture:
                 "git_ref_type": "branch",
                 "trigger": "workflow_dispatch",
                 "version": VERSION,
+                "release_candidate": CANDIDATE,
                 "workflow_run_id": RUN_ID,
                 "workflow_run_attempt": str(RUN_ATTEMPT),
             },
@@ -348,8 +350,8 @@ class CandidateRootTests(unittest.TestCase):
                 ):
                     validate_candidate_root(**fixture.arguments())
 
-    def test_final_release_manifest_11_resources_and_signers_are_required(self) -> None:
-        cases = ("old-schema", "resource-hash", "signer-order")
+    def test_final_release_manifest_12_candidate_resources_and_signers_are_required(self) -> None:
+        cases = ("old-schema", "candidate", "resource-hash", "signer-order")
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 fixture = CandidateFixture(Path(directory))
@@ -359,13 +361,15 @@ class CandidateRootTests(unittest.TestCase):
                     manifest["schema_version"] = "1.0"
                 elif case == "resource-hash":
                     manifest["compose_sha256"] = "f" * 64
+                elif case == "candidate":
+                    manifest["release_candidate"] = f"{VERSION}-{'b' * 12}"
                 else:
                     manifest["allowed_authenticode_signer_certificate_sha256"] = [
                         "9" * 64,
                         "8" * 64,
                     ]
                 self._write_manifest(manifest_path, manifest)
-                with self.assertRaisesRegex(ValueError, "release manifest 1.1"):
+                with self.assertRaisesRegex(ValueError, "release manifest 1.2"):
                     fixture.generate()
 
     def test_candidate_image_lock_must_come_from_linux_build_evidence(self) -> None:

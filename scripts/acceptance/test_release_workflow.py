@@ -268,6 +268,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_windows_release_scripts_require_configured_non_path_tools(self) -> None:
         expected = {
             "scripts/windows/build-installer.ps1": (
+                "ReleaseCandidate",
                 "CargoPath",
                 "RustcPath",
                 "MakensisPath",
@@ -275,12 +276,14 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 "AllowedSignerFile",
             ),
             "scripts/release/finalize_windows_publisher_binding.ps1": (
+                "ReleaseCandidate",
                 "CargoPath",
                 "RustcPath",
                 "MakensisPath",
                 "SigntoolPath",
             ),
             "scripts/windows/validate-release.ps1": (
+                "ExpectedReleaseCandidate",
                 "CargoPath",
                 "RustcPath",
                 "SigntoolPath",
@@ -307,10 +310,17 @@ class ReleaseWorkflowTests(unittest.TestCase):
             ):
                 self.assertIn(f'"{variable}"', source)
             for parameter in parameters:
-                self.assertIn(
-                    f"[Parameter(Mandatory = $true)]\n    [string]${parameter}",
-                    source,
-                )
+                if parameter in {"ReleaseCandidate", "ExpectedReleaseCandidate"}:
+                    self.assertIn(
+                        "[ValidatePattern('^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-[0-9a-f]{12}$')]"
+                        f"\n    [string]${parameter}",
+                        source,
+                    )
+                else:
+                    self.assertIn(
+                        f"[Parameter(Mandatory = $true)]\n    [string]${parameter}",
+                        source,
+                    )
 
     def test_workflow_passes_the_mandatory_tool_paths_to_each_release_script(self) -> None:
         job = self.workflow["jobs"]["windows-signed-candidate"]
@@ -342,6 +352,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             if step["name"] == "Build and sign Launcher and Setup"
         )["run"]
         for parameter, variable in (
+            ("ReleaseCandidate", "RELEASE_CANDIDATE"),
             ("CargoPath", "CARGO_PATH"),
             ("RustcPath", "RUSTC_PATH"),
             ("MakensisPath", "MAKENSIS_PATH"),
@@ -356,6 +367,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             if step["name"] == "Assemble and verify the signed candidate evidence"
         )["run"]
         for parameter, variable in (
+            ("ExpectedReleaseCandidate", "RELEASE_CANDIDATE"),
             ("CargoPath", "CARGO_PATH"),
             ("RustcPath", "RUSTC_PATH"),
             ("SigntoolPath", "SIGNTOOL_PATH"),
@@ -385,14 +397,50 @@ class ReleaseWorkflowTests(unittest.TestCase):
             "The selected signing certificate is absent from the protected SHA-256 allowlist.",
             builder,
         )
-        self.assertIn('schema_version = "1.1"', builder)
+        self.assertIn('schema_version = "1.2"', builder)
+        self.assertIn('release_candidate = $ReleaseCandidate', builder)
+        self.assertIn('"DES_RELEASE_CANDIDATE"', builder)
+        self.assertIn('"/DRELEASE_CANDIDATE=$ReleaseCandidate"', builder)
         self.assertIn(
             "allowed_authenticode_signer_certificate_sha256 = @($allowedSigners)",
             builder,
         )
         self.assertNotIn('schema_version = "1.0"\n    product_version = $ProductVersion', builder)
-        self.assertIn('manifest.schema_version != "1.1"', launcher)
+        self.assertIn('manifest.schema_version != "1.2"', launcher)
+        self.assertIn('option_env!("DES_RELEASE_CANDIDATE")', launcher)
+        self.assertIn('RELEASE_CANDIDATE_BINDING_FAILED', launcher)
         self.assertIn("allowed_authenticode_signer_certificate_sha256", launcher)
+
+    def test_release_candidate_flows_from_preparation_to_hosted_candidate_root(self) -> None:
+        linux_job = self.workflow["jobs"]["linux-images"]
+        self.assertEqual(
+            linux_job["outputs"]["release_candidate"],
+            "${{ steps.prepare.outputs.release_candidate }}",
+        )
+
+        windows_job = self.workflow["jobs"]["windows-signed-candidate"]
+        build = next(
+            step
+            for step in windows_job["steps"]
+            if step["name"] == "Build and sign Launcher and Setup"
+        )["run"]
+        evidence = next(
+            step
+            for step in windows_job["steps"]
+            if step["name"] == "Assemble and verify the signed candidate evidence"
+        )["run"]
+        self.assertIn("RELEASE_CANDIDATE", build)
+        self.assertIn("ReleaseCandidate = $env:RELEASE_CANDIDATE", build)
+        self.assertIn("ExpectedReleaseCandidate = $env:RELEASE_CANDIDATE", evidence)
+
+        hosted_job = self.workflow["jobs"]["hosted-candidate-attestor"]
+        root = next(
+            step
+            for step in hosted_job["steps"]
+            if step["name"]
+            == "Verify the handoff manifest and establish the canonical blocked root"
+        )["run"]
+        self.assertIn('release_candidate="${RELEASE_CANDIDATE}"', root)
 
     def test_verifier_download_is_bound_to_the_locked_installer(self) -> None:
         job = self.workflow["jobs"]["hosted-candidate-attestor"]

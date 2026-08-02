@@ -209,7 +209,7 @@ release qualification、最终安装包和公开晋级拆开。这里的双重�
   `candidate-root.v1.json` 自身外的全部文件进入安全相对路径、大小、SHA-256 的 canonical
   有序清单；生成器/验证器拒绝重复 JSON key、路径逃逸、大小写冲突、symlink/reparse、
   非普通文件、额外/缺失文件及内容或身份篡改。
-- 生成器交叉核对 release context、最终 release manifest 1.1、Compose、顶层/内嵌 image
+- 生成器交叉核对 release context、最终 release manifest 1.2（含精确 `release_candidate`）、Compose、顶层/内嵌 image
   lock 与 Linux build evidence 生成的 image lock（这三者必须逐字节一致）、ACL helper、
   canonical signer SHA-256 allowlist、acceptance/environment/
   requirements catalog、SPDX SBOM index 及 Windows build environment；只允许当前 checkout
