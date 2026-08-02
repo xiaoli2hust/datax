@@ -17,6 +17,7 @@ from datax_studio.core.schemas import (
     EndpointPolicyResponse,
     EndpointPolicyRevisionResponse,
 )
+from datax_studio.credentials.ingress import DatasourceOperationAdmissionGuard
 from datax_studio.credentials.schemas import (
     CredentialSecretPage,
     CredentialSecretStatusChange,
@@ -44,6 +45,148 @@ router = APIRouter()
 _service_lock = Lock()
 _if_match_pattern = re.compile(r'^W/"([1-9][0-9]*)"$')
 
+# The detailed, machine-readable contract remains in docs/contracts/openapi.yaml.
+# These JSON Schema fragments deliberately retain the status/code/retryability
+# discriminators and standard headers in FastAPI's generated surface too, so a
+# consumer cannot mistake the live route metadata for an untyped JSON error.
+_DATASOURCE_OPERATION_PROBLEM_BASE = {
+    "type": "object",
+    "required": ["status", "code", "retryable"],
+    "properties": {
+        "status": {"type": "integer"},
+        "code": {"type": "string"},
+        "retryable": {"type": "boolean"},
+    },
+}
+_DATASOURCE_OPERATION_STALE_PROBLEM = {
+    "allOf": [
+        _DATASOURCE_OPERATION_PROBLEM_BASE,
+        {
+            "type": "object",
+            "properties": {
+                "status": {"const": 409},
+                "code": {"const": "DATASOURCE_OPERATION_STALE"},
+                "retryable": {"const": True},
+            },
+        },
+    ]
+}
+_DATASOURCE_OPERATION_OTHER_CONFLICT_PROBLEM = {
+    "allOf": [
+        _DATASOURCE_OPERATION_PROBLEM_BASE,
+        {
+            "type": "object",
+            "properties": {
+                "status": {"const": 409},
+                "code": {
+                    "type": "string",
+                    "not": {"const": "DATASOURCE_OPERATION_STALE"},
+                },
+            },
+        },
+    ]
+}
+_DATASOURCE_OPERATION_ADMISSION_LIMITED_PROBLEM = {
+    "allOf": [
+        _DATASOURCE_OPERATION_PROBLEM_BASE,
+        {
+            "type": "object",
+            "properties": {
+                "status": {"const": 429},
+                "code": {"const": "DATASOURCE_OPERATION_ADMISSION_LIMITED"},
+                "retryable": {"const": True},
+            },
+        },
+    ]
+}
+_DATASOURCE_OPERATION_DEADLINE_PROBLEM = {
+    "allOf": [
+        _DATASOURCE_OPERATION_PROBLEM_BASE,
+        {
+            "type": "object",
+            "properties": {
+                "status": {"const": 503},
+                "code": {"const": "DATASOURCE_OPERATION_DEADLINE_EXCEEDED"},
+                "retryable": {"const": True},
+            },
+        },
+    ]
+}
+_DATASOURCE_OPERATION_OTHER_UNAVAILABLE_PROBLEM = {
+    "allOf": [
+        _DATASOURCE_OPERATION_PROBLEM_BASE,
+        {
+            "type": "object",
+            "properties": {
+                "status": {"const": 503},
+                "code": {
+                    "type": "string",
+                    "not": {"const": "DATASOURCE_OPERATION_DEADLINE_EXCEEDED"},
+                },
+            },
+        },
+    ]
+}
+_DATASOURCE_OPERATION_COMMON_HEADERS = {
+    "X-Request-Id": {
+        "description": "Opaque request correlation identifier.",
+        "schema": {"type": "string", "format": "uuid"},
+    },
+    "Cache-Control": {
+        "description": "Problem responses are never cacheable.",
+        "schema": {"type": "string", "const": "no-store"},
+    },
+}
+_IDEMPOTENCY_REPLAYED_RESPONSE_HEADER = {
+    "description": "Present with value true when the idempotent request was replayed.",
+    "schema": {"type": "string", "const": "true"},
+}
+
+
+def _problem_content(schema: dict[str, object]) -> dict[str, object]:
+    return {"application/problem+json": {"schema": schema}}
+
+
+DATASOURCE_EXTERNAL_OPERATION_RESPONSES = {
+    409: {
+        "description": "Security binding changed while the external operation was in flight.",
+        "headers": _DATASOURCE_OPERATION_COMMON_HEADERS,
+        "content": _problem_content(
+            {
+                "oneOf": [
+                    _DATASOURCE_OPERATION_STALE_PROBLEM,
+                    _DATASOURCE_OPERATION_OTHER_CONFLICT_PROBLEM,
+                ]
+            }
+        ),
+    },
+    429: {
+        "description": "The API-process external datasource operation admission is full.",
+        "headers": {
+            "Retry-After": {
+                "description": "Fixed manual retry delay in seconds.",
+                "schema": {"type": "integer", "const": 60},
+            },
+            **_DATASOURCE_OPERATION_COMMON_HEADERS,
+        },
+        "content": _problem_content(_DATASOURCE_OPERATION_ADMISSION_LIMITED_PROBLEM),
+    },
+    503: {
+        "description": (
+            "The operation deadline or a required external security dependency is unavailable."
+        ),
+        "headers": _DATASOURCE_OPERATION_COMMON_HEADERS,
+        "content": _problem_content(
+            {
+                "oneOf": [
+                    _DATASOURCE_OPERATION_DEADLINE_PROBLEM,
+                    _DATASOURCE_OPERATION_OTHER_UNAVAILABLE_PROBLEM,
+                ]
+            }
+        ),
+    },
+}
+
 
 def get_credential_service(request: Request) -> CredentialService:
     service = getattr(request.app.state, "credential_service", None)
@@ -55,6 +198,14 @@ def get_credential_service(request: Request) -> CredentialService:
             service = build_credential_service(request.app.state.settings)
             request.app.state.credential_service = service
     return service
+
+
+def get_datasource_operation_admission(
+    request: Request,
+) -> DatasourceOperationAdmissionGuard:
+    """Return the one API-process admission guard owned by the app."""
+
+    return request.app.state.datasource_operation_admission
 
 
 @router.patch(
@@ -141,6 +292,7 @@ def list_datasources(
     "/projects/{project_id}/datasources",
     response_model=DatasourceAdminDetail,
     status_code=201,
+    responses=DATASOURCE_EXTERNAL_OPERATION_RESPONSES,
 )
 def create_datasource(
     project_id: UUID,
@@ -150,6 +302,10 @@ def create_datasource(
     idempotency_key: IdempotencyKey,
     principal: Annotated[Principal, Depends(business_principal)],
     service: Annotated[CredentialService, Depends(get_credential_service)],
+    admission: Annotated[
+        DatasourceOperationAdmissionGuard,
+        Depends(get_datasource_operation_admission),
+    ],
 ) -> DatasourceAdminDetail:
     result = service.create_datasource(
         principal=principal,
@@ -157,6 +313,7 @@ def create_datasource(
         request=request_body,
         idempotency_key=idempotency_key,
         audit=audit_context(request),
+        admission=admission,
     )
     response.headers["ETag"] = _etag(result.value.row_version)
     if result.replayed:
@@ -203,6 +360,7 @@ def get_datasource_admin_detail(
 @router.patch(
     "/datasources/{datasource_id}",
     response_model=DatasourceAdminDetail,
+    responses=DATASOURCE_EXTERNAL_OPERATION_RESPONSES,
 )
 def update_datasource(
     datasource_id: UUID,
@@ -212,6 +370,10 @@ def update_datasource(
     if_match: Annotated[str, Header(alias="If-Match")],
     principal: Annotated[Principal, Depends(business_principal)],
     service: Annotated[CredentialService, Depends(get_credential_service)],
+    admission: Annotated[
+        DatasourceOperationAdmissionGuard,
+        Depends(get_datasource_operation_admission),
+    ],
 ) -> DatasourceAdminDetail:
     result = service.update_datasource(
         principal=principal,
@@ -219,6 +381,7 @@ def update_datasource(
         request=request_body,
         expected_version=_parse_if_match(if_match),
         audit=audit_context(request),
+        admission=admission,
     )
     response.headers["ETag"] = _etag(result.row_version)
     return result
@@ -323,6 +486,7 @@ def list_datasource_credential_secrets(
 @router.post(
     "/datasources/{datasource_id}/credential-secrets/{secret_version}/status",
     response_model=CredentialSecretSummary,
+    responses={200: {"headers": {"Idempotency-Replayed": _IDEMPOTENCY_REPLAYED_RESPONSE_HEADER}}},
 )
 def change_datasource_credential_status(
     datasource_id: UUID,
@@ -350,30 +514,41 @@ def change_datasource_credential_status(
 @router.post(
     "/datasources/{datasource_id}/test",
     response_model=DatasourceTestResult,
+    responses=DATASOURCE_EXTERNAL_OPERATION_RESPONSES,
 )
 def test_datasource(
     datasource_id: UUID,
     request: Request,
     principal: Annotated[Principal, Depends(business_principal)],
     service: Annotated[CredentialService, Depends(get_credential_service)],
+    admission: Annotated[
+        DatasourceOperationAdmissionGuard,
+        Depends(get_datasource_operation_admission),
+    ],
 ) -> DatasourceTestResult:
     return service.test_datasource(
         principal=principal,
         datasource_id=datasource_id,
         request_id=request.state.request_id,
         audit=audit_context(request),
+        admission=admission,
     )
 
 
 @router.get(
     "/datasources/{datasource_id}/schema/tables",
     response_model=TableSchemaPage,
+    responses=DATASOURCE_EXTERNAL_OPERATION_RESPONSES,
 )
 def list_datasource_tables(
     datasource_id: UUID,
     request: Request,
     principal: Annotated[Principal, Depends(business_principal)],
     service: Annotated[CredentialService, Depends(get_credential_service)],
+    admission: Annotated[
+        DatasourceOperationAdmissionGuard,
+        Depends(get_datasource_operation_admission),
+    ],
     usage: Annotated[Literal["SOURCE_USE", "TARGET_USE"], Query()],
     schema_name: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
     table_name: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
@@ -392,6 +567,7 @@ def list_datasource_tables(
         cursor=cursor,
         limit=limit,
         audit=audit_context(request),
+        admission=admission,
     )
 
 

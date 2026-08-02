@@ -16,6 +16,8 @@ param(
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[0-9A-Fa-f]{40}$')]
     [string]$SigningCertificateThumbprint,
+    [Parameter(Mandatory = $true)]
+    [string]$AllowedSignerFile,
     [ValidatePattern('^https://')]
     [string]$TimestampUrl = "https://timestamp.digicert.com"
 )
@@ -194,17 +196,101 @@ function Assert-AuthenticodeSignature {
         [Parameter(Mandatory = $true)]
         [string]$Path,
         [Parameter(Mandatory = $true)]
-        [string]$ExpectedThumbprint
+        [string]$ExpectedThumbprint,
+        [Parameter(Mandatory = $true)]
+        [string]$ExpectedSha256,
+        [Parameter(Mandatory = $true)]
+        [string[]]$AllowedSha256
     )
 
     $signature = Get-AuthenticodeSignature -LiteralPath $Path
-    if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid) {
+    if ($signature.Status -ne [Management.Automation.SignatureStatus]::Valid -or
+        $null -eq $signature.SignerCertificate) {
         throw "Authenticode verification failed for $Path with status $($signature.Status)."
     }
-    $actual = $signature.SignerCertificate.Thumbprint.Replace(" ", "")
-    if (-not $actual.Equals($ExpectedThumbprint, [StringComparison]::OrdinalIgnoreCase)) {
+    $actualSha1 = $signature.SignerCertificate.Thumbprint.Replace(" ", "")
+    $actualSha256 = Get-CertificateSha256 -Certificate $signature.SignerCertificate
+    if (-not $actualSha1.Equals($ExpectedThumbprint, [StringComparison]::OrdinalIgnoreCase) -or
+        -not $actualSha256.Equals($ExpectedSha256, [StringComparison]::Ordinal) -or
+        -not (Test-OrdinalContains -Values $AllowedSha256 -Expected $actualSha256)) {
         throw "Unexpected signing certificate for $Path."
     }
+}
+
+function Read-CanonicalSignerAllowlist {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Path
+    )
+
+    $resolved = Resolve-ExistingFile -Path $Path -Description "publisher allowlist"
+    $item = Get-Item -LiteralPath $resolved
+    if ($item.Length -le 0 -or $item.Length -gt 16384) {
+        throw "Publisher allowlist has an invalid size."
+    }
+    $strictUtf8 = [Text.UTF8Encoding]::new($false, $true)
+    $text = [IO.File]::ReadAllText($resolved, $strictUtf8)
+    if ($text.Length -eq 0 -or $text[0] -eq [char]0xFEFF) {
+        throw "Publisher allowlist must be non-empty UTF-8 without a BOM."
+    }
+    $document = $text | ConvertFrom-Json
+    $propertyNames = @($document.PSObject.Properties.Name)
+    if ($propertyNames.Count -ne 2 -or
+        $propertyNames[0] -cne "schema_version" -or
+        $propertyNames[1] -cne "allowed_authenticode_signer_certificate_sha256" -or
+        $document.schema_version -cne "1.0") {
+        throw "Publisher allowlist schema is invalid or non-canonical."
+    }
+    $values = @($document.allowed_authenticode_signer_certificate_sha256)
+    if ($values.Count -lt 1 -or $values.Count -gt 8) {
+        throw "Publisher allowlist must contain between one and eight certificates."
+    }
+    for ($index = 0; $index -lt $values.Count; $index++) {
+        if ($values[$index] -isnot [string] -or
+            $values[$index] -cnotmatch '^[0-9a-f]{64}$') {
+            throw "Publisher allowlist contains an invalid certificate SHA-256."
+        }
+        if ($index -gt 0 -and
+            [string]::CompareOrdinal($values[$index - 1], $values[$index]) -ge 0) {
+            throw "Publisher allowlist must be strictly ordinal-sorted and unique."
+        }
+    }
+    $canonicalDocument = [ordered]@{
+        schema_version = "1.0"
+        allowed_authenticode_signer_certificate_sha256 = @($values)
+    }
+    $canonical = $canonicalDocument | ConvertTo-Json -Compress
+    if ($text -cne $canonical) {
+        throw "Publisher allowlist must use the exact canonical JSON form."
+    }
+    return [string[]]$values
+}
+
+function Get-CertificateSha256 {
+    param(
+        [Parameter(Mandatory = $true)]
+        [Security.Cryptography.X509Certificates.X509Certificate2]$Certificate
+    )
+
+    return $Certificate.GetCertHashString(
+        [Security.Cryptography.HashAlgorithmName]::SHA256
+    ).ToLowerInvariant()
+}
+
+function Test-OrdinalContains {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Values,
+        [Parameter(Mandatory = $true)]
+        [string]$Expected
+    )
+
+    foreach ($value in $Values) {
+        if ($value.Equals($Expected, [StringComparison]::Ordinal)) {
+            return $true
+        }
+    }
+    return $false
 }
 
 function Read-And-ValidateImageLock {
@@ -287,6 +373,30 @@ $aclScriptSource = Resolve-ExistingFile -Path $aclScriptSource -Description "ACL
 $nsiSource = Resolve-ExistingFile -Path $installerScript -Description "NSIS installer script"
 $launcherCargoManifest = Resolve-ExistingFile -Path $launcherCargoManifest -Description "Launcher Cargo manifest"
 Read-And-ValidateImageLock -Path $imagesSource
+$allowedSigners = Read-CanonicalSignerAllowlist -Path $AllowedSignerFile
+$expectedSignerThumbprint = $SigningCertificateThumbprint.Replace(" ", "").ToUpperInvariant()
+$certificatePath = "Cert:\CurrentUser\My\$expectedSignerThumbprint"
+$signingCertificate = Get-Item -LiteralPath $certificatePath -ErrorAction Stop
+if (-not $signingCertificate.HasPrivateKey) {
+    throw "The selected Windows signing certificate has no private key."
+}
+$now = Get-Date
+if ($signingCertificate.NotBefore -gt $now -or $signingCertificate.NotAfter -le $now) {
+    throw "The selected signing certificate is not currently valid."
+}
+$codeSigning = @(
+    $signingCertificate.Extensions |
+        Where-Object { $_.Oid.Value -eq "2.5.29.37" } |
+        ForEach-Object { $_.EnhancedKeyUsages } |
+        Where-Object { $_.Value -eq "1.3.6.1.5.5.7.3.3" }
+)
+if ($codeSigning.Count -eq 0) {
+    throw "The selected certificate is not authorized for code signing."
+}
+$expectedSignerSha256 = Get-CertificateSha256 -Certificate $signingCertificate
+if (-not (Test-OrdinalContains -Values $allowedSigners -Expected $expectedSignerSha256)) {
+    throw "The selected signing certificate is absent from the protected SHA-256 allowlist."
+}
 
 $metadataJson = Invoke-ConfiguredCargo -Cargo $cargo -Rustc $rustc -Arguments @(
     "metadata", "--format-version", "1", "--no-deps",
@@ -343,11 +453,12 @@ $composeHash = (Get-FileHash -LiteralPath $composeStaged -Algorithm SHA256).Hash
 $imagesHash = (Get-FileHash -LiteralPath $imagesStaged -Algorithm SHA256).Hash.ToLowerInvariant()
 $aclScriptHash = (Get-FileHash -LiteralPath $aclScriptStaged -Algorithm SHA256).Hash.ToLowerInvariant()
 $releaseManifest = [ordered]@{
-    schema_version = "1.0"
+    schema_version = "1.1"
     product_version = $ProductVersion
     compose_sha256 = $composeHash
     images_sha256 = $imagesHash
     acl_script_sha256 = $aclScriptHash
+    allowed_authenticode_signer_certificate_sha256 = @($allowedSigners)
 }
 $manifestJson = $releaseManifest | ConvertTo-Json -Compress
 $utf8WithoutBom = New-Object -TypeName Text.UTF8Encoding -ArgumentList $false
@@ -388,12 +499,16 @@ $launcherSource = Resolve-ExistingFile -Path $launcherSource -Description "Windo
 Copy-Item -LiteralPath $launcherSource -Destination $launcherStaged
 
 Invoke-Checked -Program $signtool -Arguments @(
-    "sign", "/sha1", $SigningCertificateThumbprint,
+    "sign", "/sha1", $expectedSignerThumbprint,
     "/fd", "SHA256", "/td", "SHA256",
     "/tr", $TimestampUrl,
     $launcherStaged
 )
-Assert-AuthenticodeSignature -Path $launcherStaged -ExpectedThumbprint $SigningCertificateThumbprint
+Assert-AuthenticodeSignature `
+    -Path $launcherStaged `
+    -ExpectedThumbprint $expectedSignerThumbprint `
+    -ExpectedSha256 $expectedSignerSha256 `
+    -AllowedSha256 $allowedSigners
 
 $setupPath = Join-Path $outputDirectoryResolved "DataX-Enterprise-Studio-Setup-$ProductVersion-x64.exe"
 if (Test-Path -LiteralPath $setupPath) {
@@ -412,12 +527,16 @@ Invoke-Checked -Program $makensis -Arguments @(
 )
 
 Invoke-Checked -Program $signtool -Arguments @(
-    "sign", "/sha1", $SigningCertificateThumbprint,
+    "sign", "/sha1", $expectedSignerThumbprint,
     "/fd", "SHA256", "/td", "SHA256",
     "/tr", $TimestampUrl,
     $setupPath
 )
-Assert-AuthenticodeSignature -Path $setupPath -ExpectedThumbprint $SigningCertificateThumbprint
+Assert-AuthenticodeSignature `
+    -Path $setupPath `
+    -ExpectedThumbprint $expectedSignerThumbprint `
+    -ExpectedSha256 $expectedSignerSha256 `
+    -AllowedSha256 $allowedSigners
 
 $launcherDigest = (Get-FileHash -LiteralPath $launcherStaged -Algorithm SHA256).Hash.ToLowerInvariant()
 $setupDigest = (Get-FileHash -LiteralPath $setupPath -Algorithm SHA256).Hash.ToLowerInvariant()

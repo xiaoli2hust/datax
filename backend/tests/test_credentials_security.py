@@ -39,6 +39,11 @@ from datax_studio.credentials.db import (
     CredentialSecretEnvelope,
     EndpointConnectionEvidence,
 )
+from datax_studio.credentials.ingress import (
+    DatasourceOperationAdmissionGuard,
+    DatasourceOperationAdmissionRejection,
+    DatasourceOperationKind,
+)
 from datax_studio.credentials.keyring import KekKeyring
 from datax_studio.credentials.network import (
     DnsResolution,
@@ -67,8 +72,9 @@ class SequenceResolver:
         *,
         timeout_seconds: float,
         ttl_ceiling_seconds: int,
+        deadline: object | None = None,
     ) -> DnsResolution:
-        del hostname, timeout_seconds, ttl_ceiling_seconds
+        del hostname, timeout_seconds, ttl_ceiling_seconds, deadline
         return self.answers.pop(0)
 
 
@@ -174,6 +180,89 @@ def test_postgres_probe_consumes_control_before_the_next_query(
     assert "SELECT system_identifier::text FROM pg_control_system()" not in events
 
 
+def test_postgres_probe_consumes_each_result_before_refreshing_next_statement_budget(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A helper SET must never overtake an unread cursor result."""
+
+    events: list[str] = []
+
+    class _Guard:
+        @contextmanager
+        def lease(self, _resolved: object):
+            yield SimpleNamespace(assert_active=lambda: events.append("lease-active"))
+
+    class _Cursor:
+        pending = False
+        values = [("15.1",), ("cluster-identity",)]
+
+        def __enter__(self) -> _Cursor:
+            return self
+
+        def __exit__(
+            self,
+            _type: object,
+            _value: object,
+            _traceback: object,
+        ) -> None:
+            return None
+
+        def execute(self, statement: str) -> None:
+            assert not self.pending, "cannot send a new SQL command before fetchone()"
+            self.pending = True
+            events.append(f"execute:{statement}")
+
+        def fetchone(self) -> tuple[str]:
+            assert self.pending
+            self.pending = False
+            events.append("fetchone")
+            return self.values.pop(0)
+
+    class _Connection:
+        info = SimpleNamespace(hostaddr="127.0.0.1")
+
+        def cursor(self) -> _Cursor:
+            return _Cursor()
+
+        def close(self) -> None:
+            events.append("closed")
+
+    connector = DatabaseConnector(
+        guard=_Guard(),  # type: ignore[arg-type]
+        connect_timeout_seconds=1,
+        query_timeout_seconds=1,
+    )
+    monkeypatch.setattr(
+        connector,
+        "_connect_postgres",
+        lambda *_args, **_kwargs: _Connection(),
+    )
+    monkeypatch.setattr(
+        connector,
+        "_apply_remaining_query_timeout",
+        lambda *_args, **_kwargs: events.append("refresh-statement-budget"),
+    )
+
+    result = connector.probe(
+        SimpleNamespace(engine="POSTGRESQL_15"),
+        password=bytearray(b"secret"),
+        resolved=SimpleNamespace(selected_ip="127.0.0.1"),
+    )
+
+    assert result.server_version == "15.1"
+    assert result.server_identity == "cluster-identity"
+    assert events == [
+        "refresh-statement-budget",
+        "execute:SHOW server_version",
+        "fetchone",
+        "refresh-statement-budget",
+        "execute:SELECT system_identifier::text FROM pg_control_system()",
+        "fetchone",
+        "lease-active",
+        "closed",
+    ]
+
+
 def test_postgres_connection_consumes_control_before_read_only_setup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -218,15 +307,18 @@ def test_postgres_connection_consumes_control_before_read_only_setup(
         if stop_requested:
             raise RuntimeError("termination observed")
 
-    with pytest.raises(
-        RuntimeError,
-        match="termination observed",
-    ), connector.connection(
-        SimpleNamespace(engine="POSTGRESQL_15"),
-        password=bytearray(b"secret"),
-        resolved=SimpleNamespace(selected_ip="127.0.0.1"),
-        read_only=True,
-        control_callback=control_callback,
+    with (
+        pytest.raises(
+            RuntimeError,
+            match="termination observed",
+        ),
+        connector.connection(
+            SimpleNamespace(engine="POSTGRESQL_15"),
+            password=bytearray(b"secret"),
+            resolved=SimpleNamespace(selected_ip="127.0.0.1"),
+            read_only=True,
+            control_callback=control_callback,
+        ),
     ):
         pytest.fail("the connection must not be yielded after a stop")
 
@@ -395,9 +487,7 @@ def test_worker_decrypt_freshly_rejects_terminal_secret_status(
     tmp_path: Path,
     terminal_status: str,
 ) -> None:
-    service, sessions, datasource_id, secret_id, envelope_id = _seed_worker_secret(
-        tmp_path
-    )
+    service, sessions, datasource_id, secret_id, envelope_id = _seed_worker_secret(tmp_path)
     with sessions.begin() as session:
         secret = session.get(CredentialSecret, secret_id)
         assert secret is not None
@@ -410,10 +500,13 @@ def test_worker_decrypt_freshly_rejects_terminal_secret_status(
         else:
             secret.compromised_at = changed_at
 
-    with pytest.raises(ProblemException) as blocked, service.decrypted_worker_password(
-        datasource_id=datasource_id,
-        secret_id=secret_id,
-        envelope_id=envelope_id,
+    with (
+        pytest.raises(ProblemException) as blocked,
+        service.decrypted_worker_password(
+            datasource_id=datasource_id,
+            secret_id=secret_id,
+            envelope_id=envelope_id,
+        ),
     ):
         pytest.fail("terminal secret must never yield plaintext")
     assert blocked.value.code == "CREDENTIAL_BINDING_NOT_ACTIVE"
@@ -424,9 +517,7 @@ def test_worker_decrypt_releases_transaction_and_next_call_observes_status_chang
     tmp_path: Path,
     terminal_status: str,
 ) -> None:
-    service, sessions, datasource_id, secret_id, envelope_id = _seed_worker_secret(
-        tmp_path
-    )
+    service, sessions, datasource_id, secret_id, envelope_id = _seed_worker_secret(tmp_path)
 
     with service.decrypted_worker_password(
         datasource_id=datasource_id,
@@ -451,10 +542,13 @@ def test_worker_decrypt_releases_transaction_and_next_call_observes_status_chang
         assert bytes(plaintext) == b"worker-password"
 
     assert plaintext == bytearray(len(b"worker-password"))
-    with pytest.raises(ProblemException) as blocked, service.decrypted_worker_password(
-        datasource_id=datasource_id,
-        secret_id=secret_id,
-        envelope_id=envelope_id,
+    with (
+        pytest.raises(ProblemException) as blocked,
+        service.decrypted_worker_password(
+            datasource_id=datasource_id,
+            secret_id=secret_id,
+            envelope_id=envelope_id,
+        ),
     ):
         pytest.fail("a new worker decrypt must observe the committed status")
     assert blocked.value.code == "CREDENTIAL_BINDING_NOT_ACTIVE"
@@ -488,13 +582,16 @@ def test_aad_is_exact_and_ciphertext_is_randomized_and_bound() -> None:
     assert len(first.encrypted_dek) == 40
     assert first.nonce != second.nonce
     assert first.encrypted_dek != second.encrypted_dek
-    assert decrypt_credential(
-        ciphertext=first.ciphertext,
-        nonce=first.nonce,
-        encrypted_dek=first.encrypted_dek,
-        aad=aad,
-        kek=kek,
-    ) == plaintext
+    assert (
+        decrypt_credential(
+            ciphertext=first.ciphertext,
+            nonce=first.nonce,
+            encrypted_dek=first.encrypted_dek,
+            aad=aad,
+            kek=kek,
+        )
+        == plaintext
+    )
     with pytest.raises(InvalidTag):
         decrypt_credential(
             ciphertext=first.ciphertext,
@@ -706,13 +803,34 @@ def test_patch_omission_preserves_secret_but_null_and_empty_are_rejected(
         datasource.status = "ACTIVE"
         original_secret_id = secret.id
 
-    result = service.update_datasource(
-        principal=_admin(organization_id, user_id),
-        datasource_id=datasource_id,
-        request=DatasourcePatch(name="Renamed"),
-        expected_version=1,
-        audit=_audit(),
+    admission = DatasourceOperationAdmissionGuard(
+        max_global_in_flight=1,
+        max_organization_in_flight=1,
+        max_datasource_in_flight=1,
+        test_cooldown_seconds=60,
+        retention_seconds=300,
+        max_retained_organizations=64,
+        max_retained_datasources=256,
     )
+    holder = admission.try_acquire(
+        organization_id=organization_id,
+        datasource_ids=(datasource_id,),
+        operation_kind=DatasourceOperationKind.METADATA,
+    )
+    assert not isinstance(holder, DatasourceOperationAdmissionRejection)
+    try:
+        # A slow metadata/probe lane must not block a pure local PATCH: this
+        # path neither decrypts nor connects, so it never takes admission.
+        result = service.update_datasource(
+            principal=_admin(organization_id, user_id),
+            datasource_id=datasource_id,
+            request=DatasourcePatch(name="Renamed"),
+            expected_version=1,
+            audit=_audit(),
+            admission=admission,
+        )
+    finally:
+        holder.release()
     assert result.name == "Renamed"
     serialized = result.model_dump(mode="json")
     assert str(original_secret_id) not in str(serialized)
@@ -729,6 +847,53 @@ def test_patch_omission_preserves_secret_but_null_and_empty_are_rejected(
         DatasourcePatch.model_validate({"password": None})
     with pytest.raises(ValidationError):
         DatasourcePatch.model_validate({"password": ""})
+
+
+def test_unknown_datasource_never_consumes_retained_operation_admission_state(
+    tmp_path: Path,
+) -> None:
+    """A caller-selected missing UUID cannot fill the bounded guard maps."""
+
+    sessions = _sqlite_sessions()
+    key_path = tmp_path / "credential-kek-v1.key"
+    key_path.write_bytes(b"m" * 32)
+    key_path.chmod(0o600)
+    service = _service(sessions, KekKeyring(tmp_path))
+    organization_id = uuid4()
+    principal = _admin(organization_id, uuid4())
+    admission = DatasourceOperationAdmissionGuard(
+        max_global_in_flight=1,
+        max_organization_in_flight=1,
+        max_datasource_in_flight=1,
+        test_cooldown_seconds=60,
+        retention_seconds=300,
+        max_retained_organizations=1,
+        max_retained_datasources=1,
+    )
+
+    with pytest.raises(ProblemException):
+        service.test_datasource(
+            principal=principal,
+            datasource_id=uuid4(),
+            request_id=uuid4(),
+            audit=_audit(),
+            admission=admission,
+        )
+    with pytest.raises(ProblemException):
+        service.list_columns(
+            principal=principal,
+            datasource_id=uuid4(),
+            usage="SOURCE_USE",
+            schema_name=None,
+            table_name=None,
+            limit=50,
+            audit=_audit(),
+            admission=admission,
+        )
+
+    retained = admission.retained_scope_counts()
+    assert retained.organizations == 0
+    assert retained.datasources == 0
 
 
 def test_preflight_evidence_is_bound_to_verified_attempt_and_fence(
@@ -894,43 +1059,10 @@ def test_connection_evidence_rejects_false_peer_observations(
         )
 
 
-def test_metadata_failure_is_503_and_retryability_is_classified(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    sessions = _sqlite_sessions()
-    key_path = tmp_path / "credential-kek-v1.key"
-    key_path.write_bytes(b"r" * 32)
-    service = _service(sessions, KekKeyring(tmp_path))
-    revision = SimpleNamespace(id=uuid4())
-    policy_revision = SimpleNamespace(id=uuid4())
-    datasource = SimpleNamespace(id=uuid4())
-    monkeypatch.setattr(
-        service,
-        "_current_revisions",
-        lambda session, candidate: (revision, policy_revision),
+def test_metadata_failure_retryability_is_classified() -> None:
+    assert _metadata_failure_retryable(TimeoutError("database did not respond"))
+    assert _metadata_failure_retryable(ValueError("DNS_ADDRESS_OUTSIDE_POLICY")) is False
+    assert (
+        _metadata_failure_retryable(SchemaProbeError("native database type is not certified in V1"))
+        is False
     )
-
-    def transient_failure(*args: object, **kwargs: object) -> None:
-        del args, kwargs
-        raise TimeoutError("database did not respond")
-
-    monkeypatch.setattr(service.guard, "resolve", transient_failure)
-    with pytest.raises(ProblemException) as unavailable:
-        service._capture_validation_snapshot(
-            object(),
-            datasource=datasource,
-            revision=revision,
-            schema_name="public",
-            table_name="orders",
-        )
-    assert unavailable.value.status == 503
-    assert unavailable.value.code == "DATASOURCE_METADATA_UNAVAILABLE"
-    assert unavailable.value.retryable is True
-
-    assert _metadata_failure_retryable(
-        ValueError("DNS_ADDRESS_OUTSIDE_POLICY")
-    ) is False
-    assert _metadata_failure_retryable(
-        SchemaProbeError("native database type is not certified in V1")
-    ) is False

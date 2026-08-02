@@ -2,7 +2,11 @@
 import { ElMessage, ElMessageBox } from "element-plus";
 import { computed, onMounted, reactive, ref, watch } from "vue";
 
-import { newIdempotencyKey } from "../api/client";
+import {
+  isApiError,
+  newIdempotencyKey,
+  requiresManualDatasourceOperationRetry,
+} from "../api/client";
 import {
   createDatasource,
   deleteDatasource,
@@ -103,6 +107,11 @@ const editForm = reactive({
 
 const activePolicies = computed(() =>
   policies.value.filter((policy) => policy.status === "ACTIVE"),
+);
+const metadataRequiresExplicitRetry = computed(
+  () =>
+    isApiError(metadataError.value) &&
+    requiresManualDatasourceOperationRetry(metadataError.value.problem),
 );
 const createPolicies = computed(() =>
   activePolicies.value.filter((policy) => policy.current_revision.engine === form.engine),
@@ -997,6 +1006,16 @@ watch(
         </el-radio-group>
       </div>
       <ProblemPanel v-if="metadataError" :error="metadataError" @retry="retryMetadata" />
+      <div v-if="metadataError && metadataRequiresExplicitRetry" class="page-actions">
+        <el-button
+          type="primary"
+          plain
+          :disabled="metadataLoading || metadataLoadingMore || metadataLoadingAll"
+          @click="retryMetadata"
+        >
+          重新读取元数据
+        </el-button>
+      </div>
       <el-skeleton v-if="metadataLoading" :rows="8" animated />
       <el-collapse v-else-if="tables.length">
         <el-collapse-item

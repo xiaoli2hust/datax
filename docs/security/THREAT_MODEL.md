@@ -104,7 +104,24 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
 | TM-24 | 出口租约伪造、未授权创建、重放或守卫死亡后残留 | 客户端自报 lease ID、token 被记录/重放；普通调用者复用 API/Worker 共享 netns 对 `POST /v1/leases` 申请 ACTIVE 策略内任意 IP+port；API/Worker 不在守卫 netns；守卫死亡后旧 allow 无限存活，或 nft 原子替换的无语义 runtime metadata 触发错误漂移 | lease ID 与 32-byte bearer 均由守卫生成；`POST /v1/leases` 必须恰好携带 Launcher 由 32 个 OS CSPRNG 原始字节生成的 64 字符小写十六进制 Docker-secret 能力，guard 在 body/策略/controller/nftables 前用常量时间比较；能力只挂载给 guard/API/Worker，缺失/重复/错误统一 `401 LEASE_CREATION_AUTH_INVALID` 且不得记录/回显/传给 Job 或 DataX 环境。它阻断不能读 secret 的普通同 netns 调用者，不是同 UID Worker/DataX RCE sandbox。token 仅首次响应且内存只存域分离摘要；create/renew 重读 ACTIVE view；逻辑 30 秒、5 秒续租、nft 元素最多 15 秒；ruleset hash 只排除内核重新分配的 `handle` 与 `expires` 倒计时，仍绑定 timeout、地址、端口、表达式、hook 和 policy；真实规则漂移锁存 base-deny；Launcher 实测三容器 netns 相等 | 缺失/错误/重复能力头在 body/策略读取前统一 401；secret mount target、响应/日志/Job/DataX 环境泄漏负例；普通 netns 调用者不得创建租约；有效 API/Worker 正例；错误 token、token 日志扫描、netns 不等、guard kill 15 秒、DB 失败、nft `handle`/expires 变化不误降级、timeout/规则变化和撤策故障注入；同 UID RCE 只记录为残余风险，不能宣称被此控制消除 |
 
 | TM-26 | 资格自举、签名替代或发布哈希循环 | 将测试注入/环境变量/自申报 JSON 作为生产资格；让 QH 进入普通包；让 QR 回写 Worker 镜像，或让 QR 与 Setup/manifest 互相绑定后仍宣称同一候选 | ADR-0011 固定 P → 受保护 QH → 独立 QR → 精确 F Phase B → hosted final root 的单向链。HQA 只能签短期 QH，RQA 才能签 QR；固定 keyring 不接受 envelope 公钥；标准 Compose 拒绝 QH；QR 为 detached 资源且不绑定包含自身的 F；普通 reader 对签名、purpose、有效期和 P/commit/image/runtime/JAR/依赖/许可证逐项失败关闭；公开发布还须 ADR-0010 provenance | QH/QR 篡改、未知 key/purpose、过期、nonce 重放、所有 payload 错配、标准 Compose 注入、资源替换、自引用、同版本不同候选、self-hosted provenance 混淆和真实 Phase A/B 证据；当前全部 BLOCKED |
-| TM-27 | 数据源外部操作持锁造成控制面 DoS 与陈旧结果 | 获授权用户让允许端点缓慢响应，或高并发执行 datasource create/update probe、test、metadata、job validation；外部 DNS/JDBC/schema I/O 持有 Organization/Project/Datasource/Job 锁，阻塞取消、凭据 revoke、目标独占撤回；I/O 后变更 revision/secret/grant/policy 时旧结果又可能覆盖/泄露 | **要求，当前未实现：** ADR-0014 的五入口 A/B/C 边界。A 只短事务授权并绑定 immutable datasource/policy/secret/envelope/grant/job/transfer snapshot；B 无产品 DB 锁做 resolve/egress/strict-current credential barrier/connector，且有总 deadline；C 重新授权并比较全部安全 binding，漂移统一 409 stale、无旧 metadata/evidence/audit/last-test 副作用。认证后、A 前的单 API 进程非阻塞 admission 限制全局/组织/datasource 在途和 TEST 间隔，429 在外部 I/O/audit 前返回。当前 `ASR-013=OPEN`，不得声称连接测试已限速 | 关闭前：五入口 source/contract 回归；revision/secret/envelope/grant/policy/job/scope/namespace 漂移负例；429 无 connector/DNS/decrypt/audit；真实 PostgreSQL `pg_locks`/时间界限证明阻塞 connector 不持有 Organization lock，并发 cancel/revoke/update 成功；真实 MySQL/PostgreSQL E3 deadline、DNS/egress、分页和恢复 |
+| TM-27 | 数据源外部操作持锁造成控制面 DoS 与陈旧结果 | 获授权用户让允许端点缓慢响应，或高并发执行 datasource create/update probe、test、metadata、job validation；外部 DNS/JDBC/schema I/O 若持有 Organization/Project/Datasource/Job 锁，会阻塞取消、凭据 revoke、目标独占撤回；I/O 后变更 revision/secret/grant/policy 时旧结果又可能覆盖/泄露 | **候选源码/E1 与局部 PostgreSQL E2 已实施，未关闭：** ADR-0014 五入口 A/B/C。A 只短事务授权并绑定 immutable datasource/policy/secret/envelope/grant/job/transfer/namespace/runtime/AuthSession snapshot；已有凭据的 B 先以极短 barrier 锁定、复制、提交，随后无产品 DB 锁做 resolve/egress/解密/connector（创建使用候选请求凭据），受总 deadline；C 重新授权并比较全部 security binding，漂移统一 409 stale、无旧 metadata/evidence/audit/last-test 副作用。PUBLISHED/ARCHIVED Job 在外部 I/O 前拒绝。已有 datasource/job 仅在 A 验证后才进入单 API 进程非阻塞 admission（global=4、organization/datasource=1、TEST 60 秒），未知 UUID 不得污染 retained state；429 在外部 I/O/audit 前返回，deadline 503 不持久化 B 结果。隔离 PostgreSQL E2 已证明阻塞 B probe 不持有同一 Organization 行锁；完整并发矩阵与真实 E3 未验证，`ASR-013=IN_PROGRESS`，不得声称连接测试限速已关闭 | 关闭前：五入口 source/contract 回归；AuthSession/revision/secret/envelope/grant/policy/job/project/scope/namespace/runtime 漂移负例；429 无 connector/DNS/decrypt/audit；真实 PostgreSQL `pg_locks`/时间界限证明阻塞 connector 不持有 Organization lock，并发 cancel/revoke/update 成功；真实 MySQL/PostgreSQL E3 deadline、DNS/egress、分页和恢复 |
+
+**TM-27 范围与审查补充。** 表中“五个入口”只指 Credential Service 的五个直接外部操作；
+`POST /projects/{project_id}/transfer-policies` 与会重算范围的
+`PATCH /transfer-policies/{transfer_policy_id}` 是同一 metadata lane 的双数据源复合调用。它们在
+A 阶段释放产品数据库 Session 后，必须原子取得 source/target 两个 permit；两个嵌套
+`list_columns` 复用同一 live lease 和同一 `OperationDeadline`。因此外层 `429` 发生在任一
+DNS、connector、解密、metadata evidence 或 audit 之前，不能先完成源端 probe 再因目标端限流。
+
+`0019` 已让 `DatasourceUsageGrant` 在 revoke/regrant 时递增代际；A/C 还检查 Organization、调用者
+User 与 Project 的状态/row version。已完成的模板化路由幂等 replay 同时核验 durable resource 与
+保存 response，跨 Project/Job/Execution 的同 key 重放必须 409。所有 egress attestation 错误保留
+503 平台 code，deadline 优先于晚到错误。C 阶段会在关键数据库步骤前按剩余预算刷新 PostgreSQL
+transaction-local `lock_timeout`/`statement_timeout`，并在提交前执行 `configure → flush → check`，使
+已到期的 validation/evidence/audit 写入回滚。MySQL TCP 后握手、每条 catalog SQL 和 cleanup 也会按
+剩余预算重新夹紧；但 PostgreSQL 的设置仍按单条语句计时，终端检查到 COMMIT 存在极小窗口，且同步
+psycopg 网络黑洞的 read/fetch/rollback/close 没有已验证的强制中断。因此 30 秒配置不是端到端硬返回
+保证，`ASR-013` 仍为发布阻塞。
 
 **TM-12/TM-23 Windows 容量补充控制。** `%LOCALAPPDATA%` 的 40 GiB 水位只保护
 Launcher 自身文件，不能证明 Docker Desktop VHD 或 named volume 余量。当前 `start` 与

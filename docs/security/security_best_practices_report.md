@@ -5,7 +5,7 @@
 | 审查日期 | 2026-08-02 |
 | 审查范围 | Windows Launcher/Setup、Compose/egress-guard、API 登录准入与审计 readiness、数据源外部操作、Worker 租约客户端、GitHub Windows 签名链，以及其权威契约与验收追踪 |
 | 方法 | 从攻击者可控制的环境变量、同 netns 调用、同名容器、安装器参数、Runner 工具路径和工作区污染出发；每项都要求失败关闭或明确外部阻塞 |
-| 当前结论 | 已有源码修复仍只到 E1/E2；本轮补齐登录入口与审计 readiness 的资源边界，并确认数据源外部操作持锁/无准入（ASR-013，仍 `OPEN`）、安装路径重解析、Compose 项目归属和 GitHub 发布治理缺口。Windows 实机、真实签名和发布仍 `BLOCKED` |
+| 当前结论 | 已有源码修复仍只到 E1/E2；本轮完成数据源外部操作 ASR-013 的候选 A/B/C、准入、deadline、会话/状态陈旧结果防护，并保留真实 PostgreSQL/E3 验证为未关闭门禁。Windows 实机、真实签名和发布仍 `BLOCKED` |
 
 ## 证据等级
 
@@ -54,9 +54,9 @@
 
 发现：新 secret 已加入运行面，但既有 Worker secret-closure 测试和两个 Worker settings fixture 最初没有同步。完整后端回归立即暴露该漂移。
 
-修复：将能力 secret 纳入 exact Compose closure、Worker settings fixture、备份固定 secret 集合、威胁模型、部署/架构契约和机器验收 catalog；新增 `SEC-EGRESS-LEASE-001`，后续对抗式审查又把安装器、Compose、WSL、磁盘、本机登录准入、审计 readiness 和数据源外部操作边界测试纳入 catalog，当前为 81 个需求、106 个 requirement/test 对。
+修复：将能力 secret 纳入 exact Compose closure、Worker settings fixture、备份固定 secret 集合、威胁模型、部署/架构契约和机器验收 catalog；新增 `SEC-EGRESS-LEASE-001`，后续对抗式审查又把安装器、Compose、WSL、磁盘、本机登录准入、审计 readiness 和数据源外部操作边界测试纳入 catalog，当前为 81 个需求、107 个 requirement/test 对。
 
-验证：本轮 67 个 acceptance 回归已通过；requirements catalog canonical check 已重算，catalog SHA-256 为 `07d6b3fe09cae64c065de5d733569f347e00abc7c701512fbd03815aa2074985`。完整回归结果记录于本报告末尾；仍只代表 E1/E2。
+验证：本轮 68 个 acceptance 回归已通过；requirements catalog canonical check 已重算，catalog SHA-256 为 `e797409612c4c352a88d76167adfe4f3303ab09ec4924ecec1c24b1090220af4`。完整回归结果记录于本报告末尾；仍只代表 E1/E2。
 
 ### ASR-006 — High — Environment 保护检查发生在 signing job 已引用名称之后
 
@@ -179,8 +179,8 @@ watermark 和索引 tail；完整重放最多每 60 秒、单次 30 秒，suffix
 nonblocking singleflight 不让并发 health 请求排队。
 
 验证：SQLite migration/readiness 回归覆盖 PENDING 首次重放、常规路径不读取 `event_json`、篡改、
-state 缺失、CAS 竞争、concurrent check 与 timeout 后 cadence 限制；临时真实 PostgreSQL E2 已
-验证 `0018→0017→head` 迁移回退/重升，以及隔离 schema 的 pending watermark replay 和
+state 缺失、CAS 竞争、concurrent check 与 timeout 后 cadence 限制；2026-08-02 临时真实 PostgreSQL E2 已
+验证当前 `0019→0017→head` 迁移回退/重升，以及隔离 schema 的 pending watermark replay 和
 transaction-local statement-timeout 设置。它不启动产品 API/Worker health loop，也不做负载 timeout，
 故真实 health poll、压力行为与 Windows E4 仍需单独证据。
 
@@ -189,32 +189,59 @@ transaction-local statement-timeout 设置。它不启动产品 API/Worker healt
 
 ## 开放发现
 
-### ASR-013 — High — 数据源外部探测持有组织锁，且没有独立准入
+### ASR-013 — High — 数据源外部探测可造成控制面 DoS 或提交陈旧结果
 
-**状态：OPEN，未修复。**
+**状态：IN_PROGRESS / 发布 BLOCKED；`FIXED_IN_SOURCE`（E1），局部 PostgreSQL E2 不等于真实
+PostgreSQL/MySQL/DataX E3，且同步 psycopg 网络黑洞尚未证明 30 秒内可强制返回。**
 
 攻击路径：获授权的 Admin 可反复触发数据源创建/更新的连接 probe 或显式连接测试；拥有精确
-`SOURCE_USE`/`TARGET_USE` grant 的 Developer 也可读取 metadata。当前这五个入口——
+`SOURCE_USE`/`TARGET_USE` grant 的 Developer 也可读取 metadata。若五个入口——
 `create_datasource()`、`update_datasource()` 的 `requires_probe`、`test_datasource()`、
-`list_columns()`（Schema tables）和 `collect_job_validation_material()` 经
-`_capture_validation_snapshot()`——在产品数据库事务和 Organization/Project/Datasource/Job
-等锁仍持有时做 DNS、egress、密码解密、JDBC/数据库连接和 Schema 读取。慢的允许端点或最多
-200 张表的探测可使同一 Organization 的取消、凭据 revoke、目标外部独占撤回和其他控制写入
-排队；当前没有针对这一面向的连接测试/metadata admission。
+`list_columns()`（Schema tables）和 `validate_job()` 的两端 Schema 读取——把 DNS、egress、密码
+解密、JDBC/数据库连接和 Schema 读取留在 Organization/Project/Datasource/Job 锁内，慢的允许
+端点可使取消、凭据 revoke、目标独占撤回和其他控制写入排队。B 阶段期间再撤销 session、修改
+数据源/策略/凭据/授权/任务或目标命名空间，则旧结果还可能泄露或回写到不同的安全事实。
 
-已接受的修复：ADR-0014 要求所有五个入口采用 A（短事务授权和不可变绑定 snapshot）→ B
-（无产品 DB 锁的 DNS/egress/strict current-credential barrier/connector，受总 deadline）→ C
-（短事务重新授权与完整 binding 复核）三阶段。revision、policy、current secret/envelope、
-成员/UsageGrant、Job spec、TransferPolicy scope 或 TargetNamespace 在 B 期间变化时，C 必须
-返回 409 stale，不能泄露旧 metadata、写 evidence/audit 或覆盖新状态。单 API 进程内的非阻塞
-admission 必须在认证后、A 前限制全局/组织/datasource 在途操作，并让拒绝在任何 resolver、
-connector、解密或 audit 前以 429 返回。
+修复：`credentials/operation_boundary.py` 提供不可变 operation snapshot 与单调总 deadline；
+`credentials/ingress.py` 提供单 API 进程内、非阻塞的 global=4、organization/datasource=1 和
+TEST 60 秒 admission。五个入口均采用 A（短事务重新授权并冻结 AuthSession、数据源、凭据、
+grant、Organization/调用者 User/Project 代际、Job/TransferPolicy/TargetNamespace/runtime binding）→ B（已有凭据先在极短 current-credential
+barrier 中锁定、复制并提交；随后无产品数据库事务/锁的 DNS/egress、解密、connector；创建使用候选
+请求凭据）→ C（短事务重新授权并逐项复核）边界。已有 datasource 先通过 A 身份/授权验证才进入
+retained admission bucket，纯描述性/DISABLED PATCH 不取 permit；已完成创建 replay 是无外部 I/O 的
+只读返回。429 在 resolver/connector/解密/audit/幂等写入之前返回，deadline 到期后仅在 C 复核仍有效时返回
+`503 DATASOURCE_OPERATION_DEADLINE_EXCEEDED`，不持久化 B 结果。PUBLISHED/ARCHIVED Job 在
+外部 I/O 前拒绝；校验 material 只在 C 事务原子写入当前 Job validation state/evidence/audit，
+不创建或修改 `JobVersion`。`0019` 令 UsageGrant 的 revoke/regrant 单调换代；模板化路由的
+idempotency replay 同时对 durable resource 与保存 response 重绑定，跨 User、Datasource secret、
+Project/Job/Execution 重放返回 409。egress attestation 故障保留稳定 503 平台 code，只有明确可用性集合可人工重试，且在
+共享预算已耗尽时 deadline 结果优先。
 
-尚未验证：没有相应源码、OpenAPI 409/429 契约、admission、总 deadline 或回归。关闭前必须
-在真实 PostgreSQL 用可控阻塞 connector 证明外部调用期间没有 Organization lock，且并发
-取消、目标独占撤回、secret revoke、datasource/job/policy 更新可完成；解锁后旧请求必须 stale
-且没有陈旧副作用。随后仍需真 MySQL/PostgreSQL E3 与 Windows 运行证据。不能用 API 空闲
-事务 timeout、SQLite、mock 或“登录已限速”代替该修复。
+**本次对抗审查修订。** 上文“五个入口”仅指五个 Credential Service 直接入口；创建
+TransferPolicy 及会重算 scope 的 PATCH 是同一 metadata lane 的双数据源复合调用。它们在 A 阶段
+释放产品数据库 Session 后原子取得 source/target permit，两个嵌套 Schema probe 必须复用同一 live
+lease 与同一 `OperationDeadline`；因此外层 `429` 不得先触发任一端 DNS、connector、解密、metadata
+evidence 或 audit。任务校验 C 阶段还会在关键产品数据库步骤前按剩余预算刷新 transaction-local
+`lock_timeout`/`statement_timeout`，并在提交前执行 `configure → flush → check`，以回滚已到期的
+validation/evidence/audit 写入。这是逐语句的数据库侧约束；同步 psycopg 网络黑洞及终端检查到
+COMMIT 的极小窗口仍不能证明端到端硬 30 秒返回，故 `ASR-013` 继续 `IN_PROGRESS/BLOCKED`。
+
+验证：新增 admission、deadline、operation-boundary、Job validation closure 以及 API/契约回归。
+覆盖 permit 释放、429 无 DNS/connector/decrypt/audit、deadline 剩余预算、AuthSession、Organization、
+User、Project 在 B 期间漂移、跨资源 idempotency replay，以及 PUBLISHED/ARCHIVED Job 无外部 I/O。
+MySQL TCP 后握手、每条 catalog SQL 与 cleanup 的预算重夹紧已有 L1 回归。2026-08-02 已运行
+`scripts/test-postgres-e2.sh`：PostgreSQL-only 的受控阻塞 probe 在 B 阶段等待时，第二个会话以
+`FOR UPDATE NOWAIT` 成功取得同一 Organization 行；CI 也已配置 `DATAX_CREDENTIAL_POSTGRES_TEST_URL`
+执行。该局部锁证据是 E2；connector 仍为受控替身，尚未覆盖取消/撤回/revoke/更新全竞态，mock/SQLite
+更不能替代真实 PostgreSQL 或 DataX E3。
+
+尚未验证/关闭条件：在真实 PostgreSQL 用可控阻塞 connector 和 `pg_locks` 或时间界限证明 B
+阶段不持有 Organization lock，且并发取消、目标独占撤回、secret revoke、datasource/job/policy
+更新可完成；解锁后旧请求必须 stale 且没有陈旧副作用。随后仍需固定 Runtime 上真
+MySQL/PostgreSQL E3 deadline、DNS/egress、metadata 分页和恢复证据。特别是 PostgreSQL transport
+blackhole 必须用可验证的 client-side cancel/close 或隔离进程边界证明时限内收敛；`statement_timeout`
+仅约束服务端 SQL，不能强制中断客户端 read/fetch/rollback/close。不能用 API 空闲事务 timeout、
+SQLite、mock 或“登录已限速”代替这些证据。
 
 ## 未关闭的发布阻塞
 
@@ -236,12 +263,10 @@ connector、解密或 audit 前以 429 返回。
 | 检查 | 结果 | 证据等级 |
 |---|---|---|
 | `git diff --check` | 通过 | E1 |
-| guard 单元/HTTP 合约 | 21/21 通过 | E1 |
-| 后端完整测试 | 402 通过、9 跳过 | E1/E2 |
-| acceptance 测试 | 67/67 通过（含 hosted Windows 预检、安装器静默/重解析静态边界和本地 E4 前置观察器负向边界） | E1 |
-| GitHub-hosted Windows 预检 `30724285608` | Windows Server 上的 Launcher 测试/release 构建、固定 NSIS hash、临时 installer 编译与删除均通过；无签名、上传或安装 | E1 |
-| release/Environment/Setup 定向测试 | 20/20 通过 | E1 |
-| Launcher Rust 库测试 | 70/70 通过 | E1 |
+| 后端完整测试 | 464 通过、10 跳过；跳过项均要求未配置的真实 PostgreSQL URL | E1/E2 |
+| acceptance 测试 | 68/68 通过（含 hosted Windows 预检、安装器静默/重解析静态边界和本地 E4 前置观察器负向边界） | E1 |
+| `scripts/test-postgres-e2.sh` | disposable PostgreSQL migrations、角色边界、审计、credential/auth 并发 E2 子集通过 | E2；不是 DataX E3 或 Windows E4 |
+| Launcher Rust 库测试 | 75/75 通过 | E1 |
 | Rust format + Clippy | 通过 | E1 |
 | Ruff | 通过 | E1 |
 | requirements catalog + release YAML parse | 通过 | E1 |

@@ -42,6 +42,13 @@ from datax_studio.core.db import (
 from datax_studio.core.db import (
     TransferPolicyApproval as TransferPolicyApprovalRow,
 )
+from datax_studio.credentials.ingress import (
+    DatasourceOperationAdmissionGuard,
+    DatasourceOperationAdmissionLease,
+    DatasourceOperationAdmissionRejection,
+    DatasourceOperationKind,
+)
+from datax_studio.credentials.operation_boundary import OperationDeadline
 from datax_studio.credentials.schemas import TableSchema, TableSchemaPage
 from datax_studio.governance.schemas import (
     Member,
@@ -67,6 +74,8 @@ _PROJECT_ROLES = (Role.DEVELOPER, Role.OPERATOR, Role.VIEWER)
 
 
 class MetadataProbe(Protocol):
+    def new_operation_deadline(self) -> OperationDeadline: ...
+
     def list_columns(
         self,
         *,
@@ -77,6 +86,9 @@ class MetadataProbe(Protocol):
         table_name: str | None,
         limit: int,
         audit: AuditContext,
+        admission: DatasourceOperationAdmissionGuard | None = None,
+        admission_lease: DatasourceOperationAdmissionLease | None = None,
+        operation_deadline: OperationDeadline | None = None,
     ) -> TableSchemaPage: ...
 
 
@@ -429,6 +441,7 @@ class GovernanceService:
         idempotency_key: str,
         audit: AuditContext,
         metadata_probe: MetadataProbe,
+        admission: DatasourceOperationAdmissionGuard | None = None,
     ) -> OperationResult[TransferPolicyResponse]:
         self._require_admin_principal(principal)
         body = request.model_dump(mode="json")
@@ -458,6 +471,7 @@ class GovernanceService:
             requested_scope=request.requested_scope,
             metadata_probe=metadata_probe,
             audit=audit,
+            admission=admission,
         )
         now = utc_now()
         with self.sessions.begin() as session:
@@ -572,6 +586,7 @@ class GovernanceService:
         expected_version: int,
         audit: AuditContext,
         metadata_probe: MetadataProbe,
+        admission: DatasourceOperationAdmissionGuard | None = None,
     ) -> TransferPolicyResponse:
         self._require_admin_principal(principal)
         fields = set(request.model_fields_set)
@@ -584,6 +599,8 @@ class GovernanceService:
         material: _ScopeMaterial | None = None
         requested_source_revision_id: UUID | None = None
         requested_target_revision_id: UUID | None = None
+        probe_context: _RevisionContext | None = None
+        probe_requested_scope: TransferPolicyScopeInput | None = None
         with self.sessions() as session:
             self._require_current_admin(session, principal)
             policy, project = self._visible_policy(
@@ -638,13 +655,24 @@ class GovernanceService:
                     )
                     if requested_scope is None:
                         raise RuntimeError("requested scope unexpectedly missing")
-                    material = self._probe_and_normalize_scope(
-                        principal=principal,
-                        context=context,
-                        requested_scope=requested_scope,
-                        metadata_probe=metadata_probe,
-                        audit=audit,
-                    )
+                    probe_context = context
+                    probe_requested_scope = requested_scope
+
+        # Phase A's Session may have begun a read transaction while it looked
+        # up the current policy and revisions.  It must be closed before the
+        # two real metadata probes, just as the create route closes its A
+        # session before entering B.
+        if probe_context is not None:
+            if probe_requested_scope is None:
+                raise RuntimeError("requested scope unexpectedly missing")
+            material = self._probe_and_normalize_scope(
+                principal=principal,
+                context=probe_context,
+                requested_scope=probe_requested_scope,
+                metadata_probe=metadata_probe,
+                audit=audit,
+                admission=admission,
+            )
 
         now = utc_now()
         with self.sessions.begin() as session:
@@ -1243,6 +1271,39 @@ class GovernanceService:
             target_revision=target_revision,
         )
 
+    @staticmethod
+    def _acquire_transfer_policy_metadata_admission(
+        *,
+        admission: DatasourceOperationAdmissionGuard | None,
+        organization_id: UUID,
+        datasource_ids: tuple[UUID, UUID],
+    ) -> DatasourceOperationAdmissionLease | None:
+        """Atomically reserve both scope-probe endpoints before either probe.
+
+        Transfer-policy creation and scope-changing PATCH are composite
+        metadata operations.  Acquiring each side independently would permit a
+        source probe and its audit to run before the target later receives a
+        429, violating the outer endpoint's no-I/O admission contract.
+        """
+
+        if admission is None:
+            return None
+        result = admission.try_acquire(
+            organization_id=organization_id,
+            datasource_ids=datasource_ids,
+            operation_kind=DatasourceOperationKind.METADATA,
+        )
+        if isinstance(result, DatasourceOperationAdmissionRejection):
+            raise ProblemException(
+                status=429,
+                code="DATASOURCE_OPERATION_ADMISSION_LIMITED",
+                title="数据源外部操作暂时受限",
+                detail="请等待后手动重新提交；系统没有执行本次外部连接。",
+                retryable=True,
+                headers={"Retry-After": str(result.retry_after_seconds)},
+            )
+        return result
+
     # ------------------------------------------------------------------
     # Metadata normalization and policy hashing
     # ------------------------------------------------------------------
@@ -1254,6 +1315,7 @@ class GovernanceService:
         requested_scope: TransferPolicyScopeInput,
         metadata_probe: MetadataProbe,
         audit: AuditContext,
+        admission: DatasourceOperationAdmissionGuard | None,
     ) -> _ScopeMaterial:
         self._validate_requested_side_before_probe(
             requested_scope.source,
@@ -1265,7 +1327,17 @@ class GovernanceService:
             context.target_revision,
             field="target",
         )
+        lease = self._acquire_transfer_policy_metadata_admission(
+            admission=admission,
+            organization_id=principal.organization_id,
+            datasource_ids=(context.source_datasource.id, context.target_datasource.id),
+        )
         try:
+            # Scope capture is one composite external operation, even though
+            # it reads two endpoints.  Reuse the one fixed deadline for both
+            # reads so the target cannot receive a fresh full budget after a
+            # slow source probe.
+            deadline = metadata_probe.new_operation_deadline()
             source_page = metadata_probe.list_columns(
                 principal=principal,
                 datasource_id=context.source_datasource.id,
@@ -1278,6 +1350,9 @@ class GovernanceService:
                 table_name=requested_scope.source.table,
                 limit=2,
                 audit=audit,
+                admission=admission,
+                admission_lease=lease,
+                operation_deadline=deadline,
             )
             target_page = metadata_probe.list_columns(
                 principal=principal,
@@ -1291,7 +1366,16 @@ class GovernanceService:
                 table_name=requested_scope.target.table,
                 limit=2,
                 audit=audit,
+                admission=admission,
+                admission_lease=lease,
+                operation_deadline=deadline,
             )
+        except ProblemException:
+            # list_columns already distinguishes stale authorization, admission,
+            # deadline and egress platform failures.  Collapsing them here
+            # would let a transfer-policy caller observe a different contract
+            # from the same external metadata lane.
+            raise
         except Exception as exc:
             raise ProblemException(
                 status=503,
@@ -1300,6 +1384,9 @@ class GovernanceService:
                 detail="真实数据库元数据当前不可用；未创建或修改策略。",
                 retryable=True,
             ) from exc
+        finally:
+            if lease is not None:
+                lease.release()
         source_table = self._single_table(source_page, field="source")
         target_table = self._single_table(target_page, field="target")
         if hmac.compare_digest(

@@ -133,6 +133,49 @@ API 容器和一个 Uvicorn 进程；默认控制为 burst `5`、每分钟 `5` �
 该进程内控制仅适用于 V1 的单 API 部署，不能用 Uvicorn workers、Compose scale、额外 API
 容器或旁路入口扩大部署；多进程/HA 需要新的 Accepted ADR、共享准入与重放租约设计。
 
+### 3.5 数据源外部操作的 A/B/C 与准入
+
+五个直接的已认证 Credential Service 入口属于同一数据源外部操作面：创建数据源、带探针的
+数据源更新、连接测试、Schema/表列读取，以及任务草稿校验中的两端 Schema 采集。创建传输策略
+及会重算 source/target/requested_scope 的传输策略 PATCH 会委托两端 Schema 探测，因此也必须遵循
+[ADR-0014](./adr/0014-数据源外部操作短事务与准入边界.md) 的 A/B/C 契约：
+
+- **A**：在短产品数据库事务中重新授权并冻结非秘密、安全相关快照；不得 DNS、解密、连接或读取外部数据库。
+- **B**：已有凭据先在新的极短事务内做严格 current-credential barrier（锁定、复制、提交），随后
+  在无产品数据库锁的条件下执行 DNS/egress、解密和 connector；创建使用冻结的候选请求凭据。每次
+  操作受总 deadline 约束；需要两端 Schema 的任务校验和传输策略 scope probe 必须共享同一 deadline。
+- **C**：在新的短事务中重新授权并逐项复核快照。Organization 和调用者 User 的状态/row version、
+  当前 `AuthSession`、项目/Job 状态或 row version、数据源/修订、EndpointPolicy、secret/envelope、
+  UsageGrant、cursor scope、
+  TargetNamespace、Job 草稿、TransferPolicy 或运行时证明漂移时，必须拒绝旧结果。任务校验
+  只能在该 C 事务已复核后原子写入当前 `SyncJob.validation_report/status`、connection evidence
+  和审计；它不会创建或修改 `JobVersion`。
+
+创建在 completed-idempotency replay 读取后、候选外部工作前取得本 API 进程内 permit；已有
+datasource 的 test、metadata、带 probe 的 PATCH、任务校验和传输策略 scope probe 先完成只读 A 身份/授权验证、释放锁，
+再取得全局、organization 与真实 datasource 在途 permit。纯描述性或 DISABLED-only PATCH 不取
+permit，未知/无权 datasource UUID 也不能进入保留桶；同 organization/datasource 最多一个外部操作，
+任务校验和传输策略 scope probe 必须按稳定顺序原子取得 source 与 target 两个 datasource permit。未获 permit 固定返回
+`429 DATASOURCE_OPERATION_ADMISSION_LIMITED`，带固定 `Retry-After: 60`、`X-Request-Id` 与
+`Cache-Control: no-store`，且不得执行 resolver/connector/解密、写审计或幂等状态；已完成创建
+幂等 replay 是无外部 I/O 的只读返回，可以绕过 admission。
+
+B 阶段结束后的任一安全绑定漂移固定返回 `409 DATASOURCE_OPERATION_STALE`，
+`retryable=true`，并带 `X-Request-Id` 与 `Cache-Control: no-store`；不得返回旧 Schema、
+写旧 connection evidence、覆盖 `last_test_*` 或接受陈旧 validation material。两个响应的
+`retryable` 都只允许用户等待或刷新相关事实后**从原始操作显式手动重试**；前端和 API client
+不得自动重放。总 deadline 到期且 C 复核仍有效时固定返回
+`503 DATASOURCE_OPERATION_DEADLINE_EXCEEDED`（`retryable=true`、`X-Request-Id`、
+`Cache-Control: no-store`），不返回或持久化 B 阶段旧结果。全部 egress attestation 错误保留稳定
+平台 code 并返回 503；仅明确的 guard/lease 可用性错误可人工重试，且在预算已耗尽时 deadline
+结果优先。Windows 发布配置把总 deadline 固定为 30 秒；Settings 仅允许 5–120 秒的受限值。
+这是外部操作返回后的结果规则，不是同步 PostgreSQL 网络黑洞下可验证的 30 秒强制返回承诺；该
+transport 缺口仍是 `ASR-013` 发布阻塞。
+
+五个直接入口及传输策略双端 scope probe 的候选源码、OpenAPI 和 E1 回归现已覆盖上述路径；隔离
+PostgreSQL 已有受控阻塞 probe + `FOR UPDATE NOWAIT` 的单个 E2 不持锁场景，但完整的取消/撤回/
+revoke/更新并发矩阵和真 MySQL/PostgreSQL E3 仍未取证，`ASR-013` 保持 `IN_PROGRESS`，不能把本节当作漏洞关闭声明。
+
 ## 4. RBAC
 
 一个用户可拥有多个角色，权限取并集。组织级 Admin 可访问组织内全部项目；其他角色必须在项目作用域内授予。
@@ -188,17 +231,23 @@ GET /api/v1/projects/{project_id}/executions?state=FAILED&limit=50&cursor=<opaqu
 
 以下操作强制携带 8..128 字符的 `Idempotency-Key`：
 
-- 创建 Project、Datasource、SyncJob；
-- 创建 User、解锁用户、重置用户密码；
-- 发布 JobVersion；
-- 创建 Execution 或恢复后再次执行（机器路径保留 `rerun`）；
-- 请求取消 Execution。
+- 创建 User、Project、EndpointPolicy、Datasource、TransferPolicy、SyncJob；
+- 解锁用户、重置用户密码；
+- 变更 CredentialSecret 状态、提交或审批 TransferPolicy、发布 JobVersion；
+- 创建 Execution、请求取消或撤回目标独占声明、提交 recovery/remediation、恢复后再次执行（机器路径保留 `rerun`）。
 
 同一用户、路由作用域和 key 在 24 小时内：
 
 - 请求体哈希相同：返回首次状态码和响应，带 `Idempotency-Replayed: true`。
 - 请求体哈希不同：返回 `409 IDEMPOTENCY_CONFLICT`。
 - 请求仍处理中：返回 `409 IDEMPOTENCY_IN_PROGRESS`，可按 `Retry-After` 重试。
+
+若模板化路由的 scope 未包含所有路径资源，服务端还必须从持久化资源和已保存响应中复核本次
+请求的具体目标：User 解锁/重置密码必须仍属于请求 User；CredentialSecret 状态变更必须仍属于
+请求 datasource 与 secret version；创建 Job/Datasource 必须仍属于请求 Project，发布必须仍属于请求
+Job，取消、目标独占撤回和 recovery/remediation 必须精确属于请求 Execution，rerun 必须精确指向
+请求的原 Execution。任一 resource/response 不一致都返回 `409 IDEMPOTENCY_CONFLICT`；不得把另一
+资源的历史 2xx 响应当作合法 replay。
 
 PostgreSQL 在读取或创建幂等记录前，必须对 `actor_id + scope + key` 的域分离摘要取得
 事务级 advisory try-lock；未取得时立即返回稳定的 `IDEMPOTENCY_IN_PROGRESS`，不得等待
@@ -250,6 +299,7 @@ GET 单个 Project、Datasource、SyncJob 时返回 `ETag: W/"<row_version>"`。
 | 400 | `IDEMPOTENCY_KEY_INVALID` | key 格式错误 |
 | 401 | `AUTH_INVALID_CREDENTIALS` | 登录失败，不区分账号是否存在 |
 | 429 | `AUTH_LOGIN_ADMISSION_LIMITED` | 尚未进入认证决策的全局登录入口准入拒绝；固定 `Retry-After: 60`，不创建 session、不验密码、不改失败计数、不写审计，且不设置 Cookie 或 `WWW-Authenticate`；只允许人工等待后重新输入密码提交，不能自动重放 |
+| 429 | `DATASOURCE_OPERATION_ADMISSION_LIMITED` | 已认证的数据源外部操作未获得进程内 global/organization/datasource permit；固定 `Retry-After: 60`、`X-Request-Id` 和 `Cache-Control: no-store`，不发起外部 I/O、不解密、不写审计或幂等状态；等待后只能从原按钮手动重试 |
 | 401 | `AUTH_TOKEN_EXPIRED` | access token 到期 |
 | 403 | `PASSWORD_CHANGE_REQUIRED` | 当前账号必须先修改临时密码 |
 | 403 | `FORBIDDEN` | 已认证但无操作权限 |
@@ -257,6 +307,8 @@ GET 单个 Project、Datasource、SyncJob 时返回 `ETag: W/"<row_version>"`。
 | 409 | `VERSION_CONFLICT` | ETag/row_version 冲突 |
 | 409 | `IDEMPOTENCY_CONFLICT` | 同 key 不同请求 |
 | 409 | `IDEMPOTENCY_IN_PROGRESS` | 同一 actor/scope/key 正在事务内处理；保留 key 并按 `Retry-After` 重试 |
+| 409 | `DATASOURCE_OPERATION_STALE` | 数据源外部 I/O 返回后，AuthSession、项目/Job 状态、datasource/revision/policy/secret/envelope/grant/cursor、TargetNamespace 或 Job/TransferPolicy/runtime 快照已漂移；不返回或持久化旧结果，刷新相关事实后只能手动重新发起原操作 |
+| 409 | `JOB_ARCHIVED` / `JOB_PUBLISHED` | 已归档或已发布 Job 不能启动或接受草稿校验；服务端在任何外部 I/O 前拒绝，用户必须先按 Job 编辑语义生成可校验的新 DRAFT |
 | 409 | `JOB_NOT_PUBLISHED` | 无可执行版本 |
 | 409 | `EXECUTION_NOT_CANCELABLE` | 当前状态不能取消 |
 | 409 | `TARGET_ACTIVE_EXECUTION` | 同一 TargetNamespace 已有 `RESERVED/ACTIVE/RECOVERY_REQUIRED` 锁；不同幂等键请求在 API 事务内拒绝，不创建第二个 QUEUED |
@@ -267,12 +319,14 @@ GET 单个 Project、Datasource、SyncJob 时返回 `ETag: W/"<row_version>"`。
 | 410 | `LOG_EXPIRED` | 日志正文已按策略删除 |
 | 422 | `VALIDATION_ERROR` | 通用请求校验失败 |
 | 422 | `JOB_SPEC_INVALID` | JobSpec 结构或语义错误 |
+| 503 | `DATASOURCE_OPERATION_DEADLINE_EXCEEDED` | 外部数据源操作耗尽总 deadline，且 C 复核仍证明原快照有效；不得返回或写入 B 阶段旧 metadata/evidence/测试或校验结果，只能人工从原操作重试 |
+| 503 | `EGRESS_*` | egress guard/lease/attestation 平台失败保留稳定 code；只有明确可用性子集 `retryable=true`，策略、命名空间或证明不一致仍失败关闭且不可自动重放 |
 | 422 | `SOURCE_QUIESCENCE_CONFIRMATION_REQUIRED` | 未确认源端将从运行前检查开始到独立 oracle 完成始终静默 |
 | 422 | `TARGET_EXCLUSIVITY_CONFIRMATION_REQUIRED` | 未由 Operator/DBA 确认从 Worker 最后空表观察到 oracle 目标一致性读事务完成期间无平台外 DML/DDL |
 | 422 | `TYPE_MAPPING_UNSUPPORTED` | 字段类型不兼容 |
 | 422 | `SOURCE_TARGET_SAME_TABLE` | insert-only 源目标指向同一物理表 |
 | 422 | `SCHEMA_DRIFT_DETECTED` | 运行前 Schema 与版本快照不同 |
-| 502 | `DATASOURCE_CONNECTION_FAILED` | 数据库连接/认证失败 |
+| 503 | `DATASOURCE_METADATA_UNAVAILABLE` | Schema/传输策略范围所需的真实数据库元数据当前不可用；不返回替代 metadata，也不创建或修改策略 |
 | 503 | `RUNTIME_UNAVAILABLE` | Worker/Runtime 未就绪 |
 | 503 | `CAPACITY_ADMISSION_BLOCKED` | 普通新 Execution 未通过容量准入；`details.reason` 仅为 `QUEUE_LIMIT/BACKLOG_LIMIT/DISK_YELLOW/DISK_RED/LOG_BUDGET` |
 | 503 | `SERVICE_UNAVAILABLE` | 关键依赖不可用 |
@@ -376,16 +430,16 @@ Reader/Writer 配对一致性，尚没有受信 reader，也没有带签名、�
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
 | GET | `/projects/{project_id}/datasources` | 项目可读 | 分页列表，永不返回密码 |
-| POST | `/projects/{project_id}/datasources` | Admin | 命中 ACTIVE EndpointPolicy 后创建首个不可变修订并加密密码 |
+| POST | `/projects/{project_id}/datasources` | Admin | 命中 ACTIVE EndpointPolicy 后，以 A/B/C 探针复核成功才创建首个不可变修订并加密密码；准入/陈旧响应不写对象或幂等保留 |
 | GET | `/datasources/{datasource_id}` | 项目可读 | `DatasourceRedactedSummary`；不返回真实 host/port/database/schema/username |
 | GET | `/datasources/{datasource_id}/admin-detail` | Admin | `DatasourceAdminDetail`；可读非秘密连接定位，仍不返回任何 secret |
-| PATCH | `/datasources/{datasource_id}` | Admin | 连接字段变化创建新 DatasourceRevision；密码单独轮换，需 If-Match |
+| PATCH | `/datasources/{datasource_id}` | Admin | 连接字段变化在 A/B/C 探针复核成功后创建新 DatasourceRevision；密码单独轮换，需 If-Match；旧探针结果不得写入已漂移的候选 |
 | DELETE | `/datasources/{datasource_id}` | Admin | 软删除；有活动引用时 409 |
 | GET | `/datasources/{datasource_id}/revisions/{revision_id}` | Admin | 读取真实连接定位字段的不可变修订原始详情 |
 | GET | `/datasources/{datasource_id}/credential-secrets` | Admin | 只读 `ACTIVE/RETIRED/REVOKED/COMPROMISED` 生命周期与 Envelope 摘要 |
 | POST | `/datasources/{datasource_id}/credential-secrets/{version}/status` | Admin | 已先切换为另一枚 current secret 的历史 `ACTIVE→RETIRED/REVOKED/COMPROMISED`，`RETIRED→REVOKED/COMPROMISED`；直接退役 current secret 返回 `CREDENTIAL_STATUS_CONFLICT`。紧急终态同事务禁用 current 数据源并为受影响的已绑定与未领取工作建立持久终止事实；不可重新激活或降级 |
-| POST | `/datasources/{datasource_id}/test` | Admin | 复检 EndpointPolicy、DNS 与出口规则后受限连接测试 |
-| GET | `/datasources/{datasource_id}/schema/tables` | 有 `SOURCE_USE/TARGET_USE` | 游标读取表和列元数据 |
+| POST | `/datasources/{datasource_id}/test` | Admin | A/B/C 复检 EndpointPolicy、DNS 与出口规则后受限连接测试；普通已获准的数据库连通/鉴权失败才以 `200 + status=FAILED` 表达，egress 平台失败必须保留 503 code，陈旧/超时结果不覆盖当前测试事实 |
+| GET | `/datasources/{datasource_id}/schema/tables` | 有 `SOURCE_USE/TARGET_USE` | 游标读取表和列元数据；用途/cursor/grant 漂移时不披露旧页 |
 
 创建请求：
 
@@ -532,7 +586,7 @@ control 子网的独立 netns 之前，执行前 preflight 对任一 `EXACT_FQDN
 | POST | `/projects/{project_id}/jobs` | Admin/Developer | 创建任务和首个草稿 |
 | GET | `/jobs/{job_id}` | 项目可读 | 当前草稿和发布信息 |
 | PATCH | `/jobs/{job_id}` | Admin/Developer | 修改元数据/草稿，需 If-Match，状态回 DRAFT |
-| POST | `/jobs/{job_id}/validate` | Admin/Developer | 校验当前已保存草稿 |
+| POST | `/jobs/{job_id}/validate` | Admin/Developer | 原子取得两端 datasource permit，按 A/B/C 校验当前已保存草稿；陈旧 Schema material 不得被接受，已归档/发布任务在外部 I/O 前拒绝 |
 | POST | `/jobs/{job_id}/preview` | Admin/Developer | 生成不可执行、已脱敏 DataX JSON |
 | GET | `/jobs/{job_id}/versions` | 项目可读 | 不可变版本列表 |
 | POST | `/jobs/{job_id}/versions` | Admin/Developer | 发布当前 VALID 草稿 |
@@ -954,6 +1008,9 @@ Attempt 结束后再 graceful stop。仍有活动工作时默认拒绝直接停�
 - Execution 在 `CANCEL_REQUESTED` 前可能已存在待处理 CancelRequest；分别展示。只有服务端返回 RecoveryGate 时才展示恢复入口，不能仅按 `CANCELED` 状态推断。
 - `VERIFYING` 不显示成功；`LOST` 不自动重跑；用户发起恢复后再次执行前必须通过恢复门禁并产生新记录。
 - 401 只自动 refresh 一次；403 展示无权限；404 不推断资源属于其他项目。
+- `DATASOURCE_OPERATION_ADMISSION_LIMITED` 展示 `Retry-After` 等待提示，
+  `DATASOURCE_OPERATION_STALE` 提示刷新相关事实，
+  `DATASOURCE_OPERATION_DEADLINE_EXCEEDED` 提示本次外部操作到期；三者均不自动重放，用户只能从原操作按钮显式重试。
 - 409 VERSION_CONFLICT 先保留用户本地编辑，再刷新并提示人工合并。
 - 422 使用 `field_errors[].path` 定位表单；未知 path 展示在页面级错误区。
 - 日志断线后使用最后一个服务端 cursor 续传，不能用本地行号拼 cursor。

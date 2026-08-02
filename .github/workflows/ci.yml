@@ -171,6 +171,8 @@ jobs:
           DATAX_API_POSTGRES_TEST_URL='postgresql+psycopg://datax_api:1111111111111111111111111111111111111111111111111111111111111111@127.0.0.1:5432/datax_studio' \
           DATAX_WORKER_POSTGRES_TEST_URL='postgresql+psycopg://datax_worker:2222222222222222222222222222222222222222222222222222222222222222@127.0.0.1:5432/datax_studio' \
             python -m pytest tests/test_runtime_database_roles_postgres.py
+          DATAX_CREDENTIAL_POSTGRES_TEST_URL='postgresql+psycopg://datax_studio:3333333333333333333333333333333333333333333333333333333333333333@127.0.0.1:5432/datax_studio' \
+            python -m pytest tests/test_credentials_postgres.py
           alembic -c alembic.ini downgrade base
           alembic -c alembic.ini upgrade head
 

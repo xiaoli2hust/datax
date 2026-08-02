@@ -864,7 +864,11 @@ paths:
       tags: [Datasources]
       operationId: createDatasource
       summary: 创建数据源并加密凭证
-      description: 仅 Admin；host/port 必须命中 ACTIVE EndpointPolicy，运行时仍需 DNS 重解析和出口策略复检。
+      description: |
+        仅 Admin；host/port 必须命中 ACTIVE EndpointPolicy，运行时仍需 DNS 重解析和出口策略复检。
+        连接探针采用数据源外部操作 A/B/C 契约：短事务授权并冻结非秘密快照，随后在无产品
+        数据库锁的条件下完成外部工作，最终仅在安全绑定仍一致时写入新数据源。准入拒绝不探测、
+        解密、写审计或创建幂等保留；外部阶段后的安全绑定漂移不会创建数据源。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -900,7 +904,11 @@ paths:
         '403':
           $ref: '#/components/responses/Forbidden'
         '409':
-          $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
+        '503':
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
         '422':
           $ref: '#/components/responses/ValidationError'
 
@@ -932,7 +940,9 @@ paths:
         password 缺失表示安全复用当前 ACTIVE secret；null 或空字符串无效。任一非秘密连接
         定位字段变化时，服务端必须先按当前 ACTIVE EndpointPolicyRevision 完成 DNS、精确
         出口、TLS/认证与物理实例身份探针，再新增不可变 DatasourceRevision 并原子切换
-        current_revision_id；探针失败时整次 PATCH 失败且不能保存新修订或新 secret。
+        current_revision_id；探针失败时整次 PATCH 失败且不能保存新修订或新 secret。外部探针
+        遵循数据源外部操作 A/B/C 契约；若原 ETag、安全指针或候选配置在探针期间漂移，服务端
+        不得把旧探针结果写入新修订，而是返回可人工重试的 stale 响应。
       parameters:
         - $ref: '#/components/parameters/IfMatch'
       requestBody:
@@ -956,11 +966,13 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
         '422':
           $ref: '#/components/responses/ValidationError'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
     delete:
       tags: [Datasources]
       operationId: deleteDatasource
@@ -1085,6 +1097,9 @@ paths:
       responses:
         '200':
           description: 更新后的非秘密生命周期摘要
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
           content:
             application/json:
               schema:
@@ -1160,7 +1175,12 @@ paths:
       tags: [Datasources]
       operationId: testDatasource
       summary: 使用已保存凭证执行受限连接测试
-      description: 仅 Admin；连接前必须复检 ACTIVE EndpointPolicy、DNS 解析结果和网络出口限制。
+      description: |
+        仅 Admin；连接前必须复检 ACTIVE EndpointPolicy、DNS 解析结果和网络出口限制。服务端在
+        A 阶段冻结授权与安全绑定，在无产品数据库锁的 B 阶段执行外部测试，并只在 C 阶段复核
+        成功后持久化测试状态和证据。普通已获准的数据库连通/鉴权失败通过 `200 + status=FAILED`
+        表达；egress guard/lease/attestation 平台失败必须保留 503 Problem code，不能伪装为测试
+        失败，也不能写入测试状态、evidence 或 audit。准入拒绝与 stale 响应均不会把旧结果覆盖到当前配置。
       responses:
         '200':
           description: 测试已完成；连接失败通过 status=FAILED 表达
@@ -1172,8 +1192,12 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
 
   /datasources/{datasource_id}/schema/tables:
     parameters:
@@ -1182,7 +1206,10 @@ paths:
       tags: [Datasources]
       operationId: listDatasourceTables
       summary: 读取表和列元数据
-      description: Admin 可按任一用途检查；Developer 必须声明 SOURCE_USE 或 TARGET_USE，服务端按该精确用途授权，cursor 同时绑定用途。
+      description: |
+        Admin 可按任一用途检查；Developer 必须声明 SOURCE_USE 或 TARGET_USE，服务端按该精确用途
+        授权，cursor 同时绑定用途。服务端在 A 阶段冻结用途、筛选、cursor scope 与安全绑定，
+        在无产品数据库锁的 B 阶段读取 Schema，并在 C 阶段重新授权；任一漂移不返回旧 metadata。
       parameters:
         - name: usage
           in: query
@@ -1217,10 +1244,12 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
-        '502':
-          $ref: '#/components/responses/DatasourceConnectionFailed'
+        '409':
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
 
   /projects/{project_id}/transfer-policies:
     parameters:
@@ -1253,7 +1282,11 @@ paths:
         selection_mode=ALL_COLUMNS 也必须先由元数据解析为显式 allowed_columns 后提交，不接受
         *、正则或“运行时全部列”。服务端校验两侧表属于所选 DatasourceRevision，解析并固定
         PhysicalEndpointIdentity，按引擎标识符规则规范化/排序/去重后生成不可变 scope_json，
-        再计算 scope_hash；客户端不能自报 scope_hash。
+        再计算 scope_hash；客户端不能自报 scope_hash。创建和任何会重算 scope 的 PATCH 都是
+        双数据源复合 metadata 操作：A 阶段完成两端安全绑定检查后，必须在任一 resolver、connector、
+        解密或审计前原子取得 source/target 两个 datasource permit；两个 probe 复用同一个总 deadline，
+        但同步 PostgreSQL transport 网络黑洞和提交窗口仍未证明端到端必在 30 秒返回。429 不发起任一
+        外部 probe，也不写 audit 或新的幂等状态；C 阶段只在绑定仍一致时创建或更新策略。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -1286,14 +1319,22 @@ paths:
           headers:
             ETag:
               $ref: '#/components/headers/ETag'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/TransferPolicy'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
+        '503':
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
         '422':
           $ref: '#/components/responses/ValidationError'
 
@@ -1327,7 +1368,12 @@ paths:
       tags: [SecurityPolicies]
       operationId: updateTransferPolicy
       summary: Admin 修订 DRAFT 或撤销策略
-      description: 修改 source、target、requested_scope 或 classification 会把策略退回 DRAFT、清空旧审批并重算规范化 scope_json/scope_hash；ACTIVE 只允许变为 REVOKED。
+      description: |
+        修改 source、target、requested_scope 或 classification 会把策略退回 DRAFT、清空旧审批并重算
+        规范化 scope_json/scope_hash；ACTIVE 只允许变为 REVOKED。前 3 类变更会进行双数据源复合
+        metadata probe：两端 permit 必须在任一外部 I/O 前原子取得，并在 source/target probe 间复用
+        同一总 deadline；classification-only 和 ACTIVE→REVOKED 不进入外部操作面。当前 deadline
+        是 fail-closed 结果规则，不是同步 PostgreSQL 网络黑洞下端到端 30 秒必返回承诺。
       parameters:
         - $ref: '#/components/parameters/IfMatch'
       requestBody:
@@ -1351,7 +1397,11 @@ paths:
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
+        '503':
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
         '422':
           $ref: '#/components/responses/ValidationError'
 
@@ -1380,6 +1430,11 @@ paths:
       responses:
         '200':
           description: 状态进入 PENDING_APPROVAL
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
           content:
             application/json:
               schema:
@@ -1418,6 +1473,11 @@ paths:
       responses:
         '200':
           description: 当前策略；达到门槛后原子进入 ACTIVE，任一拒绝立即进入 REJECTED
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
           content:
             application/json:
               schema:
@@ -1570,7 +1630,13 @@ paths:
       tags: [Jobs]
       operationId: validateJobDraft
       summary: 校验当前已保存草稿
-      description: 包括结构、权限、同一物理表别名自复制阻断、Schema 漂移、类型兼容，以及每个 source/target mapping 都是当前 ACTIVE TransferPolicy 精确 scope 的子集。
+      description: |
+        包括结构、权限、同一物理表别名自复制阻断、Schema 漂移、类型兼容，以及每个 source/target
+        mapping 都是当前 ACTIVE TransferPolicy 精确 scope 的子集。两端 Schema 采集采用数据源
+        外部操作 A/B/C 契约：source/target datasource permit 必须原子取得；外部读取无产品数据库
+        锁；C 阶段重新验证 AuthSession、项目/Job 状态、数据源、授权、TargetNamespace、runtime
+        proof 和 TransferPolicy，并与当前 Job validation state/evidence/audit 接受原子化；它不创建
+        或修改 JobVersion。PUBLISHED/ARCHIVED Job 在任何外部 I/O 前返回普通 409。
       responses:
         '200':
           description: 校验已完成；valid=false 是正常业务结果
@@ -1582,8 +1648,12 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
 
   /jobs/{job_id}/preview:
     parameters:
@@ -2008,6 +2078,9 @@ paths:
       responses:
         '202':
           description: 已提交处置确认并创建独立 RecoveryProbe 事实
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
           content:
             application/json:
               schema:
@@ -2380,6 +2453,26 @@ components:
       schema:
         type: string
         format: uuid
+    RetryAfter:
+      description: |
+        服务端给出的、对内部 admission 状态不透明的 delta-seconds 等待提示。客户端只能用于
+        告知用户何时手动重试，不得据此自动重放原请求。
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 3600
+    DatasourceOperationRetryAfter:
+      description: |
+        数据源外部操作 admission 的固定 delta-seconds 等待提示。它不泄露 permit、队列或 token
+        状态；客户端只能提示用户等待后手动重试，不能自动重放。
+      schema:
+        type: integer
+        const: 60
+    CacheControlNoStore:
+      description: 防止浏览器或中间层缓存包含外部操作拒绝或过期上下文的响应。
+      schema:
+        type: string
+        const: no-store
     ETag:
       description: 弱 ETag，值为 W/"row_version"
       schema:
@@ -2464,6 +2557,9 @@ components:
       name: Idempotency-Key
       in: header
       required: true
+      description: >-
+        同一 actor/作用域/key 的 replay 仍必须与本次路径的 durable resource 及保存 response 精确绑定；
+        Project、Job 或 Execution 不一致时返回 IDEMPOTENCY_CONFLICT，不能复用另一资源的历史 2xx。
       schema:
         type: string
         minLength: 8
@@ -2508,6 +2604,77 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
+    DatasourceOperationStale:
+      description: |
+        `DATASOURCE_OPERATION_STALE` 表示外部工作期间的 datasource、secret/envelope、
+        EndpointPolicy、授权/AuthSession、cursor scope、项目/Job 状态、TargetNamespace、runtime
+        proof、Job draft 或 TransferPolicy 安全绑定已漂移。
+        `retryable=true` 只表示调用方可先刷新相关事实后从原始操作手动重试；服务端不会返回旧
+        metadata 或持久化旧 evidence/测试状态。创建和更新接口仍可能返回其既有的其他 409
+        冲突码，响应 schema 因此同时保留非 stale 的通用 409 形状。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/DatasourceOperationConflictProblem'
+    DatasourceOperationAdmissionLimited:
+      description: |
+        `DATASOURCE_OPERATION_ADMISSION_LIMITED` 表示已认证请求未获得本 API 进程内的外部
+        datasource operation permit。对已有 datasource、Job 校验或 TransferPolicy scope probe，请求会先
+        完成短事务、只读的 A 阶段授权与安全绑定检查，随后才申请 permit；双数据源复合操作必须一次
+        性取得 source/target 两个 key。已完成的 create 幂等回放也可直接返回，因为
+        它不创建任何新外部工作。429 本身发生在 resolver、connector、凭据解密、审计和新的幂等
+        状态写入之前；固定 `Retry-After: 60`，客户端仅能等待后从原始操作手动重试，禁止自动重放。
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/DatasourceOperationRetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/DatasourceOperationAdmissionLimitedProblem'
+    DatasourceOperationDeadlineExceeded:
+      description: |
+        `DATASOURCE_OPERATION_DEADLINE_EXCEEDED` 表示本次外部数据源操作已耗尽总 deadline，且
+        C 阶段仍确认原安全绑定有效。服务端不返回或持久化 B 阶段旧 metadata、evidence、测试状态
+        或 Job validation material；客户端只能由用户从原操作手动重试，禁止自动重放。当前 30 秒
+        配置是外部 I/O 返回后的失败关闭规则；同步 PostgreSQL transport 网络黑洞尚无已验证的
+        client-side 强制中断，因此该响应契约不是“服务端必在 30 秒返回”的发布承诺。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/DatasourceOperationDeadlineExceededProblem'
+    DatasourceOperationUnavailable:
+      description: |
+        外部数据源操作的 `503` 联合响应。`DATASOURCE_OPERATION_DEADLINE_EXCEEDED` 表示总
+        deadline 已耗尽且 C 阶段仍确认安全绑定有效；其他 `503` 表示 connector、DNS/egress、
+        凭据或运行依赖不可用。所有 egress guard/lease/attestation 错误保留稳定平台 code 并为
+        503，只有显式 guard/lease 可用性 code 集合可令 `retryable=true`；策略、命名空间或证明
+        不一致仍失败关闭。若共享 deadline 已耗尽，deadline 结果优先于晚到 egress 错误。所有
+        分支均不允许返回或持久化过期的 B 阶段结果；客户端不得自动重放。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/problem+json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/DatasourceOperationDeadlineExceededProblem'
+              - $ref: '#/components/schemas/DatasourceOperationOtherUnavailableProblem'
     Gone:
       description: 日志已按保留策略删除
       content:
@@ -2522,12 +2689,6 @@ components:
             $ref: '#/components/schemas/Problem'
     ValidationError:
       description: 请求或业务语义校验失败
-      content:
-        application/problem+json:
-          schema:
-            $ref: '#/components/schemas/Problem'
-    DatasourceConnectionFailed:
-      description: 数据源连接、认证或元数据读取失败
       content:
         application/problem+json:
           schema:
@@ -2685,6 +2846,65 @@ components:
               const: 请稍后重试。
             retryable:
               const: true
+    DatasourceOperationStaleProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            status:
+              const: 409
+            code:
+              const: DATASOURCE_OPERATION_STALE
+            retryable:
+              const: true
+    DatasourceOperationOtherConflictProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            status:
+              const: 409
+            code:
+              type: string
+              not:
+                const: DATASOURCE_OPERATION_STALE
+    DatasourceOperationConflictProblem:
+      oneOf:
+        - $ref: '#/components/schemas/DatasourceOperationStaleProblem'
+        - $ref: '#/components/schemas/DatasourceOperationOtherConflictProblem'
+    DatasourceOperationAdmissionLimitedProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            status:
+              const: 429
+            code:
+              const: DATASOURCE_OPERATION_ADMISSION_LIMITED
+            retryable:
+              const: true
+    DatasourceOperationDeadlineExceededProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            status:
+              const: 503
+            code:
+              const: DATASOURCE_OPERATION_DEADLINE_EXCEEDED
+            retryable:
+              const: true
+    DatasourceOperationOtherUnavailableProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            status:
+              const: 503
+            code:
+              type: string
+              not:
+                const: DATASOURCE_OPERATION_DEADLINE_EXCEEDED
     CapacityAdmissionProblem:
       allOf:
         - $ref: '#/components/schemas/Problem'

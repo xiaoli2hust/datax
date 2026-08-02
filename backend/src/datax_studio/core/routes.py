@@ -46,10 +46,14 @@ from datax_studio.core.schemas import (
 )
 from datax_studio.core.service import (
     ControlService,
-    ValidationMaterial,
     build_control_service,
 )
-from datax_studio.credentials.routes import get_credential_service
+from datax_studio.credentials.ingress import DatasourceOperationAdmissionGuard
+from datax_studio.credentials.routes import (
+    DATASOURCE_EXTERNAL_OPERATION_RESPONSES,
+    get_credential_service,
+    get_datasource_operation_admission,
+)
 from datax_studio.credentials.service import CredentialService
 
 router = APIRouter()
@@ -324,8 +328,7 @@ def list_jobs(
     limit: Annotated[int, Query(ge=1, le=200)] = 50,
     q: Annotated[str | None, Query(min_length=1, max_length=128)] = None,
     status: Literal["DRAFT", "VALID", "PUBLISHED", "ARCHIVED"] | None = None,
-    exclude_status: Literal["DRAFT", "VALID", "PUBLISHED", "ARCHIVED"]
-    | None = None,
+    exclude_status: Literal["DRAFT", "VALID", "PUBLISHED", "ARCHIVED"] | None = None,
     has_published_version: bool | None = None,
     reader_plugin: Literal["mysqlreader", "postgresqlreader"] | None = None,
     writer_plugin: Literal["mysqlwriter", "postgresqlwriter"] | None = None,
@@ -418,7 +421,11 @@ def update_job(
     return job
 
 
-@router.post("/jobs/{job_id}/validate", response_model=ValidationReport)
+@router.post(
+    "/jobs/{job_id}/validate",
+    response_model=ValidationReport,
+    responses=DATASOURCE_EXTERNAL_OPERATION_RESPONSES,
+)
 def validate_job(
     job_id: UUID,
     request: Request,
@@ -428,55 +435,17 @@ def validate_job(
         CredentialService,
         Depends(get_credential_service),
     ],
+    admission: Annotated[
+        DatasourceOperationAdmissionGuard,
+        Depends(get_datasource_operation_admission),
+    ],
 ) -> ValidationReport:
-    runtime = service.runtime_validation_material(
+    return credential_service.validate_job(
         principal=principal,
         job_id=job_id,
-    )
-    try:
-        schema = credential_service.collect_job_validation_material(
-            principal=principal,
-            job_id=job_id,
-            audit=audit_context(request),
-        )
-        validated = service.accept_validation_material(
-            principal=principal,
-            job_id=job_id,
-            material=ValidationMaterial(
-                source_schema_snapshot=schema.source_schema_snapshot,
-                target_schema_snapshot=schema.target_schema_snapshot,
-                source_schema_hash=schema.source_schema_hash,
-                target_schema_hash=schema.target_schema_hash,
-                source_physical_table_identity_hash=(
-                    schema.source_physical_table_identity_hash
-                ),
-                target_namespace_id=schema.target_namespace_id,
-                transfer_policy_id=schema.transfer_policy_id,
-                transfer_policy_scope_hash=schema.transfer_policy_scope_hash,
-                runtime_sha256=runtime.runtime_sha256,
-                reader_plugin_sha256=runtime.reader_plugin_sha256,
-                writer_plugin_sha256=runtime.writer_plugin_sha256,
-            ),
-            audit=audit_context(request),
-        )
-    except ProblemException as problem:
-        issue_code = _validation_issue_code(problem.code)
-        if issue_code is None:
-            raise
-        return service.validation_failure_report(
-            principal=principal,
-            job_id=job_id,
-            code=issue_code,
-            message=problem.detail or problem.title,
-            audit=audit_context(request),
-        )
-    return ValidationReport(
-        valid=True,
-        draft_spec_hash=validated.draft_spec_hash,
-        source_schema_hash=schema.source_schema_hash,
-        target_schema_hash=schema.target_schema_hash,
-        errors=[],
-        warnings=[],
+        control_service=service,
+        audit=audit_context(request),
+        admission=admission,
     )
 
 
@@ -744,9 +713,7 @@ def _validate_time_window(
     queued_to: datetime | None,
 ) -> None:
     for field, value in (("from", queued_from), ("to", queued_to)):
-        if value is not None and (
-            value.tzinfo is None or value.utcoffset() is None
-        ):
+        if value is not None and (value.tzinfo is None or value.utcoffset() is None):
             raise ProblemException(
                 status=422,
                 code="VALIDATION_ERROR",

@@ -1,7 +1,11 @@
 <script setup lang="ts">
 import { computed } from "vue";
 
-import { isApiError } from "../api/client";
+import {
+  datasourceOperationManualRetryGuidance,
+  isApiError,
+  requiresManualDatasourceOperationRetry,
+} from "../api/client";
 
 const props = defineProps<{
   error: unknown;
@@ -14,7 +18,16 @@ const emit = defineEmits<{
 }>();
 
 const problem = computed(() => (isApiError(props.error) ? props.error.problem : null));
+const retryAfterSeconds = computed(() =>
+  isApiError(props.error) ? props.error.retryAfterSeconds : null,
+);
 const isGap = computed(() => problem.value?.code === "ENDPOINT_NOT_IMPLEMENTED");
+const requiresManualRetry = computed(() =>
+  requiresManualDatasourceOperationRetry(problem.value),
+);
+const manualRetryGuidance = computed(() =>
+  datasourceOperationManualRetryGuidance(problem.value, retryAfterSeconds.value),
+);
 const alertTitle = computed(() => {
   if (props.title) return props.title;
   if (isGap.value) return "后端尚未实现此功能";
@@ -50,6 +63,9 @@ function fieldPath(field: { path?: string; field?: string }): string {
     <div class="problem-panel__body">
       <strong>{{ alertTitle }}</strong>
       <p>{{ description }}</p>
+      <p v-if="manualRetryGuidance" class="problem-panel__guidance">
+        {{ manualRetryGuidance }}
+      </p>
       <div class="problem-panel__meta">
         <code>{{ problem?.code ?? "CLIENT_ERROR" }}</code>
         <span v-if="problem?.request_id">request_id：{{ problem.request_id }}</span>
@@ -64,7 +80,13 @@ function fieldPath(field: { path?: string; field?: string }): string {
         </li>
       </ul>
       <div class="problem-panel__actions">
-        <el-button v-if="showRetry !== false" size="small" @click="emit('retry')">重新请求</el-button>
+        <el-button
+          v-if="showRetry !== false && !requiresManualRetry"
+          size="small"
+          @click="emit('retry')"
+        >
+          重新请求
+        </el-button>
         <el-button v-if="problem?.request_id" size="small" text @click="copyDiagnostics">
           复制诊断信息
         </el-button>

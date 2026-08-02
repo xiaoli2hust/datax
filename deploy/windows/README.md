@@ -13,6 +13,11 @@ x64 电脑的 Docker Desktop + WSL2 中。
 local named pipe 与发布清单派生的值。Docker Desktop daemon 的组织级代理是独立前置，不通过
 这个子进程环境传递。此处描述的是 Rust E1 契约，真实 Windows/Docker Desktop 的行为仍待 E4。
 
+ADR-0014 的数据源外部操作准入是**单 API 进程内**状态。发布启动只能保留 Compose 中的一个
+`api` 容器和镜像默认的一个 Uvicorn worker；Launcher 不得使用 `--scale api`、增加 `--workers`、
+启动第二个 Compose project 或旁路 API。若未来需要多实例，必须先有新的 Accepted ADR 定义共享、
+带围栏的 admission；不能将现有 global=4、organization/datasource=1 的限制宣传为跨进程保护。
+
 仓库已提供 `backend/Dockerfile.worker`：它从锁定的上游源码、JDK 与插件集合构建
 Linux/amd64 DataX Runtime，并在镜像内生成
 `/opt/datax/runtime-manifest.json`。开发环境已经完成过容器构建与固定 stream smoke；

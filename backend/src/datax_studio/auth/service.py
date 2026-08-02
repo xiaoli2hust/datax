@@ -13,6 +13,7 @@ from uuid import UUID, uuid4
 
 import jwt
 import rfc8785
+from pydantic import ValidationError
 from sqlalchemy import and_, create_engine, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
@@ -1016,7 +1017,13 @@ class AuthService:
                     )
                     if replay is not None:
                         return OperationResult(
-                            UserResponse.model_validate(replay.response_body),
+                            self._user_idempotency_replay_response(
+                                session,
+                                record=replay,
+                                organization_id=principal.organization_id,
+                                expected_user_id=None,
+                                expected_status=201,
+                            ),
                             replayed=True,
                         )
                     organization = self._lock_organization(
@@ -1311,7 +1318,13 @@ class AuthService:
             )
             if replay is not None:
                 return OperationResult(
-                    UserResponse.model_validate(replay.response_body),
+                    self._user_idempotency_replay_response(
+                        session,
+                        record=replay,
+                        organization_id=principal.organization_id,
+                        expected_user_id=user_id,
+                        expected_status=200,
+                    ),
                     replayed=True,
                 )
             organization = self._lock_organization(
@@ -1390,6 +1403,15 @@ class AuthService:
                 now=now,
             )
             if replay is not None:
+                self._assert_user_idempotency_replay_resource(
+                    session,
+                    record=replay,
+                    organization_id=principal.organization_id,
+                    expected_user_id=user_id,
+                    expected_status=204,
+                )
+                if replay.response_body != {}:
+                    raise self._idempotency_resource_conflict()
                 return True
             organization = self._lock_organization(
                 session,
@@ -1852,6 +1874,63 @@ class AuthService:
         session.flush()
         return None
 
+    def _assert_user_idempotency_replay_resource(
+        self,
+        session: Session,
+        *,
+        record: IdempotencyRecord,
+        organization_id: UUID,
+        expected_user_id: UUID | None,
+        expected_status: int,
+    ) -> User:
+        """Fail closed unless a completed record still names this durable User."""
+
+        resource_id = record.resource_id
+        if (
+            record.resource_type != "USER"
+            or resource_id is None
+            or record.response_status != expected_status
+            or (expected_user_id is not None and resource_id != expected_user_id)
+        ):
+            raise self._idempotency_resource_conflict()
+        user = session.scalar(
+            select(User)
+            .join(OrganizationMember, OrganizationMember.user_id == User.id)
+            .where(
+                User.id == resource_id,
+                OrganizationMember.organization_id == organization_id,
+            )
+        )
+        if user is None:
+            raise self._idempotency_resource_conflict()
+        return user
+
+    def _user_idempotency_replay_response(
+        self,
+        session: Session,
+        *,
+        record: IdempotencyRecord,
+        organization_id: UUID,
+        expected_user_id: UUID | None,
+        expected_status: int,
+    ) -> UserResponse:
+        user = self._assert_user_idempotency_replay_resource(
+            session,
+            record=record,
+            organization_id=organization_id,
+            expected_user_id=expected_user_id,
+            expected_status=expected_status,
+        )
+        if record.response_body is None:
+            raise self._idempotency_resource_conflict()
+        try:
+            response = UserResponse.model_validate(record.response_body)
+        except ValidationError as exc:
+            raise self._idempotency_resource_conflict() from exc
+        if response.id != record.resource_id or response.id != user.id:
+            raise self._idempotency_resource_conflict()
+        return response
+
     def _idempotency_request_hash(
         self,
         *,
@@ -2084,6 +2163,15 @@ class AuthService:
             detail="请稍后使用相同 Idempotency-Key 重试。",
             retryable=True,
             headers={"Retry-After": "1"},
+        )
+
+    @staticmethod
+    def _idempotency_resource_conflict() -> ProblemException:
+        return ProblemException(
+            status=409,
+            code="IDEMPOTENCY_CONFLICT",
+            title="Idempotency-Key 已用于不同请求",
+            detail="幂等键保存的资源或响应与当前请求不一致。",
         )
 
     @staticmethod

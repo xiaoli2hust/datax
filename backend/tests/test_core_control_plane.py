@@ -20,10 +20,12 @@ from datax_studio.api.app import create_app
 from datax_studio.api.problems import ProblemException
 from datax_studio.auth.db import (
     AuditEvent,
+    AuthSession,
     Base,
     Organization,
     OrganizationMember,
     Role,
+    RoleAssignment,
     ScopeType,
     User,
 )
@@ -369,6 +371,7 @@ def core_stack() -> CoreStack:
     organization_id = uuid4()
     user_id = uuid4()
     member_id = uuid4()
+    session_id = uuid4()
     with sessions.begin() as session:
         session.add_all(
             [
@@ -393,12 +396,34 @@ def core_stack() -> CoreStack:
                     updated_at=now,
                     row_version=1,
                 ),
+                AuthSession(
+                    id=session_id,
+                    user_id=user_id,
+                    token_hash=b"c" * 32,
+                    family_id=session_id,
+                    rotated_from_id=None,
+                    issued_at=now,
+                    expires_at=now + timedelta(days=1),
+                    last_used_at=now,
+                    revoked_at=None,
+                    revoke_reason=None,
+                    ip_hash=None,
+                ),
                 OrganizationMember(
                     id=member_id,
                     organization_id=organization_id,
                     user_id=user_id,
                     status="ACTIVE",
                     joined_at=now,
+                ),
+                RoleAssignment(
+                    id=uuid4(),
+                    organization_member_id=member_id,
+                    scope_type=ScopeType.ORGANIZATION,
+                    scope_id=organization_id,
+                    role=Role.ADMIN,
+                    granted_by=user_id,
+                    created_at=now,
                 ),
                 SystemControl(
                     singleton_id=1,
@@ -416,7 +441,7 @@ def core_stack() -> CoreStack:
     principal = Principal(
         user_id=user_id,
         organization_id=organization_id,
-        session_id=uuid4(),
+        session_id=session_id,
         email="admin@example.com",
         display_name="Local Admin",
         must_change_password=False,
@@ -515,9 +540,7 @@ def test_project_idempotency_etag_archive_and_endpoint_normalization(
     assert len(revision["policy_hash"]) == 64
     policy_id = policy.json()["id"]
     listed_policies = core_stack.client.get("/api/v1/endpoint-policies")
-    fetched_policy = core_stack.client.get(
-        f"/api/v1/endpoint-policies/{policy_id}"
-    )
+    fetched_policy = core_stack.client.get(f"/api/v1/endpoint-policies/{policy_id}")
     assert listed_policies.status_code == 200
     assert [item["id"] for item in listed_policies.json()["items"]] == [policy_id]
     assert fetched_policy.status_code == 200
@@ -560,9 +583,10 @@ def test_project_creation_never_bootstraps_migration_owned_scheduler_state(
     assert response.json()["code"] == "SERVICE_UNAVAILABLE"
     with core_stack.sessions() as session:
         assert session.get(QueueSchedulerState, 1) is None
-        assert session.scalar(
-            select(Project.id).where(Project.slug == "scheduler-state-guard")
-        ) is None
+        assert (
+            session.scalar(select(Project.id).where(Project.slug == "scheduler-state-guard"))
+            is None
+        )
 
 
 def test_project_dashboard_has_fixed_window_complete_zero_counts_and_drilldowns(
@@ -648,6 +672,14 @@ def test_execution_api_only_queues_reserves_and_records_cancel_or_revoke(
         headers=headers,
         json=request_body,
     )
+    other_job = _seed_published_job(core_stack, "idempotency-job-binding")
+    cross_job_replay = core_stack.client.post(
+        f"/api/v1/jobs/{other_job.job_id}/executions",
+        headers=headers,
+        json=request_body,
+    )
+    assert cross_job_replay.status_code == 409
+    assert cross_job_replay.json()["code"] == "IDEMPOTENCY_CONFLICT"
     replay = core_stack.client.post(
         f"/api/v1/jobs/{queued_job.job_id}/executions",
         headers=headers,
@@ -680,9 +712,7 @@ def test_execution_api_only_queues_reserves_and_records_cancel_or_revoke(
         params={"from": "2026-07-30T10:00:00"},
     )
     assert matching_filter.status_code == 200
-    assert [item["id"] for item in matching_filter.json()["items"]] == [
-        str(execution_id)
-    ]
+    assert [item["id"] for item in matching_filter.json()["items"]] == [str(execution_id)]
     assert nonmatching_filter.status_code == 200
     assert nonmatching_filter.json()["items"] == []
     assert invalid_time_filter.status_code == 422
@@ -690,15 +720,11 @@ def test_execution_api_only_queues_reserves_and_records_cancel_or_revoke(
     with core_stack.sessions() as session:
         execution = session.get(Execution, execution_id)
         target_lock = session.scalar(
-            select(TargetCopyLock).where(
-                TargetCopyLock.execution_id == execution_id
-            )
+            select(TargetCopyLock).where(TargetCopyLock.execution_id == execution_id)
         )
         attempts = list(
             session.scalars(
-                select(ExecutionAttempt).where(
-                    ExecutionAttempt.execution_id == execution_id
-                )
+                select(ExecutionAttempt).where(ExecutionAttempt.execution_id == execution_id)
             )
         )
         assert execution is not None and execution.fence_epoch == 0
@@ -746,20 +772,13 @@ def test_execution_api_only_queues_reserves_and_records_cancel_or_revoke(
     assert revoke.json()["data_effect"] == "NONE"
     assert revoke.json()["verification_state"] == "NOT_STARTED"
     assert revoke.json()["target_copy_lock"]["state"] == "RESERVED"
-    assert core_stack.service.reconcile_unclaimed_target_exclusivity(
-        execution_id=UUID(revoked_id)
-    )
-    revoked_reconciled = core_stack.client.get(
-        f"/api/v1/executions/{revoked_id}"
-    ).json()
+    assert core_stack.service.reconcile_unclaimed_target_exclusivity(execution_id=UUID(revoked_id))
+    revoked_reconciled = core_stack.client.get(f"/api/v1/executions/{revoked_id}").json()
     assert revoked_reconciled["process_state"] == "CANCELED"
     assert revoked_reconciled["data_effect"] == "NONE"
     assert revoked_reconciled["verification_state"] == "NOT_STARTED"
     assert revoked_reconciled["target_copy_lock"]["state"] == "RELEASED"
-    assert (
-        revoked_reconciled["failure_code"]
-        == "TARGET_EXCLUSIVITY_REVOKED"
-    )
+    assert revoked_reconciled["failure_code"] == "TARGET_EXCLUSIVITY_REVOKED"
 
     with core_stack.sessions.begin() as session:
         control = session.get(SystemControl, 1)
@@ -775,6 +794,52 @@ def test_execution_api_only_queues_reserves_and_records_cancel_or_revoke(
     assert replay_while_draining.headers["idempotency-replayed"] == "true"
     assert replay_while_draining.json() == created.json()
     _assert_audit_contract(core_stack)
+
+
+def test_cancel_idempotency_replay_is_bound_to_exact_execution(
+    core_stack: CoreStack,
+) -> None:
+    """A route-template key cannot replay a cancellation onto another execution."""
+
+    first_job = _seed_published_job(core_stack, "cancel-idempotency-first")
+    second_job = _seed_published_job(core_stack, "cancel-idempotency-second")
+    first = core_stack.client.post(
+        f"/api/v1/jobs/{first_job.job_id}/executions",
+        headers={"Idempotency-Key": "cancel-idempotency-execution-first-001"},
+        json=_execution_request(first_job.job_version_id),
+    )
+    second = core_stack.client.post(
+        f"/api/v1/jobs/{second_job.job_id}/executions",
+        headers={"Idempotency-Key": "cancel-idempotency-execution-second-001"},
+        json=_execution_request(second_job.job_version_id),
+    )
+    assert first.status_code == 202, first.text
+    assert second.status_code == 202, second.text
+    first_execution_id = UUID(first.json()["id"])
+    second_execution_id = UUID(second.json()["id"])
+    headers = {"Idempotency-Key": "cancel-idempotency-cross-execution-001"}
+    body = {"reason": "same request body must not cross execution paths"}
+
+    requested = core_stack.client.post(
+        f"/api/v1/executions/{first_execution_id}/cancel",
+        headers=headers,
+        json=body,
+    )
+    cross_execution = core_stack.client.post(
+        f"/api/v1/executions/{second_execution_id}/cancel",
+        headers=headers,
+        json=body,
+    )
+
+    assert requested.status_code == 202, requested.text
+    assert cross_execution.status_code == 409, cross_execution.text
+    assert cross_execution.json()["code"] == "IDEMPOTENCY_CONFLICT"
+    with core_stack.sessions() as session:
+        assert session.scalar(
+            select(ExecutionCancelRequest.id).where(
+                ExecutionCancelRequest.execution_id == second_execution_id
+            )
+        ) is None
 
 
 def test_worker_claim_fence_and_independent_verification_gate(
@@ -812,18 +877,17 @@ def test_worker_claim_fence_and_independent_verification_gate(
         execution = session.get(Execution, execution_id)
         attempt = session.get(ExecutionAttempt, claim.attempt_id)
         target_lock = session.scalar(
-            select(TargetCopyLock).where(
-                TargetCopyLock.execution_id == execution_id
-            )
+            select(TargetCopyLock).where(TargetCopyLock.execution_id == execution_id)
         )
         assert execution is not None and execution.process_state == "STARTING"
         assert execution.runtime_snapshot is None
         assert execution.source_connection_evidence_id is None
         assert execution.target_connection_evidence_id is None
         assert attempt is not None
-        assert attempt.lease_token_hash == hashlib.sha256(
-            claim.lease_token.encode("ascii")
-        ).hexdigest()
+        assert (
+            attempt.lease_token_hash
+            == hashlib.sha256(claim.lease_token.encode("ascii")).hexdigest()
+        )
         assert attempt.lease_token_hash != claim.lease_token
         assert target_lock is not None and target_lock.state == "ACTIVE"
         assert target_lock.fence_epoch == 1
@@ -851,19 +915,14 @@ def test_worker_claim_fence_and_independent_verification_gate(
         )
 
     tampered_preflight = json.loads(json.dumps(runtime_preflight))
-    tampered_preflight["target_empty_evidence"][
-        "physical_table_identity_hash"
-    ] = "0" * 64
+    tampered_preflight["target_empty_evidence"]["physical_table_identity_hash"] = "0" * 64
     with pytest.raises(ProblemException) as invalid_target_empty_hash:
         core_stack.service.record_claimed_preflight(
             claim=claim,
             runtime_preflight=tampered_preflight,
             evidence_validator=evidence_validator,
         )
-    assert (
-        invalid_target_empty_hash.value.code
-        == "TARGET_EMPTY_EVIDENCE_HASH_MISMATCH"
-    )
+    assert invalid_target_empty_hash.value.code == "TARGET_EMPTY_EVIDENCE_HASH_MISMATCH"
     snapshot = core_stack.service.record_claimed_preflight(
         claim=claim,
         runtime_preflight=runtime_preflight,
@@ -908,16 +967,12 @@ def test_worker_claim_fence_and_independent_verification_gate(
         exit_code=0,
         summary_parse_status="FAILED",
     )
-    before_oracle = core_stack.client.get(
-        f"/api/v1/executions/{execution_id}"
-    ).json()
+    before_oracle = core_stack.client.get(f"/api/v1/executions/{execution_id}").json()
     assert before_oracle["process_state"] == "VERIFYING"
     assert before_oracle["verification_state"] == "NOT_STARTED"
 
     core_stack.service.mark_claimed_oracle_started(claim=claim)
-    during_verification = core_stack.client.get(
-        f"/api/v1/executions/{execution_id}"
-    ).json()
+    during_verification = core_stack.client.get(f"/api/v1/executions/{execution_id}").json()
     assert during_verification["process_state"] == "VERIFYING"
     assert during_verification["verification_state"] == "VERIFYING"
     assert during_verification["target_copy_lock"]["state"] == "ACTIVE"
@@ -927,15 +982,11 @@ def test_worker_claim_fence_and_independent_verification_gate(
 
     oracle_report = _passed_oracle_report(
         execution_response=created.json(),
-        claimed_response=core_stack.client.get(
-            f"/api/v1/executions/{execution_id}"
-        ).json(),
+        claimed_response=core_stack.client.get(f"/api/v1/executions/{execution_id}").json(),
         claim=claim,
         published=published,
         runtime_preflight=runtime_preflight,
-        source_confirmed_at=execution_request[
-            "source_quiescence_confirmation"
-        ]["confirmed_at"],
+        source_confirmed_at=execution_request["source_quiescence_confirmation"]["confirmed_at"],
     )
     core_stack.service.transition_claimed_execution(
         claim=claim,
@@ -1013,15 +1064,11 @@ def test_success_transition_refuses_accepted_cancel_and_worker_finishes_canceled
     core_stack.service.mark_claimed_oracle_started(claim=claim)
     oracle_report = _passed_oracle_report(
         execution_response=created.json(),
-        claimed_response=core_stack.client.get(
-            f"/api/v1/executions/{execution_id}"
-        ).json(),
+        claimed_response=core_stack.client.get(f"/api/v1/executions/{execution_id}").json(),
         claim=claim,
         published=published,
         runtime_preflight=runtime_preflight,
-        source_confirmed_at=execution_request[
-            "source_quiescence_confirmation"
-        ]["confirmed_at"],
+        source_confirmed_at=execution_request["source_quiescence_confirmation"]["confirmed_at"],
     )
 
     cancel = core_stack.client.post(
@@ -1050,9 +1097,7 @@ def test_success_transition_refuses_accepted_cancel_and_worker_finishes_canceled
     assert reconciler.poll_claim_action(claim) == ProcessAction.CANCEL
     reconciler.complete_claimed_cancel(claim=claim, oracle_started=True)
 
-    canceled = core_stack.client.get(
-        f"/api/v1/executions/{execution_id}"
-    ).json()
+    canceled = core_stack.client.get(f"/api/v1/executions/{execution_id}").json()
     assert canceled["process_state"] == "CANCELED"
     assert canceled["data_effect"] == "UNKNOWN"
     assert canceled["verification_state"] == "INCONCLUSIVE"
@@ -1139,9 +1184,7 @@ def test_target_revoke_creates_durable_stop_and_wins_over_operator_cancel(
                 ExecutionCancelRequest.execution_id == execution_id,
             )
         )
-        gate = session.scalar(
-            select(RecoveryGate).where(RecoveryGate.execution_id == execution_id)
-        )
+        gate = session.scalar(select(RecoveryGate).where(RecoveryGate.execution_id == execution_id))
         assert termination is not None
         assert termination.reason_code == "TARGET_EXCLUSIVITY_REVOKED"
         assert termination.status == "COMPLETED"
@@ -1278,9 +1321,7 @@ def test_elapsed_target_window_is_durable_at_every_admission_boundary(
         execution = session.get(Execution, execution_id)
         assert execution is not None
         confirmation = dict(execution.target_exclusivity_confirmation)
-        confirmation["valid_until"] = (
-            datetime.now(UTC) - timedelta(seconds=1)
-        ).isoformat()
+        confirmation["valid_until"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
         execution.target_exclusivity_confirmation = confirmation
 
     with pytest.raises(ProblemException) as blocked:
@@ -1458,9 +1499,7 @@ def test_expired_worker_keeps_safety_stop_above_operator_cancel(
                 WorkTerminationRequest.work_id == execution_id,
             )
         )
-        gate = session.scalar(
-            select(RecoveryGate).where(RecoveryGate.execution_id == execution_id)
-        )
+        gate = session.scalar(select(RecoveryGate).where(RecoveryGate.execution_id == execution_id))
         cancel_request = session.scalar(
             select(ExecutionCancelRequest).where(
                 ExecutionCancelRequest.execution_id == execution_id,
@@ -1480,10 +1519,7 @@ def test_expired_worker_keeps_safety_stop_above_operator_cancel(
         assert cancel_request is not None and cancel_request.status == "REJECTED"
         assert lost_event is not None and lost_event.event_type == "EXECUTION_LOST"
         assert lost_event.payload["primary_reason_code"] == "TARGET_EXCLUSIVITY_REVOKED"
-        assert (
-            lost_event.payload["lease_expiry_reason_code"]
-            == "SYSTEM_TERMINATION_LEASE_EXPIRED"
-        )
+        assert lost_event.payload["lease_expiry_reason_code"] == "SYSTEM_TERMINATION_LEASE_EXPIRED"
 
 
 @pytest.mark.parametrize(
@@ -1547,15 +1583,11 @@ def test_verification_exclusivity_break_fails_closed_into_recovery_gate(
     core_stack.service.mark_claimed_oracle_started(claim=claim)
     oracle_report = _passed_oracle_report(
         execution_response=created.json(),
-        claimed_response=core_stack.client.get(
-            f"/api/v1/executions/{execution_id}"
-        ).json(),
+        claimed_response=core_stack.client.get(f"/api/v1/executions/{execution_id}").json(),
         claim=claim,
         published=published,
         runtime_preflight=runtime_preflight,
-        source_confirmed_at=execution_request[
-            "source_quiescence_confirmation"
-        ]["confirmed_at"],
+        source_confirmed_at=execution_request["source_quiescence_confirmation"]["confirmed_at"],
     )
 
     with core_stack.sessions.begin() as session:
@@ -1567,16 +1599,12 @@ def test_verification_exclusivity_break_fails_closed_into_recovery_gate(
             execution.target_exclusivity_revocation_reason = "DBA_REVOKED"
         else:
             confirmation = dict(execution.target_exclusivity_confirmation)
-            confirmation["valid_until"] = (
-                datetime.now(UTC) - timedelta(seconds=1)
-            ).isoformat()
+            confirmation["valid_until"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
             execution.target_exclusivity_confirmation = confirmation
 
     if broken_kind != "EXPIRED_TERMINAL":
         with pytest.raises(ProblemException) as boundary_broken:
-            core_stack.service.assert_claimed_verification_exclusivity(
-                claim=claim
-            )
+            core_stack.service.assert_claimed_verification_exclusivity(claim=claim)
         assert boundary_broken.value.code == "TARGET_EXCLUSIVITY_BROKEN"
 
     # Even if revoke/expiry wins after the final callback, the SUCCEEDED row
@@ -1730,9 +1758,7 @@ def test_verification_failure_transition_yields_to_accepted_cancel(
     assert reconciler.poll_claim_action(claim) == ProcessAction.CANCEL
     reconciler.complete_claimed_cancel(claim=claim, oracle_started=True)
 
-    canceled = core_stack.client.get(
-        f"/api/v1/executions/{execution_id}"
-    ).json()
+    canceled = core_stack.client.get(f"/api/v1/executions/{execution_id}").json()
     assert canceled["process_state"] == "CANCELED"
     assert canceled["verification_state"] == "INCONCLUSIVE"
     assert canceled["target_copy_lock"]["state"] == "RECOVERY_REQUIRED"
@@ -1860,9 +1886,7 @@ def test_publish_and_read_immutable_job_version_route(
         target_snapshot = existing_version.target_schema_snapshot
         source_schema_hash = existing_version.source_schema_hash
         target_schema_hash = existing_version.target_schema_hash
-        source_table_identity_hash = (
-            existing_version.source_physical_table_identity_hash
-        )
+        source_table_identity_hash = existing_version.source_physical_table_identity_hash
         session.delete(existing_version)
         job.status = "VALID"
         job.latest_published_version_id = None
@@ -1914,12 +1938,8 @@ def test_publish_and_read_immutable_job_version_route(
     assert replay.json() == created.json()
 
     version_id = created.json()["id"]
-    listed = core_stack.client.get(
-        f"/api/v1/jobs/{published.job_id}/versions"
-    )
-    fetched = core_stack.client.get(
-        f"/api/v1/jobs/{published.job_id}/versions/{version_id}"
-    )
+    listed = core_stack.client.get(f"/api/v1/jobs/{published.job_id}/versions")
+    fetched = core_stack.client.get(f"/api/v1/jobs/{published.job_id}/versions/{version_id}")
     assert listed.status_code == 200
     assert [item["id"] for item in listed.json()["items"]] == [version_id]
     assert fetched.status_code == 200
@@ -1930,6 +1950,14 @@ def test_validation_material_requires_bound_canonical_schema_snapshots(
     core_stack: CoreStack,
 ) -> None:
     published = _seed_published_job(core_stack, "schema")
+    with core_stack.sessions.begin() as session:
+        job = session.get(SyncJob, published.job_id)
+        assert job is not None
+        job.status = "DRAFT"
+        job.validated_spec_hash = None
+        job.validation_report = None
+        job.updated_at = datetime.now(UTC)
+        job.row_version += 1
     with core_stack.sessions() as session:
         version = session.get(JobVersion, published.job_version_id)
         assert version is not None
@@ -1938,9 +1966,7 @@ def test_validation_material_requires_bound_canonical_schema_snapshots(
             target_schema_snapshot=version.target_schema_snapshot,
             source_schema_hash=version.source_schema_hash,
             target_schema_hash=version.target_schema_hash,
-            source_physical_table_identity_hash=(
-                version.source_physical_table_identity_hash
-            ),
+            source_physical_table_identity_hash=(version.source_physical_table_identity_hash),
             target_namespace_id=version.target_namespace_id,
             transfer_policy_id=version.transfer_policy_id,
             transfer_policy_scope_hash=version.transfer_policy_scope_hash,
@@ -1962,6 +1988,7 @@ def test_validation_material_requires_bound_canonical_schema_snapshots(
                 source_schema_snapshot={"columns": [{"name": "id"}]},
             ),
             audit=audit,
+            finalizer=lambda _session: None,
         )
     assert invalid_shape.value.code == "SCHEMA_SNAPSHOT_INVALID"
     with pytest.raises(ProblemException) as invalid_hash:
@@ -1970,6 +1997,7 @@ def test_validation_material_requires_bound_canonical_schema_snapshots(
             job_id=published.job_id,
             material=replace(material, source_schema_hash="0" * 64),
             audit=audit,
+            finalizer=lambda _session: None,
         )
     assert invalid_hash.value.code == "SCHEMA_SNAPSHOT_HASH_MISMATCH"
 
@@ -1978,18 +2006,17 @@ def test_validation_material_requires_bound_canonical_schema_snapshots(
         job_id=published.job_id,
         material=material,
         audit=audit,
+        finalizer=lambda _session: None,
     )
     assert validated.status == "VALID"
     with core_stack.sessions() as session:
         job = session.get(SyncJob, published.job_id)
         assert job is not None
-        assert (
-            job.validation_report["source_schema_hash"]
-            == schema_snapshot_hash(job.validation_report["source_schema_snapshot"])
+        assert job.validation_report["source_schema_hash"] == schema_snapshot_hash(
+            job.validation_report["source_schema_snapshot"]
         )
-        assert (
-            job.validation_report["target_schema_hash"]
-            == schema_snapshot_hash(job.validation_report["target_schema_snapshot"])
+        assert job.validation_report["target_schema_hash"] == schema_snapshot_hash(
+            job.validation_report["target_schema_snapshot"]
         )
 
 
@@ -1997,9 +2024,7 @@ def test_job_preview_is_redacted_and_explicitly_not_executable(
     core_stack: CoreStack,
 ) -> None:
     published = _seed_published_job(core_stack, "preview")
-    preview = core_stack.client.post(
-        f"/api/v1/jobs/{published.job_id}/preview"
-    )
+    preview = core_stack.client.post(f"/api/v1/jobs/{published.job_id}/preview")
     assert preview.status_code == 200, preview.text
     payload = preview.json()
     assert payload["draft_spec_hash"] == "b" * 64
@@ -2013,16 +2038,17 @@ def test_job_preview_is_redacted_and_explicitly_not_executable(
     assert '"transformer"' not in encoded
 
 
-def test_job_validation_fails_closed_without_current_worker_attestation(
+def test_runtime_validation_material_fails_closed_without_current_attestation(
     core_stack: CoreStack,
 ) -> None:
     published = _seed_published_job(core_stack, "validate-runtime")
-    validation = core_stack.client.post(
-        f"/api/v1/jobs/{published.job_id}/validate"
-    )
-    assert validation.status_code == 503
-    assert validation.json()["code"] == "RUNTIME_ATTESTATION_UNAVAILABLE"
-    assert validation.json()["retryable"] is True
+    with pytest.raises(ProblemException) as unavailable:
+        core_stack.service.runtime_validation_material(
+            principal=core_stack.principal,
+            job_id=published.job_id,
+        )
+    assert unavailable.value.code == "RUNTIME_ATTESTATION_UNAVAILABLE"
+    assert unavailable.value.retryable is True
 
 
 def test_service_draining_blocks_new_execution_before_target_admission(
@@ -2058,9 +2084,7 @@ def test_claim_persists_expired_exclusivity_as_a_queue_block(
         execution = session.get(Execution, execution_id)
         assert execution is not None
         confirmation = dict(execution.target_exclusivity_confirmation)
-        confirmation["valid_until"] = (
-            datetime.now(UTC) - timedelta(seconds=1)
-        ).isoformat()
+        confirmation["valid_until"] = (datetime.now(UTC) - timedelta(seconds=1)).isoformat()
         execution.target_exclusivity_confirmation = confirmation
 
     expired_claim = core_stack.service.claim_next_execution(
@@ -2083,23 +2107,16 @@ def test_claim_persists_expired_exclusivity_as_a_queue_block(
     with core_stack.sessions() as session:
         execution = session.get(Execution, execution_id)
         target_lock = session.scalar(
-            select(TargetCopyLock).where(
-                TargetCopyLock.execution_id == execution_id
-            )
+            select(TargetCopyLock).where(TargetCopyLock.execution_id == execution_id)
         )
         assert execution is not None
         assert execution.target_exclusivity_status == "EXPIRED"
-        assert (
-            execution.target_exclusivity_revocation_reason
-            == "VALIDITY_WINDOW_EXPIRED"
-        )
+        assert execution.target_exclusivity_revocation_reason == "VALIDITY_WINDOW_EXPIRED"
         assert execution.queue_eligibility_state == "BLOCKED"
         assert execution.queue_block_reason == "TARGET_EXCLUSIVITY_EXPIRED"
         assert execution.active_attempt_id is None
         assert target_lock is not None and target_lock.state == "RESERVED"
-    assert core_stack.service.reconcile_unclaimed_target_exclusivity(
-        execution_id=execution_id
-    )
+    assert core_stack.service.reconcile_unclaimed_target_exclusivity(execution_id=execution_id)
     reconciled = core_stack.client.get(f"/api/v1/executions/{execution_id}").json()
     assert reconciled["process_state"] == "CANCELED"
     assert reconciled["data_effect"] == "NONE"
@@ -2131,20 +2148,12 @@ def _runtime_preflight(published: PublishedJob) -> dict:
     target_connection_evidence_id = uuid4()
     target_empty_document = {
         "result": "EMPTY",
-        "checked_at": (
-            datetime.now(UTC).isoformat().replace("+00:00", "Z")
-        ),
+        "checked_at": (datetime.now(UTC).isoformat().replace("+00:00", "Z")),
         "observed_row_count": 0,
-        "target_datasource_revision_id": str(
-            published.target_datasource_revision_id
-        ),
-        "target_endpoint_policy_revision_id": str(
-            published.target_endpoint_policy_revision_id
-        ),
+        "target_datasource_revision_id": str(published.target_datasource_revision_id),
+        "target_endpoint_policy_revision_id": str(published.target_endpoint_policy_revision_id),
         "target_namespace_id": str(published.target_namespace_id),
-        "physical_table_identity_hash": (
-            published.target_table_identity_hash
-        ),
+        "physical_table_identity_hash": (published.target_table_identity_hash),
         "connection_evidence_id": str(target_connection_evidence_id),
     }
     return {
@@ -2219,9 +2228,7 @@ def _passed_oracle_report(
             "target_empty_checked_at": target_empty_checked_at.isoformat(),
             "target_snapshot_id": "independent-oracle-snapshot",
             "valid_through_target_snapshot": True,
-            "confirmation_evidence_sha256": runtime[
-                "target_exclusivity_confirmation_sha256"
-            ],
+            "confirmation_evidence_sha256": runtime["target_exclusivity_confirmation_sha256"],
         },
         "normalization": {
             "row_algorithm": "SHA-256",
@@ -2234,9 +2241,7 @@ def _passed_oracle_report(
             "text_encoding": "UTF-8",
             "unicode_normalization": "NFC",
             "trim_text": False,
-            "decimal_encoding": (
-                "CANONICAL_BASE10_NO_EXPONENT_NO_INSIGNIFICANT_ZERO"
-            ),
+            "decimal_encoding": ("CANONICAL_BASE10_NO_EXPONENT_NO_INSIGNIFICANT_ZERO"),
             "negative_zero": "NORMALIZE_TO_ZERO",
             "session_timezone": "UTC",
             "timestamp_encoding": "RFC3339_UTC_MICROSECONDS",
@@ -2285,10 +2290,7 @@ def _passed_oracle_report(
 
 def _assert_audit_contract(core_stack: CoreStack) -> None:
     schema_path = (
-        Path(__file__).resolve().parents[2]
-        / "docs"
-        / "contracts"
-        / "audit-event.v1.schema.json"
+        Path(__file__).resolve().parents[2] / "docs" / "contracts" / "audit-event.v1.schema.json"
     )
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
     validator = Draft202012Validator(
@@ -2347,20 +2349,14 @@ def test_job_patch_immutable_identity_and_audit_reads(
         )
         assert stored_namespace is not None
         identity_id = stored_namespace.physical_endpoint_identity_id
-    identity = core_stack.client.get(
-        f"/api/v1/physical-endpoint-identities/{identity_id}"
-    )
+    identity = core_stack.client.get(f"/api/v1/physical-endpoint-identities/{identity_id}")
     assert identity.status_code == 200, identity.text
     assert identity.json()["id"] == str(identity_id)
     assert "verification_evidence" not in identity.json()
 
-    namespace = core_stack.client.get(
-        f"/api/v1/target-namespaces/{published.target_namespace_id}"
-    )
+    namespace = core_stack.client.get(f"/api/v1/target-namespaces/{published.target_namespace_id}")
     assert namespace.status_code == 200, namespace.text
-    assert namespace.json()["target_namespace_id"] == str(
-        published.target_namespace_id
-    )
+    assert namespace.json()["target_namespace_id"] == str(published.target_namespace_id)
 
     project_audit = core_stack.client.get(
         f"/api/v1/projects/{published.project_id}/audit-events",
@@ -2368,10 +2364,7 @@ def test_job_patch_immutable_identity_and_audit_reads(
     )
     assert project_audit.status_code == 200, project_audit.text
     assert len(project_audit.json()["items"]) == 2
-    assert all(
-        item["action"] == "JOB_DRAFT_UPDATED"
-        for item in project_audit.json()["items"]
-    )
+    assert all(item["action"] == "JOB_DRAFT_UPDATED" for item in project_audit.json()["items"])
     organization_audit = core_stack.client.get(
         "/api/v1/audit-events",
         params={"project_id": str(published.project_id)},
@@ -2483,9 +2476,7 @@ def test_job_list_filters_cursor_scope_and_archive_gate(
         params={"latest_execution_state": "QUEUED"},
     )
     assert latest_execution.status_code == 200, latest_execution.text
-    assert [item["id"] for item in latest_execution.json()["items"]] == [
-        str(published.job_id)
-    ]
+    assert [item["id"] for item in latest_execution.json()["items"]] == [str(published.job_id)]
     summary = latest_execution.json()["items"][0]
     assert summary["latest_published_version_no"] == 1
     assert summary["latest_published_reader_plugin"] == "mysqlreader"
@@ -2559,9 +2550,7 @@ def test_execution_cursor_is_bound_to_all_filters(
         },
     )
     assert matching.status_code == 200, matching.text
-    assert [item["id"] for item in matching.json()["items"]] == [
-        str(execution_id)
-    ]
+    assert [item["id"] for item in matching.json()["items"]] == [str(execution_id)]
 
 
 def test_plugins_are_derived_from_current_worker_attestation(
@@ -2648,19 +2637,16 @@ def test_plugins_are_derived_from_current_worker_attestation(
     response = core_stack.client.get("/api/v1/plugins")
     assert response.status_code == 200, response.text
     payload = response.json()
-    assert [
-        item["datax_plugin_name"] for item in payload["items"]
-    ] == [
+    assert [item["datax_plugin_name"] for item in payload["items"]] == [
         "mysqlreader",
         "mysqlwriter",
         "postgresqlreader",
         "postgresqlwriter",
     ]
     schema = json.loads(
-        (
-            Path(__file__).parents[2]
-            / "docs/contracts/plugin-manifest.v2.schema.json"
-        ).read_text(encoding="utf-8")
+        (Path(__file__).parents[2] / "docs/contracts/plugin-manifest.v2.schema.json").read_text(
+            encoding="utf-8"
+        )
     )
     validator = Draft202012Validator(
         schema,
@@ -2717,8 +2703,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
         with pytest.raises(ValidationError) as identity_error:
             PluginManifest.model_validate_json(json.dumps(invalid_identity))
         assert any(
-            error["loc"] == ()
-            and "locked engine/direction upstream mapping" in error["msg"]
+            error["loc"] == () and "locked engine/direction upstream mapping" in error["msg"]
             for error in identity_error.value.errors()
         ), label
 
@@ -2756,34 +2741,28 @@ def test_plugins_are_derived_from_current_worker_attestation(
     }
     schema_errors = list(validator.iter_errors(e4_contract_probe))
     assert any(
-        list(error.absolute_path)
-        == ["supply_chain", "dependencies", 0, "redistribution_status"]
+        list(error.absolute_path) == ["supply_chain", "dependencies", 0, "redistribution_status"]
         and error.validator == "const"
         for error in schema_errors
     )
     with pytest.raises(ValidationError) as supply_chain_error:
         PluginManifest.model_validate_json(json.dumps(e4_contract_probe))
     assert any(
-        error["loc"] == ()
-        and "requires cleared supply-chain review" in error["msg"]
+        error["loc"] == () and "requires cleared supply-chain review" in error["msg"]
         for error in supply_chain_error.value.errors()
     )
 
-    e4_contract_probe["supply_chain"]["dependencies"][0]["redistribution_status"] = (
-        "DOCUMENTED"
-    )
+    e4_contract_probe["supply_chain"]["dependencies"][0]["redistribution_status"] = "DOCUMENTED"
     e4_contract_probe["evidence"]["source"] = "TEST_INJECTION"
     schema_errors = list(validator.iter_errors(e4_contract_probe))
     assert any(
-        list(error.absolute_path) == ["evidence", "source"]
-        and error.validator in {"enum", "const"}
+        list(error.absolute_path) == ["evidence", "source"] and error.validator in {"enum", "const"}
         for error in schema_errors
     )
     with pytest.raises(ValidationError) as evidence_source_error:
         PluginManifest.model_validate_json(json.dumps(e4_contract_probe))
     assert any(
-        error["loc"] == ("evidence", "source")
-        and error["type"] == "literal_error"
+        error["loc"] == ("evidence", "source") and error["type"] == "literal_error"
         for error in evidence_source_error.value.errors()
     )
 
@@ -2791,15 +2770,13 @@ def test_plugins_are_derived_from_current_worker_attestation(
     e4_contract_probe["evidence"]["valid_until"] = "2026-08-02T00:00:00"
     schema_errors = list(validator.iter_errors(e4_contract_probe))
     assert any(
-        list(error.absolute_path) == ["evidence", "valid_until"]
-        and error.validator == "format"
+        list(error.absolute_path) == ["evidence", "valid_until"] and error.validator == "format"
         for error in schema_errors
     )
     with pytest.raises(ValidationError) as evidence_timestamp_error:
         PluginManifest.model_validate_json(json.dumps(e4_contract_probe))
     assert any(
-        error["loc"] == ("evidence", "valid_until")
-        and "timezone-aware" in error["msg"]
+        error["loc"] == ("evidence", "valid_until") and "timezone-aware" in error["msg"]
         for error in evidence_timestamp_error.value.errors()
     )
 
@@ -2813,9 +2790,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
     e4_contract_probe["ordinary_user_executable"] = False
     e4_contract_probe["block_reasons"] = ["RELEASE_PROMOTION_REQUIRED"]
     assert list(validator.iter_errors(e4_contract_probe)) == []
-    pre_promotion_manifest = PluginManifest.model_validate_json(
-        json.dumps(e4_contract_probe)
-    )
+    pre_promotion_manifest = PluginManifest.model_validate_json(json.dumps(e4_contract_probe))
     assert pre_promotion_manifest.certification_state == "WINDOWS_E4_CERTIFIED"
     assert pre_promotion_manifest.ordinary_user_executable is False
 
@@ -2830,8 +2805,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
     with pytest.raises(ValidationError) as promotion_error:
         PluginManifest.model_validate_json(json.dumps(e4_contract_probe))
     assert any(
-        error["loc"] == ()
-        and "requires a release promotion reference" in error["msg"]
+        error["loc"] == () and "requires a release promotion reference" in error["msg"]
         for error in promotion_error.value.errors()
     )
 
@@ -2850,9 +2824,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
     production_catalog = production_service.list_plugin_capabilities(
         principal=core_stack.principal,
     )
-    assert {item.certification_state for item in production_catalog.items} == {
-        "PACKAGED"
-    }
+    assert {item.certification_state for item in production_catalog.items} == {"PACKAGED"}
     assert not any(item.ordinary_user_executable for item in production_catalog.items)
     assert all(item.block_reasons for item in production_catalog.items)
 
@@ -2890,9 +2862,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
                 version=version,
             )
     assert promotion_blocked.value.code == "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED"
-    assert promotion_blocked.value.details["block_reasons"] == [
-        "RELEASE_PROMOTION_REQUIRED"
-    ]
+    assert promotion_blocked.value.details["block_reasons"] == ["RELEASE_PROMOTION_REQUIRED"]
 
     original_service = core_stack.client.app.state.control_service
     core_stack.client.app.state.control_service = pre_promotion_service
@@ -2905,9 +2875,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
     finally:
         core_stack.client.app.state.control_service = original_service
     assert pre_promotion_create.status_code == 409, pre_promotion_create.text
-    assert pre_promotion_create.json()["details"]["block_reasons"] == [
-        "RELEASE_PROMOTION_REQUIRED"
-    ]
+    assert pre_promotion_create.json()["details"]["block_reasons"] == ["RELEASE_PROMOTION_REQUIRED"]
 
     queued = core_stack.client.post(
         f"/api/v1/jobs/{pre_promotion_job.job_id}/executions",
@@ -2940,9 +2908,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
         assert queued_execution.queue_block_reason == "PLUGIN_E4_CERTIFICATION_BLOCKED"
 
     base_source = _explicit_test_plugin_certification()
-    damaged_records = {
-        name: base_source.get_record(name) for name in _TEST_PLUGIN_HASHES
-    }
+    damaged_records = {name: base_source.get_record(name) for name in _TEST_PLUGIN_HASHES}
     assert all(record is not None for record in damaged_records.values())
     damaged_dependency = CertifiedDependency(
         name="\x00",
@@ -2978,9 +2944,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
             current_candidate_commit=_TEST_CANDIDATE_COMMIT,
             current_worker_image_digest=_TEST_WORKER_IMAGE,
             records={
-                name: record
-                for name, record in damaged_records.items()
-                if record is not None
+                name: record for name, record in damaged_records.items() if record is not None
             },
         ),
     )
@@ -2993,9 +2957,7 @@ def test_plugins_are_derived_from_current_worker_attestation(
     assert damaged_response.status_code == 200, damaged_response.text
     damaged_payload = damaged_response.json()
     damaged_mysqlreader = next(
-        item
-        for item in damaged_payload["items"]
-        if item["datax_plugin_name"] == "mysqlreader"
+        item for item in damaged_payload["items"] if item["datax_plugin_name"] == "mysqlreader"
     )
     assert damaged_mysqlreader["certification_state"] == "BLOCKED"
     assert damaged_mysqlreader["ordinary_user_executable"] is False
@@ -3011,26 +2973,22 @@ def test_plugins_are_derived_from_current_worker_attestation(
             "license_file": invalid_license_file,
             "redistribution_status": "DOCUMENTED",
         }
-        dependency_errors = list(
-            dependency_validator.iter_errors(invalid_dependency)
-        )
+        dependency_errors = list(dependency_validator.iter_errors(invalid_dependency))
         assert any(
-            list(error.absolute_path) == ["license_file"]
-            and error.validator == "pattern"
+            list(error.absolute_path) == ["license_file"] and error.validator == "pattern"
             for error in dependency_errors
         )
         with pytest.raises(ValidationError) as dependency_path_error:
             PluginDependency.model_validate_json(json.dumps(invalid_dependency))
         assert any(
-            error["loc"] == ("license_file",)
-            and "contained relative path" in error["msg"]
+            error["loc"] == ("license_file",) and "contained relative path" in error["msg"]
             for error in dependency_path_error.value.errors()
         )
 
     inventory = json.loads(
-        (
-            Path(__file__).parents[2] / "runtime/upstream-plugin-inventory.v1.json"
-        ).read_text(encoding="utf-8")
+        (Path(__file__).parents[2] / "runtime/upstream-plugin-inventory.v1.json").read_text(
+            encoding="utf-8"
+        )
     )
     locked = {
         item["plugin_name"]: item
@@ -3066,9 +3024,7 @@ def test_execution_api_rejects_production_default_without_windows_e4(
 
     assert response.status_code == 409, response.text
     assert response.json()["code"] == "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED"
-    assert response.json()["details"]["block_reasons"] == [
-        "WINDOWS_E4_EVIDENCE_MISSING"
-    ]
+    assert response.json()["details"]["block_reasons"] == ["WINDOWS_E4_EVIDENCE_MISSING"]
     with core_stack.sessions() as session:
         assert (session.scalar(select(func.count(Execution.id))) or 0) == before
 
@@ -3124,9 +3080,7 @@ def test_plugin_catalog_redacts_invalid_opaque_promotion_reference(
         with pytest.raises(ProblemException) as blocked:
             service.require_job_version_plugin_certification(version=version)
     assert blocked.value.code == "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED"
-    assert blocked.value.details["block_reasons"] == [
-        "RELEASE_PROMOTION_REF_INVALID"
-    ]
+    assert blocked.value.details["block_reasons"] == ["RELEASE_PROMOTION_REF_INVALID"]
 
 
 def test_plugin_catalog_blocks_mismatched_candidate_promotion_references(
@@ -3180,9 +3134,7 @@ def test_plugin_catalog_blocks_mismatched_candidate_promotion_references(
         with pytest.raises(ProblemException) as blocked:
             service.require_job_version_plugin_certification(version=version)
     assert blocked.value.code == "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED"
-    assert blocked.value.details["block_reasons"] == [
-        "PAIR_RELEASE_PROMOTION_MISMATCH"
-    ]
+    assert blocked.value.details["block_reasons"] == ["PAIR_RELEASE_PROMOTION_MISMATCH"]
 
 
 @pytest.mark.parametrize(
@@ -3276,9 +3228,7 @@ def test_worker_claim_rechecks_expired_e4_and_blocks_queued_execution(
         ),
     )
 
-    def credential_selector_must_not_run(
-        *_args: object, **_kwargs: object
-    ) -> CredentialBinding:
+    def credential_selector_must_not_run(*_args: object, **_kwargs: object) -> CredentialBinding:
         raise AssertionError("credential selection must remain behind the E4 gate")
 
     claim = expired_service.claim_next_execution(
@@ -3319,18 +3269,10 @@ def _seed_published_job(core_stack: CoreStack, label: str) -> PublishedJob:
     target_catalog = f"target_{label}"
     source_table = f"source_table_{label}"
     target_table = f"target_table_{label}"
-    source_identity_hash = hashlib.sha256(
-        f"{label}:source-identity".encode()
-    ).hexdigest()
-    target_identity_hash = hashlib.sha256(
-        f"{label}:target-identity".encode()
-    ).hexdigest()
-    target_table_hash = hashlib.sha256(
-        f"{label}:target-table".encode()
-    ).hexdigest()
-    source_table_hash = hashlib.sha256(
-        f"{label}:source-table".encode()
-    ).hexdigest()
+    source_identity_hash = hashlib.sha256(f"{label}:source-identity".encode()).hexdigest()
+    target_identity_hash = hashlib.sha256(f"{label}:target-identity".encode()).hexdigest()
+    target_table_hash = hashlib.sha256(f"{label}:target-table".encode()).hexdigest()
+    source_table_hash = hashlib.sha256(f"{label}:source-table".encode()).hexdigest()
     spec = {
         "schema_version": "1.0",
         "source": {
@@ -3742,19 +3684,12 @@ def _preflight_evidence_validator(
     ) -> None:
         assert session.in_transaction()
         assert claim == expected_claim
-        assert source_evidence_id == UUID(
-            runtime_preflight["source_connection_evidence_id"]
-        )
-        assert target_evidence_id == UUID(
-            runtime_preflight["target_connection_evidence_id"]
-        )
+        assert source_evidence_id == UUID(runtime_preflight["source_connection_evidence_id"])
+        assert target_evidence_id == UUID(runtime_preflight["target_connection_evidence_id"])
         assert source_revision_id != target_revision_id
         assert target_revision_id == published.target_datasource_revision_id
         assert source_policy_revision_id != target_policy_revision_id
-        assert (
-            target_policy_revision_id
-            == published.target_endpoint_policy_revision_id
-        )
+        assert target_policy_revision_id == published.target_endpoint_policy_revision_id
 
     return validate
 

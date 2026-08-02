@@ -38,7 +38,7 @@ def test_runtime_database_roles_have_dml_but_no_ddl_authority() -> None:
         with owner.connect() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == "20260802_0018"
+            ).scalar_one() == "20260802_0019"
             roles = {
                 row.rolname: row
                 for row in connection.execute(

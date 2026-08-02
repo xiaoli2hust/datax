@@ -8,6 +8,7 @@ from uuid import uuid4
 import pytest
 
 from datax_studio.core.schemas import JobSpecV1
+from datax_studio.credentials.operation_boundary import OperationDeadlineExpired
 from datax_studio.schema_snapshot import SchemaSnapshot, schema_snapshot_hash
 from datax_studio.worker.schema_probe import (
     SchemaProbeError,
@@ -301,6 +302,61 @@ def test_schema_probe_stops_before_fetch_when_control_changes_during_execute(
         )
 
     assert trace == ["control", "execute", "control"]
+
+
+@pytest.mark.parametrize(
+    ("engine", "responses"),
+    [
+        ("MYSQL_8", _mysql_probe_responses),
+        ("POSTGRESQL_15", _postgres_probe_responses),
+    ],
+)
+def test_schema_probe_refreshes_statement_budget_before_each_internal_sql(
+    engine: str,
+    responses: Callable[[], list[object]],
+) -> None:
+    """A multi-query schema probe cannot reuse one table-start timeout."""
+
+    trace: list[str] = []
+    connection = _ScriptedConnection(responses(), trace)
+
+    snapshot = probe_schema_snapshot(
+        connection,
+        engine=engine,  # type: ignore[arg-type]
+        identity=_identity(engine=engine),
+        statement_callback=lambda: trace.append("statement_budget"),
+    )
+
+    assert snapshot.engine == engine
+    assert trace.count("statement_budget") == trace.count("execute")
+    for index, operation in enumerate(trace):
+        if operation == "execute":
+            assert trace[index - 1] == "statement_budget"
+
+
+def test_schema_probe_stops_before_second_internal_sql_when_budget_expires() -> None:
+    """The second catalog query is never sent after the total budget ends."""
+
+    trace: list[str] = []
+    connection = _ScriptedConnection(_mysql_probe_responses(), trace)
+    statements = 0
+
+    def refresh_budget() -> None:
+        nonlocal statements
+        statements += 1
+        trace.append("statement_budget")
+        if statements == 2:
+            raise OperationDeadlineExpired("DATASOURCE_OPERATION_DEADLINE_EXCEEDED")
+
+    with pytest.raises(OperationDeadlineExpired, match="DEADLINE_EXCEEDED"):
+        probe_schema_snapshot(
+            connection,
+            engine="MYSQL_8",
+            identity=_identity(engine="MYSQL_8"),
+            statement_callback=refresh_budget,
+        )
+
+    assert trace == ["statement_budget", "execute", "fetchone", "statement_budget"]
 
 
 def test_physical_table_hash_is_domain_separated_and_identifier_sensitive() -> None:

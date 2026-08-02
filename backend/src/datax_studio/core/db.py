@@ -274,6 +274,7 @@ class DatasourceUsageGrant(Base):
     __table_args__ = (
         CheckConstraint("usage IN ('SOURCE_USE', 'TARGET_USE')", name="ck_dsug_usage"),
         CheckConstraint("status IN ('ACTIVE', 'REVOKED')", name="ck_dsug_status"),
+        CheckConstraint("row_version >= 1", name="ck_dsug_row_version"),
         UniqueConstraint(
             "datasource_id",
             "organization_member_id",
@@ -313,6 +314,14 @@ class DatasourceUsageGrant(Base):
         ForeignKey("users.id", ondelete="RESTRICT"),
     )
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # Every revoke or re-grant changes this generation. Long-running external
+    # operations freeze it in A and reject their B result in C if the grant
+    # changed, even when the same row returns to ACTIVE.
+    row_version: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=1,
+    )
 
 
 class TransferPolicy(Base):

@@ -6,10 +6,11 @@ import hmac
 import ipaddress
 import json
 import logging
+import math
 import re
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID, uuid4
@@ -18,14 +19,16 @@ import rfc8785
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESSIV
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-from sqlalchemy import Engine, and_, create_engine, func, or_, select
-from sqlalchemy.exc import IntegrityError
+from pydantic import ValidationError
+from sqlalchemy import Engine, and_, create_engine, func, or_, select, text
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from datax_studio.api.problems import ProblemException
 from datax_studio.audit_integrity import advance_audit_chain_watermark
 from datax_studio.auth.db import (
     AuditEvent,
+    AuthSession,
     IdempotencyRecord,
     MembershipStatus,
     Organization,
@@ -63,8 +66,13 @@ from datax_studio.core.schemas import (
     EndpointPolicyResponse,
     EndpointPolicyRevisionResponse,
     JobSpecV1,
+    ValidationReport,
 )
-from datax_studio.core.service import ControlService
+from datax_studio.core.service import (
+    ControlService,
+    RuntimeValidationMaterial,
+    ValidationMaterial,
+)
 from datax_studio.credentials.connectors import DatabaseConnector, ProbeResult
 from datax_studio.credentials.crypto import (
     AAD_SCHEMA_VERSION,
@@ -80,8 +88,24 @@ from datax_studio.credentials.db import (
     EndpointConnectionEvidence,
     KekKeyVersion,
 )
+from datax_studio.credentials.ingress import (
+    DatasourceOperationAdmissionGuard,
+    DatasourceOperationAdmissionLease,
+    DatasourceOperationAdmissionRejection,
+    DatasourceOperationKind,
+)
 from datax_studio.credentials.keyring import KekKeyring, zeroize
 from datax_studio.credentials.network import EndpointPolicyGuard, ResolvedEndpoint
+from datax_studio.credentials.operation_boundary import (
+    CurrentCredentialMaterial,
+    DatasourceOperationSnapshot,
+    FrozenActorAuthorization,
+    FrozenCredentialBinding,
+    FrozenDatasourceRevision,
+    FrozenEndpointPolicy,
+    OperationDeadline,
+    OperationDeadlineExpired,
+)
 from datax_studio.credentials.schemas import (
     ColumnSchema,
     CredentialSecretEnvelopeSummary,
@@ -103,7 +127,10 @@ from datax_studio.credentials.schemas import (
     TableSchema,
     TableSchemaPage,
 )
-from datax_studio.egress_attestation import LoopbackEgressAttestationClient
+from datax_studio.egress_attestation import (
+    EgressAttestationError,
+    LoopbackEgressAttestationClient,
+)
 from datax_studio.recovery.db import RecoveryGate, RecoveryProbe
 from datax_studio.schema_snapshot import SchemaSnapshot, schema_snapshot_hash
 from datax_studio.settings import Settings
@@ -167,6 +194,16 @@ _NON_RETRYABLE_METADATA_VALUE_ERRORS = frozenset(
         "UNSUPPORTED_ENGINE",
     }
 )
+_RETRYABLE_EGRESS_UNAVAILABLE_CODES = frozenset(
+    {
+        "EGRESS_ATTESTATION_UNAVAILABLE",
+        "EGRESS_ATTESTATION_UNVERIFIED",
+        "EGRESS_ATTESTATION_STALE",
+        "EGRESS_LEASE_UNAVAILABLE",
+        "EGRESS_NETWORK_NAMESPACE_UNAVAILABLE",
+        "EGRESS_OPERATION_DEADLINE_EXCEEDED",
+    }
+)
 _NON_RETRYABLE_MYSQL_ERROR_NUMBERS = frozenset(
     {
         1044,  # access denied to database
@@ -185,16 +222,11 @@ def _metadata_failure_retryable(exc: Exception) -> bool:
 
     if isinstance(exc, SchemaProbeError):
         return False
-    if (
-        isinstance(exc, ValueError)
-        and str(exc) in _NON_RETRYABLE_METADATA_VALUE_ERRORS
-    ):
+    if isinstance(exc, ValueError) and str(exc) in _NON_RETRYABLE_METADATA_VALUE_ERRORS:
         return False
     sqlstate = getattr(exc, "sqlstate", None)
     if isinstance(sqlstate, str) and (
-        sqlstate == "3D000"
-        or sqlstate.startswith("28")
-        or sqlstate.startswith("42")
+        sqlstate == "3D000" or sqlstate.startswith("28") or sqlstate.startswith("42")
     ):
         return False
     return not (
@@ -202,18 +234,6 @@ def _metadata_failure_retryable(exc: Exception) -> bool:
         and isinstance(exc.args[0], int)
         and exc.args[0] in _NON_RETRYABLE_MYSQL_ERROR_NUMBERS
     )
-
-
-@dataclass(frozen=True)
-class SchemaValidationMaterial:
-    source_schema_snapshot: dict[str, Any]
-    target_schema_snapshot: dict[str, Any]
-    source_schema_hash: str
-    target_schema_hash: str
-    source_physical_table_identity_hash: str
-    target_namespace_id: UUID
-    transfer_policy_id: UUID
-    transfer_policy_scope_hash: str
 
 
 @dataclass(frozen=True)
@@ -225,6 +245,97 @@ class DatasourceConnectionCandidate:
     default_schema: str
     username: str
     ssl_mode: str
+
+
+@dataclass(frozen=True)
+class CreateDatasourceOperation:
+    """Non-secret phase-A create hand-off used while B is outside the DB."""
+
+    snapshot: DatasourceOperationSnapshot
+    candidate: DatasourceConnectionCandidate
+    request_body: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class UpdateDatasourceOperation:
+    """Detached phase-A update intent for a probe-required datasource patch.
+
+    ``snapshot`` freezes the datasource's *current* binding, while
+    ``candidate_policy`` freezes the possibly different policy selected for the
+    proposed revision.  Keeping them separate is important: changing an
+    endpoint policy is itself the intent under test, so it cannot be forced
+    into ``DatasourceOperationSnapshot`` whose policy is structurally tied to
+    the currently persisted revision.
+    """
+
+    snapshot: DatasourceOperationSnapshot
+    candidate: DatasourceConnectionCandidate
+    candidate_policy: FrozenEndpointPolicy
+    connection_fields: frozenset[str]
+    password_provided: bool
+
+
+@dataclass(frozen=True)
+class FrozenTransferPolicy:
+    """The exact active transfer authorization observed in phase A."""
+
+    id: UUID
+    project_id: UUID
+    source_datasource_revision_id: UUID
+    target_datasource_revision_id: UUID
+    source_physical_endpoint_identity_id: UUID
+    target_physical_endpoint_identity_id: UUID
+    status: str
+    row_version: int
+    scope_hash: str
+
+
+@dataclass(frozen=True)
+class FrozenTargetNamespace:
+    """The registered target physical-table identity observed in phase A."""
+
+    id: UUID
+    physical_endpoint_identity_id: UUID
+    engine: str
+    normalized_catalog_name: str
+    normalized_schema_name: str
+    normalized_table_name: str
+    normalization_version: str
+    physical_table_identity_hash: str
+
+
+@dataclass(frozen=True)
+class JobValidationOperation:
+    """Detached A-time binding for one dual-datasource validation operation."""
+
+    operation_id: UUID
+    job_id: UUID
+    project_id: UUID
+    project_status: str
+    project_row_version: int
+    job_status: str
+    job_row_version: int
+    job_draft_spec_hash: str
+    source: DatasourceOperationSnapshot
+    target: DatasourceOperationSnapshot
+    transfer_policy: FrozenTransferPolicy
+    target_namespace: FrozenTargetNamespace
+    source_plugin_name: str
+    target_plugin_name: str
+    runtime: RuntimeValidationMaterial
+    source_schema_name: str
+    source_table_name: str
+    target_schema_name: str
+    target_table_name: str
+
+
+@dataclass(frozen=True)
+class ValidationSchemaProbe:
+    """Non-ORM B-time schema result awaiting C-time persistence."""
+
+    snapshot: SchemaSnapshot
+    resolved: ResolvedEndpoint
+    peer_ip: str
 
 
 def build_credential_service(
@@ -273,6 +384,13 @@ def build_credential_service(
             connect_timeout_seconds=settings.datasource_connect_timeout_seconds,
             query_timeout_seconds=settings.datasource_query_timeout_seconds,
         ),
+        # Worker-focused callers historically pass a narrow, read-only
+        # settings-shaped object.  The production Settings model always has
+        # this field; retain the explicit secure default for those test/helper
+        # construction paths rather than making the Worker own an API setting.
+        operation_deadline_seconds=float(
+            getattr(settings, "datasource_operation_deadline_seconds", 30.0)
+        ),
     )
     if register_active_kek:
         service.ensure_active_kek_registered()
@@ -291,9 +409,12 @@ class CredentialService:
         integrity_hmac_key: bytes,
         guard: EndpointPolicyGuard,
         connector: DatabaseConnector,
+        operation_deadline_seconds: float = 30.0,
     ) -> None:
         if len(integrity_hmac_key) != 32:
             raise ValueError("integrity HMAC key must contain exactly 32 bytes")
+        if operation_deadline_seconds <= 0:
+            raise ValueError("operation deadline must be positive")
         self.sessions = sessions
         self.keyring = keyring
         self.active_kek_version = active_kek_version
@@ -307,6 +428,19 @@ class CredentialService:
         self._password_request_fingerprint_cipher = AESSIV(fingerprint_key)
         self.guard = guard
         self.connector = connector
+        self.operation_deadline_seconds = operation_deadline_seconds
+
+    def new_operation_deadline(self) -> OperationDeadline:
+        """Create one shared budget for a composite metadata caller.
+
+        Direct API operations create their own budget inside the corresponding
+        method.  A caller that coordinates more than one metadata read (the
+        transfer-policy scope flow) must instead create one deadline here and
+        pass it to every nested read so a second endpoint cannot reset the
+        first endpoint's remaining budget.
+        """
+
+        return OperationDeadline(self.operation_deadline_seconds)
 
     def ensure_active_kek_registered(self) -> None:
         try:
@@ -317,9 +451,7 @@ class CredentialService:
         try:
             with self.sessions.begin() as session:
                 active = session.scalar(
-                    select(KekKeyVersion)
-                    .where(KekKeyVersion.status == "ACTIVE")
-                    .with_for_update()
+                    select(KekKeyVersion).where(KekKeyVersion.status == "ACTIVE").with_for_update()
                 )
                 registered = session.get(KekKeyVersion, self.active_kek_version)
                 if registered is None:
@@ -335,7 +467,7 @@ class CredentialService:
                             activated_at=now,
                             created_at=now,
                         )
-                    )
+                )
                     return
                 if (
                     active is None
@@ -363,9 +495,7 @@ class CredentialService:
         except (OSError, ValueError) as exc:
             raise self._keyring_unavailable() from exc
         with self.sessions() as session:
-            active = session.scalar(
-                select(KekKeyVersion).where(KekKeyVersion.status == "ACTIVE")
-            )
+            active = session.scalar(select(KekKeyVersion).where(KekKeyVersion.status == "ACTIVE"))
             registered = session.get(KekKeyVersion, self.active_kek_version)
             if (
                 active is None
@@ -473,9 +603,7 @@ class CredentialService:
         )
         if len(envelopes) != len(secret_ids):
             raise self._binding_unavailable()
-        envelopes_by_secret = {
-            envelope.credential_secret_id: envelope for envelope in envelopes
-        }
+        envelopes_by_secret = {envelope.credential_secret_id: envelope for envelope in envelopes}
         if set(envelopes_by_secret) != set(secret_ids):
             raise self._binding_unavailable()
 
@@ -567,32 +695,9 @@ class CredentialService:
                 or evidence.fence_epoch != claim.fence_epoch
                 or evidence.datasource_revision_id != revision_id
                 or evidence.endpoint_policy_revision_id != policy_revision_id
-                or ensure_aware(evidence.dns_valid_until)
-                < ensure_aware(evidence.observed_at)
+                or ensure_aware(evidence.dns_valid_until) < ensure_aware(evidence.observed_at)
             ):
                 raise self._preflight_evidence_invalid()
-
-    @contextmanager
-    def decrypted_password(
-        self,
-        session: Session,
-        *,
-        datasource_id: UUID,
-        secret_id: UUID,
-        envelope_id: UUID,
-    ) -> Iterator[bytearray]:
-        plaintext = bytearray()
-        try:
-            plaintext = self._decrypt_password_value(
-                session,
-                datasource_id=datasource_id,
-                secret_id=secret_id,
-                envelope_id=envelope_id,
-                lock_secret=False,
-            )
-            yield plaintext
-        finally:
-            zeroize(plaintext)
 
     @contextmanager
     def decrypted_worker_password(
@@ -709,8 +814,7 @@ class CredentialService:
                     select(EndpointPolicy)
                     .where(
                         EndpointPolicy.id == endpoint_policy_id,
-                        EndpointPolicy.organization_id
-                        == principal.organization_id,
+                        EndpointPolicy.organization_id == principal.organization_id,
                     )
                     .with_for_update()
                 )
@@ -725,8 +829,7 @@ class CredentialService:
                     )
                 current_revision = session.scalar(
                     select(EndpointPolicyRevision).where(
-                        EndpointPolicyRevision.id
-                        == policy.current_revision_id,
+                        EndpointPolicyRevision.id == policy.current_revision_id,
                         EndpointPolicyRevision.endpoint_policy_id == policy.id,
                     )
                 )
@@ -744,11 +847,9 @@ class CredentialService:
                     normalized_name = request.name.strip()
                     conflict = session.scalar(
                         select(EndpointPolicy.id).where(
-                            EndpointPolicy.organization_id
-                            == principal.organization_id,
+                            EndpointPolicy.organization_id == principal.organization_id,
                             EndpointPolicy.id != policy.id,
-                            func.lower(EndpointPolicy.name)
-                            == normalized_name.casefold(),
+                            func.lower(EndpointPolicy.name) == normalized_name.casefold(),
                         )
                     )
                     if conflict is not None:
@@ -763,9 +864,7 @@ class CredentialService:
                         changed_fields.append("name")
 
                 revision = current_revision
-                config_fields = (
-                    request.model_fields_set & _ENDPOINT_POLICY_CONFIG_FIELDS
-                )
+                config_fields = request.model_fields_set & _ENDPOINT_POLICY_CONFIG_FIELDS
                 if config_fields:
                     normalized = self._normalize_endpoint_policy_patch(
                         current_revision,
@@ -812,8 +911,7 @@ class CredentialService:
                         if revision.id != current_revision.id
                         else (
                             "ENDPOINT_POLICY_DISABLED"
-                            if policy.status == "DISABLED"
-                            and changed_fields == ["status"]
+                            if policy.status == "DISABLED" and changed_fields == ["status"]
                             else "ENDPOINT_POLICY_UPDATED"
                         )
                     ),
@@ -851,8 +949,7 @@ class CredentialService:
             policy = session.scalar(
                 select(EndpointPolicy).where(
                     EndpointPolicy.id == endpoint_policy_id,
-                    EndpointPolicy.organization_id
-                    == principal.organization_id,
+                    EndpointPolicy.organization_id == principal.organization_id,
                 )
             )
             if policy is None:
@@ -879,8 +976,7 @@ class CredentialService:
                 select(EndpointConnectionEvidence)
                 .join(
                     DatasourceRevision,
-                    DatasourceRevision.id
-                    == EndpointConnectionEvidence.datasource_revision_id,
+                    DatasourceRevision.id == EndpointConnectionEvidence.datasource_revision_id,
                 )
                 .join(
                     Datasource,
@@ -898,24 +994,349 @@ class CredentialService:
                 id=evidence.id,
                 operation_kind=evidence.operation_kind,
                 datasource_revision_id=evidence.datasource_revision_id,
-                endpoint_policy_revision_id=(
-                    evidence.endpoint_policy_revision_id
-                ),
+                endpoint_policy_revision_id=(evidence.endpoint_policy_revision_id),
                 resolver_policy_version=evidence.resolver_policy_version,
                 resolved_ips=[str(value) for value in evidence.resolved_ips],
                 selected_ip=str(evidence.selected_ip),
                 peer_observation_status=evidence.peer_observation_status,
-                peer_ip=(
-                    str(evidence.peer_ip)
-                    if evidence.peer_ip is not None
-                    else None
-                ),
+                peer_ip=(str(evidence.peer_ip) if evidence.peer_ip is not None else None),
                 egress_policy_version=evidence.egress_policy_version,
                 egress_evidence_hash=evidence.egress_evidence_hash,
                 decision=evidence.decision,
                 evidence_hash=evidence.evidence_hash,
                 observed_at=ensure_aware(evidence.observed_at),
             )
+
+    def _create_candidate(
+        self,
+        request: DatasourceCreate,
+    ) -> DatasourceConnectionCandidate:
+        return DatasourceConnectionCandidate(
+            engine=request.engine.value,
+            host=request.host.rstrip(".").casefold(),
+            port=request.port,
+            database_name=request.database_name,
+            default_schema=request.default_schema,
+            username=request.username,
+            ssl_mode=request.ssl_mode.value,
+        )
+
+    def _capture_create_datasource_operation(
+        self,
+        *,
+        principal: Principal,
+        project_id: UUID,
+        request: DatasourceCreate,
+        request_body: dict[str, Any],
+    ) -> CreateDatasourceOperation:
+        candidate = self._create_candidate(request)
+        self._validate_connection_input(candidate)
+        with self.sessions.begin() as session:
+            organization = self._lock_organization(session, principal.organization_id)
+            project = self._visible_project(
+                session,
+                principal,
+                project_id,
+                lock=True,
+            )
+            if project.status != "ACTIVE":
+                raise ProblemException(
+                    status=409,
+                    code="PROJECT_ARCHIVED",
+                    title="项目已归档",
+                    detail="归档项目不能新增数据源。",
+                )
+            policy = session.scalar(
+                select(EndpointPolicy)
+                .where(
+                    EndpointPolicy.id == request.endpoint_policy_id,
+                    EndpointPolicy.organization_id == principal.organization_id,
+                )
+                .with_for_update()
+            )
+            if policy is None or policy.status != "ACTIVE" or policy.current_revision_id is None:
+                raise ProblemException(
+                    status=422,
+                    code="ENDPOINT_POLICY_NOT_ACTIVE",
+                    title="端点策略不可用",
+                    detail="必须选择当前有效的端点策略。",
+                )
+            policy_revision = session.get(
+                EndpointPolicyRevision,
+                policy.current_revision_id,
+            )
+            if policy_revision is None or policy_revision.engine != candidate.engine:
+                raise ProblemException(
+                    status=422,
+                    code="ENDPOINT_POLICY_DENIED",
+                    title="端点策略不匹配",
+                    detail="数据源引擎或连接端点不在允许范围。",
+                )
+            if policy_revision.tls_required and candidate.ssl_mode == "DISABLE":
+                raise ProblemException(
+                    status=422,
+                    code="ENDPOINT_POLICY_DENIED",
+                    title="端点策略要求 TLS",
+                    detail="该端点策略不允许关闭数据库 TLS。",
+                )
+            actor_authorization = self._read_live_operation_authorization(
+                session,
+                principal=principal,
+                project=project,
+                datasource=None,
+                usage=None,
+            )
+            candidate_hash = self._domain_hash(
+                "DXDATASOURCECREATEv1",
+                {
+                    "project_id": str(project.id),
+                    "endpoint_policy_revision_id": str(policy_revision.id),
+                    "candidate": {
+                        "engine": candidate.engine,
+                        "host": candidate.host,
+                        "port": candidate.port,
+                        "database_name": candidate.database_name,
+                        "default_schema": candidate.default_schema,
+                        "username": candidate.username,
+                        "ssl_mode": candidate.ssl_mode,
+                    },
+                    "request": request_body,
+                },
+            )
+            snapshot = DatasourceOperationSnapshot(
+                operation_kind=DatasourceOperationKind.CREATE,
+                operation_id=uuid4(),
+                organization_id=organization.id,
+                organization_status=organization.status,
+                organization_row_version=organization.row_version,
+                project_id=project.id,
+                project_status=project.status,
+                project_row_version=project.row_version,
+                datasource_id=None,
+                datasource_status=None,
+                datasource_row_version=None,
+                datasource_current_revision_id=None,
+                datasource_current_secret_id=None,
+                datasource_revision=None,
+                endpoint_policy=self._freeze_endpoint_policy(
+                    policy=policy,
+                    revision=policy_revision,
+                ),
+                credential_binding=None,
+                actor_authorization=actor_authorization,
+                candidate_config_hash=candidate_hash,
+            )
+            return CreateDatasourceOperation(
+                snapshot=snapshot,
+                candidate=candidate,
+                request_body=dict(request_body),
+            )
+
+    def _revalidate_create_datasource_operation(
+        self,
+        session: Session,
+        *,
+        principal: Principal,
+        request: DatasourceCreate,
+        operation: CreateDatasourceOperation,
+    ) -> tuple[Organization, Project, EndpointPolicyRevision]:
+        snapshot = operation.snapshot
+        try:
+            organization = self._lock_organization(session, snapshot.organization_id)
+            project = self._visible_project(
+                session,
+                principal,
+                snapshot.project_id,
+                lock=True,
+            )
+            if project.status != "ACTIVE" or snapshot.endpoint_policy is None:
+                raise self._operation_stale()
+            policy = session.scalar(
+                select(EndpointPolicy)
+                .where(
+                    EndpointPolicy.id == snapshot.endpoint_policy.endpoint_policy_id,
+                    EndpointPolicy.organization_id == organization.id,
+                )
+                .with_for_update()
+            )
+            if policy is None or policy.current_revision_id is None:
+                raise self._operation_stale()
+            policy_revision = session.get(
+                EndpointPolicyRevision,
+                policy.current_revision_id,
+            )
+            if policy_revision is None:
+                raise self._operation_stale()
+            actor_authorization = self._read_live_operation_authorization(
+                session,
+                principal=principal,
+                project=project,
+                datasource=None,
+                usage=None,
+            )
+        except ProblemException as exc:
+            if exc.code == "DATASOURCE_OPERATION_STALE":
+                raise
+            raise self._operation_stale() from exc
+        if (
+            organization.status != snapshot.organization_status
+            or organization.row_version != snapshot.organization_row_version
+            or project.status != snapshot.project_status
+            or project.row_version != snapshot.project_row_version
+            or
+            self._freeze_endpoint_policy(policy=policy, revision=policy_revision)
+            != snapshot.endpoint_policy
+            or actor_authorization != snapshot.actor_authorization
+            or self._create_candidate(request) != operation.candidate
+        ):
+            raise self._operation_stale()
+        return organization, project, policy_revision
+
+    def _ensure_create_datasource_name_available(
+        self,
+        session: Session,
+        *,
+        project: Project,
+        request: DatasourceCreate,
+    ) -> None:
+        """Check a new-create name only after the completed replay decision.
+
+        A successfully completed idempotent request necessarily owns this name.
+        Checking the name before looking up its completed response makes a
+        legitimate retry look like an unrelated conflict.
+        """
+
+        if session.scalar(
+            select(Datasource.id).where(
+                Datasource.project_id == project.id,
+                func.lower(Datasource.name) == request.name.strip().casefold(),
+                Datasource.status != "DELETED",
+            )
+        ):
+            raise ProblemException(
+                status=409,
+                code="DATASOURCE_NAME_CONFLICT",
+                title="数据源名称已存在",
+                detail="请使用其他名称。",
+            )
+
+    def _read_completed_create_idempotency_replay(
+        self,
+        *,
+        principal: Principal,
+        project_id: UUID,
+        idempotency_key: str,
+        request_body: dict[str, Any],
+    ) -> OperationResult[DatasourceAdminDetail] | None:
+        """Return a completed create replay without reserving a new record.
+
+        ADR-0014 forbids persisting a partial idempotency record before phase
+        B.  This read-only A-time check preserves normal retries without
+        creating the incomplete reservation used by ``_claim_idempotency``.
+        """
+
+        now = utc_now()
+        scope = "POST /projects/{project_id}/datasources"
+        request_hash = self._idempotency_hash(
+            actor_id=principal.user_id,
+            scope=scope,
+            body=request_body,
+        )
+        with self.sessions.begin() as session:
+            organization = self._lock_organization(session, principal.organization_id)
+            project = self._visible_project(
+                session,
+                principal,
+                project_id,
+                lock=True,
+            )
+            self._read_live_operation_authorization(
+                session,
+                principal=principal,
+                project=project,
+                datasource=None,
+                usage=None,
+            )
+            # Keep organization in scope so a missing/inconsistent hierarchy is
+            # treated exactly as the normal phase-A capture path.
+            if organization.id != principal.organization_id:
+                self._not_found()
+            record = session.scalar(
+                select(IdempotencyRecord)
+                .where(
+                    IdempotencyRecord.actor_id == principal.user_id,
+                    IdempotencyRecord.scope == scope,
+                    IdempotencyRecord.idempotency_key == idempotency_key,
+                )
+                .with_for_update()
+            )
+            if record is None or ensure_aware(record.expires_at) <= now:
+                return None
+            if record.request_hash_scheme != IDEMPOTENCY_HASH_SCHEME or not hmac.compare_digest(
+                record.request_hash, request_hash
+            ):
+                raise ProblemException(
+                    status=409,
+                    code="IDEMPOTENCY_CONFLICT",
+                    title="Idempotency-Key 已用于不同请求",
+                    detail="请为新的业务意图使用新的 Idempotency-Key。",
+                )
+            if record.response_status is None or record.response_body is None:
+                raise ProblemException(
+                    status=409,
+                    code="IDEMPOTENCY_IN_PROGRESS",
+                    title="相同请求仍在处理中",
+                    detail="请稍后使用相同 Idempotency-Key 重试。",
+                    retryable=True,
+                    headers={"Retry-After": "1"},
+                )
+            return OperationResult(
+                self._create_datasource_replay_response(
+                    session,
+                    record=record,
+                    project_id=project.id,
+                ),
+                replayed=True,
+            )
+
+    @staticmethod
+    def _create_datasource_replay_conflict() -> ProblemException:
+        """Fail closed when a create replay is not bound to this Project."""
+
+        return ProblemException(
+            status=409,
+            code="IDEMPOTENCY_CONFLICT",
+            title="Idempotency-Key 已用于不同请求",
+            detail="该 Idempotency-Key 已绑定到另一项目的数据源创建请求。",
+        )
+
+    def _create_datasource_replay_response(
+        self,
+        session: Session,
+        *,
+        record: IdempotencyRecord,
+        project_id: UUID,
+    ) -> DatasourceAdminDetail:
+        """Bind a completed create replay to the requested Project.
+
+        The idempotency scope is the route template, so it deliberately omits
+        the concrete ``project_id``.  A matching body/key must therefore also
+        prove that the durable datasource and stored response both belong to
+        the requested project before a replay is exposed.
+        """
+
+        if record.resource_type != "DATASOURCE" or record.resource_id is None:
+            raise self._create_datasource_replay_conflict()
+        datasource = session.get(Datasource, record.resource_id)
+        if datasource is None or datasource.project_id != project_id:
+            raise self._create_datasource_replay_conflict()
+        try:
+            response = DatasourceAdminDetail.model_validate(record.response_body)
+        except (TypeError, ValueError) as exc:
+            raise self._create_datasource_replay_conflict() from exc
+        if response.id != datasource.id:
+            raise self._create_datasource_replay_conflict()
+        return response
 
     def create_datasource(
         self,
@@ -925,23 +1346,103 @@ class CredentialService:
         request: DatasourceCreate,
         idempotency_key: str,
         audit: AuditContext,
+        admission: DatasourceOperationAdmissionGuard | None = None,
     ) -> OperationResult[DatasourceAdminDetail]:
         self._require_admin(principal)
         password = bytearray(request.password.get_secret_value().encode("utf-8"))
         request_body = request.model_dump(mode="json", exclude={"password"})
-        request_body["password_fingerprint"] = self._password_request_fingerprint(
-            password
-        )
-        now = utc_now()
+        request_body["password_fingerprint"] = self._password_request_fingerprint(password)
+        lease: DatasourceOperationAdmissionLease | None = None
         try:
-            with self.sessions.begin() as session:
-                organization = self._lock_organization(session, principal.organization_id)
-                project = self._visible_project(
-                    session,
-                    principal,
-                    project_id,
-                    lock=True,
+            replay = self._read_completed_create_idempotency_replay(
+                principal=principal,
+                project_id=project_id,
+                idempotency_key=idempotency_key,
+                request_body=request_body,
+            )
+            if replay is not None:
+                return replay
+            lease = self._acquire_datasource_operation_admission(
+                admission=admission,
+                organization_id=principal.organization_id,
+                datasource_ids=(),
+                operation_kind=DatasourceOperationKind.CREATE,
+            )
+            operation = self._capture_create_datasource_operation(
+                principal=principal,
+                project_id=project_id,
+                request=request,
+                request_body=request_body,
+            )
+            snapshot = operation.snapshot
+            assert snapshot.endpoint_policy is not None
+            deadline = OperationDeadline(self.operation_deadline_seconds)
+            try:
+                deadline.check_expired()
+                resolved = self.guard.resolve(
+                    snapshot.endpoint_policy,
+                    host=operation.candidate.host,
+                    port=operation.candidate.port,
+                    deadline=deadline,
                 )
+                deadline.check_expired()
+                self.guard.verify_rebinding(
+                    snapshot.endpoint_policy,
+                    resolved,
+                    deadline=deadline,
+                )
+                deadline.check_expired()
+                probe = self.connector.probe(
+                    operation.candidate,
+                    password=password,
+                    resolved=resolved,
+                    deadline=deadline,
+                )
+                deadline.check_expired()
+            except OperationDeadlineExpired as exc:
+                # The remaining budget is already zero.  Do not start an
+                # unbounded C revalidation just to decide whether to report a
+                # response that cannot persist any B-phase material.
+                raise self._operation_deadline_problem(
+                    "本次连接验证超过总时限；没有创建数据源或幂等记录。"
+                ) from exc
+            except ProblemException:
+                with self._deadline_transaction(deadline) as session:
+                    self._revalidate_create_datasource_operation(
+                        session,
+                        principal=principal,
+                        request=request,
+                        operation=operation,
+                    )
+                raise
+            except Exception as exc:
+                # A connector/DNS implementation may report its own timeout
+                # instead of OperationDeadlineExpired.  The fixed operation
+                # deadline remains authoritative: once exhausted, do not
+                # downgrade it to a generic probe failure.
+                if deadline.remaining_seconds() <= 0.0:
+                    raise self._operation_deadline_problem(
+                        "本次连接验证超过总时限；没有创建数据源或幂等记录。"
+                    ) from exc
+                with self._deadline_transaction(deadline) as session:
+                    self._revalidate_create_datasource_operation(
+                        session,
+                        principal=principal,
+                        request=request,
+                        operation=operation,
+                    )
+                raise self._safe_probe_problem(exc) from exc
+            now = utc_now()
+            with self._deadline_transaction(deadline) as session:
+                organization, project, policy_revision = (
+                    self._revalidate_create_datasource_operation(
+                        session,
+                        principal=principal,
+                        request=request,
+                        operation=operation,
+                    )
+                )
+                deadline.check_expired()
                 replay = self._claim_idempotency(
                     session,
                     actor_id=principal.user_id,
@@ -952,79 +1453,17 @@ class CredentialService:
                 )
                 if replay is not None:
                     return OperationResult(
-                        DatasourceAdminDetail.model_validate(replay.response_body),
+                        self._create_datasource_replay_response(
+                            session,
+                            record=replay,
+                            project_id=project.id,
+                        ),
                         replayed=True,
                     )
-                if project.status != "ACTIVE":
-                    raise ProblemException(
-                        status=409,
-                        code="PROJECT_ARCHIVED",
-                        title="项目已归档",
-                        detail="归档项目不能新增数据源。",
-                    )
-                policy = session.scalar(
-                    select(EndpointPolicy)
-                    .where(
-                        EndpointPolicy.id == request.endpoint_policy_id,
-                        EndpointPolicy.organization_id == principal.organization_id,
-                    )
-                    .with_for_update()
-                )
-                if (
-                    policy is None
-                    or policy.status != "ACTIVE"
-                    or policy.current_revision_id is None
-                ):
-                    raise ProblemException(
-                        status=422,
-                        code="ENDPOINT_POLICY_NOT_ACTIVE",
-                        title="端点策略不可用",
-                        detail="必须选择当前有效的端点策略。",
-                    )
-                policy_revision = session.get(
-                    EndpointPolicyRevision,
-                    policy.current_revision_id,
-                )
-                if policy_revision is None or policy_revision.engine != request.engine.value:
-                    raise ProblemException(
-                        status=422,
-                        code="ENDPOINT_POLICY_DENIED",
-                        title="端点策略不匹配",
-                        detail="数据源引擎或连接端点不在允许范围。",
-                    )
-                if policy_revision.tls_required and request.ssl_mode.value == "DISABLE":
-                    raise ProblemException(
-                        status=422,
-                        code="ENDPOINT_POLICY_DENIED",
-                        title="端点策略要求 TLS",
-                        detail="该端点策略不允许关闭数据库 TLS。",
-                    )
-                self._validate_connection_input(request)
-                if session.scalar(
-                    select(Datasource.id).where(
-                        Datasource.project_id == project.id,
-                        func.lower(Datasource.name) == request.name.strip().casefold(),
-                        Datasource.status != "DELETED",
-                    )
-                ):
-                    raise ProblemException(
-                        status=409,
-                        code="DATASOURCE_NAME_CONFLICT",
-                        title="数据源名称已存在",
-                        detail="请使用其他名称。",
-                    )
-
-                resolved = self.guard.resolve(
-                    policy_revision,
-                    host=request.host,
-                    port=request.port,
-                    now=now,
-                )
-                self.guard.verify_rebinding(policy_revision, resolved)
-                probe = self.connector.probe(
-                    request,
-                    password=password,
-                    resolved=resolved,
+                self._ensure_create_datasource_name_available(
+                    session,
+                    project=project,
+                    request=request,
                 )
                 datasource = self._persist_new_datasource(
                     session,
@@ -1051,6 +1490,10 @@ class CredentialService:
                     resource_id=datasource.id,
                 )
                 return OperationResult(response)
+        except OperationDeadlineExpired as exc:
+            raise self._operation_deadline_problem(
+                "本次连接验证超过总时限；没有创建数据源或幂等记录。"
+            ) from exc
         except ProblemException:
             raise
         except IntegrityError as exc:
@@ -1060,10 +1503,450 @@ class CredentialService:
                 title="数据源创建冲突",
                 detail="请刷新后重试。",
             ) from exc
-        except Exception as exc:
-            raise self._safe_probe_problem(exc) from exc
         finally:
+            if lease is not None:
+                lease.release()
             zeroize(password)
+
+    def _prepare_update_datasource_operation(
+        self,
+        session: Session,
+        *,
+        principal: Principal,
+        datasource: Datasource,
+        project: Project,
+        organization: Organization,
+        request: DatasourcePatch,
+    ) -> UpdateDatasourceOperation | None:
+        """Freeze an update probe intent while the original binding is locked.
+
+        A password-supplied repair intentionally does not require the old
+        secret to be usable: it probes the supplied secret and replaces the
+        broken one only after phase C.  A password-less update does require the
+        strict active binding because phase B will decrypt it.
+        """
+
+        connection_fields = frozenset(request.model_fields_set & _DATASOURCE_REVISION_FIELDS)
+        activating = (
+            "status" in request.model_fields_set
+            and request.status == "ACTIVE"
+            and datasource.status != "ACTIVE"
+        )
+        requires_probe = bool(connection_fields or request.password is not None or activating)
+        if not requires_probe:
+            return None
+
+        current_revision = self._datasource_revision_record(session, datasource)
+        if connection_fields:
+            candidate, candidate_policy_revision = self._datasource_patch_candidate(
+                session,
+                principal=principal,
+                current=current_revision,
+                request=request,
+            )
+        else:
+            current_revision, candidate_policy_revision = self._current_revisions(
+                session,
+                datasource,
+            )
+            candidate = DatasourceConnectionCandidate(
+                engine=current_revision.engine,
+                host=current_revision.host,
+                port=current_revision.port,
+                database_name=current_revision.database_name,
+                default_schema=current_revision.default_schema,
+                username=current_revision.username,
+                ssl_mode=current_revision.ssl_mode,
+            )
+        candidate_policy = session.scalar(
+            select(EndpointPolicy)
+            .where(
+                EndpointPolicy.id == candidate_policy_revision.endpoint_policy_id,
+                EndpointPolicy.organization_id == organization.id,
+            )
+            .with_for_update()
+        )
+        if candidate_policy is None:
+            raise self._binding_unavailable()
+        snapshot = self._freeze_current_datasource_operation(
+            session,
+            principal=principal,
+            organization=organization,
+            project=project,
+            datasource=datasource,
+            operation_kind=DatasourceOperationKind.UPDATE,
+            usage=None,
+            # A changed endpoint policy is the proposal being probed.  The
+            # current policy only has to remain comparable through phase C.
+            require_current_policy_active=False,
+            require_credential_binding=request.password is None,
+            # A disabled datasource with an ACTIVE secret must be able to be
+            # re-probed and activated without pretending it was already live.
+            require_datasource_active_for_credential=False,
+        )
+        candidate_hash = self._domain_hash(
+            "DXDATASOURCEUPDATEv1",
+            {
+                "datasource_id": str(datasource.id),
+                "expected_row_version": datasource.row_version,
+                "candidate": {
+                    "engine": candidate.engine,
+                    "host": candidate.host,
+                    "port": candidate.port,
+                    "database_name": candidate.database_name,
+                    "default_schema": candidate.default_schema,
+                    "username": candidate.username,
+                    "ssl_mode": candidate.ssl_mode,
+                },
+                "candidate_policy_revision_id": str(candidate_policy_revision.id),
+                "connection_fields": sorted(connection_fields),
+                "password_supplied": request.password is not None,
+            },
+        )
+        return UpdateDatasourceOperation(
+            snapshot=replace(snapshot, candidate_config_hash=candidate_hash),
+            candidate=candidate,
+            candidate_policy=self._freeze_endpoint_policy(
+                policy=candidate_policy,
+                revision=candidate_policy_revision,
+            ),
+            connection_fields=connection_fields,
+            password_provided=request.password is not None,
+        )
+
+    def _apply_non_probe_datasource_update(
+        self,
+        session: Session,
+        *,
+        principal: Principal,
+        datasource: Datasource,
+        project: Project,
+        organization: Organization,
+        request: DatasourcePatch,
+        audit: AuditContext,
+    ) -> DatasourceAdminDetail:
+        """Commit the ordinary short-transaction PATCH variants.
+
+        Name, description and disable operations deliberately do not enter the
+        expensive external-I/O lane.  The caller already holds the normal
+        organization/project/datasource lock hierarchy.
+        """
+
+        now = utc_now()
+        revision = self._datasource_revision_record(session, datasource)
+        changed_fields: list[str] = []
+        actions: list[str] = []
+        if "name" in request.model_fields_set:
+            assert request.name is not None
+            normalized_name = request.name.strip()
+            conflict = session.scalar(
+                select(Datasource.id).where(
+                    Datasource.project_id == project.id,
+                    Datasource.id != datasource.id,
+                    func.lower(Datasource.name) == normalized_name.casefold(),
+                    Datasource.status != "DELETED",
+                )
+            )
+            if conflict is not None:
+                raise ProblemException(
+                    status=409,
+                    code="DATASOURCE_NAME_CONFLICT",
+                    title="数据源名称已存在",
+                    detail="请使用其他名称。",
+                )
+            if datasource.name != normalized_name:
+                datasource.name = normalized_name
+                changed_fields.append("name")
+                actions.append("DATASOURCE_UPDATED")
+        if "description" in request.model_fields_set:
+            description = request.description.strip() if request.description else None
+            if datasource.description != description:
+                datasource.description = description
+            changed_fields.append("description")
+            actions.append("DATASOURCE_UPDATED")
+        requested_status = request.status if "status" in request.model_fields_set else None
+        if requested_status == "ACTIVE":
+            self._assert_datasource_can_activate(session, datasource)
+        if requested_status is not None and datasource.status != requested_status:
+            datasource.status = requested_status
+            changed_fields.append("status")
+            actions.append(
+                "DATASOURCE_DISABLED" if requested_status == "DISABLED" else "DATASOURCE_UPDATED"
+            )
+        if not changed_fields:
+            return self._admin_detail(session, datasource)
+        datasource.row_version += 1
+        datasource.updated_at = now
+        self._append_audit(
+            session,
+            organization=organization,
+            project_id=project.id,
+            action=actions[-1],
+            actor_id=principal.user_id,
+            target_type="DATASOURCE",
+            target_id=datasource.id,
+            target_name=datasource.name,
+            changed_fields=[*changed_fields, "row_version"],
+            audit=audit,
+            metadata={
+                "credential_rotated": False,
+                "connection_validated": False,
+                "revision_id": str(revision.id),
+                "revision_no": revision.revision_no,
+                "config_hash": revision.config_hash,
+                "secret_version": None,
+            },
+        )
+        return self._admin_detail(session, datasource)
+
+    def _revalidate_update_datasource_operation(
+        self,
+        session: Session,
+        *,
+        principal: Principal,
+        datasource_id: UUID,
+        request: DatasourcePatch,
+        expected_version: int,
+        operation: UpdateDatasourceOperation,
+    ) -> tuple[
+        Datasource,
+        Project,
+        Organization,
+        EndpointPolicyRevision,
+    ]:
+        """Phase C for a probe-required PATCH; every B-time drift is stale."""
+
+        try:
+            datasource, project, organization = self._locked_datasource_context(
+                session,
+                principal=principal,
+                datasource_id=datasource_id,
+            )
+            if (
+                datasource.status == "DELETED"
+                or datasource.row_version != expected_version
+                or datasource.row_version != operation.snapshot.datasource_row_version
+            ):
+                raise self._operation_stale()
+            current = self._freeze_current_datasource_operation(
+                session,
+                principal=principal,
+                organization=organization,
+                project=project,
+                datasource=datasource,
+                operation_kind=DatasourceOperationKind.UPDATE,
+                usage=None,
+                require_current_policy_active=False,
+                require_credential_binding=not operation.password_provided,
+                require_datasource_active_for_credential=False,
+            )
+            if not self._operation_snapshot_state_matches(operation.snapshot, current):
+                raise self._operation_stale()
+            current_revision = self._datasource_revision_record(session, datasource)
+            candidate, candidate_policy_revision = self._datasource_patch_candidate(
+                session,
+                principal=principal,
+                current=current_revision,
+                request=request,
+            )
+            candidate_policy = session.scalar(
+                select(EndpointPolicy)
+                .where(
+                    EndpointPolicy.id == candidate_policy_revision.endpoint_policy_id,
+                    EndpointPolicy.organization_id == organization.id,
+                )
+                .with_for_update()
+            )
+            if candidate_policy is None:
+                raise self._operation_stale()
+            current_candidate_policy = self._freeze_endpoint_policy(
+                policy=candidate_policy,
+                revision=candidate_policy_revision,
+            )
+        except ProblemException as exc:
+            if exc.code == "DATASOURCE_OPERATION_STALE":
+                raise
+            raise self._operation_stale() from exc
+        if (
+            candidate != operation.candidate
+            or current_candidate_policy != operation.candidate_policy
+        ):
+            raise self._operation_stale()
+        if "name" in request.model_fields_set:
+            assert request.name is not None
+            conflict = session.scalar(
+                select(Datasource.id).where(
+                    Datasource.project_id == project.id,
+                    Datasource.id != datasource.id,
+                    func.lower(Datasource.name) == request.name.strip().casefold(),
+                    Datasource.status != "DELETED",
+                )
+            )
+            if conflict is not None:
+                raise ProblemException(
+                    status=409,
+                    code="DATASOURCE_NAME_CONFLICT",
+                    title="数据源名称已存在",
+                    detail="请使用其他名称。",
+                )
+        return datasource, project, organization, candidate_policy_revision
+
+    def _persist_probed_datasource_update(
+        self,
+        session: Session,
+        *,
+        principal: Principal,
+        datasource: Datasource,
+        project: Project,
+        organization: Organization,
+        request: DatasourcePatch,
+        operation: UpdateDatasourceOperation,
+        candidate_policy_revision: EndpointPolicyRevision,
+        resolved: ResolvedEndpoint,
+        probe: ProbeResult,
+        password: bytearray | None,
+        audit: AuditContext,
+    ) -> DatasourceAdminDetail:
+        """The only phase allowed to persist a successful external probe."""
+
+        now = utc_now()
+        revision = self._datasource_revision_record(session, datasource)
+        changed_fields: list[str] = []
+        actions: list[str] = []
+        if operation.connection_fields:
+            identity = self._physical_identity_from_probe(
+                session,
+                principal=principal,
+                organization=organization,
+                policy_revision=candidate_policy_revision,
+                candidate=operation.candidate,
+                resolved=resolved,
+                probe=probe,
+                now=now,
+            )
+            config = self._datasource_revision_config(
+                policy_revision=candidate_policy_revision,
+                physical_endpoint_identity_id=identity.id,
+                candidate=operation.candidate,
+            )
+            config_hash = self._domain_hash("DXDATASOURCEREVISIONv1", config)
+            if config_hash != revision.config_hash:
+                revision = DatasourceRevision(
+                    id=uuid4(),
+                    datasource_id=datasource.id,
+                    revision_no=revision.revision_no + 1,
+                    endpoint_policy_revision_id=candidate_policy_revision.id,
+                    physical_endpoint_identity_id=identity.id,
+                    engine=operation.candidate.engine,
+                    host=operation.candidate.host,
+                    port=operation.candidate.port,
+                    database_name=operation.candidate.database_name,
+                    default_schema=operation.candidate.default_schema,
+                    username=operation.candidate.username,
+                    ssl_mode=operation.candidate.ssl_mode,
+                    connection_options={},
+                    config_hash=config_hash,
+                    created_by=principal.user_id,
+                    created_at=now,
+                )
+                session.add(revision)
+                session.flush()
+                datasource.current_revision_id = revision.id
+                changed_fields.extend([*sorted(operation.connection_fields), "current_revision_id"])
+                actions.append("DATASOURCE_REVISION_CREATED")
+        if "name" in request.model_fields_set:
+            assert request.name is not None
+            normalized_name = request.name.strip()
+            if datasource.name != normalized_name:
+                datasource.name = normalized_name
+                changed_fields.append("name")
+                actions.append("DATASOURCE_UPDATED")
+        if "description" in request.model_fields_set:
+            description = request.description.strip() if request.description else None
+            if datasource.description != description:
+                datasource.description = description
+            changed_fields.append("description")
+            actions.append("DATASOURCE_UPDATED")
+        if password is not None:
+            previous = session.get(CredentialSecret, datasource.current_secret_id)
+            if previous is not None and previous.status == "ACTIVE":
+                previous.status = "RETIRED"
+                previous.status_reason_code = "ROTATED"
+                previous.status_changed_at = now
+                previous.retired_at = now
+            self._install_secret(
+                session,
+                organization_id=organization.id,
+                project_id=project.id,
+                datasource=datasource,
+                password=password,
+                actor_id=principal.user_id,
+                now=now,
+            )
+            changed_fields.append("current_secret_id")
+            actions.append("DATASOURCE_CREDENTIAL_ROTATED")
+        self._persist_connection_evidence(
+            session,
+            operation_kind="TEST",
+            datasource_revision=revision,
+            resolved=resolved,
+            peer_ip=probe.peer_ip,
+            tls_peer_spki_sha256=probe.tls_peer_spki_sha256,
+            observed_at=now,
+        )
+        datasource.last_test_status = "SUCCEEDED"
+        datasource.last_tested_at = now
+        datasource.last_test_error_code = None
+        changed_fields.extend(["last_test_status", "last_tested_at", "last_test_error_code"])
+        actions.append("DATASOURCE_TESTED")
+        requested_status = (
+            request.status
+            if "status" in request.model_fields_set
+            else ("ACTIVE" if password is not None else None)
+        )
+        if requested_status == "ACTIVE":
+            self._assert_datasource_can_activate(session, datasource)
+        if requested_status is not None and datasource.status != requested_status:
+            datasource.status = requested_status
+            changed_fields.append("status")
+            actions.append(
+                "DATASOURCE_DISABLED" if requested_status == "DISABLED" else "DATASOURCE_UPDATED"
+            )
+        datasource.row_version += 1
+        datasource.updated_at = now
+        self._append_audit(
+            session,
+            organization=organization,
+            project_id=project.id,
+            action=(
+                "DATASOURCE_CREDENTIAL_ROTATED"
+                if "DATASOURCE_CREDENTIAL_ROTATED" in actions
+                else (
+                    "DATASOURCE_REVISION_CREATED"
+                    if "DATASOURCE_REVISION_CREATED" in actions
+                    else actions[-1]
+                )
+            ),
+            actor_id=principal.user_id,
+            target_type="DATASOURCE",
+            target_id=datasource.id,
+            target_name=datasource.name,
+            changed_fields=[*changed_fields, "row_version"],
+            audit=audit,
+            metadata={
+                "credential_rotated": password is not None,
+                "connection_validated": True,
+                "revision_id": str(revision.id),
+                "revision_no": revision.revision_no,
+                "config_hash": revision.config_hash,
+                "secret_version": (
+                    self._current_secret_record(session, datasource).secret_version
+                    if password is not None
+                    else None
+                ),
+            },
+        )
+        return self._admin_detail(session, datasource)
 
     def update_datasource(
         self,
@@ -1073,14 +1956,17 @@ class CredentialService:
         request: DatasourcePatch,
         expected_version: int,
         audit: AuditContext,
+        admission: DatasourceOperationAdmissionGuard | None = None,
     ) -> DatasourceAdminDetail:
+        """Update a datasource without holding product locks during I/O."""
+
         self._require_admin(principal)
         password = (
             bytearray(request.password.get_secret_value().encode("utf-8"))
             if request.password is not None
             else None
         )
-        probe_attempted = False
+        lease: DatasourceOperationAdmissionLease | None = None
         try:
             with self.sessions.begin() as session:
                 datasource, project, organization = self._locked_datasource_context(
@@ -1102,277 +1988,156 @@ class CredentialService:
                         title="数据源已被修改",
                         detail="请刷新后重试。",
                     )
-                now = utc_now()
-                changed_fields: list[str] = []
-                actions: list[str] = []
-                connection_fields = (
-                    request.model_fields_set & _DATASOURCE_REVISION_FIELDS
-                )
-                activating = (
-                    "status" in request.model_fields_set
-                    and request.status == "ACTIVE"
-                    and datasource.status != "ACTIVE"
-                )
-                requires_probe = bool(
-                    connection_fields or password is not None or activating
-                )
-                probe: ProbeResult | None = None
-                resolved: ResolvedEndpoint | None = None
-                candidate: DatasourceConnectionCandidate | None = None
-                revision = self._datasource_revision_record(
+                operation = self._prepare_update_datasource_operation(
                     session,
-                    datasource,
+                    principal=principal,
+                    datasource=datasource,
+                    project=project,
+                    organization=organization,
+                    request=request,
                 )
-                policy_revision: EndpointPolicyRevision | None = None
-
-                if connection_fields:
-                    candidate, policy_revision = (
-                        self._datasource_patch_candidate(
-                            session,
-                            principal=principal,
-                            current=revision,
-                            request=request,
-                        )
-                    )
-                elif requires_probe:
-                    revision, policy_revision = self._current_revisions(
-                        session,
-                        datasource,
-                    )
-                    candidate = DatasourceConnectionCandidate(
-                        engine=revision.engine,
-                        host=revision.host,
-                        port=revision.port,
-                        database_name=revision.database_name,
-                        default_schema=revision.default_schema,
-                        username=revision.username,
-                        ssl_mode=revision.ssl_mode,
-                    )
-
-                if requires_probe:
-                    assert candidate is not None
-                    assert policy_revision is not None
-                    probe_attempted = True
-                    resolved = self.guard.resolve(
-                        policy_revision,
-                        host=candidate.host,
-                        port=candidate.port,
-                        now=now,
-                    )
-                    self.guard.verify_rebinding(policy_revision, resolved)
-                    if password is not None:
-                        probe = self.connector.probe(
-                            candidate,
-                            password=password,
-                            resolved=resolved,
-                        )
-                    else:
-                        current_secret = self._current_secret_record(
-                            session,
-                            datasource,
-                        )
-                        active_envelope = session.scalar(
-                            select(CredentialSecretEnvelope).where(
-                                CredentialSecretEnvelope.credential_secret_id
-                                == current_secret.id,
-                                CredentialSecretEnvelope.status == "ACTIVE",
-                            )
-                        )
-                        if (
-                            current_secret.status != "ACTIVE"
-                            or active_envelope is None
-                        ):
-                            raise self._binding_unavailable()
-                        with self.decrypted_password(
-                            session,
-                            datasource_id=datasource.id,
-                            secret_id=current_secret.id,
-                            envelope_id=active_envelope.id,
-                        ) as current_password:
-                            probe = self.connector.probe(
-                                candidate,
-                                password=current_password,
-                                resolved=resolved,
-                            )
-
-                    identity = self._physical_identity_from_probe(
+                if operation is None:
+                    return self._apply_non_probe_datasource_update(
                         session,
                         principal=principal,
-                        organization=organization,
-                        policy_revision=policy_revision,
-                        candidate=candidate,
-                        resolved=resolved,
-                        probe=probe,
-                        now=now,
-                    )
-                    config = self._datasource_revision_config(
-                        policy_revision=policy_revision,
-                        physical_endpoint_identity_id=identity.id,
-                        candidate=candidate,
-                    )
-                    config_hash = self._domain_hash(
-                        "DXDATASOURCEREVISIONv1",
-                        config,
-                    )
-                    if config_hash != revision.config_hash:
-                        revision = DatasourceRevision(
-                            id=uuid4(),
-                            datasource_id=datasource.id,
-                            revision_no=revision.revision_no + 1,
-                            endpoint_policy_revision_id=policy_revision.id,
-                            physical_endpoint_identity_id=identity.id,
-                            engine=candidate.engine,
-                            host=candidate.host,
-                            port=candidate.port,
-                            database_name=candidate.database_name,
-                            default_schema=candidate.default_schema,
-                            username=candidate.username,
-                            ssl_mode=candidate.ssl_mode,
-                            connection_options={},
-                            config_hash=config_hash,
-                            created_by=principal.user_id,
-                            created_at=now,
-                        )
-                        session.add(revision)
-                        session.flush()
-                        datasource.current_revision_id = revision.id
-                        changed_fields.extend(
-                            [
-                                *sorted(connection_fields),
-                                "current_revision_id",
-                            ]
-                        )
-                        actions.append("DATASOURCE_REVISION_CREATED")
-
-                if "name" in request.model_fields_set:
-                    assert request.name is not None
-                    normalized_name = request.name.strip()
-                    conflict = session.scalar(
-                        select(Datasource.id).where(
-                            Datasource.project_id == project.id,
-                            Datasource.id != datasource.id,
-                            func.lower(Datasource.name)
-                            == normalized_name.casefold(),
-                            Datasource.status != "DELETED",
-                        )
-                    )
-                    if conflict is not None:
-                        raise ProblemException(
-                            status=409,
-                            code="DATASOURCE_NAME_CONFLICT",
-                            title="数据源名称已存在",
-                            detail="请使用其他名称。",
-                        )
-                    if datasource.name != normalized_name:
-                        datasource.name = normalized_name
-                        changed_fields.append("name")
-                        actions.append("DATASOURCE_UPDATED")
-                if "description" in request.model_fields_set:
-                    description = (
-                        request.description.strip() if request.description else None
-                    )
-                    if datasource.description != description:
-                        datasource.description = description
-                    changed_fields.append("description")
-                    actions.append("DATASOURCE_UPDATED")
-                if password is not None:
-                    previous = session.get(
-                        CredentialSecret,
-                        datasource.current_secret_id,
-                    )
-                    if previous is not None and previous.status == "ACTIVE":
-                        previous.status = "RETIRED"
-                        previous.status_reason_code = "ROTATED"
-                        previous.status_changed_at = now
-                        previous.retired_at = now
-                    self._install_secret(
-                        session,
-                        organization_id=organization.id,
-                        project_id=project.id,
                         datasource=datasource,
-                        password=password,
-                        actor_id=principal.user_id,
-                        now=now,
+                        project=project,
+                        organization=organization,
+                        request=request,
+                        audit=audit,
                     )
-                    changed_fields.append("current_secret_id")
-                    actions.append("DATASOURCE_CREDENTIAL_ROTATED")
-
-                if requires_probe:
-                    assert probe is not None
-                    assert resolved is not None
-                    self._persist_connection_evidence(
-                        session,
-                        operation_kind="TEST",
-                        datasource_revision=revision,
-                        resolved=resolved,
-                        peer_ip=probe.peer_ip,
-                        tls_peer_spki_sha256=probe.tls_peer_spki_sha256,
-                        observed_at=now,
+            # Ordinary name, description and DISABLED-only PATCHes commit in
+            # the short transaction above and never enter the expensive
+            # external-I/O lane. Only a candidate that really needs a probe
+            # consumes a permit, after phase A has released its product
+            # database locks. A saturated probe lane therefore cannot block
+            # an emergency disable.
+            lease = self._acquire_datasource_operation_admission(
+                admission=admission,
+                organization_id=principal.organization_id,
+                datasource_ids=(datasource_id,),
+                operation_kind=DatasourceOperationKind.UPDATE,
+            )
+            deadline = OperationDeadline(self.operation_deadline_seconds)
+            try:
+                deadline.check_expired()
+                if password is None:
+                    material = self._copy_strict_current_credential_material(
+                        operation.snapshot,
+                        deadline=deadline,
+                        require_datasource_active=False,
                     )
-                    datasource.last_test_status = "SUCCEEDED"
-                    datasource.last_tested_at = now
-                    datasource.last_test_error_code = None
-                    changed_fields.extend(
-                        [
-                            "last_test_status",
-                            "last_tested_at",
-                            "last_test_error_code",
-                        ]
-                    )
-                    actions.append("DATASOURCE_TESTED")
-
-                requested_status = (
-                    request.status
-                    if "status" in request.model_fields_set
-                    else ("ACTIVE" if password is not None else None)
-                )
-                if requested_status == "ACTIVE":
-                    self._assert_datasource_can_activate(session, datasource)
-                if requested_status is not None and datasource.status != requested_status:
-                    datasource.status = requested_status
-                    changed_fields.append("status")
-                    actions.append(
-                        "DATASOURCE_DISABLED"
-                        if requested_status == "DISABLED"
-                        else "DATASOURCE_UPDATED"
-                    )
-                if not changed_fields:
-                    return self._admin_detail(session, datasource)
-                datasource.row_version += 1
-                datasource.updated_at = now
-                self._append_audit(
-                    session,
-                    organization=organization,
-                    project_id=project.id,
-                    action=(
-                        "DATASOURCE_CREDENTIAL_ROTATED"
-                        if "DATASOURCE_CREDENTIAL_ROTATED" in actions
-                        else (
-                            "DATASOURCE_REVISION_CREATED"
-                            if "DATASOURCE_REVISION_CREATED" in actions
-                            else actions[-1]
+                    deadline.check_expired()
+                    with self._decrypt_current_operation_material(
+                        snapshot=operation.snapshot,
+                        material=material,
+                    ) as current_password:
+                        resolved = self.guard.resolve(
+                            operation.candidate_policy,
+                            host=operation.candidate.host,
+                            port=operation.candidate.port,
+                            deadline=deadline,
                         )
-                    ),
-                    actor_id=principal.user_id,
-                    target_type="DATASOURCE",
-                    target_id=datasource.id,
-                    target_name=datasource.name,
-                    changed_fields=[*changed_fields, "row_version"],
-                    audit=audit,
-                    metadata={
-                        "credential_rotated": password is not None,
-                        "connection_validated": requires_probe,
-                        "revision_id": str(revision.id),
-                        "revision_no": revision.revision_no,
-                        "config_hash": revision.config_hash,
-                        "secret_version": (
-                            self._current_secret_record(session, datasource).secret_version
-                            if password is not None
-                            else None
-                        ),
-                    },
+                        deadline.check_expired()
+                        self.guard.verify_rebinding(
+                            operation.candidate_policy,
+                            resolved,
+                            deadline=deadline,
+                        )
+                        deadline.check_expired()
+                        probe = self.connector.probe(
+                            operation.candidate,
+                            password=current_password,
+                            resolved=resolved,
+                            deadline=deadline,
+                        )
+                        deadline.check_expired()
+                else:
+                    resolved = self.guard.resolve(
+                        operation.candidate_policy,
+                        host=operation.candidate.host,
+                        port=operation.candidate.port,
+                        deadline=deadline,
+                    )
+                    deadline.check_expired()
+                    self.guard.verify_rebinding(
+                        operation.candidate_policy,
+                        resolved,
+                        deadline=deadline,
+                    )
+                    deadline.check_expired()
+                    probe = self.connector.probe(
+                        operation.candidate,
+                        password=password,
+                        resolved=resolved,
+                        deadline=deadline,
+                    )
+                    deadline.check_expired()
+            except OperationDeadlineExpired as exc:
+                raise self._operation_deadline_problem(
+                    "本次数据源更新验证超过总时限；没有保存更新。"
+                ) from exc
+            except ProblemException:
+                with self._deadline_transaction(deadline) as session:
+                    self._revalidate_update_datasource_operation(
+                        session,
+                        principal=principal,
+                        datasource_id=datasource_id,
+                        request=request,
+                        expected_version=expected_version,
+                        operation=operation,
+                    )
+                raise
+            except Exception as exc:
+                # See create_datasource(): an adapter-level timeout at the
+                # total-deadline boundary must not become a generic failure.
+                if deadline.remaining_seconds() <= 0.0:
+                    raise self._operation_deadline_problem(
+                        "本次数据源更新验证超过总时限；没有保存更新。"
+                    ) from exc
+                with self._deadline_transaction(deadline) as session:
+                    self._revalidate_update_datasource_operation(
+                        session,
+                        principal=principal,
+                        datasource_id=datasource_id,
+                        request=request,
+                        expected_version=expected_version,
+                        operation=operation,
+                    )
+                raise self._safe_probe_problem(exc) from exc
+            with self._deadline_transaction(deadline) as session:
+                (
+                    datasource,
+                    project,
+                    organization,
+                    candidate_policy_revision,
+                ) = self._revalidate_update_datasource_operation(
+                    session,
+                    principal=principal,
+                    datasource_id=datasource_id,
+                    request=request,
+                    expected_version=expected_version,
+                    operation=operation,
                 )
-                return self._admin_detail(session, datasource)
+                deadline.check_expired()
+                return self._persist_probed_datasource_update(
+                    session,
+                    principal=principal,
+                    datasource=datasource,
+                    project=project,
+                    organization=organization,
+                    request=request,
+                    operation=operation,
+                    candidate_policy_revision=candidate_policy_revision,
+                    resolved=resolved,
+                    probe=probe,
+                    password=password,
+                    audit=audit,
+                )
+        except OperationDeadlineExpired as exc:
+            raise self._operation_deadline_problem(
+                "本次数据源更新验证超过总时限；没有保存更新。"
+            ) from exc
         except ProblemException:
             raise
         except IntegrityError as exc:
@@ -1382,11 +2147,9 @@ class CredentialService:
                 title="数据源更新冲突",
                 detail="请刷新后重试。",
             ) from exc
-        except Exception as exc:
-            if probe_attempted:
-                raise self._safe_probe_problem(exc) from exc
-            raise
         finally:
+            if lease is not None:
+                lease.release()
             if password is not None:
                 zeroize(password)
 
@@ -1400,12 +2163,10 @@ class CredentialService:
     ) -> None:
         self._require_admin(principal)
         with self.sessions.begin() as session:
-            datasource, project, organization = (
-                self._lock_admin_datasource_context(
-                    session,
-                    principal=principal,
-                    datasource_id=datasource_id,
-                )
+            datasource, project, organization = self._lock_admin_datasource_context(
+                session,
+                principal=principal,
+                datasource_id=datasource_id,
             )
             if datasource.status == "DELETED":
                 self._not_found()
@@ -1448,6 +2209,10 @@ class CredentialService:
                 grant.status = "REVOKED"
                 grant.revoked_by = principal.user_id
                 grant.revoked_at = now
+                # A datasource deletion is still a grant revocation.  Preserve
+                # the monotonic generation so any A/B/C operation that froze
+                # this row cannot accept work after the grant was removed.
+                grant.row_version += 1
             datasource.status = "DELETED"
             datasource.deleted_at = now
             datasource.updated_at = now
@@ -1465,11 +2230,7 @@ class CredentialService:
                     "status",
                     "deleted_at",
                     "row_version",
-                    *(
-                        ["usage_grants"]
-                        if grants
-                        else []
-                    ),
+                    *(["usage_grants"] if grants else []),
                 ],
                 audit=audit,
                 metadata={"revoked_usage_grant_count": len(grants)},
@@ -1568,12 +2329,10 @@ class CredentialService:
     ) -> DatasourceUsageGrantPage:
         self._require_admin(principal)
         with self.sessions.begin() as session:
-            datasource, project, organization = (
-                self._lock_admin_datasource_context(
-                    session,
-                    principal=principal,
-                    datasource_id=datasource_id,
-                )
+            datasource, project, organization = self._lock_admin_datasource_context(
+                session,
+                principal=principal,
+                datasource_id=datasource_id,
             )
             if datasource.status == "DELETED":
                 raise ProblemException(
@@ -1586,8 +2345,7 @@ class CredentialService:
                 select(OrganizationMember)
                 .where(
                     OrganizationMember.id == member_id,
-                    OrganizationMember.organization_id
-                    == principal.organization_id,
+                    OrganizationMember.organization_id == principal.organization_id,
                 )
                 .with_for_update()
             )
@@ -1605,9 +2363,7 @@ class CredentialService:
                     RoleAssignment.organization_member_id == member.id,
                     RoleAssignment.scope_type == ScopeType.PROJECT,
                     RoleAssignment.scope_id == project.id,
-                    RoleAssignment.role.in_(
-                        (Role.DEVELOPER, Role.OPERATOR, Role.VIEWER)
-                    ),
+                    RoleAssignment.role.in_((Role.DEVELOPER, Role.OPERATOR, Role.VIEWER)),
                 )
             )
             if project_membership is None:
@@ -1656,11 +2412,13 @@ class CredentialService:
                         grant.granted_at = now
                         grant.revoked_by = None
                         grant.revoked_at = None
+                        grant.row_version += 1
                         activated.append(usage)
                 elif grant is not None and grant.status == "ACTIVE":
                     grant.status = "REVOKED"
                     grant.revoked_by = principal.user_id
                     grant.revoked_at = now
+                    grant.row_version += 1
                     revoked.append(usage)
             session.flush()
             active = [
@@ -1669,16 +2427,8 @@ class CredentialService:
                 if usage in existing and existing[usage].status == "ACTIVE"
             ]
             audit_actions = [
-                *(
-                    ["DATASOURCE_USAGE_GRANTED"]
-                    if activated
-                    else []
-                ),
-                *(
-                    ["DATASOURCE_USAGE_REVOKED"]
-                    if revoked
-                    else []
-                ),
+                *(["DATASOURCE_USAGE_GRANTED"] if activated else []),
+                *(["DATASOURCE_USAGE_REVOKED"] if revoked else []),
             ] or ["DATASOURCE_UPDATED"]
             for action in audit_actions:
                 self._append_audit(
@@ -1690,11 +2440,7 @@ class CredentialService:
                     target_type="DATASOURCE",
                     target_id=datasource.id,
                     target_name=datasource.name,
-                    changed_fields=(
-                        ["usage_grants"]
-                        if activated or revoked
-                        else []
-                    ),
+                    changed_fields=(["usage_grants"] if activated or revoked else []),
                     audit=audit,
                     metadata={
                         "organization_member_id": str(member.id),
@@ -1804,7 +2550,13 @@ class CredentialService:
             )
             if replay is not None:
                 return OperationResult(
-                    CredentialSecretSummary.model_validate(replay.response_body),
+                    self._credential_secret_status_replay_response(
+                        session,
+                        record=replay,
+                        datasource_id=datasource.id,
+                        secret_id=candidate_secret_id,
+                        secret_version=secret_version,
+                    ),
                     replayed=True,
                 )
             secret = session.scalar(
@@ -1947,11 +2699,7 @@ class CredentialService:
                 changed_fields=[
                     "credential_status",
                     "datasource_status",
-                    *(
-                        ["work_termination_requests"]
-                        if termination_requests
-                        else []
-                    ),
+                    *(["work_termination_requests"] if termination_requests else []),
                 ],
                 audit=audit,
                 metadata={
@@ -1959,9 +2707,7 @@ class CredentialService:
                     "reason_code": request.reason_code,
                     "affected_nonterminal_execution_count": len(affected_executions),
                     "affected_nonterminal_recovery_probe_count": len(affected_probes),
-                    "termination_request_ids": [
-                        str(item.id) for item in termination_requests
-                    ],
+                    "termination_request_ids": [str(item.id) for item in termination_requests],
                 },
             )
             response = self._secret_summary(session, secret)
@@ -2041,9 +2787,7 @@ class CredentialService:
             if engine is not None:
                 filters.append(
                     Datasource.current_revision_id.in_(
-                        select(DatasourceRevision.id).where(
-                            DatasourceRevision.engine == engine
-                        )
+                        select(DatasourceRevision.id).where(DatasourceRevision.engine == engine)
                     )
                 )
             if cursor_position is not None:
@@ -2082,109 +2826,458 @@ class CredentialService:
                 has_more=has_more,
             )
 
-    def test_datasource(
+    def _acquire_datasource_operation_admission(
+        self,
+        *,
+        admission: DatasourceOperationAdmissionGuard | None,
+        organization_id: UUID,
+        datasource_ids: tuple[UUID, ...],
+        operation_kind: DatasourceOperationKind,
+    ) -> DatasourceOperationAdmissionLease | None:
+        """Take a non-blocking API ingress permit before external I/O.
+
+        The public routes pass the app-scoped guard. Most operations acquire
+        it before phase A; PATCH acquires it after phase A proves it needs a
+        probe, keeping ordinary local control-plane edits available while the
+        external lane is saturated. The optional argument keeps direct service
+        tests and non-HTTP construction explicit without introducing a global
+        mutable guard into the Worker credential service.
+        """
+
+        if admission is None:
+            return None
+        result = admission.try_acquire(
+            organization_id=organization_id,
+            datasource_ids=datasource_ids,
+            operation_kind=operation_kind,
+        )
+        if isinstance(result, DatasourceOperationAdmissionRejection):
+            raise ProblemException(
+                status=429,
+                code="DATASOURCE_OPERATION_ADMISSION_LIMITED",
+                title="数据源外部操作暂时受限",
+                detail="请等待后手动重新提交；系统没有执行本次外部连接。",
+                retryable=True,
+                headers={"Retry-After": str(result.retry_after_seconds)},
+            )
+        return result
+
+    def _freeze_datasource_revision(
+        self,
+        revision: DatasourceRevision,
+    ) -> FrozenDatasourceRevision:
+        return FrozenDatasourceRevision(
+            id=revision.id,
+            datasource_id=revision.datasource_id,
+            revision_no=revision.revision_no,
+            endpoint_policy_revision_id=revision.endpoint_policy_revision_id,
+            physical_endpoint_identity_id=revision.physical_endpoint_identity_id,
+            engine=revision.engine,
+            host=revision.host,
+            port=revision.port,
+            database_name=revision.database_name,
+            default_schema=revision.default_schema,
+            username=revision.username,
+            ssl_mode=revision.ssl_mode,
+            config_hash=revision.config_hash,
+        )
+
+    def _freeze_endpoint_policy(
+        self,
+        *,
+        policy: EndpointPolicy,
+        revision: EndpointPolicyRevision,
+    ) -> FrozenEndpointPolicy:
+        return FrozenEndpointPolicy(
+            id=revision.id,
+            endpoint_policy_id=policy.id,
+            endpoint_policy_current_revision_id=(policy.current_revision_id),
+            endpoint_policy_status=policy.status,
+            endpoint_policy_row_version=policy.row_version,
+            revision_no=revision.revision_no,
+            engine=revision.engine,
+            host_kind=revision.host_kind,
+            host_value=revision.host_value,
+            allowed_cidrs=tuple(revision.allowed_cidrs),
+            allowed_ports=tuple(revision.allowed_ports),
+            tls_required=revision.tls_required,
+            dns_ttl_ceiling_seconds=revision.dns_ttl_ceiling_seconds,
+            resolver_policy_version=revision.resolver_policy_version,
+            egress_policy_version=revision.egress_policy_version,
+            policy_hash=revision.policy_hash,
+        )
+
+    def _strict_active_credential_binding(
+        self,
+        session: Session,
+        *,
+        datasource: Datasource,
+        lock: bool,
+        require_datasource_active: bool = True,
+    ) -> tuple[CredentialSecret, CredentialSecretEnvelope, KekKeyVersion, FrozenCredentialBinding]:
+        if (
+            require_datasource_active and datasource.status != "ACTIVE"
+        ) or datasource.current_secret_id is None:
+            raise self._binding_unavailable()
+        secret_statement = select(CredentialSecret).where(
+            CredentialSecret.id == datasource.current_secret_id,
+            CredentialSecret.datasource_id == datasource.id,
+        )
+        if lock:
+            secret_statement = secret_statement.with_for_update()
+        secret = session.scalar(secret_statement)
+        if secret is None or secret.status != "ACTIVE":
+            raise self._binding_unavailable()
+        envelope_statement = select(CredentialSecretEnvelope).where(
+            CredentialSecretEnvelope.credential_secret_id == secret.id,
+            CredentialSecretEnvelope.status == "ACTIVE",
+        )
+        if lock:
+            envelope_statement = envelope_statement.with_for_update()
+        envelope = session.scalar(envelope_statement)
+        if envelope is None:
+            raise self._binding_unavailable()
+        key_statement = select(KekKeyVersion).where(
+            KekKeyVersion.key_version == envelope.kek_version,
+        )
+        if lock:
+            key_statement = key_statement.with_for_update()
+        key = session.scalar(key_statement)
+        if (
+            key is None
+            or key.status not in {"ACTIVE", "DECRYPT_ONLY"}
+            or key.purpose != "CREDENTIAL_DEK_WRAP"
+            or key.wrapping_algorithm != WRAPPING_ALGORITHM
+            or secret.data_algorithm != DATA_ALGORITHM
+            or secret.aad_schema_version != AAD_SCHEMA_VERSION
+            or envelope.wrapping_algorithm != WRAPPING_ALGORITHM
+        ):
+            raise self._binding_unavailable()
+        return (
+            secret,
+            envelope,
+            key,
+            FrozenCredentialBinding(
+                datasource_id=datasource.id,
+                secret_id=secret.id,
+                secret_version=secret.secret_version,
+                secret_status=secret.status,
+                envelope_id=envelope.id,
+                envelope_version=envelope.envelope_version,
+                envelope_status=envelope.status,
+                kek_version=key.key_version,
+                kek_status=key.status,
+                kek_fingerprint_sha256=key.fingerprint_sha256,
+                kek_wrapping_algorithm=key.wrapping_algorithm,
+                data_algorithm=secret.data_algorithm,
+                aad_schema_version=secret.aad_schema_version,
+            ),
+        )
+
+    def _read_live_operation_authorization(
+        self,
+        session: Session,
+        *,
+        principal: Principal,
+        project: Project,
+        datasource: Datasource | None,
+        usage: str | None,
+    ) -> FrozenActorAuthorization:
+        """Read exact live role/grant bindings without trusting a stale JWT.
+
+        Authorization was already checked by the route, but a long external
+        operation can overlap a role or grant revocation.  Both phase A and
+        phase C call this helper under their short transactions so a detached
+        result is never committed under a role/grant observed only at request
+        entry.
+        """
+
+        # Do not trust the JWT's user flags after Phase A.  A password reset,
+        # disable, or login lockout may commit while Phase B is performing
+        # external I/O.  Lock and freeze the durable User row so Phase C
+        # cannot publish a result under an account that is no longer active.
+        user = session.scalar(
+            select(User).where(User.id == principal.user_id).with_for_update()
+        )
+        if user is None or user.status != "ACTIVE":
+            raise ProblemException(
+                status=403,
+                code="FORBIDDEN",
+                title="无权限执行数据源外部操作",
+                detail="当前用户已被锁定、停用或不存在。",
+            )
+        if user.must_change_password:
+            raise ProblemException(
+                status=403,
+                code="PASSWORD_CHANGE_REQUIRED",
+                title="必须先修改临时密码",
+                detail="完成本人密码修改后才能执行数据源外部操作。",
+            )
+        auth_session = session.scalar(
+            select(AuthSession)
+            .where(
+                AuthSession.id == principal.session_id,
+                AuthSession.user_id == principal.user_id,
+                AuthSession.revoked_at.is_(None),
+                AuthSession.expires_at > utc_now(),
+            )
+            .with_for_update()
+        )
+        if auth_session is None:
+            raise ProblemException(
+                status=403,
+                code="FORBIDDEN",
+                title="无权限执行数据源外部操作",
+                detail="当前登录会话已失效、过期或被撤回。",
+            )
+        membership = session.scalar(
+            select(OrganizationMember)
+            .where(
+                OrganizationMember.organization_id == principal.organization_id,
+                OrganizationMember.user_id == principal.user_id,
+            )
+            .with_for_update()
+        )
+        if membership is None or membership.status != MembershipStatus.ACTIVE:
+            raise ProblemException(
+                status=403,
+                code="FORBIDDEN",
+                title="无权限执行数据源外部操作",
+                detail="当前组织成员资格已不可用。",
+            )
+        if principal.is_admin:
+            role = session.scalar(
+                select(RoleAssignment)
+                .where(
+                    RoleAssignment.organization_member_id == membership.id,
+                    RoleAssignment.scope_type == ScopeType.ORGANIZATION,
+                    RoleAssignment.scope_id == principal.organization_id,
+                    RoleAssignment.role == Role.ADMIN,
+                )
+                .with_for_update()
+            )
+            if role is None:
+                raise ProblemException(
+                    status=403,
+                    code="FORBIDDEN",
+                    title="无权限执行数据源外部操作",
+                    detail="组织级 Admin 权限已不可用。",
+                )
+            return FrozenActorAuthorization(
+                actor_id=principal.user_id,
+                actor_user_status=user.status,
+                actor_user_row_version=user.row_version,
+                session_id=principal.session_id,
+                organization_id=principal.organization_id,
+                project_id=project.id,
+                organization_member_id=membership.id,
+                organization_member_status=membership.status,
+                actor_must_change_password=user.must_change_password,
+                authorization_mode="ORGANIZATION_ADMIN",
+                role_assignment_id=role.id,
+                usage=usage,
+                usage_grant_id=None,
+                usage_grant_status=None,
+                usage_grant_row_version=None,
+            )
+        if usage not in {"SOURCE_USE", "TARGET_USE"}:
+            raise ProblemException(
+                status=403,
+                code="FORBIDDEN",
+                title="无权限执行数据源外部操作",
+                detail="需要组织级 Admin 或项目 Developer 权限。",
+            )
+        if datasource is None:
+            raise ProblemException(
+                status=403,
+                code="FORBIDDEN",
+                title="无权限执行数据源外部操作",
+                detail="创建数据源需要组织级 Admin 权限。",
+            )
+        if not any(
+            assignment.scope_type == ScopeType.PROJECT
+            and assignment.scope_id == project.id
+            and Role.DEVELOPER in assignment.roles
+            for assignment in principal.role_assignments
+        ):
+            raise ProblemException(
+                status=403,
+                code="FORBIDDEN",
+                title="无权限读取数据源元数据",
+                detail="需要当前项目 Developer 角色及有效数据源用途授权。",
+            )
+        role = session.scalar(
+            select(RoleAssignment)
+            .where(
+                RoleAssignment.organization_member_id == membership.id,
+                RoleAssignment.scope_type == ScopeType.PROJECT,
+                RoleAssignment.scope_id == project.id,
+                RoleAssignment.role == Role.DEVELOPER,
+            )
+            .with_for_update()
+        )
+        if role is None:
+            raise ProblemException(
+                status=403,
+                code="FORBIDDEN",
+                title="无权限读取数据源元数据",
+                detail="需要当前项目 Developer 角色及有效数据源用途授权。",
+            )
+        grant = session.scalar(
+            select(DatasourceUsageGrant)
+            .where(
+                DatasourceUsageGrant.datasource_id == datasource.id,
+                DatasourceUsageGrant.organization_member_id == membership.id,
+                DatasourceUsageGrant.usage == usage,
+                DatasourceUsageGrant.status == "ACTIVE",
+            )
+            .with_for_update()
+        )
+        if grant is None:
+            raise ProblemException(
+                status=403,
+                code="DATASOURCE_USAGE_NOT_GRANTED",
+                title="缺少数据源用途授权",
+                detail=f"Developer 缺少该数据源的 {usage} 元数据用途授权。",
+            )
+        return FrozenActorAuthorization(
+            actor_id=principal.user_id,
+            actor_user_status=user.status,
+            actor_user_row_version=user.row_version,
+            session_id=principal.session_id,
+            organization_id=principal.organization_id,
+            project_id=project.id,
+            organization_member_id=membership.id,
+            organization_member_status=membership.status,
+            actor_must_change_password=user.must_change_password,
+            authorization_mode="PROJECT_DEVELOPER",
+            role_assignment_id=role.id,
+            usage=usage,
+            usage_grant_id=grant.id,
+            usage_grant_status=grant.status,
+            usage_grant_row_version=grant.row_version,
+        )
+
+    def _freeze_current_datasource_operation(
+        self,
+        session: Session,
+        *,
+        principal: Principal,
+        organization: Organization,
+        project: Project,
+        datasource: Datasource,
+        operation_kind: DatasourceOperationKind,
+        usage: str | None,
+        schema_name: str | None = None,
+        table_name: str | None = None,
+        limit: int | None = None,
+        require_current_policy_active: bool = True,
+        require_credential_binding: bool = True,
+        require_datasource_active_for_credential: bool = True,
+    ) -> DatasourceOperationSnapshot:
+        if project.status != "ACTIVE":
+            raise ProblemException(
+                status=409,
+                code="PROJECT_ARCHIVED",
+                title="项目已归档",
+                detail="归档项目不能执行数据源外部操作。",
+            )
+        revision = self._datasource_revision_record(session, datasource)
+        policy_revision = session.get(
+            EndpointPolicyRevision,
+            revision.endpoint_policy_revision_id,
+        )
+        if policy_revision is None:
+            raise self._binding_unavailable()
+        policy = session.scalar(
+            select(EndpointPolicy)
+            .where(
+                EndpointPolicy.id == policy_revision.endpoint_policy_id,
+                EndpointPolicy.organization_id == organization.id,
+            )
+            .with_for_update()
+        )
+        if policy is None or policy.current_revision_id is None:
+            raise ProblemException(
+                status=409,
+                code="ENDPOINT_POLICY_NOT_ACTIVE",
+                title="端点策略不再有效",
+                detail="当前数据源需要重新配置并验证。",
+            )
+        if require_current_policy_active and (
+            policy.status != "ACTIVE" or policy.current_revision_id != policy_revision.id
+        ):
+            raise ProblemException(
+                status=409,
+                code="ENDPOINT_POLICY_NOT_ACTIVE",
+                title="端点策略不再有效",
+                detail="当前数据源需要重新配置并验证。",
+            )
+        actor_authorization = self._read_live_operation_authorization(
+            session,
+            principal=principal,
+            project=project,
+            datasource=datasource,
+            usage=usage,
+        )
+        credential_binding: FrozenCredentialBinding | None = None
+        if require_credential_binding:
+            _, _, _, credential_binding = self._strict_active_credential_binding(
+                session,
+                datasource=datasource,
+                lock=True,
+                require_datasource_active=(require_datasource_active_for_credential),
+            )
+        return DatasourceOperationSnapshot(
+            operation_kind=operation_kind,
+            operation_id=uuid4(),
+            organization_id=organization.id,
+            organization_status=organization.status,
+            organization_row_version=organization.row_version,
+            project_id=project.id,
+            project_status=project.status,
+            project_row_version=project.row_version,
+            datasource_id=datasource.id,
+            datasource_status=datasource.status,
+            datasource_row_version=datasource.row_version,
+            datasource_current_revision_id=datasource.current_revision_id,
+            datasource_current_secret_id=datasource.current_secret_id,
+            datasource_revision=self._freeze_datasource_revision(revision),
+            endpoint_policy=self._freeze_endpoint_policy(
+                policy=policy,
+                revision=policy_revision,
+            ),
+            credential_binding=credential_binding,
+            actor_authorization=actor_authorization,
+            metadata_usage=usage,
+            metadata_schema_name=schema_name,
+            metadata_table_name=table_name,
+            metadata_limit=limit,
+        )
+
+    def _capture_test_operation_snapshot(
         self,
         *,
         principal: Principal,
         datasource_id: UUID,
-        request_id: UUID,
-        audit: AuditContext,
-    ) -> DatasourceTestResult:
-        self._require_admin(principal)
+    ) -> DatasourceOperationSnapshot:
         with self.sessions.begin() as session:
             datasource, project, organization = self._locked_datasource_context(
                 session,
                 principal=principal,
                 datasource_id=datasource_id,
             )
-            revision, policy_revision = self._current_revisions(session, datasource)
-            secret, envelope = self._active_secret_and_envelope(session, datasource)
-            resolved = self.guard.resolve(
-                policy_revision,
-                host=revision.host,
-                port=revision.port,
-            )
-            self.guard.verify_rebinding(policy_revision, resolved)
-            tested_at = utc_now()
-            try:
-                with self.decrypted_password(
-                    session,
-                    datasource_id=datasource.id,
-                    secret_id=secret.id,
-                    envelope_id=envelope.id,
-                ) as password:
-                    probe = self.connector.probe(
-                        revision,
-                        password=password,
-                        resolved=resolved,
-                    )
-            except ProblemException:
-                raise
-            except Exception as exc:
-                code = self._safe_probe_error_code(exc)
-                datasource.last_test_status = "FAILED"
-                datasource.last_tested_at = tested_at
-                datasource.last_test_error_code = code
-                self._append_audit(
-                    session,
-                    organization=organization,
-                    project_id=project.id,
-                    action="DATASOURCE_TESTED",
-                    actor_id=principal.user_id,
-                    target_type="DATASOURCE",
-                    target_id=datasource.id,
-                    target_name=datasource.name,
-                    changed_fields=["last_test_status", "last_tested_at"],
-                    audit=audit,
-                    metadata={"error_code": code},
-                    outcome="FAILED",
-                    reason_code=code,
-                )
-                return DatasourceTestResult(
-                    status="FAILED",
-                    tested_at=tested_at,
-                    latency_ms=0,
-                    server_version=None,
-                    error_code=code,
-                    message="连接测试失败；请检查端点策略、网络、TLS 与数据库账号。",
-                    request_id=request_id,
-                )
-            self._persist_connection_evidence(
+            return self._freeze_current_datasource_operation(
                 session,
-                operation_kind="TEST",
-                datasource_revision=revision,
-                resolved=resolved,
-                peer_ip=probe.peer_ip,
-                tls_peer_spki_sha256=probe.tls_peer_spki_sha256,
-                observed_at=tested_at,
-            )
-            datasource.last_test_status = "SUCCEEDED"
-            datasource.last_tested_at = tested_at
-            datasource.last_test_error_code = None
-            self._append_audit(
-                session,
+                principal=principal,
                 organization=organization,
-                project_id=project.id,
-                action="DATASOURCE_TESTED",
-                actor_id=principal.user_id,
-                target_type="DATASOURCE",
-                target_id=datasource.id,
-                target_name=datasource.name,
-                changed_fields=["last_test_status", "last_tested_at"],
-                audit=audit,
-                metadata={"egress_enforcement_status": resolved.egress_enforcement_status},
-            )
-            return DatasourceTestResult(
-                status="SUCCEEDED",
-                tested_at=tested_at,
-                latency_ms=probe.latency_ms,
-                server_version=probe.server_version[:128],
-                error_code=None,
-                message="数据库连接、身份与端点策略检查通过。",
-                request_id=request_id,
+                project=project,
+                datasource=datasource,
+                operation_kind=DatasourceOperationKind.TEST,
+                usage=None,
             )
 
-    def list_columns(
+    def _capture_metadata_operation_snapshot(
         self,
         *,
         principal: Principal,
@@ -2193,26 +3286,27 @@ class CredentialService:
         schema_name: str | None,
         table_name: str | None,
         limit: int,
-        audit: AuditContext,
-        cursor: str | None = None,
-    ) -> TableSchemaPage:
+        cursor: str | None,
+    ) -> DatasourceOperationSnapshot:
         with self.sessions.begin() as session:
             datasource, project, organization = self._locked_datasource_context(
                 session,
                 principal=principal,
                 datasource_id=datasource_id,
             )
-            self._require_metadata_access(
+            # Preserve the existing cursor contract: a signed cursor is bound
+            # to the authenticated actor and current revision before any
+            # credential lookup.  This is still within phase A and performs no
+            # outbound work; live authorization runs first so an unauthorized
+            # caller cannot use cursor errors as an oracle.
+            self._read_live_operation_authorization(
                 session,
                 principal=principal,
-                datasource=datasource,
                 project=project,
+                datasource=datasource,
                 usage=usage,
             )
-            revision, policy_revision = self._current_revisions(
-                session,
-                datasource,
-            )
+            revision = self._datasource_revision_record(session, datasource)
             cursor_scope = self._cursor_scope(
                 "GET /datasources/{datasource_id}/schema/tables",
                 {
@@ -2233,48 +3327,639 @@ class CredentialService:
                 if cursor is not None
                 else None
             )
+            snapshot = self._freeze_current_datasource_operation(
+                session,
+                principal=principal,
+                organization=organization,
+                project=project,
+                datasource=datasource,
+                operation_kind=DatasourceOperationKind.METADATA,
+                usage=usage,
+                schema_name=schema_name,
+                table_name=table_name,
+                limit=limit,
+            )
+            return replace(
+                snapshot,
+                metadata_cursor_scope=cursor_scope,
+                metadata_after=after,
+                metadata_cursor=cursor,
+            )
+
+    @staticmethod
+    def _operation_stale() -> ProblemException:
+        return ProblemException(
+            status=409,
+            code="DATASOURCE_OPERATION_STALE",
+            title="数据源外部操作结果已过期",
+            detail="数据源、凭据、授权或端点策略在探测期间发生变化；请刷新后手动重试。",
+            retryable=True,
+        )
+
+    @staticmethod
+    def _operation_deadline_problem(detail: str) -> ProblemException:
+        """Return the single public outcome for an exhausted operation budget."""
+
+        return ProblemException(
+            status=503,
+            code="DATASOURCE_OPERATION_DEADLINE_EXCEEDED",
+            title="数据源外部操作超时",
+            detail=detail,
+            retryable=True,
+        )
+
+    @staticmethod
+    def _is_product_database_deadline_error(exc: DBAPIError) -> bool:
+        """Recognize the PostgreSQL errors caused by our transaction-local cap."""
+
+        original = exc.orig
+        sqlstate = getattr(original, "sqlstate", None) or getattr(original, "pgcode", None)
+        # 55P03 is lock_not_available (including lock_timeout); 57014 is the
+        # query-canceled code used by statement_timeout.  Both can only be
+        # interpreted as this operation's deadline after _deadline_transaction
+        # has installed the remaining budget as a transaction-local setting.
+        return sqlstate in {"55P03", "57014"}
+
+    def _configure_deadline_transaction(
+        self,
+        session: Session,
+        *,
+        deadline: OperationDeadline,
+    ) -> None:
+        """Clamp product-DB lock and statement waits to the shared budget.
+
+        The product database is PostgreSQL in the supported Windows topology.
+        SQLite remains intentionally unconfigured for unit tests; the explicit
+        pre/post checks still make an expired synthetic deadline fail closed.
+        """
+
+        remaining_ms = max(1, math.floor(deadline.check_expired() * 1000.0))
+        if session.get_bind().dialect.name != "postgresql":
+            return
+        timeout = f"{remaining_ms}ms"
+        session.execute(
+            text("SELECT set_config('lock_timeout', :timeout, true)"),
+            {"timeout": timeout},
+        )
+        deadline.check_expired()
+        session.execute(
+            text("SELECT set_config('statement_timeout', :timeout, true)"),
+            {"timeout": timeout},
+        )
+        deadline.check_expired()
+
+    @contextmanager
+    def _deadline_transaction(self, deadline: OperationDeadline) -> Iterator[Session]:
+        """Run a short product-DB phase without donating time beyond deadline.
+
+        The final check occurs before the transaction context commits.  Thus a
+        late C phase rolls back evidence, result state and audit writes instead
+        of returning a successful response after the shared deadline.
+        """
+
+        deadline.check_expired()
+        try:
+            with self.sessions.begin() as session:
+                self._configure_deadline_transaction(session, deadline=deadline)
+                yield session
+                deadline.check_expired()
+        except DBAPIError as exc:
+            if self._is_product_database_deadline_error(exc):
+                raise OperationDeadlineExpired(
+                    "DATASOURCE_OPERATION_DEADLINE_EXCEEDED"
+                ) from exc
+            raise
+
+    def _copy_strict_current_credential_material(
+        self,
+        snapshot: DatasourceOperationSnapshot,
+        *,
+        deadline: OperationDeadline,
+        require_datasource_active: bool = True,
+    ) -> CurrentCredentialMaterial:
+        """Perform B's short current-active credential barrier, then commit.
+
+        No keyring file access, decrypt, resolver, lease, or connector call is
+        allowed while this transaction is open.  The copied encrypted material
+        is private and only survives long enough to decrypt outside the product
+        database.
+        """
+
+        if (
+            snapshot.datasource_id is None
+            or snapshot.datasource_revision is None
+            or snapshot.endpoint_policy is None
+            or snapshot.credential_binding is None
+        ):
+            raise self._operation_stale()
+        with self._deadline_transaction(deadline) as session:
+            datasource = session.scalar(
+                select(Datasource).where(Datasource.id == snapshot.datasource_id).with_for_update()
+            )
+            if datasource is None or datasource.project_id != snapshot.project_id:
+                raise self._operation_stale()
+            revision = self._datasource_revision_record(session, datasource)
+            policy_revision = session.get(
+                EndpointPolicyRevision,
+                revision.endpoint_policy_revision_id,
+            )
+            if policy_revision is None:
+                raise self._operation_stale()
+            policy = session.scalar(
+                select(EndpointPolicy)
+                .where(EndpointPolicy.id == policy_revision.endpoint_policy_id)
+                .with_for_update()
+            )
+            if policy is None:
+                raise self._operation_stale()
             try:
-                secret, envelope = self._active_secret_and_envelope(
+                secret, envelope, key, binding = self._strict_active_credential_binding(
                     session,
-                    datasource,
+                    datasource=datasource,
+                    lock=True,
+                    require_datasource_active=require_datasource_active,
                 )
-                resolved = self.guard.resolve(
-                    policy_revision,
-                    host=revision.host,
-                    port=revision.port,
+            except ProblemException as exc:
+                raise self._operation_stale() from exc
+            if not self._snapshot_security_matches(
+                snapshot,
+                datasource=datasource,
+                revision=revision,
+                policy=policy,
+                policy_revision=policy_revision,
+                binding=binding,
+            ):
+                raise self._operation_stale()
+            if key.key_version != binding.kek_version:
+                raise self._operation_stale()
+            return CurrentCredentialMaterial(
+                binding=binding,
+                ciphertext=secret.ciphertext,
+                nonce=secret.nonce,
+                encrypted_dek=envelope.encrypted_dek,
+            )
+
+    @contextmanager
+    def _decrypt_current_operation_material(
+        self,
+        *,
+        snapshot: DatasourceOperationSnapshot,
+        material: CurrentCredentialMaterial,
+    ) -> Iterator[bytearray]:
+        """Yield a zeroized current-credential password outside any DB lock."""
+
+        plaintext = bytearray()
+        try:
+            binding = material.binding
+            try:
+                actual_fingerprint = self.keyring.fingerprint(binding.kek_version)
+            except (OSError, ValueError) as exc:
+                raise self._keyring_unavailable() from exc
+            if not hmac.compare_digest(
+                binding.kek_fingerprint_sha256,
+                actual_fingerprint,
+            ):
+                raise self._keyring_unavailable()
+            if snapshot.datasource_id is None:
+                raise self._operation_stale()
+            aad = build_credential_aad(
+                organization_id=snapshot.organization_id,
+                project_id=snapshot.project_id,
+                datasource_id=snapshot.datasource_id,
+                credential_secret_id=binding.secret_id,
+                secret_version=binding.secret_version,
+            )
+            with self.keyring.open_key(binding.kek_version) as kek:
+                plaintext = decrypt_credential(
+                    ciphertext=material.ciphertext,
+                    nonce=material.nonce,
+                    encrypted_dek=material.encrypted_dek,
+                    aad=aad,
+                    kek=kek,
                 )
-                self.guard.verify_rebinding(policy_revision, resolved)
-                if resolved.egress_enforcement_status != "VERIFIED":
-                    raise ProblemException(
-                        status=503,
-                        code="EGRESS_ENFORCEMENT_UNVERIFIED",
-                        title="数据库出口强制策略尚未验证",
-                        detail="出口策略获得独立 VERIFIED 证据前不能读取真实元数据。",
-                        retryable=False,
-                    )
-                with self.decrypted_password(
-                    session,
-                    datasource_id=datasource.id,
-                    secret_id=secret.id,
-                    envelope_id=envelope.id,
+            yield plaintext
+        finally:
+            zeroize(plaintext)
+
+    def _snapshot_security_matches(
+        self,
+        snapshot: DatasourceOperationSnapshot,
+        *,
+        datasource: Datasource,
+        revision: DatasourceRevision,
+        policy: EndpointPolicy,
+        policy_revision: EndpointPolicyRevision,
+        binding: FrozenCredentialBinding,
+    ) -> bool:
+        frozen_revision = snapshot.datasource_revision
+        frozen_policy = snapshot.endpoint_policy
+        return (
+            frozen_revision is not None
+            and frozen_policy is not None
+            and snapshot.datasource_status == datasource.status
+            and snapshot.datasource_row_version == datasource.row_version
+            and snapshot.datasource_current_revision_id == datasource.current_revision_id
+            and snapshot.datasource_current_secret_id == datasource.current_secret_id
+            and frozen_revision == self._freeze_datasource_revision(revision)
+            and frozen_policy
+            == self._freeze_endpoint_policy(
+                policy=policy,
+                revision=policy_revision,
+            )
+            and snapshot.credential_binding == binding
+        )
+
+    @staticmethod
+    def _operation_snapshot_state_matches(
+        snapshot: DatasourceOperationSnapshot,
+        current: DatasourceOperationSnapshot,
+    ) -> bool:
+        """Compare the mutable authorization/security state, not operation ID.
+
+        Phase C intentionally creates a fresh immutable snapshot.  Its random
+        operation ID and request-only metadata therefore cannot participate in
+        the equality decision; every datasource, policy, credential, and live
+        authorization pointer that can invalidate phase B does.
+        """
+
+        return (
+            snapshot.organization_id == current.organization_id
+            and snapshot.organization_status == current.organization_status
+            and snapshot.organization_row_version == current.organization_row_version
+            and snapshot.project_id == current.project_id
+            and snapshot.project_status == current.project_status
+            and snapshot.project_row_version == current.project_row_version
+            and snapshot.datasource_id == current.datasource_id
+            and snapshot.datasource_status == current.datasource_status
+            and snapshot.datasource_row_version == current.datasource_row_version
+            and (snapshot.datasource_current_revision_id == current.datasource_current_revision_id)
+            and (snapshot.datasource_current_secret_id == current.datasource_current_secret_id)
+            and snapshot.datasource_revision == current.datasource_revision
+            and snapshot.endpoint_policy == current.endpoint_policy
+            and snapshot.credential_binding == current.credential_binding
+            and snapshot.actor_authorization == current.actor_authorization
+        )
+
+    def _revalidate_datasource_operation_snapshot(
+        self,
+        session: Session,
+        *,
+        principal: Principal,
+        snapshot: DatasourceOperationSnapshot,
+    ) -> tuple[Datasource, Project, Organization]:
+        """Phase C: live reauthorization plus complete security comparison."""
+
+        if snapshot.datasource_id is None:
+            raise self._operation_stale()
+        try:
+            datasource, project, organization = self._locked_datasource_context(
+                session,
+                principal=principal,
+                datasource_id=snapshot.datasource_id,
+            )
+            current = self._freeze_current_datasource_operation(
+                session,
+                principal=principal,
+                organization=organization,
+                project=project,
+                datasource=datasource,
+                operation_kind=snapshot.operation_kind,
+                usage=snapshot.metadata_usage,
+                schema_name=snapshot.metadata_schema_name,
+                table_name=snapshot.metadata_table_name,
+                limit=snapshot.metadata_limit,
+            )
+        except ProblemException as exc:
+            raise self._operation_stale() from exc
+        if not self._operation_snapshot_state_matches(snapshot, current):
+            raise self._operation_stale()
+        return datasource, project, organization
+
+    def test_datasource(
+        self,
+        *,
+        principal: Principal,
+        datasource_id: UUID,
+        request_id: UUID,
+        audit: AuditContext,
+        admission: DatasourceOperationAdmissionGuard | None = None,
+    ) -> DatasourceTestResult:
+        self._require_admin(principal)
+        lease: DatasourceOperationAdmissionLease | None = None
+        try:
+            snapshot = self._capture_test_operation_snapshot(
+                principal=principal,
+                datasource_id=datasource_id,
+            )
+            assert snapshot.datasource_revision is not None
+            assert snapshot.endpoint_policy is not None
+            # A validates the datasource and authorization first.  Never let
+            # a caller-selected, nonexistent UUID become retained process
+            # admission state; acquire only for real external work after A
+            # has committed and released its product locks.
+            lease = self._acquire_datasource_operation_admission(
+                admission=admission,
+                organization_id=principal.organization_id,
+                datasource_ids=(datasource_id,),
+                operation_kind=DatasourceOperationKind.TEST,
+            )
+            deadline = OperationDeadline(self.operation_deadline_seconds)
+            try:
+                deadline.check_expired()
+                material = self._copy_strict_current_credential_material(
+                    snapshot,
+                    deadline=deadline,
+                )
+                deadline.check_expired()
+                with self._decrypt_current_operation_material(
+                    snapshot=snapshot,
+                    material=material,
                 ) as password:
-                    snapshots, peer_ip, has_more = (
-                        self.connector.schema_snapshots(
-                            revision,
-                            physical_endpoint_identity_id=(
-                                revision.physical_endpoint_identity_id
-                            ),
-                            password=password,
-                            resolved=resolved,
-                            schema_name=schema_name,
-                            table_name=table_name,
-                            limit=limit,
-                            after=after,
+                    deadline.check_expired()
+                    resolved = self.guard.resolve(
+                        snapshot.endpoint_policy,
+                        host=snapshot.datasource_revision.host,
+                        port=snapshot.datasource_revision.port,
+                        deadline=deadline,
+                    )
+                    deadline.check_expired()
+                    self.guard.verify_rebinding(
+                        snapshot.endpoint_policy,
+                        resolved,
+                        deadline=deadline,
+                    )
+                    deadline.check_expired()
+                    probe = self.connector.probe(
+                        snapshot.datasource_revision,
+                        password=password,
+                        resolved=resolved,
+                        deadline=deadline,
+                    )
+                    deadline.check_expired()
+            except OperationDeadlineExpired as exc:
+                raise self._operation_deadline_problem(
+                    "本次连接测试超过总时限；没有写入测试结果。"
+                ) from exc
+            except ProblemException:
+                with self._deadline_transaction(deadline) as session:
+                    self._revalidate_datasource_operation_snapshot(
+                        session,
+                        principal=principal,
+                        snapshot=snapshot,
+                    )
+                raise
+            except EgressAttestationError as exc:
+                # Egress availability is a platform dependency, not a failed
+                # user database credential test.  Do not overwrite the last
+                # test fact or emit a success-shaped 200/audit result.
+                if deadline.remaining_seconds() <= 0.0:
+                    raise self._operation_deadline_problem(
+                        "本次连接测试超过总时限；没有写入测试结果。"
+                    ) from exc
+                with self._deadline_transaction(deadline) as session:
+                    self._revalidate_datasource_operation_snapshot(
+                        session,
+                        principal=principal,
+                        snapshot=snapshot,
+                    )
+                # A failed attestation can arrive after the one shared
+                # operation budget is already exhausted.  The deadline is
+                # the primary public outcome in that case, consistently with
+                # metadata reads and job validation; never expose a
+                # connector-specific late error instead.
+                raise self._safe_probe_problem(exc) from exc
+            except Exception as exc:
+                # Do this before constructing a FAILED test result or audit
+                # event.  A resolver/connector may throw a generic timeout
+                # after it consumed the shared budget.
+                if deadline.remaining_seconds() <= 0.0:
+                    raise self._operation_deadline_problem(
+                        "本次连接测试超过总时限；没有写入测试结果。"
+                    ) from exc
+                code = self._safe_probe_error_code(exc)
+                tested_at = utc_now()
+                with self._deadline_transaction(deadline) as session:
+                    datasource, project, organization = (
+                        self._revalidate_datasource_operation_snapshot(
+                            session,
+                            principal=principal,
+                            snapshot=snapshot,
                         )
                     )
+                    deadline.check_expired()
+                    datasource.last_test_status = "FAILED"
+                    datasource.last_tested_at = tested_at
+                    datasource.last_test_error_code = code
+                    self._append_audit(
+                        session,
+                        organization=organization,
+                        project_id=project.id,
+                        action="DATASOURCE_TESTED",
+                        actor_id=principal.user_id,
+                        target_type="DATASOURCE",
+                        target_id=datasource.id,
+                        target_name=datasource.name,
+                        changed_fields=["last_test_status", "last_tested_at"],
+                        audit=audit,
+                        metadata={"error_code": code},
+                        outcome="FAILED",
+                        reason_code=code,
+                    )
+                    return DatasourceTestResult(
+                        status="FAILED",
+                        tested_at=tested_at,
+                        latency_ms=0,
+                        server_version=None,
+                        error_code=code,
+                        message="连接测试失败；请检查端点策略、网络、TLS 与数据库账号。",
+                        request_id=request_id,
+                    )
+            tested_at = utc_now()
+            with self._deadline_transaction(deadline) as session:
+                datasource, project, organization = self._revalidate_datasource_operation_snapshot(
+                    session,
+                    principal=principal,
+                    snapshot=snapshot,
+                )
+                deadline.check_expired()
+                revision = self._datasource_revision_record(session, datasource)
+                self._persist_connection_evidence(
+                    session,
+                    operation_kind="TEST",
+                    datasource_revision=revision,
+                    resolved=resolved,
+                    peer_ip=probe.peer_ip,
+                    tls_peer_spki_sha256=probe.tls_peer_spki_sha256,
+                    observed_at=tested_at,
+                )
+                datasource.last_test_status = "SUCCEEDED"
+                datasource.last_tested_at = tested_at
+                datasource.last_test_error_code = None
+                self._append_audit(
+                    session,
+                    organization=organization,
+                    project_id=project.id,
+                    action="DATASOURCE_TESTED",
+                    actor_id=principal.user_id,
+                    target_type="DATASOURCE",
+                    target_id=datasource.id,
+                    target_name=datasource.name,
+                    changed_fields=["last_test_status", "last_tested_at"],
+                    audit=audit,
+                    metadata={"egress_enforcement_status": (resolved.egress_enforcement_status)},
+                )
+                return DatasourceTestResult(
+                    status="SUCCEEDED",
+                    tested_at=tested_at,
+                    latency_ms=probe.latency_ms,
+                    server_version=probe.server_version[:128],
+                    error_code=None,
+                    message="数据库连接、身份与端点策略检查通过。",
+                    request_id=request_id,
+                )
+        except OperationDeadlineExpired as exc:
+            raise self._operation_deadline_problem(
+                "本次连接测试超过总时限；没有写入测试结果。"
+            ) from exc
+        finally:
+            if lease is not None:
+                lease.release()
+
+    def list_columns(
+        self,
+        *,
+        principal: Principal,
+        datasource_id: UUID,
+        usage: str,
+        schema_name: str | None,
+        table_name: str | None,
+        limit: int,
+        audit: AuditContext,
+        cursor: str | None = None,
+        admission: DatasourceOperationAdmissionGuard | None = None,
+        admission_lease: DatasourceOperationAdmissionLease | None = None,
+        operation_deadline: OperationDeadline | None = None,
+    ) -> TableSchemaPage:
+        lease: DatasourceOperationAdmissionLease | None = None
+        owns_admission_lease = False
+        try:
+            snapshot = self._capture_metadata_operation_snapshot(
+                principal=principal,
+                datasource_id=datasource_id,
+                usage=usage,
+                schema_name=schema_name,
+                table_name=table_name,
+                limit=limit,
+                cursor=cursor,
+            )
+            assert snapshot.datasource_revision is not None
+            assert snapshot.endpoint_policy is not None
+            assert snapshot.metadata_cursor_scope is not None
+            # See test_datasource(): only a datasource that passed A is
+            # eligible to consume retained admission state or external I/O.
+            if admission_lease is not None:
+                if not admission_lease.covers(
+                    organization_id=principal.organization_id,
+                    datasource_ids=(datasource_id,),
+                ):
+                    raise RuntimeError("nested metadata admission lease does not cover datasource")
+                lease = admission_lease
+            else:
+                lease = self._acquire_datasource_operation_admission(
+                    admission=admission,
+                    organization_id=principal.organization_id,
+                    datasource_ids=(datasource_id,),
+                    operation_kind=DatasourceOperationKind.METADATA,
+                )
+                owns_admission_lease = lease is not None
+            # A transfer-policy scope operation has already atomically
+            # admitted both endpoints.  It supplies one live deadline to both
+            # nested reads; standalone metadata calls retain their own budget.
+            deadline = operation_deadline or self.new_operation_deadline()
+            try:
+                deadline.check_expired()
+                material = self._copy_strict_current_credential_material(
+                    snapshot,
+                    deadline=deadline,
+                )
+                deadline.check_expired()
+                with self._decrypt_current_operation_material(
+                    snapshot=snapshot,
+                    material=material,
+                ) as password:
+                    deadline.check_expired()
+                    resolved = self.guard.resolve(
+                        snapshot.endpoint_policy,
+                        host=snapshot.datasource_revision.host,
+                        port=snapshot.datasource_revision.port,
+                        deadline=deadline,
+                    )
+                    deadline.check_expired()
+                    self.guard.verify_rebinding(
+                        snapshot.endpoint_policy,
+                        resolved,
+                        deadline=deadline,
+                    )
+                    deadline.check_expired()
+                    if resolved.egress_enforcement_status != "VERIFIED":
+                        raise ProblemException(
+                            status=503,
+                            code="EGRESS_ENFORCEMENT_UNVERIFIED",
+                            title="数据库出口强制策略尚未验证",
+                            detail="出口策略获得独立 VERIFIED 证据前不能读取真实元数据。",
+                            retryable=False,
+                        )
+                    snapshots, peer_ip, has_more = self.connector.schema_snapshots(
+                        snapshot.datasource_revision,
+                        physical_endpoint_identity_id=(
+                            snapshot.datasource_revision.physical_endpoint_identity_id
+                        ),
+                        password=password,
+                        resolved=resolved,
+                        schema_name=snapshot.metadata_schema_name,
+                        table_name=snapshot.metadata_table_name,
+                        limit=limit,
+                        after=snapshot.metadata_after,
+                        deadline=deadline,
+                    )
+                    deadline.check_expired()
+            except OperationDeadlineExpired as exc:
+                raise self._operation_deadline_problem(
+                    "本次 Schema 读取超过总时限；没有返回或保存旧结果。"
+                ) from exc
             except ProblemException:
+                with self._deadline_transaction(deadline) as session:
+                    self._revalidate_datasource_operation_snapshot(
+                        session,
+                        principal=principal,
+                        snapshot=snapshot,
+                    )
                 raise
+            except EgressAttestationError as exc:
+                if deadline.remaining_seconds() <= 0.0:
+                    raise self._operation_deadline_problem(
+                        "本次 Schema 读取超过总时限；没有返回或保存旧结果。"
+                    ) from exc
+                with self._deadline_transaction(deadline) as session:
+                    self._revalidate_datasource_operation_snapshot(
+                        session,
+                        principal=principal,
+                        snapshot=snapshot,
+                    )
+                raise self._safe_probe_problem(exc) from exc
             except Exception as exc:
+                # A generic I/O timeout after the total budget is exhausted
+                # has the deadline contract, not METADATA_UNAVAILABLE.
+                if deadline.remaining_seconds() <= 0.0:
+                    raise self._operation_deadline_problem(
+                        "本次 Schema 读取超过总时限；没有返回或保存旧结果。"
+                    ) from exc
+                with self._deadline_transaction(deadline) as session:
+                    self._revalidate_datasource_operation_snapshot(
+                        session,
+                        principal=principal,
+                        snapshot=snapshot,
+                    )
                 raise ProblemException(
                     status=503,
                     code="DATASOURCE_METADATA_UNAVAILABLE",
@@ -2283,117 +3968,217 @@ class CredentialService:
                     retryable=_metadata_failure_retryable(exc),
                 ) from exc
             captured_at = utc_now()
-            self._persist_connection_evidence(
-                session,
-                operation_kind="METADATA",
-                datasource_revision=revision,
-                resolved=resolved,
-                peer_ip=peer_ip,
-                tls_peer_spki_sha256=None,
-                observed_at=captured_at,
-            )
-            items = [
-                self._table_schema(snapshot, captured_at)
-                for snapshot in snapshots
-            ]
-            self._append_audit(
-                session,
-                organization=organization,
-                project_id=project.id,
-                action="DATASOURCE_METADATA_READ",
-                actor_id=principal.user_id,
-                target_type="DATASOURCE",
-                target_id=datasource.id,
-                target_name=datasource.name,
-                changed_fields=[],
-                audit=audit,
-                metadata={
-                    "table_count": len(items),
-                    "column_count": sum(len(item.columns) for item in items),
-                },
-            )
-            next_cursor = None
-            if has_more and snapshots:
-                last = snapshots[-1]
-                cursor_schema = (
-                    revision.default_schema
-                    if revision.engine == "MYSQL_8"
-                    else last.schema_name
+            with self._deadline_transaction(deadline) as session:
+                datasource, project, organization = self._revalidate_datasource_operation_snapshot(
+                    session,
+                    principal=principal,
+                    snapshot=snapshot,
                 )
-                next_cursor = self._encode_table_cursor(
+                deadline.check_expired()
+                revision = self._datasource_revision_record(session, datasource)
+                self._persist_connection_evidence(
+                    session,
+                    operation_kind="METADATA",
+                    datasource_revision=revision,
+                    resolved=resolved,
+                    peer_ip=peer_ip,
+                    tls_peer_spki_sha256=None,
+                    observed_at=captured_at,
+                )
+                items = [self._table_schema(item, captured_at) for item in snapshots]
+                self._append_audit(
+                    session,
+                    organization=organization,
+                    project_id=project.id,
+                    action="DATASOURCE_METADATA_READ",
                     actor_id=principal.user_id,
-                    scope=cursor_scope,
-                    schema_name=cursor_schema,
-                    table_name=last.table_name,
+                    target_type="DATASOURCE",
+                    target_id=datasource.id,
+                    target_name=datasource.name,
+                    changed_fields=[],
+                    audit=audit,
+                    metadata={
+                        "table_count": len(items),
+                        "column_count": sum(len(item.columns) for item in items),
+                    },
                 )
-            return TableSchemaPage(
-                items=items,
-                next_cursor=next_cursor,
-                has_more=has_more,
-            )
+                next_cursor = None
+                if has_more and snapshots:
+                    last = snapshots[-1]
+                    cursor_schema = (
+                        snapshot.datasource_revision.default_schema
+                        if snapshot.datasource_revision.engine == "MYSQL_8"
+                        else last.schema_name
+                    )
+                    next_cursor = self._encode_table_cursor(
+                        actor_id=principal.user_id,
+                        scope=snapshot.metadata_cursor_scope,
+                        schema_name=cursor_schema,
+                        table_name=last.table_name,
+                    )
+                return TableSchemaPage(
+                    items=items,
+                    next_cursor=next_cursor,
+                    has_more=has_more,
+                )
+        except OperationDeadlineExpired as exc:
+            raise self._operation_deadline_problem(
+                "本次 Schema 读取超过总时限；没有返回或保存旧结果。"
+            ) from exc
+        finally:
+            if owns_admission_lease and lease is not None:
+                lease.release()
 
-    def collect_job_validation_material(
+    @staticmethod
+    def _freeze_transfer_policy(policy: TransferPolicy) -> FrozenTransferPolicy:
+        return FrozenTransferPolicy(
+            id=policy.id,
+            project_id=policy.project_id,
+            source_datasource_revision_id=policy.source_datasource_revision_id,
+            target_datasource_revision_id=policy.target_datasource_revision_id,
+            source_physical_endpoint_identity_id=(policy.source_physical_endpoint_identity_id),
+            target_physical_endpoint_identity_id=(policy.target_physical_endpoint_identity_id),
+            status=policy.status,
+            row_version=policy.row_version,
+            scope_hash=policy.scope_hash,
+        )
+
+    @staticmethod
+    def _freeze_target_namespace(
+        namespace: TargetNamespace,
+    ) -> FrozenTargetNamespace:
+        return FrozenTargetNamespace(
+            id=namespace.id,
+            physical_endpoint_identity_id=namespace.physical_endpoint_identity_id,
+            engine=namespace.engine,
+            normalized_catalog_name=namespace.normalized_catalog_name,
+            normalized_schema_name=namespace.normalized_schema_name,
+            normalized_table_name=namespace.normalized_table_name,
+            normalization_version=namespace.normalization_version,
+            physical_table_identity_hash=namespace.physical_table_identity_hash,
+        )
+
+    def _job_validation_target_namespace(
+        self,
+        session: Session,
+        *,
+        revision: DatasourceRevision,
+        schema_name: str,
+        table_name: str,
+    ) -> TargetNamespace:
+        normalized_schema = "" if revision.engine == "MYSQL_8" else schema_name
+        namespace = session.scalar(
+            select(TargetNamespace)
+            .where(
+                TargetNamespace.physical_endpoint_identity_id
+                == revision.physical_endpoint_identity_id,
+                TargetNamespace.engine == revision.engine,
+                TargetNamespace.normalized_catalog_name == revision.database_name,
+                TargetNamespace.normalized_schema_name == normalized_schema,
+                TargetNamespace.normalized_table_name == table_name,
+                TargetNamespace.normalization_version == "1.0",
+            )
+            .with_for_update()
+        )
+        if namespace is None:
+            raise ProblemException(
+                status=409,
+                code="TARGET_NAMESPACE_NOT_REGISTERED",
+                title="目标物理表尚未完成授权登记",
+                detail="ACTIVE TransferPolicy 必须绑定已登记的 TargetNamespace。",
+            )
+        return namespace
+
+    def _capture_job_validation_operation(
         self,
         *,
         principal: Principal,
         job_id: UUID,
-        audit: AuditContext,
-    ) -> SchemaValidationMaterial:
-        """Collect server-owned dual-end schema facts for `/jobs/{id}/validate`."""
+        control_service: ControlService,
+    ) -> JobValidationOperation:
+        """Phase A: freeze a job and both datasource security bindings."""
 
         with self.sessions.begin() as session:
             visible_job = session.get(SyncJob, job_id)
             if visible_job is None:
                 self._not_found()
-            organization = self._lock_organization(
-                session,
-                principal.organization_id,
-            )
+            # The request principal can be rejected from its signed role scope
+            # without taking any product row lock.  Only an eligible developer
+            # may then briefly lock SystemControl before the organization; this
+            # establishes the product-wide SystemControl -> Organization order
+            # shared with Worker/reconciliation/retention paths.
+            self._require_project_developer(principal, visible_job.project_id)
+            # Terminal jobs are rejected before requiring live runtime proof.
+            # This is a request-state decision, not a validation operation;
+            # the locked checks below repeat it to close the edit race.
+            if visible_job.status == "ARCHIVED":
+                raise ProblemException(
+                    status=409,
+                    code="JOB_ARCHIVED",
+                    title="任务已归档",
+                    detail="归档任务不能执行校验。",
+                )
+            if visible_job.status == "PUBLISHED":
+                raise ProblemException(
+                    status=409,
+                    code="JOB_PUBLISHED",
+                    title="任务已发布",
+                    detail="请先修改草稿创建新的 DRAFT，再执行校验。",
+                )
+            control_service.lock_runtime_validation_state(session)
+            organization = self._lock_organization(session, principal.organization_id)
             project = self._visible_project(
                 session,
                 principal,
                 visible_job.project_id,
                 lock=True,
             )
+            if project.status != "ACTIVE":
+                raise ProblemException(
+                    status=409,
+                    code="PROJECT_ARCHIVED",
+                    title="项目已归档",
+                    detail="归档项目不能执行任务校验。",
+                )
             self._require_project_developer(principal, project.id)
             job = session.scalar(
                 select(SyncJob)
-                .where(
-                    SyncJob.id == job_id,
-                    SyncJob.project_id == project.id,
-                )
+                .where(SyncJob.id == job_id, SyncJob.project_id == project.id)
                 .with_for_update()
             )
             if job is None:
                 self._not_found()
-            spec = JobSpecV1.model_validate(job.draft_spec_json)
-            revision_ids = sorted(
-                {
-                    spec.source.datasource_revision_id,
-                    spec.target.datasource_revision_id,
-                },
-                key=str,
-            )
-            revisions = {
-                item.id: item
-                for item in session.scalars(
-                    select(DatasourceRevision)
-                    .where(DatasourceRevision.id.in_(revision_ids))
-                    .order_by(DatasourceRevision.id)
-                    .with_for_update()
+            if job.status == "ARCHIVED":
+                raise ProblemException(
+                    status=409,
+                    code="JOB_ARCHIVED",
+                    title="任务已归档",
+                    detail="归档任务不能执行校验。",
                 )
-            }
-            if set(revisions) != set(revision_ids):
-                self._not_found()
-            source_revision = revisions[spec.source.datasource_revision_id]
-            target_revision = revisions[spec.target.datasource_revision_id]
+            if job.status == "PUBLISHED":
+                raise ProblemException(
+                    status=409,
+                    code="JOB_PUBLISHED",
+                    title="任务已发布",
+                    detail="请先修改草稿创建新的 DRAFT，再执行校验。",
+                )
+            spec = JobSpecV1.model_validate(job.draft_spec_json)
+            # SystemControl is already locked before Organization.  Resolve the
+            # plugin-specific material while retaining that lock, then continue
+            # with the product order Organization -> Project -> Job ->
+            # Datasource -> immutable revision/policy facts.
+            runtime = control_service.runtime_validation_material_for_plugins(
+                session,
+                reader_plugin_name=spec.source.plugin_name,
+                writer_plugin_name=spec.target.plugin_name,
+            )
             datasource_ids = sorted(
                 {spec.source.datasource_id, spec.target.datasource_id},
                 key=str,
             )
             datasources = {
-                item.id: item
-                for item in session.scalars(
+                row.id: row
+                for row in session.scalars(
                     select(Datasource)
                     .where(Datasource.id.in_(datasource_ids))
                     .order_by(Datasource.id)
@@ -2402,8 +4187,32 @@ class CredentialService:
             }
             if set(datasources) != set(datasource_ids):
                 self._not_found()
+            # Keep the same product-row lock order as phase C: organization,
+            # project, job, datasource, then immutable revision/policy facts.
+            # A concurrent update therefore cannot deadlock validation merely
+            # because phase A happened to lock revisions first.
+            revision_ids = sorted(
+                {
+                    spec.source.datasource_revision_id,
+                    spec.target.datasource_revision_id,
+                },
+                key=str,
+            )
+            revisions = {
+                row.id: row
+                for row in session.scalars(
+                    select(DatasourceRevision)
+                    .where(DatasourceRevision.id.in_(revision_ids))
+                    .order_by(DatasourceRevision.id)
+                    .with_for_update()
+                )
+            }
+            if set(revisions) != set(revision_ids):
+                self._not_found()
             source_datasource = datasources[spec.source.datasource_id]
             target_datasource = datasources[spec.target.datasource_id]
+            source_revision = revisions[spec.source.datasource_revision_id]
+            target_revision = revisions[spec.target.datasource_revision_id]
             if (
                 source_revision.datasource_id != source_datasource.id
                 or target_revision.datasource_id != target_datasource.id
@@ -2420,12 +4229,36 @@ class CredentialService:
                     title="任务绑定的数据源修订已不是当前版本",
                     detail="请刷新元数据并更新任务草稿后重新校验。",
                 )
-            self._require_validation_datasource_grants(
+            source = self._freeze_current_datasource_operation(
                 session,
                 principal=principal,
-                source_datasource_id=source_datasource.id,
-                target_datasource_id=target_datasource.id,
+                organization=organization,
+                project=project,
+                datasource=source_datasource,
+                operation_kind=DatasourceOperationKind.JOB_VALIDATION,
+                usage="SOURCE_USE",
             )
+            target = self._freeze_current_datasource_operation(
+                session,
+                principal=principal,
+                organization=organization,
+                project=project,
+                datasource=target_datasource,
+                operation_kind=DatasourceOperationKind.JOB_VALIDATION,
+                usage="TARGET_USE",
+            )
+            if (
+                source.datasource_revision is None
+                or target.datasource_revision is None
+                or source.datasource_revision.id != source_revision.id
+                or target.datasource_revision.id != target_revision.id
+            ):
+                raise ProblemException(
+                    status=409,
+                    code="DATASOURCE_REVISION_NOT_CURRENT",
+                    title="任务绑定的数据源修订已不是当前版本",
+                    detail="请刷新元数据并更新任务草稿后重新校验。",
+                )
             policy = self._matching_active_transfer_policy(
                 session,
                 project_id=project.id,
@@ -2433,108 +4266,601 @@ class CredentialService:
                 source_revision=source_revision,
                 target_revision=target_revision,
             )
-            source_snapshot = self._capture_validation_snapshot(
+            target_namespace = self._job_validation_target_namespace(
                 session,
-                datasource=source_datasource,
-                revision=source_revision,
-                schema_name=spec.source.table.schema_name,
-                table_name=spec.source.table.table_name,
-            )
-            target_snapshot = self._capture_validation_snapshot(
-                session,
-                datasource=target_datasource,
                 revision=target_revision,
                 schema_name=spec.target.table.schema_name,
                 table_name=spec.target.table.table_name,
             )
-            source_hash = schema_snapshot_hash(source_snapshot)
-            target_hash = schema_snapshot_hash(target_snapshot)
+            return JobValidationOperation(
+                operation_id=uuid4(),
+                job_id=job.id,
+                project_id=project.id,
+                project_status=project.status,
+                project_row_version=project.row_version,
+                job_status=job.status,
+                job_row_version=job.row_version,
+                job_draft_spec_hash=job.draft_spec_hash,
+                source=source,
+                target=target,
+                transfer_policy=self._freeze_transfer_policy(policy),
+                target_namespace=self._freeze_target_namespace(target_namespace),
+                source_plugin_name=spec.source.plugin_name,
+                target_plugin_name=spec.target.plugin_name,
+                runtime=runtime,
+                source_schema_name=spec.source.table.schema_name,
+                source_table_name=spec.source.table.table_name,
+                target_schema_name=spec.target.table.schema_name,
+                target_table_name=spec.target.table.table_name,
+            )
+
+    def _acquire_job_validation_operation(
+        self,
+        *,
+        principal: Principal,
+        job_id: UUID,
+        control_service: ControlService,
+        admission: DatasourceOperationAdmissionGuard | None,
+    ) -> tuple[JobValidationOperation, DatasourceOperationAdmissionLease | None]:
+        """Freeze valid A-time bindings, then atomically admit both endpoints.
+
+        Capturing the operation before admission means untrusted job input can
+        never create retained admission buckets for nonexistent datasource
+        UUIDs.  Phase A writes no audit or business state and releases all
+        product locks before the process-local guard is consulted.
+        """
+
+        operation = self._capture_job_validation_operation(
+            principal=principal,
+            job_id=job_id,
+            control_service=control_service,
+        )
+        source_id = operation.source.datasource_id
+        target_id = operation.target.datasource_id
+        if source_id is None or target_id is None:
+            raise self._operation_stale()
+        datasource_ids = tuple(sorted({source_id, target_id}, key=str))
+        lease = self._acquire_datasource_operation_admission(
+            admission=admission,
+            organization_id=principal.organization_id,
+            datasource_ids=datasource_ids,
+            operation_kind=DatasourceOperationKind.JOB_VALIDATION,
+        )
+        return operation, lease
+
+    def _capture_validation_schema_probe(
+        self,
+        *,
+        datasource: DatasourceOperationSnapshot,
+        schema_name: str,
+        table_name: str,
+        deadline: OperationDeadline,
+    ) -> ValidationSchemaProbe:
+        """Phase B for one job-validation datasource; no product session lives."""
+
+        if datasource.datasource_revision is None or datasource.endpoint_policy is None:
+            raise self._operation_stale()
+        try:
+            deadline.check_expired()
+            material = self._copy_strict_current_credential_material(
+                datasource,
+                deadline=deadline,
+            )
+            deadline.check_expired()
+            with self._decrypt_current_operation_material(
+                snapshot=datasource,
+                material=material,
+            ) as password:
+                resolved = self.guard.resolve(
+                    datasource.endpoint_policy,
+                    host=datasource.datasource_revision.host,
+                    port=datasource.datasource_revision.port,
+                    deadline=deadline,
+                )
+                deadline.check_expired()
+                self.guard.verify_rebinding(
+                    datasource.endpoint_policy,
+                    resolved,
+                    deadline=deadline,
+                )
+                deadline.check_expired()
+                if resolved.egress_enforcement_status != "VERIFIED":
+                    raise ProblemException(
+                        status=503,
+                        code="EGRESS_ENFORCEMENT_UNVERIFIED",
+                        title="数据库出口强制策略尚未验证",
+                        detail="在容器出口策略获得独立 VERIFIED 证据前，任务校验保持阻断。",
+                        retryable=False,
+                    )
+                snapshots, peer_ip, has_more = self.connector.schema_snapshots(
+                    datasource.datasource_revision,
+                    physical_endpoint_identity_id=(
+                        datasource.datasource_revision.physical_endpoint_identity_id
+                    ),
+                    password=password,
+                    resolved=resolved,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    limit=1,
+                    deadline=deadline,
+                )
+                deadline.check_expired()
+        except (OperationDeadlineExpired, ProblemException):
+            raise
+        except EgressAttestationError as exc:
+            # Egress attestation is a platform dependency, not a malformed
+            # metadata request.  Preserve its stable code and retryability,
+            # while still letting the single total deadline take precedence.
+            deadline.check_expired()
+            raise self._safe_probe_problem(exc) from exc
+        except Exception as exc:
+            # This helper is called inside validate_job(), whose outer
+            # deadline path performs C revalidation before returning 503.
+            # Preserve that path if a DNS/connector timeout arrives as an
+            # ordinary exception at the deadline boundary.
+            deadline.check_expired()
+            raise ProblemException(
+                status=503,
+                code="DATASOURCE_METADATA_UNAVAILABLE",
+                title="无法采集真实数据库 Schema",
+                detail="数据库连接、端点身份或完整 Schema 探针失败；未生成替代快照。",
+                retryable=_metadata_failure_retryable(exc),
+            ) from exc
+        if has_more or len(snapshots) != 1:
+            raise ProblemException(
+                status=422,
+                code="SCHEMA_TABLE_NOT_UNIQUE",
+                title="无法唯一解析任务物理表",
+                detail="任务中的 catalog、schema 与 table 必须唯一命中一张基础表。",
+            )
+        snapshot = snapshots[0]
+        expected_schema = "" if datasource.datasource_revision.engine == "MYSQL_8" else schema_name
+        if (
+            snapshot.engine != datasource.datasource_revision.engine
+            or snapshot.physical_endpoint_identity_id
+            != datasource.datasource_revision.physical_endpoint_identity_id
+            or snapshot.catalog_name != datasource.datasource_revision.database_name
+            or snapshot.schema_name != expected_schema
+            or snapshot.table_name != table_name
+        ):
+            raise ProblemException(
+                status=422,
+                code="SCHEMA_SNAPSHOT_BINDING_MISMATCH",
+                title="Schema 快照与数据源修订不匹配",
+                detail="探针结果未精确绑定任务声明的引擎、物理端点和表身份。",
+            )
+        return ValidationSchemaProbe(
+            snapshot=snapshot,
+            resolved=resolved,
+            peer_ip=peer_ip,
+        )
+
+    def _revalidate_job_validation_operation(
+        self,
+        session: Session,
+        *,
+        principal: Principal,
+        operation: JobValidationOperation,
+        control_service: ControlService,
+    ) -> tuple[
+        Organization,
+        Project,
+        SyncJob,
+        DatasourceRevision,
+        DatasourceRevision,
+    ]:
+        """Phase C: re-authorize every job/datasource/policy namespace fact."""
+
+        try:
+            organization = self._lock_organization(session, operation.source.organization_id)
+            project = self._visible_project(
+                session,
+                principal,
+                operation.project_id,
+                lock=True,
+            )
+            if (
+                project.status != "ACTIVE"
+                or project.status != operation.project_status
+                or project.row_version != operation.project_row_version
+            ):
+                raise self._operation_stale()
+            job = session.scalar(
+                select(SyncJob)
+                .where(SyncJob.id == operation.job_id, SyncJob.project_id == project.id)
+                .with_for_update()
+            )
+            if (
+                job is None
+                or job.status in {"ARCHIVED", "PUBLISHED"}
+                or job.status != operation.job_status
+                or job.row_version != operation.job_row_version
+                or job.draft_spec_hash != operation.job_draft_spec_hash
+            ):
+                raise self._operation_stale()
+            spec = JobSpecV1.model_validate(job.draft_spec_json)
+            if (
+                spec.source.table.schema_name != operation.source_schema_name
+                or spec.source.table.table_name != operation.source_table_name
+                or spec.target.table.schema_name != operation.target_schema_name
+                or spec.target.table.table_name != operation.target_table_name
+                or spec.source.plugin_name != operation.source_plugin_name
+                or spec.target.plugin_name != operation.target_plugin_name
+            ):
+                raise self._operation_stale()
+            runtime = control_service.runtime_validation_material_for_plugins(
+                session,
+                reader_plugin_name=spec.source.plugin_name,
+                writer_plugin_name=spec.target.plugin_name,
+            )
+            datasource_ids = sorted(
+                {
+                    operation.source.datasource_id,
+                    operation.target.datasource_id,
+                },
+                key=str,
+            )
+            if None in datasource_ids:
+                raise self._operation_stale()
+            datasources = {
+                row.id: row
+                for row in session.scalars(
+                    select(Datasource)
+                    .where(Datasource.id.in_(datasource_ids))
+                    .order_by(Datasource.id)
+                    .with_for_update()
+                )
+            }
+            source_id = operation.source.datasource_id
+            target_id = operation.target.datasource_id
+            if source_id is None or target_id is None:
+                raise self._operation_stale()
+            source_datasource = datasources.get(source_id)
+            target_datasource = datasources.get(target_id)
+            if source_datasource is None or target_datasource is None:
+                raise self._operation_stale()
+            source_current = self._freeze_current_datasource_operation(
+                session,
+                principal=principal,
+                organization=organization,
+                project=project,
+                datasource=source_datasource,
+                operation_kind=DatasourceOperationKind.JOB_VALIDATION,
+                usage="SOURCE_USE",
+            )
+            target_current = self._freeze_current_datasource_operation(
+                session,
+                principal=principal,
+                organization=organization,
+                project=project,
+                datasource=target_datasource,
+                operation_kind=DatasourceOperationKind.JOB_VALIDATION,
+                usage="TARGET_USE",
+            )
+            if (
+                not self._operation_snapshot_state_matches(
+                    operation.source,
+                    source_current,
+                )
+                or not self._operation_snapshot_state_matches(
+                    operation.target,
+                    target_current,
+                )
+                or source_current.datasource_revision is None
+                or target_current.datasource_revision is None
+                or source_current.datasource_revision.id != spec.source.datasource_revision_id
+                or target_current.datasource_revision.id != spec.target.datasource_revision_id
+            ):
+                raise self._operation_stale()
+            source_revision = self._datasource_revision_record(session, source_datasource)
+            target_revision = self._datasource_revision_record(session, target_datasource)
+            policy = self._matching_active_transfer_policy(
+                session,
+                project_id=project.id,
+                spec=spec,
+                source_revision=source_revision,
+                target_revision=target_revision,
+            )
+            namespace = self._job_validation_target_namespace(
+                session,
+                revision=target_revision,
+                schema_name=spec.target.table.schema_name,
+                table_name=spec.target.table.table_name,
+            )
+        except ProblemException as exc:
+            if exc.code == "DATASOURCE_OPERATION_STALE":
+                raise
+            raise self._operation_stale() from exc
+        if (
+            self._freeze_transfer_policy(policy) != operation.transfer_policy
+            or self._freeze_target_namespace(namespace) != operation.target_namespace
+            or runtime != operation.runtime
+        ):
+            raise self._operation_stale()
+        return organization, project, job, source_revision, target_revision
+
+    @staticmethod
+    def _job_validation_issue_code(problem_code: str) -> str | None:
+        return {
+            "SOURCE_TARGET_SAME_TABLE": "SOURCE_TARGET_SAME_TABLE",
+            "DATASOURCE_REVISION_NOT_CURRENT": "DATASOURCE_DISABLED",
+            "DATASOURCE_DISABLED": "DATASOURCE_DISABLED",
+            "TARGET_NAMESPACE_NOT_REGISTERED": "TARGET_TABLE_NOT_FOUND",
+            "SCHEMA_SNAPSHOT_MAPPING_MISMATCH": "SCHEMA_DRIFT_DETECTED",
+            "SCHEMA_SNAPSHOT_BINDING_MISMATCH": "SCHEMA_DRIFT_DETECTED",
+            "SCHEMA_SNAPSHOT_INVALID": "SCHEMA_DRIFT_DETECTED",
+            "SCHEMA_SNAPSHOT_HASH_MISMATCH": "SCHEMA_DRIFT_DETECTED",
+            "TRANSFER_POLICY_NOT_ACTIVE": "JOB_SPEC_INVALID",
+            "TRANSFER_SCOPE_DENIED": "JOB_SPEC_INVALID",
+        }.get(problem_code)
+
+    def validate_job(
+        self,
+        *,
+        principal: Principal,
+        job_id: UUID,
+        control_service: ControlService,
+        audit: AuditContext,
+        admission: DatasourceOperationAdmissionGuard | None = None,
+    ) -> ValidationReport:
+        """Run A/B/C validation and accept its job state in C's transaction."""
+
+        # A-time rejection has no detached operation token that could prove a
+        # later report still belongs to the same draft.  Return it directly:
+        # persisting it in a second transaction could attach an old failure to
+        # a concurrently edited draft.  B-time failures use the C finalizer
+        # below, which revalidates every captured pointer atomically.
+        operation, lease = self._acquire_job_validation_operation(
+            principal=principal,
+            job_id=job_id,
+            control_service=control_service,
+            admission=admission,
+        )
+        deadline = OperationDeadline(self.operation_deadline_seconds)
+        try:
+
+            def refresh_validation_database_deadline(session: Session) -> None:
+                """Re-clamp one C-phase database step to the shared budget.
+
+                Core invokes this hook while it owns its transaction.  Avoid
+                an incidental ORM autoflush before PostgreSQL has received the
+                new transaction-local lock/statement timeout; the next
+                database operation (or the terminal explicit flush) performs
+                the write under that freshly computed remainder.
+                """
+
+                with session.no_autoflush:
+                    self._configure_deadline_transaction(session, deadline=deadline)
+
+            def lock_runtime_before_validation_c(session: Session) -> None:
+                """Lock C's runtime proof before Organization and map drift stale."""
+
+                refresh_validation_database_deadline(session)
+                try:
+                    control_service.runtime_validation_material_for_plugins(
+                        session,
+                        reader_plugin_name=operation.source_plugin_name,
+                        writer_plugin_name=operation.target_plugin_name,
+                    )
+                except ProblemException as exc:
+                    # A was allowed only after a READY proof.  If C cannot
+                    # obtain that same proof, B's result is stale rather than
+                    # a fresh dependency failure that may be persisted.
+                    if exc.code == "RUNTIME_ATTESTATION_UNAVAILABLE":
+                        raise self._operation_stale() from exc
+                    raise
+                deadline.check_expired()
+
+            def finalize_operation(session: Session) -> None:
+                refresh_validation_database_deadline(session)
+                self._revalidate_job_validation_operation(
+                    session,
+                    principal=principal,
+                    operation=operation,
+                    control_service=control_service,
+                )
+                deadline.check_expired()
+
+            def assert_deadline_before_validation_commit(session: Session) -> None:
+                # Do not merely read the clock: force all pending connection
+                # evidence, validation state and audit rows through the
+                # freshly-clamped database budget, then reject a late commit.
+                # no_autoflush prevents set_config() itself from flushing the
+                # pending writes before it has installed that budget.
+                refresh_validation_database_deadline(session)
+                session.flush()
+                deadline.check_expired()
+
+            def report_validation_failure(
+                *,
+                code: str,
+                message: str,
+            ) -> ValidationReport:
+                return control_service.validation_failure_report(
+                    principal=principal,
+                    job_id=job_id,
+                    code=code,
+                    message=message,
+                    audit=audit,
+                    finalizer=finalize_operation,
+                    pre_organization_lock=lock_runtime_before_validation_c,
+                    before_database_step=refresh_validation_database_deadline,
+                    before_commit=assert_deadline_before_validation_commit,
+                )
+
+            try:
+                source_probe = self._capture_validation_schema_probe(
+                    datasource=operation.source,
+                    schema_name=operation.source_schema_name,
+                    table_name=operation.source_table_name,
+                    deadline=deadline,
+                )
+                target_probe = self._capture_validation_schema_probe(
+                    datasource=operation.target,
+                    schema_name=operation.target_schema_name,
+                    table_name=operation.target_table_name,
+                    deadline=deadline,
+                )
+                source_hash = schema_snapshot_hash(source_probe.snapshot)
+                target_hash = schema_snapshot_hash(target_probe.snapshot)
+            except OperationDeadlineExpired as exc:
+                raise self._operation_deadline_problem(
+                    "任务校验超过总时限；没有写入 Schema 证据或校验结果。"
+                ) from exc
+            except ProblemException as problem:
+                issue_code = self._job_validation_issue_code(problem.code)
+                if issue_code is None:
+                    with self._deadline_transaction(deadline) as session:
+                        lock_runtime_before_validation_c(session)
+                        refresh_validation_database_deadline(session)
+                        self._revalidate_job_validation_operation(
+                            session,
+                            principal=principal,
+                            operation=operation,
+                            control_service=control_service,
+                        )
+                    raise
+                return report_validation_failure(
+                    code=issue_code,
+                    message=problem.detail or problem.title,
+                )
+            # Re-read the immutable job spec in phase C rather than retaining
+            # an ORM object across B.  The finalizer will compare its hash and
+            # pointers before it writes either evidence or the job report.
+            with self._deadline_transaction(deadline) as session:
+                job = session.get(SyncJob, operation.job_id)
+                if job is None:
+                    self._not_found()
+                spec = JobSpecV1.model_validate(job.draft_spec_json)
             try:
                 assert_snapshot_matches_job(
-                    source_snapshot,
+                    source_probe.snapshot,
                     expected_hash=source_hash,
                     spec=spec,
                     side="source",
                 )
                 assert_snapshot_matches_job(
-                    target_snapshot,
+                    target_probe.snapshot,
                     expected_hash=target_hash,
                     spec=spec,
                     side="target",
                 )
-            except RuntimeError as exc:
-                raise ProblemException(
+            except RuntimeError:
+                problem = ProblemException(
                     status=422,
                     code="SCHEMA_SNAPSHOT_MAPPING_MISMATCH",
                     title="真实 Schema 与任务映射不兼容",
                     detail="字段、类型、生成列、触发器或表结构不满足 V1 校验要求。",
-                ) from exc
+                )
+                return report_validation_failure(
+                    code="SCHEMA_DRIFT_DETECTED",
+                    message=problem.detail or problem.title,
+                )
             if (
-                source_snapshot.physical_table_identity_hash
-                == target_snapshot.physical_table_identity_hash
+                source_probe.snapshot.physical_table_identity_hash
+                == target_probe.snapshot.physical_table_identity_hash
             ):
-                raise ProblemException(
-                    status=422,
+                return report_validation_failure(
                     code="SOURCE_TARGET_SAME_TABLE",
-                    title="源表和目标表不能是同一物理表",
-                    detail="V1 insert-only 一次性复制禁止自复制。",
+                    message="V1 insert-only 一次性复制禁止自复制。",
                 )
-            target_namespace = session.scalar(
-                select(TargetNamespace)
-                .where(
-                    TargetNamespace.physical_table_identity_hash
-                    == target_snapshot.physical_table_identity_hash,
-                    TargetNamespace.physical_endpoint_identity_id
-                    == target_revision.physical_endpoint_identity_id,
-                    TargetNamespace.engine == target_revision.engine,
-                    TargetNamespace.normalized_catalog_name
-                    == target_snapshot.catalog_name,
-                    TargetNamespace.normalized_schema_name
-                    == target_snapshot.schema_name,
-                    TargetNamespace.normalized_table_name
-                    == target_snapshot.table_name,
-                    TargetNamespace.normalization_version == "1.0",
-                )
-                .with_for_update()
-            )
-            if target_namespace is None:
-                raise ProblemException(
-                    status=409,
-                    code="TARGET_NAMESPACE_NOT_REGISTERED",
-                    title="目标物理表尚未完成授权登记",
-                    detail="ACTIVE TransferPolicy 必须绑定已登记的 TargetNamespace。",
-                )
-            material = SchemaValidationMaterial(
-                source_schema_snapshot=source_snapshot.model_dump(mode="json"),
-                target_schema_snapshot=target_snapshot.model_dump(mode="json"),
+            material = ValidationMaterial(
+                source_schema_snapshot=source_probe.snapshot.model_dump(mode="json"),
+                target_schema_snapshot=target_probe.snapshot.model_dump(mode="json"),
                 source_schema_hash=source_hash,
                 target_schema_hash=target_hash,
                 source_physical_table_identity_hash=(
-                    source_snapshot.physical_table_identity_hash
+                    source_probe.snapshot.physical_table_identity_hash
                 ),
-                target_namespace_id=target_namespace.id,
-                transfer_policy_id=policy.id,
-                transfer_policy_scope_hash=policy.scope_hash,
+                target_namespace_id=operation.target_namespace.id,
+                transfer_policy_id=operation.transfer_policy.id,
+                transfer_policy_scope_hash=operation.transfer_policy.scope_hash,
+                runtime_sha256=operation.runtime.runtime_sha256,
+                reader_plugin_sha256=operation.runtime.reader_plugin_sha256,
+                writer_plugin_sha256=operation.runtime.writer_plugin_sha256,
             )
-            self._append_audit(
-                session,
-                organization=organization,
-                project_id=project.id,
-                action="JOB_VALIDATION_SCHEMA_COLLECTED",
-                actor_id=principal.user_id,
-                target_type="SYNC_JOB",
-                target_id=job.id,
-                target_name=job.name,
-                changed_fields=[],
-                audit=audit,
-                metadata={
-                    "source_schema_hash": source_hash,
-                    "target_schema_hash": target_hash,
-                    "transfer_policy_id": str(policy.id),
-                    "target_namespace_id": str(target_namespace.id),
-                },
+
+            def finalize_success(session: Session) -> None:
+                refresh_validation_database_deadline(session)
+                (
+                    _organization,
+                    _project,
+                    _job,
+                    source_revision,
+                    target_revision,
+                ) = self._revalidate_job_validation_operation(
+                    session,
+                    principal=principal,
+                    operation=operation,
+                    control_service=control_service,
+                )
+                deadline.check_expired()
+                refresh_validation_database_deadline(session)
+                self._persist_connection_evidence(
+                    session,
+                    operation_kind="METADATA",
+                    datasource_revision=source_revision,
+                    resolved=source_probe.resolved,
+                    peer_ip=source_probe.peer_ip,
+                    tls_peer_spki_sha256=None,
+                    observed_at=utc_now(),
+                )
+                deadline.check_expired()
+                refresh_validation_database_deadline(session)
+                self._persist_connection_evidence(
+                    session,
+                    operation_kind="METADATA",
+                    datasource_revision=target_revision,
+                    resolved=target_probe.resolved,
+                    peer_ip=target_probe.peer_ip,
+                    tls_peer_spki_sha256=None,
+                    observed_at=utc_now(),
+                )
+                deadline.check_expired()
+
+            try:
+                accepted = control_service.accept_validation_material(
+                    principal=principal,
+                    job_id=job_id,
+                    material=material,
+                    audit=audit,
+                    finalizer=finalize_success,
+                    pre_organization_lock=lock_runtime_before_validation_c,
+                    before_database_step=refresh_validation_database_deadline,
+                    before_commit=assert_deadline_before_validation_commit,
+                )
+            except ProblemException as problem:
+                # Core rejects malformed or no-longer-compatible material in
+                # the same transaction that ran C; its evidence writes roll
+                # back.  Re-run C before recording the mapped failure report.
+                issue_code = self._job_validation_issue_code(problem.code)
+                if issue_code is None:
+                    raise
+                return report_validation_failure(
+                    code=issue_code,
+                    message=problem.detail or problem.title,
+                )
+            return ValidationReport(
+                valid=True,
+                draft_spec_hash=accepted.draft_spec_hash,
+                source_schema_hash=source_hash,
+                target_schema_hash=target_hash,
+                errors=[],
+                warnings=[],
             )
-            return material
+        except OperationDeadlineExpired as exc:
+            raise self._operation_deadline_problem(
+                "任务校验超过总时限；没有写入 Schema 证据或校验结果。"
+            ) from exc
+        except DBAPIError as exc:
+            if self._is_product_database_deadline_error(exc) or deadline.remaining_seconds() <= 0.0:
+                raise self._operation_deadline_problem(
+                    "任务校验超过总时限；没有写入 Schema 证据或校验结果。"
+                ) from exc
+            raise
+        finally:
+            if lease is not None:
+                lease.release()
 
     # Persistence and serialization helpers.
 
@@ -2582,11 +4908,7 @@ class CredentialService:
             )
             .with_for_update()
         )
-        if (
-            policy is None
-            or policy.status != "ACTIVE"
-            or policy.current_revision_id is None
-        ):
+        if policy is None or policy.status != "ACTIVE" or policy.current_revision_id is None:
             raise ProblemException(
                 status=422,
                 code="ENDPOINT_POLICY_NOT_ACTIVE",
@@ -2611,23 +4933,25 @@ class CredentialService:
             else current.engine
         )
         host = (
-            request.host
-            if "host" in request.model_fields_set and request.host is not None
-            else current.host
-        ).rstrip(".").casefold()
+            (
+                request.host
+                if "host" in request.model_fields_set and request.host is not None
+                else current.host
+            )
+            .rstrip(".")
+            .casefold()
+        )
         candidate = DatasourceConnectionCandidate(
             engine=engine,
             host=host,
             port=(
                 request.port
-                if "port" in request.model_fields_set
-                and request.port is not None
+                if "port" in request.model_fields_set and request.port is not None
                 else current.port
             ),
             database_name=(
                 request.database_name
-                if "database_name" in request.model_fields_set
-                and request.database_name is not None
+                if "database_name" in request.model_fields_set and request.database_name is not None
                 else current.database_name
             ),
             default_schema=(
@@ -2638,14 +4962,12 @@ class CredentialService:
             ),
             username=(
                 request.username
-                if "username" in request.model_fields_set
-                and request.username is not None
+                if "username" in request.model_fields_set and request.username is not None
                 else current.username
             ),
             ssl_mode=(
                 request.ssl_mode.value
-                if "ssl_mode" in request.model_fields_set
-                and request.ssl_mode is not None
+                if "ssl_mode" in request.model_fields_set and request.ssl_mode is not None
                 else current.ssl_mode
             ),
         )
@@ -2679,9 +5001,7 @@ class CredentialService:
         now: datetime,
     ) -> PhysicalEndpointIdentity:
         identity_scheme = (
-            "MYSQL_SERVER_UUID"
-            if candidate.engine == "MYSQL_8"
-            else "POSTGRES_SYSTEM_IDENTIFIER"
+            "MYSQL_SERVER_UUID" if candidate.engine == "MYSQL_8" else "POSTGRES_SYSTEM_IDENTIFIER"
         )
         identity_hash = hashlib.sha256(
             (
@@ -2737,9 +5057,7 @@ class CredentialService:
     ) -> dict[str, Any]:
         return {
             "endpoint_policy_revision_id": str(policy_revision.id),
-            "physical_endpoint_identity_id": str(
-                physical_endpoint_identity_id
-            ),
+            "physical_endpoint_identity_id": str(physical_endpoint_identity_id),
             "engine": candidate.engine,
             "host": candidate.host,
             "port": candidate.port,
@@ -2987,13 +5305,9 @@ class CredentialService:
             "schema_version": "1.0",
             "operation_kind": operation_kind,
             "datasource_revision_id": str(datasource_revision.id),
-            "endpoint_policy_revision_id": str(
-                datasource_revision.endpoint_policy_revision_id
-            ),
+            "endpoint_policy_revision_id": str(datasource_revision.endpoint_policy_revision_id),
             "execution_id": str(execution_id) if execution_id else None,
-            "recovery_probe_id": (
-                str(recovery_probe_id) if recovery_probe_id else None
-            ),
+            "recovery_probe_id": (str(recovery_probe_id) if recovery_probe_id else None),
             "attempt_id": str(attempt_id) if attempt_id else None,
             "fence_epoch": fence_epoch,
             "resolver_policy_version": resolved.resolver_policy_version,
@@ -3066,20 +5380,13 @@ class CredentialService:
         if (
             (execution_id is None) == (recovery_probe_id is None)
             or fence_epoch < 1
-            or (
-                operation_kind == "RECOVERY_PROBE"
-                and recovery_probe_id is None
-            )
-            or (
-                operation_kind != "RECOVERY_PROBE"
-                and execution_id is None
-            )
+            or (operation_kind == "RECOVERY_PROBE" and recovery_probe_id is None)
+            or (operation_kind != "RECOVERY_PROBE" and execution_id is None)
         ):
             raise ValueError("WORKER_EVIDENCE_OWNER_INVALID")
-        if (
-            resolved.egress_enforcement_status != "VERIFIED"
-            or ensure_aware(resolved.dns_valid_until) < ensure_aware(observed_at)
-        ):
+        if resolved.egress_enforcement_status != "VERIFIED" or ensure_aware(
+            resolved.dns_valid_until
+        ) < ensure_aware(observed_at):
             raise ValueError("WORKER_EVIDENCE_NETWORK_UNVERIFIED")
         return self._persist_connection_evidence(
             session,
@@ -3095,126 +5402,6 @@ class CredentialService:
             attempt_id=attempt_id,
             fence_epoch=fence_epoch,
         )
-
-    def _active_secret_and_envelope(
-        self,
-        session: Session,
-        datasource: Datasource,
-    ) -> tuple[CredentialSecret, CredentialSecretEnvelope]:
-        if datasource.status != "ACTIVE" or datasource.current_secret_id is None:
-            raise self._binding_unavailable()
-        secret = session.get(CredentialSecret, datasource.current_secret_id)
-        if secret is None or secret.status != "ACTIVE":
-            raise self._binding_unavailable()
-        envelope = session.scalar(
-            select(CredentialSecretEnvelope).where(
-                CredentialSecretEnvelope.credential_secret_id == secret.id,
-                CredentialSecretEnvelope.status == "ACTIVE",
-            )
-        )
-        if envelope is None:
-            raise self._binding_unavailable()
-        return secret, envelope
-
-    def _capture_validation_snapshot(
-        self,
-        session: Session,
-        *,
-        datasource: Datasource,
-        revision: DatasourceRevision,
-        schema_name: str,
-        table_name: str,
-    ) -> SchemaSnapshot:
-        current_revision, policy_revision = self._current_revisions(
-            session,
-            datasource,
-        )
-        if current_revision.id != revision.id:
-            raise ProblemException(
-                status=409,
-                code="DATASOURCE_REVISION_NOT_CURRENT",
-                title="数据源修订已变化",
-                detail="校验只能使用当前已验证的数据源修订。",
-            )
-        try:
-            resolved = self.guard.resolve(
-                policy_revision,
-                host=revision.host,
-                port=revision.port,
-            )
-            self.guard.verify_rebinding(policy_revision, resolved)
-            if resolved.egress_enforcement_status != "VERIFIED":
-                raise ProblemException(
-                    status=503,
-                    code="EGRESS_ENFORCEMENT_UNVERIFIED",
-                    title="数据库出口强制策略尚未验证",
-                    detail="在容器出口策略获得独立 VERIFIED 证据前，任务校验保持阻断。",
-                    retryable=False,
-                )
-            secret, envelope = self._active_secret_and_envelope(
-                session,
-                datasource,
-            )
-            with self.decrypted_password(
-                session,
-                datasource_id=datasource.id,
-                secret_id=secret.id,
-                envelope_id=envelope.id,
-            ) as password:
-                snapshots, peer_ip, has_more = self.connector.schema_snapshots(
-                    revision,
-                    physical_endpoint_identity_id=(
-                        revision.physical_endpoint_identity_id
-                    ),
-                    password=password,
-                    resolved=resolved,
-                    schema_name=schema_name,
-                    table_name=table_name,
-                    limit=1,
-                )
-        except ProblemException:
-            raise
-        except Exception as exc:
-            raise ProblemException(
-                status=503,
-                code="DATASOURCE_METADATA_UNAVAILABLE",
-                title="无法采集真实数据库 Schema",
-                detail="数据库连接、端点身份或完整 Schema 探针失败；未生成替代快照。",
-                retryable=_metadata_failure_retryable(exc),
-            ) from exc
-        if has_more or len(snapshots) != 1:
-            raise ProblemException(
-                status=422,
-                code="SCHEMA_TABLE_NOT_UNIQUE",
-                title="无法唯一解析任务物理表",
-                detail="任务中的 catalog、schema 与 table 必须唯一命中一张基础表。",
-            )
-        snapshot = snapshots[0]
-        expected_schema = "" if revision.engine == "MYSQL_8" else schema_name
-        if (
-            snapshot.engine != revision.engine
-            or snapshot.physical_endpoint_identity_id
-            != revision.physical_endpoint_identity_id
-            or snapshot.catalog_name != revision.database_name
-            or snapshot.schema_name != expected_schema
-            or snapshot.table_name != table_name
-        ):
-            raise ProblemException(
-                status=422,
-                code="SCHEMA_SNAPSHOT_BINDING_MISMATCH",
-                title="Schema 快照与数据源修订不匹配",
-                detail="探针结果未精确绑定任务声明的引擎、物理端点和表身份。",
-            )
-        self._persist_connection_evidence(
-            session,
-            operation_kind="METADATA",
-            datasource_revision=revision,
-            resolved=resolved,
-            peer_ip=peer_ip,
-            tls_peer_spki_sha256=None,
-            observed_at=utc_now(),
-        )
-        return snapshot
 
     def _current_secret_record(
         self,
@@ -3254,14 +5441,6 @@ class CredentialService:
             raise self._keyring_unavailable() from exc
         if not hmac.compare_digest(key.fingerprint_sha256, fingerprint):
             raise self._keyring_unavailable()
-
-    def _current_secret(
-        self,
-        session: Session,
-        datasource: Datasource,
-    ) -> CredentialSecret:
-        secret, _ = self._active_secret_and_envelope(session, datasource)
-        return secret
 
     def _current_revisions(
         self,
@@ -3304,11 +5483,7 @@ class CredentialService:
         fields = request.model_fields_set
 
         def selected(name: str) -> Any:
-            return (
-                getattr(request, name)
-                if name in fields
-                else getattr(current, name)
-            )
+            return getattr(request, name) if name in fields else getattr(current, name)
 
         host_kind = str(selected("host_kind"))
         host = str(selected("host_value")).rstrip(".").casefold()
@@ -3347,11 +5522,7 @@ class CredentialService:
                 "CIDR 格式无效。",
             )
         ports = sorted({int(value) for value in selected("allowed_ports")})
-        if (
-            not ports
-            or len(ports) > 16
-            or any(port < 1 or port > 65535 for port in ports)
-        ):
+        if not ports or len(ports) > 16 or any(port < 1 or port > 65535 for port in ports):
             self._endpoint_policy_validation_problem(
                 "allowed_ports",
                 "端口必须为 1..65535 且最多 16 个。",
@@ -3363,9 +5534,7 @@ class CredentialService:
             "allowed_cidrs": cidrs,
             "allowed_ports": ports,
             "tls_required": bool(selected("tls_required")),
-            "dns_ttl_ceiling_seconds": int(
-                selected("dns_ttl_ceiling_seconds")
-            ),
+            "dns_ttl_ceiling_seconds": int(selected("dns_ttl_ceiling_seconds")),
             "resolver_policy_version": self.guard.resolver_policy_version,
             "egress_policy_version": self.guard.egress_policy_version,
         }
@@ -3475,9 +5644,7 @@ class CredentialService:
             credential_status="READY" if ready else "UNAVAILABLE",
             last_test_status=datasource.last_test_status,
             last_tested_at=(
-                ensure_aware(datasource.last_tested_at)
-                if datasource.last_tested_at
-                else None
+                ensure_aware(datasource.last_tested_at) if datasource.last_tested_at else None
             ),
             last_test_error_code=datasource.last_test_error_code,
             status=datasource.status,
@@ -3580,11 +5747,7 @@ class CredentialService:
                 numeric_scale=item.numeric_scale,
                 datetime_precision=item.datetime_precision,
                 oracle_supported=not item.generated,
-                unsupported_reason=(
-                    "GENERATED_COLUMN_UNSUPPORTED"
-                    if item.generated
-                    else None
-                ),
+                unsupported_reason=("GENERATED_COLUMN_UNSUPPORTED" if item.generated else None),
             )
             for item in snapshot.columns
         ]
@@ -3660,14 +5823,18 @@ class CredentialService:
                 OrganizationMember.status == MembershipStatus.ACTIVE,
             )
         )
-        if membership is None or session.scalar(
-            select(DatasourceUsageGrant.id).where(
-                DatasourceUsageGrant.datasource_id == datasource.id,
-                DatasourceUsageGrant.organization_member_id == membership.id,
-                DatasourceUsageGrant.usage == usage,
-                DatasourceUsageGrant.status == "ACTIVE",
+        if (
+            membership is None
+            or session.scalar(
+                select(DatasourceUsageGrant.id).where(
+                    DatasourceUsageGrant.datasource_id == datasource.id,
+                    DatasourceUsageGrant.organization_member_id == membership.id,
+                    DatasourceUsageGrant.usage == usage,
+                    DatasourceUsageGrant.status == "ACTIVE",
+                )
             )
-        ) is None:
+            is None
+        ):
             raise ProblemException(
                 status=403,
                 code="DATASOURCE_USAGE_NOT_GRANTED",
@@ -3732,8 +5899,7 @@ class CredentialService:
                     DatasourceUsageGrant.datasource_id,
                     DatasourceUsageGrant.usage,
                 ).where(
-                    DatasourceUsageGrant.organization_member_id
-                    == membership.id,
+                    DatasourceUsageGrant.organization_member_id == membership.id,
                     DatasourceUsageGrant.status == "ACTIVE",
                 )
             ).all()
@@ -3764,10 +5930,8 @@ class CredentialService:
                 select(TransferPolicy)
                 .where(
                     TransferPolicy.project_id == project_id,
-                    TransferPolicy.source_datasource_revision_id
-                    == source_revision.id,
-                    TransferPolicy.target_datasource_revision_id
-                    == target_revision.id,
+                    TransferPolicy.source_datasource_revision_id == source_revision.id,
+                    TransferPolicy.target_datasource_revision_id == target_revision.id,
                     TransferPolicy.status == "ACTIVE",
                 )
                 .order_by(TransferPolicy.id)
@@ -3790,8 +5954,7 @@ class CredentialService:
                 code="TRANSFER_POLICY_NOT_ACTIVE",
                 title="没有唯一匹配的 ACTIVE 传输授权",
                 detail=(
-                    "必须存在且只能存在一条精确覆盖当前 revision、表和列的 "
-                    "ACTIVE TransferPolicy。"
+                    "必须存在且只能存在一条精确覆盖当前 revision、表和列的 ACTIVE TransferPolicy。"
                 ),
             )
         return matches[0]
@@ -3837,10 +6000,7 @@ class CredentialService:
         *,
         lock: bool = False,
     ) -> Project:
-        if (
-            not principal.is_admin
-            and project_id not in self._visible_project_ids(principal)
-        ):
+        if not principal.is_admin and project_id not in self._visible_project_ids(principal):
             self._not_found()
         statement = select(Project).where(
             Project.id == project_id,
@@ -3859,8 +6019,7 @@ class CredentialService:
             for assignment in principal.role_assignments
             if assignment.scope_type == ScopeType.PROJECT
             and any(
-                role in {Role.DEVELOPER, Role.OPERATOR, Role.VIEWER}
-                for role in assignment.roles
+                role in {Role.DEVELOPER, Role.OPERATOR, Role.VIEWER} for role in assignment.roles
             )
         }
 
@@ -3902,10 +6061,7 @@ class CredentialService:
         )
         if project_id is None:
             self._not_found()
-        if (
-            not principal.is_admin
-            and project_id not in self._visible_project_ids(principal)
-        ):
+        if not principal.is_admin and project_id not in self._visible_project_ids(principal):
             self._not_found()
         organization = self._lock_organization(session, principal.organization_id)
         project = session.scalar(
@@ -4192,12 +6348,8 @@ class CredentialService:
             .where(
                 TransferPolicy.status.in_(_ACTIVE_TRANSFER_POLICY_STATES),
                 or_(
-                    TransferPolicy.source_datasource_revision_id.in_(
-                        revision_ids
-                    ),
-                    TransferPolicy.target_datasource_revision_id.in_(
-                        revision_ids
-                    ),
+                    TransferPolicy.source_datasource_revision_id.in_(revision_ids),
+                    TransferPolicy.target_datasource_revision_id.in_(revision_ids),
                 ),
             )
             .limit(1)
@@ -4218,9 +6370,7 @@ class CredentialService:
         if session.scalar(
             select(RecoveryProbe.id)
             .where(
-                RecoveryProbe.process_state.in_(
-                    _ACTIVE_RECOVERY_PROBE_STATES
-                ),
+                RecoveryProbe.process_state.in_(_ACTIVE_RECOVERY_PROBE_STATES),
                 RecoveryProbe.target_datasource_revision_id.in_(revision_ids),
             )
             .limit(1)
@@ -4247,11 +6397,13 @@ class CredentialService:
         organization_id: UUID,
     ) -> Organization:
         organization = session.scalar(
-            select(Organization)
-            .where(Organization.id == organization_id)
-            .with_for_update()
+            select(Organization).where(Organization.id == organization_id).with_for_update()
         )
-        if organization is None:
+        # Every Phase-C revalidation goes through this lock after external
+        # I/O.  The request-time principal was authenticated while the
+        # organization was active, but it may be suspended during Phase B;
+        # fail closed rather than persist detached evidence/audit state.
+        if organization is None or organization.status != "ACTIVE":
             self._not_found()
         return organization
 
@@ -4259,11 +6411,7 @@ class CredentialService:
         self,
         request: DatasourceCreate | DatasourceConnectionCandidate,
     ) -> None:
-        engine = (
-            request.engine.value
-            if hasattr(request.engine, "value")
-            else request.engine
-        )
+        engine = request.engine.value if hasattr(request.engine, "value") else request.engine
         if engine == "MYSQL_8" and request.default_schema != request.database_name:
             raise ProblemException(
                 status=422,
@@ -4285,9 +6433,7 @@ class CredentialService:
                     detail="数据库名、Schema 或用户名包含禁止字符。",
                 )
         ssl_mode = (
-            request.ssl_mode.value
-            if hasattr(request.ssl_mode, "value")
-            else request.ssl_mode
+            request.ssl_mode.value if hasattr(request.ssl_mode, "value") else request.ssl_mode
         )
         if ssl_mode == "DISABLE":
             # The policy check below remains authoritative; this keeps the error
@@ -4319,9 +6465,8 @@ class CredentialService:
             session.flush()
             existing = None
         if existing is not None:
-            if (
-                existing.request_hash_scheme != IDEMPOTENCY_HASH_SCHEME
-                or not hmac.compare_digest(existing.request_hash, request_hash)
+            if existing.request_hash_scheme != IDEMPOTENCY_HASH_SCHEME or not hmac.compare_digest(
+                existing.request_hash, request_hash
             ):
                 raise ProblemException(
                     status=409,
@@ -4353,6 +6498,43 @@ class CredentialService:
         )
         session.flush()
         return None
+
+    def _credential_secret_status_replay_response(
+        self,
+        session: Session,
+        *,
+        record: IdempotencyRecord,
+        datasource_id: UUID,
+        secret_id: UUID,
+        secret_version: int,
+    ) -> CredentialSecretSummary:
+        """Bind a template-scoped status replay to its datasource and secret."""
+
+        if (
+            record.resource_type != "DATASOURCE"
+            or record.resource_id != datasource_id
+            or record.response_status != 200
+            or record.response_body is None
+        ):
+            raise self._idempotency_resource_conflict()
+        secret = session.scalar(
+            select(CredentialSecret)
+            .where(
+                CredentialSecret.id == secret_id,
+                CredentialSecret.datasource_id == datasource_id,
+                CredentialSecret.secret_version == secret_version,
+            )
+            .with_for_update()
+        )
+        if secret is None:
+            raise self._idempotency_resource_conflict()
+        try:
+            response = CredentialSecretSummary.model_validate(record.response_body)
+        except ValidationError as exc:
+            raise self._idempotency_resource_conflict() from exc
+        if response.secret_version != secret.secret_version:
+            raise self._idempotency_resource_conflict()
+        return response
 
     def _complete_idempotency(
         self,
@@ -4401,9 +6583,7 @@ class CredentialService:
         # intentionally taken before both the tail lookup and the watermark
         # CAS so PostgreSQL and SQLite share the same append invariant.
         session.execute(
-            select(Organization.id)
-            .where(Organization.id == organization.id)
-            .with_for_update()
+            select(Organization.id).where(Organization.id == organization.id).with_for_update()
         ).scalar_one()
         previous = session.scalar(
             select(AuditEvent)
@@ -4545,9 +6725,7 @@ class CredentialService:
             _CURSOR_DOMAIN + body,
             hashlib.sha256,
         ).digest()
-        return base64.urlsafe_b64encode(body + signature).rstrip(b"=").decode(
-            "ascii"
-        )
+        return base64.urlsafe_b64encode(body + signature).rstrip(b"=").decode("ascii")
 
     def _decode_cursor(
         self,
@@ -4580,9 +6758,7 @@ class CredentialService:
                 or payload.get("scope") != scope
             ):
                 raise ValueError
-            timestamp = datetime.fromisoformat(
-                str(payload["timestamp"]).replace("Z", "+00:00")
-            )
+            timestamp = datetime.fromisoformat(str(payload["timestamp"]).replace("Z", "+00:00"))
             return ensure_aware(timestamp), UUID(payload["resource_id"])
         except (ValueError, KeyError, TypeError, json.JSONDecodeError):
             raise ProblemException(
@@ -4619,9 +6795,7 @@ class CredentialService:
             _CURSOR_DOMAIN + body,
             hashlib.sha256,
         ).digest()
-        return base64.urlsafe_b64encode(body + signature).rstrip(b"=").decode(
-            "ascii"
-        )
+        return base64.urlsafe_b64encode(body + signature).rstrip(b"=").decode("ascii")
 
     def _decode_table_cursor(
         self,
@@ -4707,18 +6881,34 @@ class CredentialService:
 
     def _safe_probe_problem(self, exc: Exception) -> ProblemException:
         code = self._safe_probe_error_code(exc)
-        status = 503 if code in {
+        retryable = False
+        if isinstance(exc, EgressAttestationError):
+            # The egress guard/lease proof belongs to the platform security
+            # boundary. Even malformed, mismatched, or newly introduced
+            # attestation codes are never fixed by changing a datasource
+            # payload, so expose them as fail-closed 503 dependencies. Only
+            # the explicitly listed availability subset is manually retryable.
+            status = 503
+            retryable = code in _RETRYABLE_EGRESS_UNAVAILABLE_CODES
+        elif code in {
             "DNS_RESOLUTION_FAILED",
             "KEK_KEYRING_UNAVAILABLE",
             "RESOLVER_POLICY_VERSION_MISMATCH",
             "EGRESS_POLICY_VERSION_MISMATCH",
-        } else 422
+        }:
+            status = 503
+            retryable = True
+        else:
+            # User endpoint-policy denial and endpoint identity mismatches
+            # remain validation errors. EgressAttestationError itself was
+            # handled above as a platform-security dependency failure.
+            status = 422
         return ProblemException(
             status=status,
             code=code,
             title="数据源连接验证失败",
             detail="请检查端点策略、DNS、TLS 和数据库账号；系统未保存本次明文密码。",
-            retryable=status == 503,
+            retryable=retryable,
         )
 
     @staticmethod
@@ -4747,6 +6937,15 @@ class CredentialService:
             code="PREFLIGHT_EVIDENCE_INVALID",
             title="运行前连接证据无效",
             detail="连接证据与当前 Execution、Attempt、fence 或已验证出口策略不匹配。",
+        )
+
+    @staticmethod
+    def _idempotency_resource_conflict() -> ProblemException:
+        return ProblemException(
+            status=409,
+            code="IDEMPOTENCY_CONFLICT",
+            title="Idempotency-Key 已用于不同请求",
+            detail="幂等键保存的资源或响应与当前请求不一致。",
         )
 
     @staticmethod

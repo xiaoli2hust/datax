@@ -14,7 +14,12 @@ from datax_studio.auth.routes import (
     business_principal,
 )
 from datax_studio.auth.service import Principal
-from datax_studio.credentials.routes import get_credential_service
+from datax_studio.credentials.ingress import DatasourceOperationAdmissionGuard
+from datax_studio.credentials.routes import (
+    DATASOURCE_EXTERNAL_OPERATION_RESPONSES,
+    get_credential_service,
+    get_datasource_operation_admission,
+)
 from datax_studio.credentials.service import CredentialService
 from datax_studio.governance.schemas import (
     Member,
@@ -35,6 +40,19 @@ from datax_studio.governance.service import (
 router = APIRouter()
 _service_lock = Lock()
 _if_match_pattern = re.compile(r'^W/"([1-9][0-9]*)"$')
+_ETAG_RESPONSE_HEADER = {
+    "description": "Current optimistic-concurrency entity tag.",
+    "schema": {"type": "string", "pattern": '^W/"[1-9][0-9]*"$'},
+}
+_IDEMPOTENCY_REPLAYED_RESPONSE_HEADER = {
+    "description": "Present with value true when the idempotent request was replayed.",
+    "schema": {"type": "string", "const": "true"},
+}
+_TRANSFER_POLICY_VERSIONED_RESPONSE_HEADERS = {"ETag": _ETAG_RESPONSE_HEADER}
+_TRANSFER_POLICY_IDEMPOTENT_RESPONSE_HEADERS = {
+    **_TRANSFER_POLICY_VERSIONED_RESPONSE_HEADERS,
+    "Idempotency-Replayed": _IDEMPOTENCY_REPLAYED_RESPONSE_HEADER,
+}
 
 
 def get_governance_service(request: Request) -> GovernanceService:
@@ -120,6 +138,10 @@ def list_transfer_policies(
     "/projects/{project_id}/transfer-policies",
     response_model=TransferPolicyResponse,
     status_code=201,
+    responses={
+        201: {"headers": _TRANSFER_POLICY_IDEMPOTENT_RESPONSE_HEADERS},
+        **DATASOURCE_EXTERNAL_OPERATION_RESPONSES,
+    },
 )
 def create_transfer_policy(
     project_id: UUID,
@@ -133,6 +155,10 @@ def create_transfer_policy(
         CredentialService,
         Depends(get_credential_service),
     ],
+    admission: Annotated[
+        DatasourceOperationAdmissionGuard,
+        Depends(get_datasource_operation_admission),
+    ],
 ) -> TransferPolicyResponse:
     result = service.create_transfer_policy(
         principal=principal,
@@ -141,6 +167,7 @@ def create_transfer_policy(
         idempotency_key=idempotency_key,
         audit=audit_context(request),
         metadata_probe=metadata_probe,
+        admission=admission,
     )
     response.headers["ETag"] = _etag(result.value.row_version)
     if result.replayed:
@@ -169,6 +196,10 @@ def get_transfer_policy(
 @router.patch(
     "/transfer-policies/{transfer_policy_id}",
     response_model=TransferPolicyResponse,
+    responses={
+        200: {"headers": _TRANSFER_POLICY_VERSIONED_RESPONSE_HEADERS},
+        **DATASOURCE_EXTERNAL_OPERATION_RESPONSES,
+    },
 )
 def update_transfer_policy(
     transfer_policy_id: UUID,
@@ -182,6 +213,10 @@ def update_transfer_policy(
         CredentialService,
         Depends(get_credential_service),
     ],
+    admission: Annotated[
+        DatasourceOperationAdmissionGuard,
+        Depends(get_datasource_operation_admission),
+    ],
 ) -> TransferPolicyResponse:
     policy = service.update_transfer_policy(
         principal=principal,
@@ -190,6 +225,7 @@ def update_transfer_policy(
         expected_version=_parse_if_match(if_match),
         audit=audit_context(request),
         metadata_probe=metadata_probe,
+        admission=admission,
     )
     response.headers["ETag"] = _etag(policy.row_version)
     return policy
@@ -198,6 +234,7 @@ def update_transfer_policy(
 @router.post(
     "/transfer-policies/{transfer_policy_id}/submit",
     response_model=TransferPolicyResponse,
+    responses={200: {"headers": _TRANSFER_POLICY_IDEMPOTENT_RESPONSE_HEADERS}},
 )
 def submit_transfer_policy(
     transfer_policy_id: UUID,
@@ -224,6 +261,7 @@ def submit_transfer_policy(
 @router.post(
     "/transfer-policies/{transfer_policy_id}/approvals",
     response_model=TransferPolicyResponse,
+    responses={200: {"headers": _TRANSFER_POLICY_IDEMPOTENT_RESPONSE_HEADERS}},
 )
 def decide_transfer_policy(
     transfer_policy_id: UUID,

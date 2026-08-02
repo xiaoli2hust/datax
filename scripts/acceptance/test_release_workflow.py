@@ -223,6 +223,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 "RustcPath",
                 "MakensisPath",
                 "SigntoolPath",
+                "AllowedSignerFile",
             ),
             "scripts/release/finalize_windows_publisher_binding.ps1": (
                 "CargoPath",
@@ -298,6 +299,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
             ("SigntoolPath", "SIGNTOOL_PATH"),
         ):
             self.assertEqual(build.count(f"{parameter} = $env:{variable}"), 2)
+        self.assertIn("AllowedSignerFile = $env:SIGNER_ALLOWLIST_PATH", build)
 
         candidate = next(
             step
@@ -310,6 +312,38 @@ class ReleaseWorkflowTests(unittest.TestCase):
             ("SigntoolPath", "SIGNTOOL_PATH"),
         ):
             self.assertIn(f"{parameter} = $env:{variable}", candidate)
+
+    def test_builder_emits_the_same_release_manifest_contract_as_the_launcher(self) -> None:
+        builder = (
+            REPOSITORY_ROOT / "scripts/windows/build-installer.ps1"
+        ).read_text(encoding="utf-8")
+        launcher = (
+            REPOSITORY_ROOT / "desktop/windows/src/lib.rs"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            "[Parameter(Mandatory = $true)]\n    [string]$AllowedSignerFile",
+            builder,
+        )
+        self.assertIn("function Read-CanonicalSignerAllowlist", builder)
+        self.assertIn("$values.Count -lt 1 -or $values.Count -gt 8", builder)
+        self.assertIn("'^[0-9a-f]{64}$'", builder)
+        self.assertIn("strictly ordinal-sorted and unique", builder)
+        self.assertIn("Publisher allowlist must use the exact canonical JSON form.", builder)
+        self.assertIn("$allowedSigners = Read-CanonicalSignerAllowlist", builder)
+        self.assertIn("$expectedSignerSha256 = Get-CertificateSha256", builder)
+        self.assertIn(
+            "The selected signing certificate is absent from the protected SHA-256 allowlist.",
+            builder,
+        )
+        self.assertIn('schema_version = "1.1"', builder)
+        self.assertIn(
+            "allowed_authenticode_signer_certificate_sha256 = @($allowedSigners)",
+            builder,
+        )
+        self.assertNotIn('schema_version = "1.0"\n    product_version = $ProductVersion', builder)
+        self.assertIn('manifest.schema_version != "1.1"', launcher)
+        self.assertIn("allowed_authenticode_signer_certificate_sha256", launcher)
 
     def test_verifier_download_is_bound_to_the_locked_installer(self) -> None:
         job = self.workflow["jobs"]["hosted-candidate-attestor"]

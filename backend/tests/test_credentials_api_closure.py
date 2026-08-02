@@ -14,9 +14,12 @@ from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from datax_studio.api.app import create_app
+from datax_studio.api.problems import ProblemException
 from datax_studio.auth.db import (
     AuditEvent,
+    AuthSession,
     Base,
+    IdempotencyRecord,
     Organization,
     OrganizationMember,
     Role,
@@ -26,7 +29,7 @@ from datax_studio.auth.db import (
 )
 from datax_studio.auth.routes import business_principal
 from datax_studio.auth.schemas import ScopedRoles
-from datax_studio.auth.service import Principal
+from datax_studio.auth.service import AuditContext, Principal
 from datax_studio.core.db import (
     Datasource,
     DatasourceRevision,
@@ -48,7 +51,9 @@ from datax_studio.credentials.network import (
     EndpointPolicyGuard,
     ResolvedEndpoint,
 )
+from datax_studio.credentials.schemas import CredentialSecretStatusChange
 from datax_studio.credentials.service import CredentialService
+from datax_studio.egress_attestation import EgressAttestationError
 from datax_studio.schema_snapshot import SchemaSnapshot
 from datax_studio.settings import Settings
 
@@ -71,16 +76,13 @@ def _principal(
     email: str,
     role: Role,
     scope_id: UUID,
+    session_id: UUID | None = None,
 ) -> Principal:
-    scope_type = (
-        ScopeType.ORGANIZATION
-        if role == Role.ADMIN
-        else ScopeType.PROJECT
-    )
+    scope_type = ScopeType.ORGANIZATION if role == Role.ADMIN else ScopeType.PROJECT
     return Principal(
         user_id=user_id,
         organization_id=organization_id,
-        session_id=uuid4(),
+        session_id=session_id or uuid4(),
         email=email,
         display_name=email.split("@", maxsplit=1)[0],
         must_change_password=False,
@@ -133,6 +135,10 @@ def credential_api_stack(tmp_path: Path) -> CredentialApiStack:
             "viewer_a",
             "outsider_a",
             "admin_b",
+            "admin_session_a",
+            "viewer_session_a",
+            "outsider_session_a",
+            "admin_session_b",
             "admin_member_a",
             "viewer_member_a",
             "outsider_member_a",
@@ -185,6 +191,19 @@ def credential_api_stack(tmp_path: Path) -> CredentialApiStack:
                     updated_at=now,
                     row_version=1,
                 ),
+                AuthSession(
+                    id=ids["admin_session_a"],
+                    user_id=ids["admin_a"],
+                    token_hash=b"a" * 32,
+                    family_id=ids["admin_session_a"],
+                    rotated_from_id=None,
+                    issued_at=now,
+                    expires_at=now + timedelta(days=1),
+                    last_used_at=now,
+                    revoked_at=None,
+                    revoke_reason=None,
+                    ip_hash=None,
+                ),
                 User(
                     id=ids["viewer_a"],
                     email="viewer-a@example.com",
@@ -197,6 +216,19 @@ def credential_api_stack(tmp_path: Path) -> CredentialApiStack:
                     created_at=now,
                     updated_at=now,
                     row_version=1,
+                ),
+                AuthSession(
+                    id=ids["viewer_session_a"],
+                    user_id=ids["viewer_a"],
+                    token_hash=b"b" * 32,
+                    family_id=ids["viewer_session_a"],
+                    rotated_from_id=None,
+                    issued_at=now,
+                    expires_at=now + timedelta(days=1),
+                    last_used_at=now,
+                    revoked_at=None,
+                    revoke_reason=None,
+                    ip_hash=None,
                 ),
                 User(
                     id=ids["outsider_a"],
@@ -211,6 +243,19 @@ def credential_api_stack(tmp_path: Path) -> CredentialApiStack:
                     updated_at=now,
                     row_version=1,
                 ),
+                AuthSession(
+                    id=ids["outsider_session_a"],
+                    user_id=ids["outsider_a"],
+                    token_hash=b"d" * 32,
+                    family_id=ids["outsider_session_a"],
+                    rotated_from_id=None,
+                    issued_at=now,
+                    expires_at=now + timedelta(days=1),
+                    last_used_at=now,
+                    revoked_at=None,
+                    revoke_reason=None,
+                    ip_hash=None,
+                ),
                 User(
                     id=ids["admin_b"],
                     email="admin-b@example.com",
@@ -223,6 +268,19 @@ def credential_api_stack(tmp_path: Path) -> CredentialApiStack:
                     created_at=now,
                     updated_at=now,
                     row_version=1,
+                ),
+                AuthSession(
+                    id=ids["admin_session_b"],
+                    user_id=ids["admin_b"],
+                    token_hash=b"e" * 32,
+                    family_id=ids["admin_session_b"],
+                    rotated_from_id=None,
+                    issued_at=now,
+                    expires_at=now + timedelta(days=1),
+                    last_used_at=now,
+                    revoked_at=None,
+                    revoke_reason=None,
+                    ip_hash=None,
                 ),
                 OrganizationMember(
                     id=ids["admin_member_a"],
@@ -276,10 +334,46 @@ def credential_api_stack(tmp_path: Path) -> CredentialApiStack:
                 ),
                 RoleAssignment(
                     id=uuid4(),
+                    organization_member_id=ids["admin_member_a"],
+                    scope_type="ORGANIZATION",
+                    scope_id=ids["org_a"],
+                    role="ADMIN",
+                    granted_by=ids["admin_a"],
+                    created_at=now,
+                ),
+                RoleAssignment(
+                    id=uuid4(),
+                    organization_member_id=ids["admin_member_b"],
+                    scope_type="ORGANIZATION",
+                    scope_id=ids["org_b"],
+                    role="ADMIN",
+                    granted_by=ids["admin_b"],
+                    created_at=now,
+                ),
+                RoleAssignment(
+                    id=uuid4(),
+                    organization_member_id=ids["outsider_member_a"],
+                    scope_type="ORGANIZATION",
+                    scope_id=ids["org_a"],
+                    role="ADMIN",
+                    granted_by=ids["admin_a"],
+                    created_at=now,
+                ),
+                RoleAssignment(
+                    id=uuid4(),
                     organization_member_id=ids["viewer_member_a"],
                     scope_type="PROJECT",
                     scope_id=ids["project_a"],
                     role="VIEWER",
+                    granted_by=ids["admin_a"],
+                    created_at=now,
+                ),
+                RoleAssignment(
+                    id=uuid4(),
+                    organization_member_id=ids["viewer_member_a"],
+                    scope_type="PROJECT",
+                    scope_id=ids["project_a"],
+                    role="DEVELOPER",
                     granted_by=ids["admin_a"],
                     created_at=now,
                 ),
@@ -470,6 +564,7 @@ def credential_api_stack(tmp_path: Path) -> CredentialApiStack:
         email="admin-a@example.com",
         role=Role.ADMIN,
         scope_id=ids["org_a"],
+        session_id=ids["admin_session_a"],
     )
     viewer_a = _principal(
         user_id=ids["viewer_a"],
@@ -477,6 +572,7 @@ def credential_api_stack(tmp_path: Path) -> CredentialApiStack:
         email="viewer-a@example.com",
         role=Role.VIEWER,
         scope_id=ids["project_a"],
+        session_id=ids["viewer_session_a"],
     )
     principal_ref = {"value": admin_a}
     app = create_app(
@@ -487,9 +583,7 @@ def credential_api_stack(tmp_path: Path) -> CredentialApiStack:
         ),
         credential_service=service,
     )
-    app.dependency_overrides[business_principal] = (
-        lambda: principal_ref["value"]
-    )
+    app.dependency_overrides[business_principal] = lambda: principal_ref["value"]
     with TestClient(app) as client:
         yield CredentialApiStack(
             client=client,
@@ -628,9 +722,7 @@ def test_admin_only_revision_and_connection_evidence_are_redacted(
         f"{stack.ids['datasource_a']}/revisions/"
         f"{stack.ids['datasource_revision_a']}"
     )
-    evidence = stack.client.get(
-        f"/api/v1/endpoint-connection-evidence/{stack.ids['evidence_a']}"
-    )
+    evidence = stack.client.get(f"/api/v1/endpoint-connection-evidence/{stack.ids['evidence_a']}")
     assert revision.status_code == 200
     assert evidence.status_code == 200
     assert set(revision.json()) == {
@@ -667,9 +759,7 @@ def test_admin_only_revision_and_connection_evidence_are_redacted(
         "evidence_hash",
         "observed_at",
     }
-    serialized = json.dumps(
-        {"revision": revision.json(), "evidence": evidence.json()}
-    ).casefold()
+    serialized = json.dumps({"revision": revision.json(), "evidence": evidence.json()}).casefold()
     for forbidden_fragment in (
         "password",
         "secret_id",
@@ -726,6 +816,18 @@ def test_usage_grants_require_same_project_and_replace_atomically(
         "TARGET_USE",
     }
     assert {item["status"] for item in granted.json()["items"]} == {"ACTIVE"}
+    with stack.sessions() as session:
+        initial_grants = list(
+            session.scalars(
+                select(DatasourceUsageGrant)
+                .where(
+                    DatasourceUsageGrant.datasource_id == datasource_id,
+                    DatasourceUsageGrant.organization_member_id == member_id,
+                )
+                .order_by(DatasourceUsageGrant.usage)
+            )
+        )
+    assert {grant.row_version for grant in initial_grants} == {1}
     no_change = stack.client.put(
         grant_url,
         json={"usages": ["SOURCE_USE", "TARGET_USE"]},
@@ -735,6 +837,16 @@ def test_usage_grants_require_same_project_and_replace_atomically(
         "SOURCE_USE",
         "TARGET_USE",
     }
+    with stack.sessions() as session:
+        assert {
+            grant.row_version
+            for grant in session.scalars(
+                select(DatasourceUsageGrant).where(
+                    DatasourceUsageGrant.datasource_id == datasource_id,
+                    DatasourceUsageGrant.organization_member_id == member_id,
+                )
+            )
+        } == {1}
 
     first_page = stack.client.get(
         f"/api/v1/datasources/{datasource_id}/grants",
@@ -750,17 +862,9 @@ def test_usage_grants_require_same_project_and_replace_atomically(
     )
     assert second_page.status_code == 200
     assert len(second_page.json()["items"]) == 1
-    assert (
-        second_page.json()["items"][0]["id"]
-        != first_page.json()["items"][0]["id"]
-    )
-    tampered_cursor = (
-        first_page.json()["next_cursor"][:-1]
-        + (
-            "A"
-            if first_page.json()["next_cursor"][-1] != "A"
-            else "B"
-        )
+    assert second_page.json()["items"][0]["id"] != first_page.json()["items"][0]["id"]
+    tampered_cursor = first_page.json()["next_cursor"][:-1] + (
+        "A" if first_page.json()["next_cursor"][-1] != "A" else "B"
     )
     invalid_cursor = stack.client.get(
         f"/api/v1/datasources/{datasource_id}/grants",
@@ -770,23 +874,16 @@ def test_usage_grants_require_same_project_and_replace_atomically(
     assert invalid_cursor.json()["code"] == "CURSOR_INVALID"
 
     no_project_membership = stack.client.put(
-        "/api/v1/datasources/"
-        f"{datasource_id}/grants/{stack.ids['outsider_member_a']}",
+        f"/api/v1/datasources/{datasource_id}/grants/{stack.ids['outsider_member_a']}",
         json={"usages": ["SOURCE_USE"]},
     )
     cross_tenant_member = stack.client.put(
-        "/api/v1/datasources/"
-        f"{datasource_id}/grants/{stack.ids['admin_member_b']}",
+        f"/api/v1/datasources/{datasource_id}/grants/{stack.ids['admin_member_b']}",
         json={"usages": ["SOURCE_USE"]},
     )
-    cross_tenant_list = stack.client.get(
-        f"/api/v1/datasources/{stack.ids['datasource_b']}/grants"
-    )
+    cross_tenant_list = stack.client.get(f"/api/v1/datasources/{stack.ids['datasource_b']}/grants")
     assert no_project_membership.status_code == 422
-    assert (
-        no_project_membership.json()["code"]
-        == "PROJECT_MEMBERSHIP_REQUIRED"
-    )
+    assert no_project_membership.json()["code"] == "PROJECT_MEMBERSHIP_REQUIRED"
     assert cross_tenant_member.status_code == 404
     assert cross_tenant_list.status_code == 404
 
@@ -818,6 +915,7 @@ def test_usage_grants_require_same_project_and_replace_atomically(
         ]
     assert len(rows) == 2
     assert {row.status for row in rows} == {"REVOKED"}
+    assert {row.row_version for row in rows} == {2}
     assert all(row.revoked_by == stack.ids["admin_a"] for row in rows)
     assert all(row.revoked_at is not None for row in rows)
     assert actions == [
@@ -826,10 +924,32 @@ def test_usage_grants_require_same_project_and_replace_atomically(
         "DATASOURCE_USAGE_REVOKED",
     ]
 
+    regranted = stack.client.put(grant_url, json={"usages": ["SOURCE_USE"]})
+    assert regranted.status_code == 200, regranted.text
+    with stack.sessions() as session:
+        source_grant = session.scalar(
+            select(DatasourceUsageGrant).where(
+                DatasourceUsageGrant.datasource_id == datasource_id,
+                DatasourceUsageGrant.organization_member_id == member_id,
+                DatasourceUsageGrant.usage == "SOURCE_USE",
+            )
+        )
+        target_grant = session.scalar(
+            select(DatasourceUsageGrant).where(
+                DatasourceUsageGrant.datasource_id == datasource_id,
+                DatasourceUsageGrant.organization_member_id == member_id,
+                DatasourceUsageGrant.usage == "TARGET_USE",
+            )
+        )
+    assert source_grant is not None
+    assert source_grant.status == "ACTIVE"
+    assert source_grant.row_version == 3
+    assert target_grant is not None
+    assert target_grant.status == "REVOKED"
+    assert target_grant.row_version == 2
+
     stack.principal_ref["value"] = stack.viewer_a
-    forbidden_get = stack.client.get(
-        f"/api/v1/datasources/{datasource_id}/grants"
-    )
+    forbidden_get = stack.client.get(f"/api/v1/datasources/{datasource_id}/grants")
     forbidden_put = stack.client.put(
         grant_url,
         json={"usages": ["SOURCE_USE"]},
@@ -844,8 +964,7 @@ def test_metadata_requires_the_exact_declared_usage_grant(
     stack = credential_api_stack
     datasource_id = stack.ids["datasource_a"]
     granted = stack.client.put(
-        f"/api/v1/datasources/{datasource_id}/grants/"
-        f"{stack.ids['viewer_member_a']}",
+        f"/api/v1/datasources/{datasource_id}/grants/{stack.ids['viewer_member_a']}",
         json={"usages": ["SOURCE_USE"]},
     )
     assert granted.status_code == 200, granted.text
@@ -855,6 +974,7 @@ def test_metadata_requires_the_exact_declared_usage_grant(
         email="viewer-a@example.com",
         role=Role.DEVELOPER,
         scope_id=stack.ids["project_a"],
+        session_id=stack.ids["viewer_session_a"],
     )
 
     denied = stack.client.get(
@@ -926,10 +1046,7 @@ def test_datasource_delete_is_soft_blocked_by_active_references_and_audited(
     )
     assert blocked.status_code == 409
     assert blocked.json()["code"] == "DATASOURCE_HAS_ACTIVE_REFERENCES"
-    assert (
-        blocked.json()["details"]["reference_type"]
-        == "NON_ARCHIVED_JOB_DRAFT"
-    )
+    assert blocked.json()["details"]["reference_type"] == "NON_ARCHIVED_JOB_DRAFT"
 
     with stack.sessions.begin() as session:
         job = session.get(SyncJob, job_id)
@@ -953,13 +1070,10 @@ def test_datasource_delete_is_soft_blocked_by_active_references_and_audited(
     assert deleted.status_code == 204
     assert deleted.content == b""
     historical_revision = stack.client.get(
-        f"{datasource_url}/revisions/"
-        f"{stack.ids['datasource_revision_a']}"
+        f"{datasource_url}/revisions/{stack.ids['datasource_revision_a']}"
     )
     assert historical_revision.status_code == 200
-    assert historical_revision.json()["id"] == str(
-        stack.ids["datasource_revision_a"]
-    )
+    assert historical_revision.json()["id"] == str(stack.ids["datasource_revision_a"])
 
     with stack.sessions() as session:
         datasource = session.get(Datasource, datasource_id)
@@ -984,6 +1098,7 @@ def test_datasource_delete_is_soft_blocked_by_active_references_and_audited(
     assert datasource.row_version == 2
     assert grant is not None
     assert grant.status == "REVOKED"
+    assert grant.row_version == 2
     assert grant.revoked_by == stack.ids["admin_a"]
     assert grant.revoked_at is not None
     assert actions == [
@@ -1010,17 +1125,75 @@ def _install_test_credential(stack: CredentialApiStack) -> UUID:
         return secret.id
 
 
+def test_credential_secret_status_replay_rejects_tampered_resource_or_response(
+    credential_api_stack: CredentialApiStack,
+) -> None:
+    stack = credential_api_stack
+    secret_id = _install_test_credential(stack)
+    key = "secret-status-affinity-001"
+    request = CredentialSecretStatusChange(
+        status="REVOKED",
+        reason_code="AFFINITY_TEST",
+    )
+    audit = AuditContext(
+        request_id=uuid4(),
+        source_ip="127.0.0.1",
+        user_agent="credential-affinity-test",
+    )
+    first = stack.service.change_secret_status(
+        principal=stack.admin_a,
+        datasource_id=stack.ids["datasource_a"],
+        secret_version=1,
+        request=request,
+        idempotency_key=key,
+        audit=audit,
+    )
+    assert first.value.secret_version == 1
+    with stack.sessions.begin() as session:
+        secret = session.get(CredentialSecret, secret_id)
+        record = session.scalar(
+            select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == key)
+        )
+        assert secret is not None and secret.status == "REVOKED"
+        assert record is not None
+        record.resource_id = stack.ids["datasource_b"]
+    with pytest.raises(ProblemException) as caught:
+        stack.service.change_secret_status(
+            principal=stack.admin_a,
+            datasource_id=stack.ids["datasource_a"],
+            secret_version=1,
+            request=request,
+            idempotency_key=key,
+            audit=audit,
+        )
+    assert caught.value.code == "IDEMPOTENCY_CONFLICT"
+
+    with stack.sessions.begin() as session:
+        record = session.scalar(
+            select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == key)
+        )
+        assert record is not None and record.response_body is not None
+        record.resource_id = stack.ids["datasource_a"]
+        record.response_body = {**record.response_body, "secret_version": 2}
+    with pytest.raises(ProblemException) as caught:
+        stack.service.change_secret_status(
+            principal=stack.admin_a,
+            datasource_id=stack.ids["datasource_a"],
+            secret_version=1,
+            request=request,
+            idempotency_key=key,
+            audit=audit,
+        )
+    assert caught.value.code == "IDEMPOTENCY_CONFLICT"
+
+
 def _resolved(
     policy_revision: EndpointPolicyRevision,
     *,
     host: str,
     port: int,
 ) -> ResolvedEndpoint:
-    selected_ip = (
-        "10.10.0.5"
-        if policy_revision.engine == "MYSQL_8"
-        else "10.0.0.5"
-    )
+    selected_ip = "10.10.0.5" if policy_revision.engine == "MYSQL_8" else "10.0.0.5"
     return ResolvedEndpoint(
         endpoint_policy_revision_id=policy_revision.id,
         endpoint_policy_hash=policy_revision.policy_hash,
@@ -1035,6 +1208,346 @@ def _resolved(
         egress_enforcement_status="VERIFIED",
         egress_attestation_hash="a" * 64,
     )
+
+
+def test_datasource_test_revalidates_before_persisting_external_success(
+    credential_api_stack: CredentialApiStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = credential_api_stack
+    _install_test_credential(stack)
+
+    def resolve(
+        policy_revision: EndpointPolicyRevision,
+        *,
+        host: str,
+        port: int,
+        now: datetime | None = None,
+        deadline: object | None = None,
+    ) -> ResolvedEndpoint:
+        del deadline, now
+        return _resolved(policy_revision, host=host, port=port)
+
+    def probe(
+        revision: DatasourceRevision,
+        *,
+        password: bytearray,
+        resolved: ResolvedEndpoint,
+        deadline: object | None = None,
+    ) -> ProbeResult:
+        del deadline
+        assert bytes(password) == b"old-test-password"
+        return ProbeResult(
+            server_identity="postgres-system-id",
+            server_version="15.6-test",
+            peer_ip=resolved.selected_ip,
+            latency_ms=12,
+            tls_peer_spki_sha256="b" * 64,
+        )
+
+    monkeypatch.setattr(stack.service.guard, "resolve", resolve)
+    monkeypatch.setattr(
+        stack.service.guard,
+        "verify_rebinding",
+        lambda _policy, _resolved_endpoint, **_kwargs: None,
+    )
+    monkeypatch.setattr(stack.service.connector, "probe", probe)
+
+    response = stack.client.post(f"/api/v1/datasources/{stack.ids['datasource_a']}/test")
+
+    assert response.status_code == 200, response.text
+    assert response.json()["status"] == "SUCCEEDED"
+    assert response.json()["latency_ms"] == 12
+    with stack.sessions() as session:
+        datasource = session.get(Datasource, stack.ids["datasource_a"])
+        assert datasource is not None
+        assert datasource.last_test_status == "SUCCEEDED"
+        assert datasource.last_test_error_code is None
+        assert (
+            session.scalar(
+                select(func.count(EndpointConnectionEvidence.id)).where(
+                    EndpointConnectionEvidence.operation_kind == "TEST"
+                )
+            )
+            == 3
+        )
+
+
+def test_datasource_test_discards_result_when_binding_changes_during_probe(
+    credential_api_stack: CredentialApiStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stack = credential_api_stack
+    _install_test_credential(stack)
+    datasource_id = stack.ids["datasource_a"]
+    with stack.sessions() as session:
+        before_evidence = session.scalar(select(func.count(EndpointConnectionEvidence.id)))
+        before_audit = session.scalar(select(func.count(AuditEvent.id)))
+        datasource = session.get(Datasource, datasource_id)
+        assert datasource is not None
+        assert datasource.last_test_status is None
+
+    def resolve(
+        policy_revision: EndpointPolicyRevision,
+        *,
+        host: str,
+        port: int,
+        now: datetime | None = None,
+        deadline: object | None = None,
+    ) -> ResolvedEndpoint:
+        del deadline, now
+        return _resolved(policy_revision, host=host, port=port)
+
+    def probe(
+        _revision: DatasourceRevision,
+        *,
+        password: bytearray,
+        resolved: ResolvedEndpoint,
+        deadline: object | None = None,
+    ) -> ProbeResult:
+        del deadline
+        assert bytes(password) == b"old-test-password"
+        # This write represents a control-plane update that commits after A/B
+        # started.  Phase C must reject the detached success and write neither
+        # evidence nor a stale last_test/audit result.
+        with stack.sessions.begin() as session:
+            datasource = session.get(Datasource, datasource_id)
+            assert datasource is not None
+            datasource.row_version += 1
+            datasource.updated_at = datetime.now(UTC)
+        return ProbeResult(
+            server_identity="postgres-system-id",
+            server_version="15.6-test",
+            peer_ip=resolved.selected_ip,
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(stack.service.guard, "resolve", resolve)
+    monkeypatch.setattr(
+        stack.service.guard,
+        "verify_rebinding",
+        lambda _policy, _resolved_endpoint, **_kwargs: None,
+    )
+    monkeypatch.setattr(stack.service.connector, "probe", probe)
+
+    response = stack.client.post(f"/api/v1/datasources/{datasource_id}/test")
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "DATASOURCE_OPERATION_STALE"
+    with stack.sessions() as session:
+        datasource = session.get(Datasource, datasource_id)
+        assert datasource is not None
+        assert datasource.last_test_status is None
+        assert datasource.last_test_error_code is None
+        assert session.scalar(select(func.count(EndpointConnectionEvidence.id))) == (
+            before_evidence
+        )
+        assert session.scalar(select(func.count(AuditEvent.id))) == before_audit
+
+
+def test_datasource_test_discards_result_when_organization_suspends_during_probe(
+    credential_api_stack: CredentialApiStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase C must not persist B-time success after an org is suspended."""
+
+    stack = credential_api_stack
+    _install_test_credential(stack)
+    datasource_id = stack.ids["datasource_a"]
+    with stack.sessions() as session:
+        before_evidence = session.scalar(select(func.count(EndpointConnectionEvidence.id)))
+        before_audit = session.scalar(select(func.count(AuditEvent.id)))
+
+    def resolve(
+        policy_revision: EndpointPolicyRevision,
+        *,
+        host: str,
+        port: int,
+        now: datetime | None = None,
+        deadline: object | None = None,
+    ) -> ResolvedEndpoint:
+        del deadline, now
+        return _resolved(policy_revision, host=host, port=port)
+
+    def probe(
+        _revision: DatasourceRevision,
+        *,
+        password: bytearray,
+        resolved: ResolvedEndpoint,
+        deadline: object | None = None,
+    ) -> ProbeResult:
+        del deadline, password
+        with stack.sessions.begin() as session:
+            organization = session.get(Organization, stack.ids["org_a"])
+            assert organization is not None
+            organization.status = "SUSPENDED"
+            organization.row_version += 1
+            organization.updated_at = datetime.now(UTC)
+        return ProbeResult(
+            server_identity="postgres-system-id",
+            server_version="15.6-test",
+            peer_ip=resolved.selected_ip,
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(stack.service.guard, "resolve", resolve)
+    monkeypatch.setattr(
+        stack.service.guard,
+        "verify_rebinding",
+        lambda _policy, _resolved_endpoint, **_kwargs: None,
+    )
+    monkeypatch.setattr(stack.service.connector, "probe", probe)
+
+    response = stack.client.post(f"/api/v1/datasources/{datasource_id}/test")
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "DATASOURCE_OPERATION_STALE"
+    with stack.sessions() as session:
+        datasource = session.get(Datasource, datasource_id)
+        assert datasource is not None
+        assert datasource.last_test_status is None
+        assert datasource.last_test_error_code is None
+        assert session.scalar(select(func.count(EndpointConnectionEvidence.id))) == (
+            before_evidence
+        )
+        assert session.scalar(select(func.count(AuditEvent.id))) == before_audit
+
+
+def test_datasource_test_discards_result_when_actor_locks_during_probe(
+    credential_api_stack: CredentialApiStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Phase C must reject an old session after the user is locked in B."""
+
+    stack = credential_api_stack
+    _install_test_credential(stack)
+    datasource_id = stack.ids["datasource_a"]
+    with stack.sessions() as session:
+        before_evidence = session.scalar(select(func.count(EndpointConnectionEvidence.id)))
+        before_audit = session.scalar(select(func.count(AuditEvent.id)))
+
+    def resolve(
+        policy_revision: EndpointPolicyRevision,
+        *,
+        host: str,
+        port: int,
+        now: datetime | None = None,
+        deadline: object | None = None,
+    ) -> ResolvedEndpoint:
+        del deadline, now
+        return _resolved(policy_revision, host=host, port=port)
+
+    def probe(
+        _revision: DatasourceRevision,
+        *,
+        password: bytearray,
+        resolved: ResolvedEndpoint,
+        deadline: object | None = None,
+    ) -> ProbeResult:
+        del deadline, password
+        with stack.sessions.begin() as session:
+            user = session.get(User, stack.ids["admin_a"])
+            assert user is not None
+            user.status = "LOCKED"
+            user.locked_until = datetime.now(UTC) + timedelta(minutes=5)
+            user.row_version += 1
+            user.updated_at = datetime.now(UTC)
+        return ProbeResult(
+            server_identity="postgres-system-id",
+            server_version="15.6-test",
+            peer_ip=resolved.selected_ip,
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(stack.service.guard, "resolve", resolve)
+    monkeypatch.setattr(
+        stack.service.guard,
+        "verify_rebinding",
+        lambda _policy, _resolved_endpoint, **_kwargs: None,
+    )
+    monkeypatch.setattr(stack.service.connector, "probe", probe)
+
+    response = stack.client.post(f"/api/v1/datasources/{datasource_id}/test")
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "DATASOURCE_OPERATION_STALE"
+    with stack.sessions() as session:
+        datasource = session.get(Datasource, datasource_id)
+        assert datasource is not None
+        assert datasource.last_test_status is None
+        assert datasource.last_test_error_code is None
+        assert session.scalar(select(func.count(EndpointConnectionEvidence.id))) == (
+            before_evidence
+        )
+        assert session.scalar(select(func.count(AuditEvent.id))) == before_audit
+
+
+def test_datasource_test_discards_result_when_project_archives_during_probe(
+    credential_api_stack: CredentialApiStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A Project lifecycle transition invalidates an external probe result."""
+
+    stack = credential_api_stack
+    _install_test_credential(stack)
+    datasource_id = stack.ids["datasource_a"]
+    with stack.sessions() as session:
+        before_evidence = session.scalar(select(func.count(EndpointConnectionEvidence.id)))
+        before_audit = session.scalar(select(func.count(AuditEvent.id)))
+
+    def resolve(
+        policy_revision: EndpointPolicyRevision,
+        *,
+        host: str,
+        port: int,
+        now: datetime | None = None,
+        deadline: object | None = None,
+    ) -> ResolvedEndpoint:
+        del deadline, now
+        return _resolved(policy_revision, host=host, port=port)
+
+    def probe(
+        _revision: DatasourceRevision,
+        *,
+        password: bytearray,
+        resolved: ResolvedEndpoint,
+        deadline: object | None = None,
+    ) -> ProbeResult:
+        del deadline, password
+        with stack.sessions.begin() as session:
+            project = session.get(Project, stack.ids["project_a"])
+            assert project is not None
+            project.status = "ARCHIVED"
+            project.row_version += 1
+            project.updated_at = datetime.now(UTC)
+        return ProbeResult(
+            server_identity="postgres-system-id",
+            server_version="15.6-test",
+            peer_ip=resolved.selected_ip,
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(stack.service.guard, "resolve", resolve)
+    monkeypatch.setattr(
+        stack.service.guard,
+        "verify_rebinding",
+        lambda _policy, _resolved_endpoint, **_kwargs: None,
+    )
+    monkeypatch.setattr(stack.service.connector, "probe", probe)
+
+    response = stack.client.post(f"/api/v1/datasources/{datasource_id}/test")
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "DATASOURCE_OPERATION_STALE"
+    with stack.sessions() as session:
+        datasource = session.get(Datasource, datasource_id)
+        assert datasource is not None
+        assert datasource.last_test_status is None
+        assert datasource.last_test_error_code is None
+        assert session.scalar(select(func.count(EndpointConnectionEvidence.id))) == (
+            before_evidence
+        )
+        assert session.scalar(select(func.count(AuditEvent.id))) == before_audit
 
 
 def test_datasource_patch_creates_revision_reuses_or_rotates_secret_and_fails_closed(
@@ -1090,8 +1603,9 @@ def test_datasource_patch_creates_revision_reuses_or_rotates_secret_and_fails_cl
         host: str,
         port: int,
         now: datetime | None = None,
+        deadline: object | None = None,
     ) -> ResolvedEndpoint:
-        del now
+        del deadline, now
         return _resolved(policy_revision, host=host, port=port)
 
     def probe(
@@ -1099,15 +1613,13 @@ def test_datasource_patch_creates_revision_reuses_or_rotates_secret_and_fails_cl
         *,
         password: bytearray,
         resolved: ResolvedEndpoint,
+        deadline: object | None = None,
     ) -> ProbeResult:
+        del deadline
         probed_passwords.append(bytes(password))
         engine = revision.engine
         return ProbeResult(
-            server_identity=(
-                "mysql-server-uuid"
-                if engine == "MYSQL_8"
-                else "postgres-system-id"
-            ),
+            server_identity=("mysql-server-uuid" if engine == "MYSQL_8" else "postgres-system-id"),
             server_version="test-server",
             peer_ip=resolved.selected_ip,
             latency_ms=1,
@@ -1117,7 +1629,7 @@ def test_datasource_patch_creates_revision_reuses_or_rotates_secret_and_fails_cl
     monkeypatch.setattr(
         stack.service.guard,
         "verify_rebinding",
-        lambda _policy, _resolved_endpoint: None,
+        lambda _policy, _resolved_endpoint, deadline=None: None,
     )
     monkeypatch.setattr(stack.service.connector, "probe", probe)
 
@@ -1233,6 +1745,391 @@ def test_datasource_patch_creates_revision_reuses_or_rotates_secret_and_fails_cl
     assert secret_count == 2
 
 
+def test_datasource_patch_discards_probe_when_baseline_changes(
+    credential_api_stack: CredentialApiStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A successful detached PATCH probe may not write after B-time drift."""
+
+    stack = credential_api_stack
+    datasource_id = stack.ids["datasource_a"]
+    original_secret_id = _install_test_credential(stack)
+    with stack.sessions() as session:
+        before_evidence = session.scalar(select(func.count(EndpointConnectionEvidence.id)))
+        before_audit = session.scalar(select(func.count(AuditEvent.id)))
+        before_revisions = session.scalar(
+            select(func.count(DatasourceRevision.id)).where(
+                DatasourceRevision.datasource_id == datasource_id
+            )
+        )
+
+    def resolve(
+        policy_revision: EndpointPolicyRevision,
+        *,
+        host: str,
+        port: int,
+        now: datetime | None = None,
+        deadline: object | None = None,
+    ) -> ResolvedEndpoint:
+        del deadline, now
+        return _resolved(policy_revision, host=host, port=port)
+
+    def probe(
+        _revision: DatasourceRevision,
+        *,
+        password: bytearray,
+        resolved: ResolvedEndpoint,
+        deadline: object | None = None,
+    ) -> ProbeResult:
+        del deadline
+        assert bytes(password) == b"old-test-password"
+        # This simulates a real concurrent control-plane change after A has
+        # committed and while B is waiting on the external database.
+        with stack.sessions.begin() as session:
+            datasource = session.get(Datasource, datasource_id)
+            assert datasource is not None
+            datasource.description = "changed-during-probe"
+            datasource.row_version += 1
+            datasource.updated_at = datetime.now(UTC)
+        return ProbeResult(
+            server_identity="postgres-system-id",
+            server_version="15.6-test",
+            peer_ip=resolved.selected_ip,
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(stack.service.guard, "resolve", resolve)
+    monkeypatch.setattr(
+        stack.service.guard,
+        "verify_rebinding",
+        lambda _policy, _resolved_endpoint, **_kwargs: None,
+    )
+    monkeypatch.setattr(stack.service.connector, "probe", probe)
+
+    response = stack.client.patch(
+        f"/api/v1/datasources/{datasource_id}",
+        headers={"If-Match": 'W/"1"'},
+        json={"database_name": "must-not-persist"},
+    )
+
+    assert response.status_code == 409, response.text
+    assert response.json()["code"] == "DATASOURCE_OPERATION_STALE"
+    with stack.sessions() as session:
+        datasource = session.get(Datasource, datasource_id)
+        assert datasource is not None
+        assert datasource.current_secret_id == original_secret_id
+        assert datasource.current_revision_id == stack.ids["datasource_revision_a"]
+        assert datasource.last_test_status is None
+        assert session.scalar(select(func.count(EndpointConnectionEvidence.id))) == (
+            before_evidence
+        )
+        assert session.scalar(select(func.count(AuditEvent.id))) == before_audit
+        assert (
+            session.scalar(
+                select(func.count(DatasourceRevision.id)).where(
+                    DatasourceRevision.datasource_id == datasource_id
+                )
+            )
+            == before_revisions
+        )
+
+
+def test_datasource_create_replays_completed_request_before_name_check(
+    credential_api_stack: CredentialApiStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A completed create must replay, not re-probe then report name conflict."""
+
+    stack = credential_api_stack
+    stack.service.ensure_active_kek_registered()
+    probes = 0
+
+    def resolve(
+        policy_revision: EndpointPolicyRevision,
+        *,
+        host: str,
+        port: int,
+        now: datetime | None = None,
+        deadline: object | None = None,
+    ) -> ResolvedEndpoint:
+        del deadline, now
+        return _resolved(policy_revision, host=host, port=port)
+
+    def probe(
+        _revision: DatasourceRevision,
+        *,
+        password: bytearray,
+        resolved: ResolvedEndpoint,
+        deadline: object | None = None,
+    ) -> ProbeResult:
+        nonlocal probes
+        del deadline
+        probes += 1
+        assert bytes(password) == b"new-datasource-password"
+        return ProbeResult(
+            server_identity="postgres-system-id-create",
+            server_version="15.6-test",
+            peer_ip=resolved.selected_ip,
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(stack.service.guard, "resolve", resolve)
+    monkeypatch.setattr(
+        stack.service.guard,
+        "verify_rebinding",
+        lambda _policy, _resolved_endpoint, **_kwargs: None,
+    )
+    monkeypatch.setattr(stack.service.connector, "probe", probe)
+    payload = {
+        "name": "Idempotent create",
+        "description": "test",
+        "endpoint_policy_id": str(stack.ids["policy_a"]),
+        "engine": "POSTGRESQL_15",
+        "host": "db-a.example.com",
+        "port": 5432,
+        "database_name": "new_database",
+        "default_schema": "public",
+        "username": "reader",
+        "password": "new-datasource-password",
+        "ssl_mode": "VERIFY_FULL",
+    }
+    headers = {"Idempotency-Key": "datasource-create-replay-001"}
+
+    first = stack.client.post(
+        f"/api/v1/projects/{stack.ids['project_a']}/datasources",
+        headers=headers,
+        json=payload,
+    )
+    assert first.status_code == 201, first.text
+    replay = stack.client.post(
+        f"/api/v1/projects/{stack.ids['project_a']}/datasources",
+        headers=headers,
+        json=payload,
+    )
+
+    assert replay.status_code == 201, replay.text
+    assert replay.headers["idempotency-replayed"] == "true"
+    assert replay.json()["id"] == first.json()["id"]
+    assert probes == 1
+
+
+def test_datasource_create_idempotency_replay_is_bound_to_requested_project(
+    credential_api_stack: CredentialApiStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A template-scoped create key must not expose another project's row."""
+
+    stack = credential_api_stack
+    stack.service.ensure_active_kek_registered()
+    project_c = uuid4()
+    now = datetime.now(UTC)
+    with stack.sessions.begin() as session:
+        session.add(
+            Project(
+                id=project_c,
+                organization_id=stack.ids["org_a"],
+                name="Project C",
+                slug="project-c",
+                status="ACTIVE",
+                created_by=stack.ids["admin_a"],
+                created_at=now,
+                updated_at=now,
+                row_version=1,
+            )
+        )
+
+    probes = 0
+
+    def resolve(
+        policy_revision: EndpointPolicyRevision,
+        *,
+        host: str,
+        port: int,
+        now: datetime | None = None,
+        deadline: object | None = None,
+    ) -> ResolvedEndpoint:
+        del deadline, now
+        return _resolved(policy_revision, host=host, port=port)
+
+    def probe(
+        _revision: DatasourceRevision,
+        *,
+        password: bytearray,
+        resolved: ResolvedEndpoint,
+        deadline: object | None = None,
+    ) -> ProbeResult:
+        nonlocal probes
+        del deadline, password
+        probes += 1
+        return ProbeResult(
+            server_identity="postgres-system-id-create",
+            server_version="15.6-test",
+            peer_ip=resolved.selected_ip,
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(stack.service.guard, "resolve", resolve)
+    monkeypatch.setattr(
+        stack.service.guard,
+        "verify_rebinding",
+        lambda _policy, _resolved_endpoint, **_kwargs: None,
+    )
+    monkeypatch.setattr(stack.service.connector, "probe", probe)
+    payload = {
+        "name": "Cross-project idempotency",
+        "description": "test",
+        "endpoint_policy_id": str(stack.ids["policy_a"]),
+        "engine": "POSTGRESQL_15",
+        "host": "db-a.example.com",
+        "port": 5432,
+        "database_name": "new_database",
+        "default_schema": "public",
+        "username": "reader",
+        "password": "new-datasource-password",
+        "ssl_mode": "VERIFY_FULL",
+    }
+    headers = {"Idempotency-Key": "datasource-create-cross-project-001"}
+
+    first = stack.client.post(
+        f"/api/v1/projects/{stack.ids['project_a']}/datasources",
+        headers=headers,
+        json=payload,
+    )
+    assert first.status_code == 201, first.text
+    cross_project = stack.client.post(
+        f"/api/v1/projects/{project_c}/datasources",
+        headers=headers,
+        json=payload,
+    )
+
+    assert cross_project.status_code == 409, cross_project.text
+    assert cross_project.json()["code"] == "IDEMPOTENCY_CONFLICT"
+    assert probes == 1
+    with stack.sessions() as session:
+        assert session.scalar(
+            select(func.count(Datasource.id)).where(Datasource.project_id == project_c)
+        ) == 0
+
+
+@pytest.mark.parametrize(
+    ("egress_code", "retryable"),
+    [
+        ("EGRESS_ATTESTATION_UNAVAILABLE", True),
+        ("EGRESS_NETWORK_NAMESPACE_MISMATCH", False),
+    ],
+)
+def test_create_patch_and_test_map_egress_platform_failures_to_503_union(
+    credential_api_stack: CredentialApiStack,
+    monkeypatch: pytest.MonkeyPatch,
+    egress_code: str,
+    retryable: bool,
+) -> None:
+    """Egress proof failures are not user-input 422 validation errors."""
+
+    stack = credential_api_stack
+    stack.service.ensure_active_kek_registered()
+
+    def unavailable(*_args: object, **_kwargs: object) -> ResolvedEndpoint:
+        raise EgressAttestationError(egress_code)
+
+    monkeypatch.setattr(stack.service.guard, "resolve", unavailable)
+    create = stack.client.post(
+        f"/api/v1/projects/{stack.ids['project_a']}/datasources",
+        headers={"Idempotency-Key": "datasource-create-egress-001"},
+        json={
+            "name": "Unavailable egress create",
+            "description": "must not persist",
+            "endpoint_policy_id": str(stack.ids["policy_a"]),
+            "engine": "POSTGRESQL_15",
+            "host": "db-a.example.com",
+            "port": 5432,
+            "database_name": "new_database",
+            "default_schema": "public",
+            "username": "reader",
+            "password": "new-datasource-password",
+            "ssl_mode": "VERIFY_FULL",
+        },
+    )
+    assert create.status_code == 503, create.text
+    assert create.json()["code"] == egress_code
+    assert create.json()["retryable"] is retryable
+
+    _install_test_credential(stack)
+    patch = stack.client.patch(
+        f"/api/v1/datasources/{stack.ids['datasource_a']}",
+        headers={"If-Match": 'W/"1"'},
+        json={"password": "must-not-persist"},
+    )
+    assert patch.status_code == 503, patch.text
+    assert patch.json()["code"] == egress_code
+    assert patch.json()["retryable"] is retryable
+    test_result = stack.client.post(f"/api/v1/datasources/{stack.ids['datasource_a']}/test")
+    assert test_result.status_code == 503, test_result.text
+    assert test_result.json()["code"] == egress_code
+    assert test_result.json()["retryable"] is retryable
+    with stack.sessions() as session:
+        datasource = session.get(Datasource, stack.ids["datasource_a"])
+        assert datasource is not None
+        assert datasource.row_version == 1
+        assert datasource.current_secret_id is not None
+        assert datasource.last_test_status is None
+
+
+def test_datasource_test_prioritizes_total_deadline_over_late_egress_error(
+    credential_api_stack: CredentialApiStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A late egress error must not leak past the one public deadline result."""
+
+    stack = credential_api_stack
+    _install_test_credential(stack)
+
+    class DeadlineExpiredAfterExternalStage:
+        def __init__(self, _total_seconds: float) -> None:
+            return None
+
+        @staticmethod
+        def check_expired() -> float:
+            # The outbound resolver is entered with budget remaining.
+            return 0.1
+
+        @staticmethod
+        def remaining_seconds() -> float:
+            # Its failure is observed only after that shared budget elapsed.
+            return 0.0
+
+    def late_egress_failure(*_args: object, **_kwargs: object) -> ResolvedEndpoint:
+        raise EgressAttestationError("EGRESS_OPERATION_DEADLINE_EXCEEDED")
+
+    monkeypatch.setattr(
+        "datax_studio.credentials.service.OperationDeadline",
+        DeadlineExpiredAfterExternalStage,
+    )
+    monkeypatch.setattr(stack.service.guard, "resolve", late_egress_failure)
+
+    response = stack.client.post(
+        f"/api/v1/datasources/{stack.ids['datasource_a']}/test"
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["code"] == "DATASOURCE_OPERATION_DEADLINE_EXCEEDED"
+    assert response.json()["retryable"] is True
+    with stack.sessions() as session:
+        datasource = session.get(Datasource, stack.ids["datasource_a"])
+        assert datasource is not None
+        assert datasource.last_test_status is None
+        assert datasource.last_tested_at is None
+        assert (
+            session.scalar(
+                select(func.count(Datasource.id)).where(
+                    Datasource.project_id == stack.ids["project_a"],
+                    Datasource.name == "Unavailable egress create",
+                )
+            )
+            == 0
+        )
+
+
 def test_datasource_list_cursor_is_signed_and_bound_to_actor_project_and_filter(
     credential_api_stack: CredentialApiStack,
 ) -> None:
@@ -1264,9 +2161,7 @@ def test_datasource_list_cursor_is_signed_and_bound_to_actor_project_and_filter(
                     id=revision_id,
                     datasource_id=datasource_id,
                     revision_no=1,
-                    endpoint_policy_revision_id=stack.ids[
-                        "policy_revision_a"
-                    ],
+                    endpoint_policy_revision_id=stack.ids["policy_revision_a"],
                     physical_endpoint_identity_id=stack.ids["identity_a"],
                     engine="POSTGRESQL_15",
                     host="db-a.example.com",
@@ -1276,9 +2171,7 @@ def test_datasource_list_cursor_is_signed_and_bound_to_actor_project_and_filter(
                     username="reader_a",
                     ssl_mode="VERIFY_FULL",
                     connection_options={},
-                    config_hash=hashlib.sha256(
-                        str(datasource_id).encode()
-                    ).hexdigest(),
+                    config_hash=hashlib.sha256(str(datasource_id).encode()).hexdigest(),
                     created_by=stack.ids["admin_a"],
                     created_at=created_at,
                 )
@@ -1297,10 +2190,7 @@ def test_datasource_list_cursor_is_signed_and_bound_to_actor_project_and_filter(
         params={"limit": 1, "cursor": cursor},
     )
     assert second.status_code == 200
-    assert (
-        second.json()["items"][0]["id"]
-        != first.json()["items"][0]["id"]
-    )
+    assert second.json()["items"][0]["id"] != first.json()["items"][0]["id"]
 
     stack.principal_ref["value"] = stack.viewer_a
     wrong_actor = stack.client.get(
@@ -1359,9 +2249,7 @@ def _metadata_snapshot(
             "normalization_version": "1.0",
             "engine": "POSTGRESQL_15",
             "physical_endpoint_identity_id": str(identity_id),
-            "physical_table_identity_hash": hashlib.sha256(
-                table_name.encode()
-            ).hexdigest(),
+            "physical_table_identity_hash": hashlib.sha256(table_name.encode()).hexdigest(),
             "identifier_case_mode": "POSTGRESQL_FOLDED_OR_QUOTED",
             "catalog_name": "database_a",
             "schema_name": "public",
@@ -1455,8 +2343,9 @@ def test_metadata_cursor_pages_without_repeating_and_rejects_scope_changes(
         host: str,
         port: int,
         now: datetime | None = None,
+        deadline: object | None = None,
     ) -> ResolvedEndpoint:
-        del now
+        del deadline, now
         return _resolved(policy_revision, host=host, port=port)
 
     def schema_snapshots(
@@ -1469,7 +2358,9 @@ def test_metadata_cursor_pages_without_repeating_and_rejects_scope_changes(
         table_name: str | None,
         limit: int,
         after: tuple[str, str] | None = None,
+        deadline: object | None = None,
     ) -> tuple[list[SchemaSnapshot], str, bool]:
+        del deadline
         assert physical_endpoint_identity_id == stack.ids["identity_a"]
         assert bytes(password) == b"old-test-password"
         assert schema_name is None
@@ -1490,16 +2381,14 @@ def test_metadata_cursor_pages_without_repeating_and_rejects_scope_changes(
     monkeypatch.setattr(
         stack.service.guard,
         "verify_rebinding",
-        lambda _policy, _resolved_endpoint: None,
+        lambda _policy, _resolved_endpoint, **_kwargs: None,
     )
     monkeypatch.setattr(
         stack.service.connector,
         "schema_snapshots",
         schema_snapshots,
     )
-    url = (
-        f"/api/v1/datasources/{stack.ids['datasource_a']}/schema/tables"
-    )
+    url = f"/api/v1/datasources/{stack.ids['datasource_a']}/schema/tables"
     first = stack.client.get(url, params={"usage": "SOURCE_USE", "limit": 1})
     assert first.status_code == 200, first.text
     assert [item["table_name"] for item in first.json()["items"]] == ["alpha"]
@@ -1519,6 +2408,7 @@ def test_metadata_cursor_pages_without_repeating_and_rejects_scope_changes(
         email="other-admin@example.com",
         role=Role.ADMIN,
         scope_id=stack.ids["org_a"],
+        session_id=stack.ids["outsider_session_a"],
     )
     stack.principal_ref["value"] = other_admin
     wrong_actor = stack.client.get(
@@ -1572,3 +2462,34 @@ def test_metadata_cursor_pages_without_repeating_and_rejects_scope_changes(
     assert unavailable.status_code == 503
     assert unavailable.json()["code"] == "DATASOURCE_METADATA_UNAVAILABLE"
     assert unavailable.json()["retryable"] is True
+
+
+def test_metadata_egress_attestation_failure_preserves_platform_code(
+    credential_api_stack: CredentialApiStack,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Metadata must not relabel a platform egress proof failure as DB I/O."""
+
+    stack = credential_api_stack
+    _install_test_credential(stack)
+    with stack.sessions() as session:
+        before_evidence = session.scalar(select(func.count(EndpointConnectionEvidence.id)))
+        before_audit = session.scalar(select(func.count(AuditEvent.id)))
+
+    def unavailable(*_args: object, **_kwargs: object) -> ResolvedEndpoint:
+        raise EgressAttestationError("EGRESS_POLICY_VERSION_MISMATCH")
+
+    monkeypatch.setattr(stack.service.guard, "resolve", unavailable)
+    response = stack.client.get(
+        f"/api/v1/datasources/{stack.ids['datasource_a']}/schema/tables",
+        params={"usage": "SOURCE_USE", "limit": 1},
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["code"] == "EGRESS_POLICY_VERSION_MISMATCH"
+    assert response.json()["retryable"] is False
+    with stack.sessions() as session:
+        assert session.scalar(select(func.count(EndpointConnectionEvidence.id))) == (
+            before_evidence
+        )
+        assert session.scalar(select(func.count(AuditEvent.id))) == before_audit

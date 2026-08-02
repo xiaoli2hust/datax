@@ -22,7 +22,7 @@ class Settings(BaseSettings):
 
     app_version: str = "0.1.0-dev"
     app_environment: str = "development"
-    database_schema_revision: str = "20260802_0018"
+    database_schema_revision: str = "20260802_0019"
     ui_origin: str = "http://127.0.0.1:17860"
     trusted_host: str = "127.0.0.1"
     database_host: str = "postgres"
@@ -46,6 +46,39 @@ class Settings(BaseSettings):
     )
     datasource_connect_timeout_seconds: int = Field(default=5, ge=1, le=30)
     datasource_query_timeout_seconds: int = Field(default=10, ge=1, le=60)
+    # ADR-0014: V1 is one API process.  External datasource work is admitted
+    # locally before it can consume DNS, egress, decrypt, or connector budget.
+    # The per-organization and per-datasource limits are deliberately fixed at
+    # one; widening them is an architecture/security decision, not a deployment
+    # tuning knob.
+    datasource_operation_max_global_in_flight: int = Field(default=4, ge=1, le=16)
+    datasource_operation_max_organization_in_flight: int = Field(default=1, ge=1, le=1)
+    datasource_operation_max_datasource_in_flight: int = Field(default=1, ge=1, le=1)
+    datasource_operation_test_cooldown_seconds: float = Field(
+        default=60.0,
+        ge=1.0,
+        le=300.0,
+    )
+    datasource_operation_deadline_seconds: float = Field(
+        default=30.0,
+        ge=5.0,
+        le=120.0,
+    )
+    datasource_operation_retention_seconds: float = Field(
+        default=300.0,
+        ge=60.0,
+        le=3600.0,
+    )
+    datasource_operation_max_retained_organizations: int = Field(
+        default=64,
+        ge=1,
+        le=1024,
+    )
+    datasource_operation_max_retained_datasources: int = Field(
+        default=256,
+        ge=1,
+        le=4096,
+    )
     jwt_issuer: str = "datax-enterprise-studio"
     jwt_audience: str = "datax-enterprise-studio-local"
     access_token_seconds: int = Field(default=900, ge=60, le=3600)

@@ -119,6 +119,7 @@ class EgressVerifier(Protocol):
         policy_hash: str,
         policy_engine_version: str,
         resolver_policy_version: str,
+        timeout_seconds: float | None = None,
     ) -> EgressVerification: ...
 
 
@@ -130,11 +131,22 @@ class EgressLeaseClient(Protocol):
         policy_hash: str,
         selected_ip: str,
         port: int,
+        timeout_seconds: float | None = None,
     ) -> EgressLease: ...
 
-    def renew_lease(self, lease: EgressLease) -> EgressLease: ...
+    def renew_lease(
+        self,
+        lease: EgressLease,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> EgressLease: ...
 
-    def release_lease(self, lease: EgressLease) -> None: ...
+    def release_lease(
+        self,
+        lease: EgressLease,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None: ...
 
 
 def current_network_namespace_id() -> str:
@@ -216,7 +228,20 @@ class LoopbackEgressAttestationClient:
         # Never honor HTTP(S)_PROXY for a security decision bound to loopback.
         self._opener = build_opener(ProxyHandler({}))
 
-    def _fetch(self) -> tuple[EgressVerification, dict[str, str]]:
+    def _effective_timeout(self, timeout_seconds: float | None) -> float:
+        """Clamp one guard HTTP request to an enclosing operation budget."""
+
+        if timeout_seconds is None:
+            return self.timeout_seconds
+        if timeout_seconds <= 0:
+            raise EgressAttestationError("EGRESS_OPERATION_DEADLINE_EXCEEDED")
+        return min(self.timeout_seconds, timeout_seconds)
+
+    def _fetch(
+        self,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> tuple[EgressVerification, dict[str, str]]:
         request = Request(
             self.url,
             headers={"Accept": "application/json"},
@@ -225,7 +250,7 @@ class LoopbackEgressAttestationClient:
         try:
             with self._opener.open(
                 request,
-                timeout=self.timeout_seconds,
+                timeout=self._effective_timeout(timeout_seconds),
             ) as response:
                 if response.status != 200:
                     raise EgressAttestationError("EGRESS_ATTESTATION_UNAVAILABLE")
@@ -335,6 +360,7 @@ class LoopbackEgressAttestationClient:
         policy_hash: str,
         policy_engine_version: str,
         resolver_policy_version: str,
+        timeout_seconds: float | None = None,
     ) -> EgressVerification:
         if (
             policy_engine_version != self.policy_engine_version
@@ -342,7 +368,7 @@ class LoopbackEgressAttestationClient:
             or _HASH_PATTERN.fullmatch(policy_hash) is None
         ):
             raise EgressAttestationError("EGRESS_POLICY_VERSION_MISMATCH")
-        verification, policies = self._fetch()
+        verification, policies = self._fetch(timeout_seconds=timeout_seconds)
         if policies.get(str(revision_id)) != policy_hash:
             raise EgressAttestationError("EGRESS_POLICY_NOT_APPLIED")
         return verification
@@ -354,6 +380,7 @@ class LoopbackEgressAttestationClient:
         policy_hash: str,
         selected_ip: str,
         port: int,
+        timeout_seconds: float | None = None,
     ) -> EgressLease:
         document = {
             "schema_version": ATTESTATION_SCHEMA_VERSION,
@@ -374,6 +401,7 @@ class LoopbackEgressAttestationClient:
             expected_status=201,
             bearer_token=None,
             lease_creation_capability=self._read_lease_creation_capability(),
+            timeout_seconds=timeout_seconds,
         )
         return self._parse_lease_response(
             response,
@@ -385,7 +413,12 @@ class LoopbackEgressAttestationClient:
             existing_token=None,
         )
 
-    def renew_lease(self, lease: EgressLease) -> EgressLease:
+    def renew_lease(
+        self,
+        lease: EgressLease,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> EgressLease:
         response = self._lease_request(
             f"{self._lease_collection_url}/{lease.lease_id}",
             method="PUT",
@@ -393,6 +426,7 @@ class LoopbackEgressAttestationClient:
             expected_status=200,
             bearer_token=lease.bearer_token,
             lease_creation_capability=None,
+            timeout_seconds=timeout_seconds,
         )
         renewed = self._parse_lease_response(
             response,
@@ -407,7 +441,12 @@ class LoopbackEgressAttestationClient:
             raise EgressAttestationError("EGRESS_LEASE_RESPONSE_INVALID")
         return renewed
 
-    def release_lease(self, lease: EgressLease) -> None:
+    def release_lease(
+        self,
+        lease: EgressLease,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
         response = self._lease_request(
             f"{self._lease_collection_url}/{lease.lease_id}",
             method="DELETE",
@@ -416,6 +455,7 @@ class LoopbackEgressAttestationClient:
             bearer_token=lease.bearer_token,
             lease_creation_capability=None,
             expect_json=False,
+            timeout_seconds=timeout_seconds,
         )
         if response is not None:
             raise EgressAttestationError("EGRESS_LEASE_RESPONSE_INVALID")
@@ -430,6 +470,7 @@ class LoopbackEgressAttestationClient:
         bearer_token: str | None,
         lease_creation_capability: str | None,
         expect_json: bool = True,
+        timeout_seconds: float | None = None,
     ) -> dict[str, object] | None:
         headers = {
             "Accept": "application/json",
@@ -461,7 +502,7 @@ class LoopbackEgressAttestationClient:
         try:
             with self._opener.open(
                 request,
-                timeout=self.timeout_seconds,
+                timeout=self._effective_timeout(timeout_seconds),
             ) as response:
                 if response.status != expected_status:
                     raise EgressAttestationError("EGRESS_LEASE_UNAVAILABLE")
@@ -634,8 +675,15 @@ class UnavailableEgressVerifier:
         policy_hash: str,
         policy_engine_version: str,
         resolver_policy_version: str,
+        timeout_seconds: float | None = None,
     ) -> EgressVerification:
-        del revision_id, policy_hash, policy_engine_version, resolver_policy_version
+        del (
+            revision_id,
+            policy_hash,
+            policy_engine_version,
+            resolver_policy_version,
+            timeout_seconds,
+        )
         raise EgressAttestationError("EGRESS_ATTESTATION_UNAVAILABLE")
 
 
@@ -645,12 +693,22 @@ class UnavailableEgressLeaseClient:
     def create_lease(self, **_kwargs: object) -> EgressLease:
         raise EgressAttestationError("EGRESS_LEASE_UNAVAILABLE")
 
-    def renew_lease(self, lease: EgressLease) -> EgressLease:
-        del lease
+    def renew_lease(
+        self,
+        lease: EgressLease,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> EgressLease:
+        del lease, timeout_seconds
         raise EgressAttestationError("EGRESS_LEASE_UNAVAILABLE")
 
-    def release_lease(self, lease: EgressLease) -> None:
-        del lease
+    def release_lease(
+        self,
+        lease: EgressLease,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        del lease, timeout_seconds
         raise EgressAttestationError("EGRESS_LEASE_UNAVAILABLE")
 
 

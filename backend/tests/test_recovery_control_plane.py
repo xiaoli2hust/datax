@@ -151,6 +151,101 @@ def _rerun_state_snapshot(
         }
 
 
+def test_remediation_idempotency_replay_is_bound_to_exact_execution(
+    core_stack: CoreStack,
+) -> None:
+    """A recovery submission key cannot replay a probe onto another execution."""
+
+    def prepare_open_gate(suffix: str) -> UUID:
+        _published, execution_id, claim = _claim_execution(core_stack, suffix=suffix)
+        core_stack.service.transition_claimed_execution(
+            claim=claim,
+            expected_state="STARTING",
+            new_state="FAILED",
+            data_effect="NONE",
+            verification_state="NOT_STARTED",
+            failure_code="PREFLIGHT_FAILED",
+            failure_message="idempotency replay fixture",
+        )
+        return execution_id
+
+    first_execution_id = prepare_open_gate("recovery-idempotency-first")
+    second_execution_id = prepare_open_gate("recovery-idempotency-second")
+    headers = {"Idempotency-Key": "recovery-remediation-cross-execution-001"}
+    body = {
+        "action": "NO_CLEANUP_REQUIRED",
+        "cleanup_performed": False,
+        "reason": "DataX never started; the target still needs an independent probe.",
+        "confirmed_at": datetime.now(UTC).isoformat(),
+    }
+
+    submitted = core_stack.client.post(
+        f"/api/v1/executions/{first_execution_id}/recovery",
+        headers=headers,
+        json=body,
+    )
+    cross_execution = core_stack.client.post(
+        f"/api/v1/executions/{second_execution_id}/recovery",
+        headers=headers,
+        json=body,
+    )
+
+    assert submitted.status_code == 202, submitted.text
+    assert cross_execution.status_code == 409, cross_execution.text
+    assert cross_execution.json()["code"] == "IDEMPOTENCY_CONFLICT"
+    with core_stack.sessions() as session:
+        second_gate = session.scalar(
+            select(RecoveryGate).where(RecoveryGate.execution_id == second_execution_id)
+        )
+        assert second_gate is not None
+        assert second_gate.status == "OPEN"
+        assert session.scalar(
+            select(func.count(RecoveryProbe.id)).where(
+                RecoveryProbe.recovery_gate_id == second_gate.id
+            )
+        ) == 0
+
+
+def test_rerun_idempotency_replay_is_bound_to_original_execution(
+    core_stack: CoreStack,
+) -> None:
+    """A replay must not return a rerun of a different original execution."""
+
+    first_published, first_execution_id, first_gate_id = _prepare_verified_rerun(
+        core_stack,
+        suffix="rerun-idempotency-first",
+    )
+    _second_published, second_execution_id, _second_gate_id = _prepare_verified_rerun(
+        core_stack,
+        suffix="rerun-idempotency-second",
+    )
+    body = _execution_request(first_published.job_version_id)
+    body.pop("job_version_id")
+    body["recovery_gate_id"] = str(first_gate_id)
+    headers = {"Idempotency-Key": "recovery-rerun-cross-execution-001"}
+
+    rerun = core_stack.client.post(
+        f"/api/v1/executions/{first_execution_id}/rerun",
+        headers=headers,
+        json=body,
+    )
+    cross_execution = core_stack.client.post(
+        f"/api/v1/executions/{second_execution_id}/rerun",
+        headers=headers,
+        json=body,
+    )
+
+    assert rerun.status_code == 202, rerun.text
+    assert cross_execution.status_code == 409, cross_execution.text
+    assert cross_execution.json()["code"] == "IDEMPOTENCY_CONFLICT"
+    with core_stack.sessions() as session:
+        assert session.scalar(
+            select(Execution.id).where(
+                Execution.rerun_of_execution_id == second_execution_id
+            )
+        ) is None
+
+
 @pytest.mark.parametrize(
     "terminal_state",
     ["FAILED", "TIMED_OUT", "CANCELED", "LOST"],

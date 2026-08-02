@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Event
 from uuid import UUID, uuid4
 
 import pytest
@@ -13,7 +13,17 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
 from datax_studio.api.problems import ProblemException
-from datax_studio.auth.db import Base, Organization, Role, ScopeType, User
+from datax_studio.auth.db import (
+    AuthSession,
+    Base,
+    MembershipStatus,
+    Organization,
+    OrganizationMember,
+    Role,
+    RoleAssignment,
+    ScopeType,
+    User,
+)
 from datax_studio.auth.schemas import ScopedRoles
 from datax_studio.auth.service import AuditContext, Principal
 from datax_studio.core.db import (
@@ -86,8 +96,7 @@ def postgres_rotation_stack(
             max_overflow=0,
             connect_args={
                 "options": (
-                    f"-csearch_path={schema} "
-                    "-clock_timeout=5000ms -cstatement_timeout=15000ms"
+                    f"-csearch_path={schema} -clock_timeout=5000ms -cstatement_timeout=15000ms"
                 )
             },
         )
@@ -119,11 +128,12 @@ def postgres_rotation_stack(
             *,
             password: bytearray,
             resolved: ResolvedEndpoint,
+            deadline: object,
         ) -> ProbeResult:
             # The endpoint record intentionally uses a non-routable fixture
             # address.  This test proves PostgreSQL optimistic-lock behavior,
             # so it must not silently turn into a network-probe test.
-            del password
+            del password, deadline
             return ProbeResult(
                 server_identity="postgres-credential-concurrency-fixture",
                 server_version="fixture",
@@ -136,12 +146,14 @@ def postgres_rotation_stack(
         now = datetime.now(UTC)
         organization_id = uuid4()
         user_id = uuid4()
+        session_id = uuid4()
         project_id = uuid4()
         policy_id = uuid4()
         policy_revision_id = uuid4()
         identity_id = uuid4()
         datasource_id = uuid4()
         revision_id = uuid4()
+        organization_member_id = uuid4()
         with sessions.begin() as session:
             session.add_all(
                 [
@@ -167,6 +179,45 @@ def postgres_rotation_stack(
                         row_version=1,
                     ),
                 ]
+            )
+            session.flush()
+            # SQLAlchemy has no ORM relationships between these independent
+            # facts, so retain the real FK order explicitly for PostgreSQL.
+            session.add_all(
+                [
+                    AuthSession(
+                        id=session_id,
+                        user_id=user_id,
+                        token_hash=b"p" * 32,
+                        family_id=session_id,
+                        rotated_from_id=None,
+                        issued_at=now,
+                        expires_at=now + timedelta(days=1),
+                        last_used_at=now,
+                        revoked_at=None,
+                        revoke_reason=None,
+                        ip_hash=None,
+                    ),
+                    OrganizationMember(
+                        id=organization_member_id,
+                        organization_id=organization_id,
+                        user_id=user_id,
+                        status=MembershipStatus.ACTIVE,
+                        joined_at=now,
+                    ),
+                ]
+            )
+            session.flush()
+            session.add(
+                RoleAssignment(
+                    id=uuid4(),
+                    organization_member_id=organization_member_id,
+                    scope_type=ScopeType.ORGANIZATION,
+                    scope_id=organization_id,
+                    role=Role.ADMIN,
+                    granted_by=user_id,
+                    created_at=now,
+                )
             )
             session.flush()
             session.add_all(
@@ -273,7 +324,7 @@ def postgres_rotation_stack(
         principal = Principal(
             user_id=user_id,
             organization_id=organization_id,
-            session_id=uuid4(),
+            session_id=session_id,
             email="admin@example.com",
             display_name="Admin",
             must_change_password=False,
@@ -330,15 +381,18 @@ def test_postgres_concurrent_rotation_has_one_winner(
             first.result(timeout=10),
             second.result(timeout=10),
         }
-    assert results == {"ROTATED", "VERSION_CONFLICT"}
+    # Depending on which phase-A transaction obtains the row after the
+    # winner's C commit, the loser either sees the old ETag immediately or
+    # has its detached A/B result rejected as stale.  Both are correct; two
+    # successful rotations are not.
+    assert results in (
+        {"ROTATED", "VERSION_CONFLICT"},
+        {"ROTATED", "DATASOURCE_OPERATION_STALE"},
+    )
 
     with sessions() as session:
         secrets = list(
-            session.scalars(
-                select(CredentialSecret).order_by(
-                    CredentialSecret.secret_version
-                )
-            )
+            session.scalars(select(CredentialSecret).order_by(CredentialSecret.secret_version))
         )
         envelopes = list(session.scalars(select(CredentialSecretEnvelope)))
         datasource = session.get(Datasource, datasource_id)
@@ -349,6 +403,82 @@ def test_postgres_concurrent_rotation_has_one_winner(
         assert datasource.current_secret_id == secrets[-1].id
         assert len(envelopes) == 2
         assert all(b"winner" not in secret.ciphertext for secret in secrets)
+
+
+def test_postgres_blocked_probe_holds_no_organization_lock(
+    postgres_rotation_stack: tuple[
+        CredentialService,
+        sessionmaker,
+        Principal,
+        UUID,
+    ],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """E2 lock-order evidence for ADR-0014's B phase.
+
+    The connector waits only after phase A and the strict-current credential
+    barrier have both committed.  A second PostgreSQL session must be able to
+    take the same Organization row lock with NOWAIT while that probe remains
+    blocked.  This is deliberately a real PostgreSQL test, not a SQLite/mock
+    substitute for lock behavior.
+    """
+
+    service, sessions, principal, datasource_id = postgres_rotation_stack
+    probe_started = Event()
+    release_probe = Event()
+
+    def blocked_probe(
+        _revision: object,
+        *,
+        password: bytearray,
+        resolved: ResolvedEndpoint,
+        deadline: object,
+    ) -> ProbeResult:
+        del password, deadline
+        probe_started.set()
+        assert release_probe.wait(timeout=5), "test must release the blocked B-phase probe"
+        return ProbeResult(
+            server_identity="postgres-credential-lock-fixture",
+            server_version="fixture",
+            peer_ip=resolved.selected_ip,
+            latency_ms=1,
+        )
+
+    monkeypatch.setattr(service.connector, "probe", blocked_probe)
+
+    def test_datasource() -> str:
+        try:
+            result = service.test_datasource(
+                principal=principal,
+                datasource_id=datasource_id,
+                request_id=uuid4(),
+                audit=AuditContext(
+                    request_id=uuid4(),
+                    source_ip="127.0.0.1",
+                    user_agent="postgres-adr-0014-lock-test",
+                ),
+            )
+        except ProblemException as exc:
+            return exc.code
+        return result.status
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(test_datasource)
+        assert probe_started.wait(timeout=5), "connector probe did not enter B phase"
+
+        # A blocked probe must not retain the Organization row locked by phase
+        # A.  NOWAIT makes any accidental product-transaction lock an immediate
+        # , deterministic PostgreSQL failure instead of a timing assertion.
+        with sessions.begin() as session:
+            organization = session.scalar(
+                select(Organization)
+                .where(Organization.id == principal.organization_id)
+                .with_for_update(nowait=True)
+            )
+            assert organization is not None
+
+        release_probe.set()
+        assert future.result(timeout=10) == "SUCCEEDED"
 
 
 def test_postgres_concurrent_endpoint_policy_patch_has_one_revision_winner(
@@ -411,9 +541,7 @@ def test_postgres_concurrent_endpoint_policy_patch_has_one_revision_winner(
         revisions = list(
             session.scalars(
                 select(EndpointPolicyRevision)
-                .where(
-                    EndpointPolicyRevision.endpoint_policy_id == policy_id
-                )
+                .where(EndpointPolicyRevision.endpoint_policy_id == policy_id)
                 .order_by(EndpointPolicyRevision.revision_no)
             )
         )

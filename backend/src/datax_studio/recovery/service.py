@@ -13,7 +13,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from datax_studio.api.problems import ProblemException
-from datax_studio.auth.db import Role
+from datax_studio.auth.db import IdempotencyRecord, Role
 from datax_studio.auth.security import ensure_aware, utc_now
 from datax_studio.auth.service import AuditContext, OperationResult, Principal
 from datax_studio.core.db import (
@@ -150,7 +150,11 @@ class RecoveryService:
             )
             if replay is not None:
                 return OperationResult(
-                    RecoverySubmissionResponse.model_validate(replay.response_body),
+                    self._remediation_replay_response(
+                        session,
+                        record=replay,
+                        execution_id=execution.id,
+                    ),
                     replayed=True,
                 )
             gate = session.scalar(
@@ -373,7 +377,11 @@ class RecoveryService:
             )
             if replay is not None:
                 return OperationResult(
-                    ExecutionResponse.model_validate(replay.response_body),
+                    self._rerun_replay_response(
+                        session,
+                        record=replay,
+                        original_execution_id=original.id,
+                    ),
                     replayed=True,
                 )
             self.control._require_accepting_new_executions(session)  # noqa: SLF001
@@ -1162,6 +1170,77 @@ class RecoveryService:
             log_dropped_bytes=0,
             created_at=now,
         )
+
+    @staticmethod
+    def _idempotency_resource_conflict(detail: str) -> ProblemException:
+        """Fail closed when a template-scoped key belongs to another execution."""
+
+        return ProblemException(
+            status=409,
+            code="IDEMPOTENCY_CONFLICT",
+            title="Idempotency-Key 已用于不同请求",
+            detail=detail,
+        )
+
+    def _remediation_replay_response(
+        self,
+        session: Session,
+        *,
+        record: IdempotencyRecord,
+        execution_id: UUID,
+    ) -> RecoverySubmissionResponse:
+        """Bind a remediation replay to the exact execution path parameter."""
+
+        def conflict() -> ProblemException:
+            return self._idempotency_resource_conflict(
+                "该 Idempotency-Key 已绑定到另一执行的恢复处置请求。"
+            )
+        if record.resource_type != "RECOVERY_PROBE" or record.resource_id is None:
+            raise conflict()
+        probe = session.get(RecoveryProbe, record.resource_id)
+        if probe is None:
+            raise conflict()
+        gate = session.get(RecoveryGate, probe.recovery_gate_id)
+        if gate is None or gate.execution_id != execution_id:
+            raise conflict()
+        try:
+            response = RecoverySubmissionResponse.model_validate(record.response_body)
+        except (TypeError, ValueError) as exc:
+            raise conflict() from exc
+        if (
+            response.recovery_gate.id != gate.id
+            or response.recovery_gate.execution_id != execution_id
+            or response.recovery_probe.id != probe.id
+            or response.recovery_probe.recovery_gate_id != gate.id
+        ):
+            raise conflict()
+        return response
+
+    def _rerun_replay_response(
+        self,
+        session: Session,
+        *,
+        record: IdempotencyRecord,
+        original_execution_id: UUID,
+    ) -> ExecutionResponse:
+        """Bind a rerun replay to the original execution in its URL path."""
+
+        def conflict() -> ProblemException:
+            return self._idempotency_resource_conflict(
+                "该 Idempotency-Key 已绑定到另一执行的再次执行请求。"
+            )
+        if record.resource_type != "EXECUTION" or record.resource_id is None:
+            raise conflict()
+        rerun = session.get(Execution, record.resource_id)
+        if rerun is None or rerun.rerun_of_execution_id != original_execution_id:
+            raise conflict()
+        try:
+            response = ExecutionResponse.model_validate(record.response_body)
+        except (TypeError, ValueError) as exc:
+            raise conflict() from exc
+        if response.id != rerun.id or response.rerun_of_execution_id != original_execution_id:
+            raise conflict()
+        return response
 
     @staticmethod
     def _gate_response(gate: RecoveryGate) -> RecoveryGateResponse:

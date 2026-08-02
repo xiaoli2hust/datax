@@ -37,6 +37,12 @@ from datax_studio.core.db import (
     TransferPolicy,
     TransferPolicyApproval,
 )
+from datax_studio.credentials.ingress import (
+    DatasourceOperationAdmissionGuard,
+    DatasourceOperationAdmissionLease,
+    DatasourceOperationKind,
+)
+from datax_studio.credentials.operation_boundary import OperationDeadline
 from datax_studio.credentials.schemas import (
     ColumnSchema,
     TableSchema,
@@ -60,6 +66,16 @@ class FakeMetadataProbe:
     calls: list[tuple[UUID, str, str | None, str | None]] = field(
         default_factory=list
     )
+    admissions: list[DatasourceOperationAdmissionGuard | None] = field(
+        default_factory=list
+    )
+    admission_leases: list[DatasourceOperationAdmissionLease | None] = field(
+        default_factory=list
+    )
+    operation_deadlines: list[OperationDeadline | None] = field(default_factory=list)
+
+    def new_operation_deadline(self) -> OperationDeadline:
+        return OperationDeadline(30.0)
 
     def list_columns(
         self,
@@ -71,9 +87,15 @@ class FakeMetadataProbe:
         table_name: str | None,
         limit: int,
         audit: AuditContext,
+        admission: DatasourceOperationAdmissionGuard | None = None,
+        admission_lease: DatasourceOperationAdmissionLease | None = None,
+        operation_deadline: OperationDeadline | None = None,
     ) -> TableSchemaPage:
         del principal, limit, audit
         self.calls.append((datasource_id, usage, schema_name, table_name))
+        self.admissions.append(admission)
+        self.admission_leases.append(admission_lease)
+        self.operation_deadlines.append(operation_deadline)
         if self.fail:
             raise RuntimeError("database is offline")
         return self.pages[datasource_id]
@@ -514,6 +536,77 @@ def test_server_fixes_scope_from_real_metadata_and_hashes_canonical_json(
             "orders_copy",
         ),
     ]
+    assert len(governance_stack.probe.operation_deadlines) == 2
+    assert governance_stack.probe.operation_deadlines[0] is not None
+    assert (
+        governance_stack.probe.operation_deadlines[0]
+        is governance_stack.probe.operation_deadlines[1]
+    )
+
+
+def test_transfer_policy_scope_admission_is_atomic_and_releases_after_both_probes(
+    governance_stack: GovernanceStack,
+) -> None:
+    guard = DatasourceOperationAdmissionGuard(
+        max_global_in_flight=1,
+        max_organization_in_flight=1,
+        max_datasource_in_flight=1,
+        test_cooldown_seconds=0.0,
+        retention_seconds=60.0,
+        max_retained_organizations=10,
+        max_retained_datasources=10,
+    )
+    blocker = guard.try_acquire(
+        organization_id=governance_stack.requester.organization_id,
+        datasource_ids=(
+            governance_stack.source_datasource_id,
+            governance_stack.target_datasource_id,
+        ),
+        operation_kind=DatasourceOperationKind.METADATA,
+    )
+    assert isinstance(blocker, DatasourceOperationAdmissionLease)
+
+    with pytest.raises(ProblemException) as caught:
+        _create_policy(
+            governance_stack,
+            classification="STANDARD",
+            key="create-policy-admission-atomic-001",
+            admission=guard,
+        )
+    assert caught.value.status == 429
+    assert caught.value.code == "DATASOURCE_OPERATION_ADMISSION_LIMITED"
+    assert governance_stack.probe.calls == []
+    with governance_stack.sessions() as session:
+        assert session.scalar(select(func.count()).select_from(TransferPolicy)) == 0
+
+    blocker.release()
+    _create_policy(
+        governance_stack,
+        classification="STANDARD",
+        key="create-policy-admission-atomic-002",
+        admission=guard,
+    )
+    assert len(governance_stack.probe.admission_leases) == 2
+    first_lease, second_lease = governance_stack.probe.admission_leases
+    assert first_lease is not None
+    assert first_lease is second_lease
+    assert not first_lease.covers(
+        organization_id=governance_stack.requester.organization_id,
+        datasource_ids=(
+            governance_stack.source_datasource_id,
+            governance_stack.target_datasource_id,
+        ),
+    )
+    next_lease = guard.try_acquire(
+        organization_id=governance_stack.requester.organization_id,
+        datasource_ids=(
+            governance_stack.source_datasource_id,
+            governance_stack.target_datasource_id,
+        ),
+        operation_kind=DatasourceOperationKind.METADATA,
+    )
+    assert isinstance(next_lease, DatasourceOperationAdmissionLease)
+    next_lease.release()
 
 
 def test_transfer_policy_scope_is_admin_only(
@@ -792,6 +885,7 @@ def _create_policy(
     *,
     classification: str,
     key: str,
+    admission: DatasourceOperationAdmissionGuard | None = None,
 ):
     return stack.service.create_transfer_policy(
         principal=stack.requester,
@@ -809,6 +903,7 @@ def _create_policy(
         idempotency_key=key,
         audit=stack.audit,
         metadata_probe=stack.probe,
+        admission=admission,
     )
 
 

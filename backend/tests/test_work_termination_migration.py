@@ -65,7 +65,7 @@ def test_0015_is_linear_and_settings_require_it() -> None:
 
     assert module.revision == "20260802_0015"
     assert module.down_revision == "20260731_0014"
-    assert Settings().database_schema_revision == "20260802_0018"
+    assert Settings().database_schema_revision == "20260802_0019"
 
 
 def test_0015_creates_and_rolls_back_durable_termination_lifecycle() -> None:

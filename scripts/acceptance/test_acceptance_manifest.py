@@ -32,8 +32,8 @@ class AcceptanceManifestTests(unittest.TestCase):
         self.assertEqual(document["requirement_count"], 81)
         self.assertEqual(document["v1_must_count"], 80)
         self.assertEqual(document["post_v1_count"], 1)
-        self.assertEqual(document["entry_count"], 106)
-        self.assertEqual(len(entries), 106)
+        self.assertEqual(document["entry_count"], 107)
+        self.assertEqual(len(entries), 107)
         self.assertTrue(
             {"PERF-001", "PERF-002", "SEC-001", "SEC-002", "SEC-003"}.isdisjoint(
                 entry.test_id for entry in entries

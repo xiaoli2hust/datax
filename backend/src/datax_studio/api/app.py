@@ -20,6 +20,7 @@ from datax_studio.auth.routes import router as auth_router
 from datax_studio.auth.service import AuthService
 from datax_studio.core.routes import router as core_router
 from datax_studio.core.service import ControlService
+from datax_studio.credentials.ingress import DatasourceOperationAdmissionGuard
 from datax_studio.credentials.routes import router as credential_router
 from datax_studio.credentials.service import CredentialService
 from datax_studio.governance.routes import router as governance_router
@@ -51,9 +52,23 @@ def create_app(
         rate_per_minute=resolved_settings.login_admission_rate_per_minute,
         max_in_flight=resolved_settings.login_admission_max_in_flight,
     )
+    app.state.datasource_operation_admission = DatasourceOperationAdmissionGuard(
+        max_global_in_flight=(resolved_settings.datasource_operation_max_global_in_flight),
+        max_organization_in_flight=(
+            resolved_settings.datasource_operation_max_organization_in_flight
+        ),
+        max_datasource_in_flight=(resolved_settings.datasource_operation_max_datasource_in_flight),
+        test_cooldown_seconds=(resolved_settings.datasource_operation_test_cooldown_seconds),
+        retention_seconds=resolved_settings.datasource_operation_retention_seconds,
+        max_retained_organizations=(
+            resolved_settings.datasource_operation_max_retained_organizations
+        ),
+        max_retained_datasources=(resolved_settings.datasource_operation_max_retained_datasources),
+    )
     app.state.auth_service = auth_service
     app.state.control_service = control_service
     app.state.credential_service = credential_service
+
     @app.middleware("http")
     async def loopback_origin_middleware(
         request: Request,
@@ -71,10 +86,7 @@ def create_app(
                 ),
             )
         admission = None
-        if (
-            request.method == "POST"
-            and request.url.path == "/api/v1/auth/login"
-        ):
+        if request.method == "POST" and request.url.path == "/api/v1/auth/login":
             admission = request.app.state.login_admission.try_acquire()
             if isinstance(admission, LoginAdmissionRejection):
                 return problem_response(

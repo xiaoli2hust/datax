@@ -165,6 +165,78 @@ def _create_user(
     return response.json()
 
 
+def test_completed_user_idempotency_replay_rejects_tampered_resource_or_response(
+    auth_stack: tuple[TestClient, AuthService, sessionmaker, TokenManager],
+) -> None:
+    client, _, sessions, _ = auth_stack
+    admin_token = _activate_admin(client)
+    target = _create_user(
+        client,
+        admin_token,
+        email="affinity-target@example.com",
+        key="affinity-target-create-001",
+    )
+    other = _create_user(
+        client,
+        admin_token,
+        email="affinity-other@example.com",
+        key="affinity-other-create-001",
+    )
+
+    unlock_key = "affinity-unlock-001"
+    unlocked = client.post(
+        f"/api/v1/users/{target['id']}/unlock",
+        headers={
+            "Authorization": f"Bearer {admin_token}",
+            "Idempotency-Key": unlock_key,
+        },
+    )
+    assert unlocked.status_code == 200, unlocked.text
+    with sessions.begin() as session:
+        record = session.scalar(
+            select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == unlock_key)
+        )
+        assert record is not None and record.response_body is not None
+        record.response_body = {**record.response_body, "id": other["id"]}
+    response_mismatch = client.post(
+        f"/api/v1/users/{target['id']}/unlock",
+        headers={
+            "Authorization": f"Bearer {admin_token}",
+            "Idempotency-Key": unlock_key,
+        },
+    )
+    assert response_mismatch.status_code == 409
+    assert response_mismatch.json()["code"] == "IDEMPOTENCY_CONFLICT"
+
+    reset_key = "affinity-reset-001"
+    reset_payload = {"temporary_password": "Affinity-reset-password-123!"}
+    reset = client.post(
+        f"/api/v1/users/{target['id']}/reset-password",
+        headers={
+            "Authorization": f"Bearer {admin_token}",
+            "Idempotency-Key": reset_key,
+        },
+        json=reset_payload,
+    )
+    assert reset.status_code == 204, reset.text
+    with sessions.begin() as session:
+        record = session.scalar(
+            select(IdempotencyRecord).where(IdempotencyRecord.idempotency_key == reset_key)
+        )
+        assert record is not None
+        record.resource_id = UUID(other["id"])
+    resource_mismatch = client.post(
+        f"/api/v1/users/{target['id']}/reset-password",
+        headers={
+            "Authorization": f"Bearer {admin_token}",
+            "Idempotency-Key": reset_key,
+        },
+        json=reset_payload,
+    )
+    assert resource_mismatch.status_code == 409
+    assert resource_mismatch.json()["code"] == "IDEMPOTENCY_CONFLICT"
+
+
 def test_login_uses_argon2id_ed25519_and_strict_loopback_cookie(
     auth_stack: tuple[TestClient, AuthService, sessionmaker, TokenManager],
 ) -> None:

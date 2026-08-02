@@ -7,6 +7,7 @@ import ipaddress
 import json
 import re
 import secrets
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Protocol
@@ -246,6 +247,10 @@ class RuntimeValidationMaterial:
     runtime_sha256: str
     reader_plugin_sha256: str
     writer_plugin_sha256: str
+    # This is deliberately separate from the three immutable artifact hashes.
+    # A worker restart/reconciliation can preserve those bytes while changing
+    # the live proof that made the validator eligible to accept their result.
+    runtime_proof_fingerprint: str
 
 
 class CredentialBindingSelector(Protocol):
@@ -558,8 +563,7 @@ class ControlService:
                 or 0
             )
             success_denominator = sum(
-                process_counts[state]
-                for state in ("SUCCEEDED", "FAILED", "TIMED_OUT", "LOST")
+                process_counts[state] for state in ("SUCCEEDED", "FAILED", "TIMED_OUT", "LOST")
             )
             unresolved_failure_count = int(
                 session.scalar(
@@ -588,8 +592,8 @@ class ControlService:
                     )
                 )
             )
-            verified_value, missing_verification_count = (
-                _dashboard_verified_record_count(verified_reports)
+            verified_value, missing_verification_count = _dashboard_verified_record_count(
+                verified_reports
             )
             recent_rows = session.execute(
                 select(Execution, SyncJob.name)
@@ -613,9 +617,7 @@ class ControlService:
             while bucket_start < window_to:
                 bucket_end = min(bucket_start + timedelta(days=1), window_to)
                 bucket_process = {state: 0 for state in _PROCESS_STATES}
-                bucket_verification = {
-                    state: 0 for state in _VERIFICATION_STATES
-                }
+                bucket_verification = {state: 0 for state in _VERIFICATION_STATES}
                 for process_state, verification_state, count in session.execute(
                     select(
                         Execution.process_state,
@@ -636,21 +638,15 @@ class ControlService:
                         process_state not in bucket_process
                         or verification_state not in bucket_verification
                     ):
-                        raise RuntimeError(
-                            "execution contains a state outside the V1 contract"
-                        )
+                        raise RuntimeError("execution contains a state outside the V1 contract")
                     bucket_process[process_state] += int(count)
                     bucket_verification[verification_state] += int(count)
                 trend.append(
                     DashboardTrendBucket(
                         bucket_start=bucket_start,
                         bucket_end=bucket_end,
-                        process_counts=DashboardExecutionCounts(
-                            **bucket_process
-                        ),
-                        verification_counts=DashboardVerificationCounts(
-                            **bucket_verification
-                        ),
+                        process_counts=DashboardExecutionCounts(**bucket_process),
+                        verification_counts=DashboardVerificationCounts(**bucket_verification),
                     )
                 )
                 bucket_start = bucket_end
@@ -668,21 +664,13 @@ class ControlService:
                 executable=executable,
             ),
             execution_total=execution_total,
-            execution_state_counts=DashboardExecutionCounts(
-                **process_counts
-            ),
-            verification_state_counts=DashboardVerificationCounts(
-                **verification_counts
-            ),
+            execution_state_counts=DashboardExecutionCounts(**process_counts),
+            verification_state_counts=DashboardVerificationCounts(**verification_counts),
             data_effect_counts=DashboardDataEffectCounts(**effect_counts),
             success_rate=DashboardSuccessRate(
                 numerator=success_numerator,
                 denominator=success_denominator,
-                ratio=(
-                    success_numerator / success_denominator
-                    if success_denominator
-                    else None
-                ),
+                ratio=(success_numerator / success_denominator if success_denominator else None),
             ),
             unresolved_failure_count=unresolved_failure_count,
             verified_records=DashboardVerifiedRecords(
@@ -715,9 +703,10 @@ class ControlService:
         now: datetime,
     ) -> DashboardRuntime:
         try:
-            row = session.execute(
-                text(
-                    """
+            row = (
+                session.execute(
+                    text(
+                        """
                     SELECT
                         status,
                         runtime_code,
@@ -731,8 +720,11 @@ class ControlService:
                     ORDER BY updated_at DESC, worker_id
                     LIMIT 1
                     """
+                    )
                 )
-            ).mappings().one_or_none()
+                .mappings()
+                .one_or_none()
+            )
         except SQLAlchemyError:
             row = None
         if row is None:
@@ -760,10 +752,7 @@ class ControlService:
             and row["runtime_code"] == "RUNTIME_OK"
         )
         oracle_ready = (
-            online
-            and reconciled
-            and row["status"] == "READY"
-            and row["oracle_code"] == "ORACLE_OK"
+            online and reconciled and row["status"] == "READY" and row["oracle_code"] == "ORACLE_OK"
         )
         return DashboardRuntime(
             worker_online=online,
@@ -885,9 +874,10 @@ class ControlService:
             )
         with self.sessions() as session:
             try:
-                row = session.execute(
-                    text(
-                        """
+                row = (
+                    session.execute(
+                        text(
+                            """
                         SELECT
                             wh.status,
                             wh.runtime_code,
@@ -911,15 +901,18 @@ class ControlService:
                         WHERE wh.worker_id = :worker_id
                           AND sc.singleton_id = 1
                         """
-                    ).columns(
-                        reconcile_epoch=Uuid(as_uuid=True),
-                        control_reconcile_epoch=Uuid(as_uuid=True),
-                        reconciled_at=DateTime(timezone=True),
-                        control_reconciled_at=DateTime(timezone=True),
-                        updated_at=DateTime(timezone=True),
-                    ),
-                    {"worker_id": self._worker_id},
-                ).mappings().one_or_none()
+                        ).columns(
+                            reconcile_epoch=Uuid(as_uuid=True),
+                            control_reconcile_epoch=Uuid(as_uuid=True),
+                            reconciled_at=DateTime(timezone=True),
+                            control_reconciled_at=DateTime(timezone=True),
+                            updated_at=DateTime(timezone=True),
+                        ),
+                        {"worker_id": self._worker_id},
+                    )
+                    .mappings()
+                    .one_or_none()
+                )
             except SQLAlchemyError:
                 self._runtime_attestation_unavailable()
         if row is None:
@@ -931,8 +924,7 @@ class ControlService:
             "postgresqlwriter": "postgresqlwriter_plugin_sha256",
         }
         plugin_hashes = {
-            name: str(row[column] or "")
-            for name, column in plugin_hash_columns.items()
+            name: str(row[column] or "") for name, column in plugin_hash_columns.items()
         }
         reconciled_at = row["reconciled_at"]
         control_reconciled_at = row["control_reconciled_at"]
@@ -949,15 +941,10 @@ class ControlService:
             and row["reconcile_epoch"] == row["control_reconcile_epoch"]
             and reconciled_at is not None
             and control_reconciled_at is not None
-            and ensure_aware(reconciled_at)
-            == ensure_aware(control_reconciled_at)
+            and ensure_aware(reconciled_at) == ensure_aware(control_reconciled_at)
             and ensure_aware(row["updated_at"])
-            >= utc_now()
-            - timedelta(seconds=self._worker_stale_seconds)
-            and all(
-                re.fullmatch(r"[a-f0-9]{64}", value)
-                for value in plugin_hashes.values()
-            )
+            >= utc_now() - timedelta(seconds=self._worker_stale_seconds)
+            and all(re.fullmatch(r"[a-f0-9]{64}", value) for value in plugin_hashes.values())
         )
         if not current:
             self._runtime_attestation_unavailable()
@@ -1045,8 +1032,7 @@ class ControlService:
                 "MySQL 8 Reader",
                 "MYSQL_8",
                 "READER",
-                "datax/plugin/reader/mysqlreader/"
-                "mysqlreader-0.0.1-SNAPSHOT.jar",
+                "datax/plugin/reader/mysqlreader/mysqlreader-0.0.1-SNAPSHOT.jar",
                 "c4ffc40c90af4068999178ac7297bb2066de59b8dccfa6e8e956b48327487206",
                 "86ef9813bfc558048a99e32ffaf4889a48f2f082b0f692dc73770f5385161e8f",
             ),
@@ -1055,8 +1041,7 @@ class ControlService:
                 "MySQL 8 Writer",
                 "MYSQL_8",
                 "WRITER",
-                "datax/plugin/writer/mysqlwriter/"
-                "mysqlwriter-0.0.1-SNAPSHOT.jar",
+                "datax/plugin/writer/mysqlwriter/mysqlwriter-0.0.1-SNAPSHOT.jar",
                 "b83fe2a8eb0d1e535b84914e5fa169722bd085686eb11d63841e92a6d7cf1b2c",
                 "2c5914e3625f3c32e79d661407ec4644e94905037c78e1aa21391e0174c2d3ed",
             ),
@@ -1065,8 +1050,7 @@ class ControlService:
                 "PostgreSQL 15 Reader",
                 "POSTGRESQL_15",
                 "READER",
-                "datax/plugin/reader/postgresqlreader/"
-                "postgresqlreader-0.0.1-SNAPSHOT.jar",
+                "datax/plugin/reader/postgresqlreader/postgresqlreader-0.0.1-SNAPSHOT.jar",
                 "f14129fe23f6ca90bfc36b3c3bf64ff8d53288053af26e666411dde47211a835",
                 "5f298fb97165625ae5de9c32cb8454128feaa9c7ef8856f943f7683191291b32",
             ),
@@ -1075,8 +1059,7 @@ class ControlService:
                 "PostgreSQL 15 Writer",
                 "POSTGRESQL_15",
                 "WRITER",
-                "datax/plugin/writer/postgresqlwriter/"
-                "postgresqlwriter-0.0.1-SNAPSHOT.jar",
+                "datax/plugin/writer/postgresqlwriter/postgresqlwriter-0.0.1-SNAPSHOT.jar",
                 "d29dcd149b37c269e8e741184172a69ce80cd6ffc69503440fdd9d4afe49e4c4",
                 "1ea3e7ef4deebb90b36e4c7b1cb1e91852abbe9d6db0d52eee7a42fa037589f6",
             ),
@@ -1108,9 +1091,7 @@ class ControlService:
                     expected_plugin_name=name,
                     expected_plugin_sha256=plugin_hashes[name],
                     expected_runtime_sha256=runtime_sha256,
-                    current_candidate_id=(
-                        self._plugin_certification_source.current_candidate_id
-                    ),
+                    current_candidate_id=(self._plugin_certification_source.current_candidate_id),
                     current_candidate_commit=(
                         self._plugin_certification_source.current_candidate_commit
                     ),
@@ -1175,9 +1156,7 @@ class ControlService:
                     expected_plugin_name=name,
                     expected_plugin_sha256=plugin_hashes[name],
                     expected_runtime_sha256=runtime_sha256,
-                    current_candidate_id=(
-                        self._plugin_certification_source.current_candidate_id
-                    ),
+                    current_candidate_id=(self._plugin_certification_source.current_candidate_id),
                     current_candidate_commit=(
                         self._plugin_certification_source.current_candidate_commit
                     ),
@@ -1233,18 +1212,12 @@ class ControlService:
                     ),
                     runtime=PluginRuntime(jdk_major=8, python_major=3),
                     supply_chain=PluginSupplyChain(
-                        dependency_inventory_status=(
-                            "COMPLETE" if e4_certified else "INCOMPLETE"
-                        ),
-                        license_review_status=(
-                            "CLEARED" if e4_certified else "REVIEW_REQUIRED"
-                        ),
+                        dependency_inventory_status=("COMPLETE" if e4_certified else "INCOMPLETE"),
+                        license_review_status=("CLEARED" if e4_certified else "REVIEW_REQUIRED"),
                         dependency_inventory_ref=(
                             record.dependency_inventory_ref if e4_certified else None
                         ),
-                        license_review_ref=(
-                            record.license_review_ref if e4_certified else None
-                        ),
+                        license_review_ref=(record.license_review_ref if e4_certified else None),
                         dependencies=(
                             [
                                 PluginDependency(
@@ -1267,9 +1240,7 @@ class ControlService:
                         column_selection=True,
                         direct_mapping_only=True,
                         target_table_must_exist=True,
-                        write_modes=(
-                            [] if direction == "READER" else ["INSERT"]
-                        ),
+                        write_modes=([] if direction == "READER" else ["INSERT"]),
                         supports_free_sql=False,
                         supports_pre_sql=False,
                         supports_post_sql=False,
@@ -1302,29 +1273,19 @@ class ControlService:
                             else "CURRENT_RUNTIME_ATTESTATION"
                         ),
                         candidate_id=(record.candidate_id if e4_certified else None),
-                        candidate_commit=(
-                            record.candidate_commit if e4_certified else None
-                        ),
-                        worker_image_digest=(
-                            record.worker_image_digest if e4_certified else None
-                        ),
+                        candidate_commit=(record.candidate_commit if e4_certified else None),
+                        worker_image_digest=(record.worker_image_digest if e4_certified else None),
                         runtime_sha256=runtime_sha256,
-                        e3_evidence_ref=(
-                            record.e3_evidence_ref if e4_certified else None
-                        ),
+                        e3_evidence_ref=(record.e3_evidence_ref if e4_certified else None),
                         windows_e4_evidence_ref=(
                             record.windows_e4_evidence_ref if e4_certified else None
                         ),
                         release_promotion_ref=(
-                            record.release_promotion_ref
-                            if ordinary_user_executable
-                            else None
+                            record.release_promotion_ref if ordinary_user_executable else None
                         ),
                         valid_until=(record.valid_until if e4_certified else None),
                     ),
-                    block_reasons=(
-                        [] if ordinary_user_executable else public_block_reasons
-                    ),
+                    block_reasons=([] if ordinary_user_executable else public_block_reasons),
                 )
             )
         return PluginPage(items=manifests)
@@ -1345,9 +1306,7 @@ class ControlService:
             writer=writer,
             version=version,
             current_candidate_id=self._plugin_certification_source.current_candidate_id,
-            current_candidate_commit=(
-                self._plugin_certification_source.current_candidate_commit
-            ),
+            current_candidate_commit=(self._plugin_certification_source.current_candidate_commit),
             current_worker_image_digest=(
                 self._plugin_certification_source.current_worker_image_digest
             ),
@@ -1547,10 +1506,8 @@ class ControlService:
         with self.sessions() as session:
             identity = session.scalar(
                 select(PhysicalEndpointIdentity).where(
-                    PhysicalEndpointIdentity.id
-                    == physical_endpoint_identity_id,
-                    PhysicalEndpointIdentity.organization_id
-                    == principal.organization_id,
+                    PhysicalEndpointIdentity.id == physical_endpoint_identity_id,
+                    PhysicalEndpointIdentity.organization_id == principal.organization_id,
                 )
             )
             if identity is None:
@@ -1561,9 +1518,7 @@ class ControlService:
                 engine=identity.engine,
                 identity_scheme=identity.identity_scheme,
                 server_identity_hash=identity.server_identity_hash,
-                verification_evidence_hash=(
-                    identity.verification_evidence_hash
-                ),
+                verification_evidence_hash=(identity.verification_evidence_hash),
                 created_by=identity.created_by,
                 created_at=ensure_aware(identity.created_at),
             )
@@ -1580,13 +1535,11 @@ class ControlService:
                 select(TargetNamespace, PhysicalEndpointIdentity)
                 .join(
                     PhysicalEndpointIdentity,
-                    PhysicalEndpointIdentity.id
-                    == TargetNamespace.physical_endpoint_identity_id,
+                    PhysicalEndpointIdentity.id == TargetNamespace.physical_endpoint_identity_id,
                 )
                 .where(
                     TargetNamespace.id == target_namespace_id,
-                    PhysicalEndpointIdentity.organization_id
-                    == principal.organization_id,
+                    PhysicalEndpointIdentity.organization_id == principal.organization_id,
                 )
             ).one_or_none()
             if row is None:
@@ -1594,17 +1547,13 @@ class ControlService:
             namespace, _identity = row
             return TargetNamespaceSnapshot(
                 target_namespace_id=namespace.id,
-                physical_endpoint_identity_id=(
-                    namespace.physical_endpoint_identity_id
-                ),
+                physical_endpoint_identity_id=(namespace.physical_endpoint_identity_id),
                 engine=namespace.engine,
                 normalized_catalog_name=namespace.normalized_catalog_name,
                 normalized_schema_name=namespace.normalized_schema_name,
                 normalized_table_name=namespace.normalized_table_name,
                 normalization_version=namespace.normalization_version,
-                physical_table_identity_hash=(
-                    namespace.physical_table_identity_hash
-                ),
+                physical_table_identity_hash=(namespace.physical_table_identity_hash),
             )
 
     # ------------------------------------------------------------------
@@ -1644,7 +1593,11 @@ class ControlService:
                 )
                 if replay is not None:
                     return OperationResult(
-                        JobResponse.model_validate(replay.response_body),
+                        self._created_job_replay_response(
+                            session,
+                            record=replay,
+                            project_id=project.id,
+                        ),
                         replayed=True,
                     )
                 if session.scalar(
@@ -1735,14 +1688,10 @@ class ControlService:
                     or_(
                         func.lower(SyncJob.name).like(pattern, escape="\\"),
                         func.lower(
-                            SyncJob.draft_spec_json["source"]["table"][
-                                "table_name"
-                            ].as_string()
+                            SyncJob.draft_spec_json["source"]["table"]["table_name"].as_string()
                         ).like(pattern, escape="\\"),
                         func.lower(
-                            SyncJob.draft_spec_json["target"]["table"][
-                                "table_name"
-                            ].as_string()
+                            SyncJob.draft_spec_json["target"]["table"]["table_name"].as_string()
                         ).like(pattern, escape="\\"),
                     )
                 )
@@ -1751,22 +1700,16 @@ class ControlService:
             if exclude_status is not None:
                 statement = statement.where(SyncJob.status != exclude_status)
             if has_published_version is True:
-                statement = statement.where(
-                    SyncJob.latest_published_version_id.is_not(None)
-                )
+                statement = statement.where(SyncJob.latest_published_version_id.is_not(None))
             elif has_published_version is False:
-                statement = statement.where(
-                    SyncJob.latest_published_version_id.is_(None)
-                )
+                statement = statement.where(SyncJob.latest_published_version_id.is_(None))
             if reader_plugin is not None:
                 statement = statement.where(
-                    SyncJob.draft_spec_json["source"]["plugin_name"].as_string()
-                    == reader_plugin
+                    SyncJob.draft_spec_json["source"]["plugin_name"].as_string() == reader_plugin
                 )
             if writer_plugin is not None:
                 statement = statement.where(
-                    SyncJob.draft_spec_json["target"]["plugin_name"].as_string()
-                    == writer_plugin
+                    SyncJob.draft_spec_json["target"]["plugin_name"].as_string() == writer_plugin
                 )
             if latest_execution_state is not None:
                 latest_state = (
@@ -1883,8 +1826,7 @@ class ControlService:
                         select(SyncJob.id).where(
                             SyncJob.project_id == job.project_id,
                             SyncJob.id != job.id,
-                            func.lower(SyncJob.name)
-                            == normalized_name.casefold(),
+                            func.lower(SyncJob.name) == normalized_name.casefold(),
                         )
                     )
                     if conflict is not None:
@@ -1951,11 +1893,7 @@ class ControlService:
                     return self._job_response(session, job)
                 job.updated_at = now
                 job.row_version += 1
-                action = (
-                    "JOB_ARCHIVED"
-                    if job.status == "ARCHIVED"
-                    else "JOB_DRAFT_UPDATED"
-                )
+                action = "JOB_ARCHIVED" if job.status == "ARCHIVED" else "JOB_DRAFT_UPDATED"
                 self._append_audit(
                     session,
                     organization=organization,
@@ -1992,8 +1930,71 @@ class ControlService:
                 {Role.DEVELOPER},
             )
             spec = JobSpecV1.model_validate(job.draft_spec_json)
-            try:
-                row = session.execute(
+            return self.runtime_validation_material_for_plugins(
+                session,
+                reader_plugin_name=spec.source.plugin_name,
+                writer_plugin_name=spec.target.plugin_name,
+            )
+
+    def lock_runtime_validation_state(self, session: Session) -> None:
+        """Lock the live runtime proof before any organization-scoped row.
+
+        Job-validation A/C needs a stable runtime proof, while retention and
+        Worker lifecycle paths already lock ``SystemControl`` before their
+        organization/audit facts.  This intentionally minimal pre-lock avoids
+        parsing a Job draft before live authorization, yet establishes the
+        product-wide ``SystemControl -> Organization`` order.  Callers then use
+        ``runtime_validation_material_for_plugins`` in the same transaction to
+        validate the selected plugin hashes.
+        """
+
+        lock_clause = (
+            " FOR UPDATE OF wh, sc" if session.get_bind().dialect.name == "postgresql" else ""
+        )
+        try:
+            row = (
+                session.execute(
+                    text(
+                        """
+                        SELECT wh.worker_id
+                        FROM worker_heartbeats AS wh
+                        CROSS JOIN system_control AS sc
+                        WHERE wh.worker_id = :worker_id
+                          AND sc.singleton_id = 1
+                        """
+                        + lock_clause
+                    ),
+                    {"worker_id": self._worker_id},
+                )
+                .mappings()
+                .one_or_none()
+            )
+        except SQLAlchemyError:
+            row = None
+        if row is None:
+            self._runtime_attestation_unavailable()
+
+    def runtime_validation_material_for_plugins(
+        self,
+        session: Session,
+        *,
+        reader_plugin_name: str,
+        writer_plugin_name: str,
+    ) -> RuntimeValidationMaterial:
+        """Read one runtime attestation for already-authorized plugin names.
+
+        Job-validation A/C passes its existing short product transaction here.
+        PostgreSQL takes worker/control row locks so the material checked in C
+        remains the material accepted by that transaction; SQLite test fixtures
+        intentionally omit unsupported ``FOR UPDATE`` syntax.
+        """
+
+        lock_clause = (
+            " FOR UPDATE OF wh, sc" if session.get_bind().dialect.name == "postgresql" else ""
+        )
+        try:
+            row = (
+                session.execute(
                     text(
                         """
                         SELECT
@@ -2019,6 +2020,7 @@ class ControlService:
                         WHERE wh.worker_id = :worker_id
                           AND sc.singleton_id = 1
                         """
+                        + lock_clause
                     ).columns(
                         reconcile_epoch=Uuid(as_uuid=True),
                         control_reconcile_epoch=Uuid(as_uuid=True),
@@ -2027,58 +2029,82 @@ class ControlService:
                         updated_at=DateTime(timezone=True),
                     ),
                     {"worker_id": self._worker_id},
-                ).mappings().one_or_none()
-            except SQLAlchemyError:
-                row = None
-            if row is None:
-                self._runtime_attestation_unavailable()
-            updated_at = ensure_aware(row["updated_at"]).astimezone(UTC)
-            fresh = (
-                utc_now() - updated_at
-            ).total_seconds() <= self._worker_stale_seconds
-            reconciled = (
-                row["host_boot_id"]
-                and row["host_boot_id"] == row["control_host_boot_id"]
-                and row["reconcile_epoch"] is not None
-                and row["reconcile_epoch"] == row["control_reconcile_epoch"]
-                and row["reconciled_at"] is not None
-                and row["control_reconciled_at"] is not None
-                and ensure_aware(row["reconciled_at"])
-                == ensure_aware(row["control_reconciled_at"])
-                and not row["draining"]
+                )
+                .mappings()
+                .one_or_none()
             )
+        except SQLAlchemyError:
+            row = None
+        if row is None:
+            self._runtime_attestation_unavailable()
+        updated_at = ensure_aware(row["updated_at"]).astimezone(UTC)
+        fresh = (utc_now() - updated_at).total_seconds() <= self._worker_stale_seconds
+        reconciled = (
+            row["host_boot_id"]
+            and row["host_boot_id"] == row["control_host_boot_id"]
+            and row["reconcile_epoch"] is not None
+            and row["reconcile_epoch"] == row["control_reconcile_epoch"]
+            and row["reconciled_at"] is not None
+            and row["control_reconciled_at"] is not None
+            and ensure_aware(row["reconciled_at"]) == ensure_aware(row["control_reconciled_at"])
+            and not row["draining"]
+        )
+        try:
             reader_field = {
                 "mysqlreader": "mysqlreader_plugin_sha256",
                 "postgresqlreader": "postgresqlreader_plugin_sha256",
-            }[spec.source.plugin_name]
+            }[reader_plugin_name]
             writer_field = {
                 "mysqlwriter": "mysqlwriter_plugin_sha256",
                 "postgresqlwriter": "postgresqlwriter_plugin_sha256",
-            }[spec.target.plugin_name]
-            values = (
-                row["runtime_sha256"],
-                row[reader_field],
-                row[writer_field],
+            }[writer_plugin_name]
+        except KeyError as exc:
+            raise ValueError("unsupported runtime validation plugin") from exc
+        values = (
+            row["runtime_sha256"],
+            row[reader_field],
+            row[writer_field],
+        )
+        if (
+            not fresh
+            or not reconciled
+            or row["status"] != "READY"
+            or row["runtime_code"] != "RUNTIME_OK"
+            or row["oracle_code"] != "ORACLE_OK"
+            or row["datax_release"] != "datax_v202309"
+            or any(
+                not isinstance(value, str) or not re.fullmatch(r"[a-f0-9]{64}", value)
+                for value in values
             )
-            if (
-                not fresh
-                or not reconciled
-                or row["status"] != "READY"
-                or row["runtime_code"] != "RUNTIME_OK"
-                or row["oracle_code"] != "ORACLE_OK"
-                or row["datax_release"] != "datax_v202309"
-                or any(
-                    not isinstance(value, str)
-                    or not re.fullmatch(r"[a-f0-9]{64}", value)
-                    for value in values
-                )
-            ):
-                self._runtime_attestation_unavailable()
-            return RuntimeValidationMaterial(
-                runtime_sha256=values[0],
-                reader_plugin_sha256=values[1],
-                writer_plugin_sha256=values[2],
-            )
+        ):
+            self._runtime_attestation_unavailable()
+        runtime_proof_fingerprint = _domain_hash(
+            "DXRUNTIMEVALIDATIONPROOFv1",
+            {
+                "worker_id": self._worker_id,
+                "worker_status": row["status"],
+                "worker_runtime_code": row["runtime_code"],
+                "worker_oracle_code": row["oracle_code"],
+                "datax_release": row["datax_release"],
+                "worker_host_boot_id": str(row["host_boot_id"]),
+                "worker_reconcile_epoch": str(row["reconcile_epoch"]),
+                "worker_reconciled_at": _rfc3339(
+                    ensure_aware(row["reconciled_at"]).astimezone(UTC)
+                ),
+                "control_draining": bool(row["draining"]),
+                "control_host_boot_id": str(row["control_host_boot_id"]),
+                "control_reconcile_epoch": str(row["control_reconcile_epoch"]),
+                "control_reconciled_at": _rfc3339(
+                    ensure_aware(row["control_reconciled_at"]).astimezone(UTC)
+                ),
+            },
+        )
+        return RuntimeValidationMaterial(
+            runtime_sha256=values[0],
+            reader_plugin_sha256=values[1],
+            writer_plugin_sha256=values[2],
+            runtime_proof_fingerprint=runtime_proof_fingerprint,
+        )
 
     def validation_failure_report(
         self,
@@ -2088,19 +2114,67 @@ class ControlService:
         code: str,
         message: str,
         audit: AuditContext,
+        finalizer: Callable[[Session], None],
+        pre_organization_lock: Callable[[Session], None] | None = None,
+        before_database_step: Callable[[Session], None] | None = None,
+        before_commit: Callable[[Session], None] | None = None,
     ) -> ValidationReport:
+        """Write a B-time validation failure only after mandatory C revalidation.
+
+        ``before_database_step`` is an optional transaction-local checkpoint
+        for callers that carry an external-operation deadline into C.  It runs
+        immediately before each lock-bearing or database-heavy phase, so the
+        caller can refresh database lock/statement limits using the remaining
+        budget.  It must not perform external I/O.  ``before_commit`` is the
+        terminal checkpoint and may flush/check the transaction before the
+        context manager commits it.
+        """
+
         now = utc_now()
         with self.sessions.begin() as session:
+            # SystemControl is globally ordered before Organization.  A
+            # validation finalizer may need its runtime proof; lock it before
+            # the organization so retention/worker control paths cannot form
+            # SystemControl <-> Organization cycles.
+            if before_database_step is not None:
+                with session.no_autoflush:
+                    before_database_step(session)
+            if pre_organization_lock is not None:
+                pre_organization_lock(session)
+            if before_database_step is not None:
+                with session.no_autoflush:
+                    before_database_step(session)
+            organization = self._lock_organization(
+                session,
+                principal.organization_id,
+            )
+            if before_database_step is not None:
+                with session.no_autoflush:
+                    before_database_step(session)
+            finalizer(session)
+            if before_database_step is not None:
+                with session.no_autoflush:
+                    before_database_step(session)
             job = self._visible_job(session, principal, job_id, lock=True)
             self._require_project_role(
                 principal,
                 job.project_id,
                 {Role.DEVELOPER},
             )
-            organization = self._lock_organization(
-                session,
-                principal.organization_id,
-            )
+            if job.status == "ARCHIVED":
+                raise ProblemException(
+                    status=409,
+                    code="JOB_ARCHIVED",
+                    title="任务已归档",
+                    detail="归档任务不能写入校验结果。",
+                )
+            if job.status == "PUBLISHED":
+                raise ProblemException(
+                    status=409,
+                    code="JOB_PUBLISHED",
+                    title="任务已发布",
+                    detail="请先修改草稿创建新的 DRAFT，再写入校验结果。",
+                )
             report = ValidationReport(
                 valid=False,
                 draft_spec_hash=job.draft_spec_hash,
@@ -2120,6 +2194,12 @@ class ControlService:
             job.validation_report = report.model_dump(mode="json")
             job.updated_at = now
             job.row_version += 1
+            if before_database_step is not None:
+                # The audit writer takes the Organization serialization lock
+                # and can autoflush the pending validation report.  Refresh
+                # the caller's remaining DB budget first.
+                with session.no_autoflush:
+                    before_database_step(session)
             self._append_audit(
                 session,
                 organization=organization,
@@ -2139,6 +2219,8 @@ class ControlService:
                 outcome="FAILED",
                 reason_code=code,
             )
+            if before_commit is not None:
+                before_commit(session)
             return report
 
     def preview_job(
@@ -2159,16 +2241,8 @@ class ControlService:
                 ValidationIssue.model_validate(item)
                 for item in (job.validation_report or {}).get("warnings", [])
             ]
-        source_engine = (
-            "MYSQL_8"
-            if spec.source.plugin_name == "mysqlreader"
-            else "POSTGRESQL_15"
-        )
-        target_engine = (
-            "MYSQL_8"
-            if spec.target.plugin_name == "mysqlwriter"
-            else "POSTGRESQL_15"
-        )
+        source_engine = "MYSQL_8" if spec.source.plugin_name == "mysqlreader" else "POSTGRESQL_15"
+        target_engine = "MYSQL_8" if spec.target.plugin_name == "mysqlwriter" else "POSTGRESQL_15"
         try:
             redacted_job = build_datax_job(
                 spec,
@@ -2212,26 +2286,65 @@ class ControlService:
         job_id: UUID,
         material: ValidationMaterial,
         audit: AuditContext,
+        finalizer: Callable[[Session], None],
+        pre_organization_lock: Callable[[Session], None] | None = None,
+        before_database_step: Callable[[Session], None] | None = None,
+        before_commit: Callable[[Session], None] | None = None,
     ) -> JobResponse:
         """Persist facts returned by the real metadata validator.
 
         This method intentionally does not fabricate schema or network evidence.
+        The caller must provide the C-phase revalidator that binds material to
+        the current job, authorization and datasource security pointers.
+        ``before_database_step`` and ``before_commit`` have the same deadline
+        checkpoint semantics as :meth:`validation_failure_report`.
         """
 
         now = utc_now()
         with self.sessions.begin() as session:
+            # Keep the global SystemControl -> Organization -> Job order.  The
+            # runtime proof is locked before any organization/audit row, which
+            # matches Worker/reconciliation/retention control paths.
+            if before_database_step is not None:
+                with session.no_autoflush:
+                    before_database_step(session)
+            if pre_organization_lock is not None:
+                pre_organization_lock(session)
+            if before_database_step is not None:
+                with session.no_autoflush:
+                    before_database_step(session)
+            organization = self._lock_organization(session, principal.organization_id)
+            if before_database_step is not None:
+                with session.no_autoflush:
+                    before_database_step(session)
+            finalizer(session)
+            if before_database_step is not None:
+                with session.no_autoflush:
+                    before_database_step(session)
             job = self._visible_job(session, principal, job_id, lock=True)
             self._require_project_role(principal, job.project_id, {Role.DEVELOPER})
-            organization = self._lock_organization(session, principal.organization_id)
+            if job.status == "ARCHIVED":
+                raise ProblemException(
+                    status=409,
+                    code="JOB_ARCHIVED",
+                    title="任务已归档",
+                    detail="归档任务不能写入校验结果。",
+                )
+            if job.status == "PUBLISHED":
+                raise ProblemException(
+                    status=409,
+                    code="JOB_PUBLISHED",
+                    title="任务已发布",
+                    detail="请先修改草稿创建新的 DRAFT，再写入校验结果。",
+                )
+            if before_database_step is not None:
+                with session.no_autoflush:
+                    before_database_step(session)
             spec = JobSpecV1.model_validate(job.draft_spec_json)
             self._check_job_spec_resources(session, job.project_id, spec)
             try:
-                source_snapshot = validate_schema_snapshot(
-                    material.source_schema_snapshot
-                )
-                target_snapshot = validate_schema_snapshot(
-                    material.target_schema_snapshot
-                )
+                source_snapshot = validate_schema_snapshot(material.source_schema_snapshot)
+                target_snapshot = validate_schema_snapshot(material.target_schema_snapshot)
             except ValueError as exc:
                 raise ProblemException(
                     status=422,
@@ -2362,6 +2475,12 @@ class ControlService:
             job.validation_report = report
             job.updated_at = now
             job.row_version += 1
+            if before_database_step is not None:
+                # _append_audit() obtains an ordered Organization lock and can
+                # autoflush the pending validation facts.  Keep that flush
+                # under the caller's freshly-clamped remaining budget.
+                with session.no_autoflush:
+                    before_database_step(session)
             self._append_audit(
                 session,
                 organization=organization,
@@ -2378,7 +2497,17 @@ class ControlService:
                     "transfer_policy_scope_hash": material.transfer_policy_scope_hash,
                 },
             )
-            return self._job_response(session, job)
+            if before_database_step is not None:
+                # The response performs two database reads and may autoflush
+                # the pending job/audit mutation.  It must run before the
+                # terminal callback, otherwise a deadline can pass after that
+                # callback but before the transaction context commits.
+                with session.no_autoflush:
+                    before_database_step(session)
+            response = self._job_response(session, job)
+            if before_commit is not None:
+                before_commit(session)
+            return response
 
     def publish_validated_job(
         self,
@@ -2401,8 +2530,8 @@ class ControlService:
         now = utc_now()
         request_body = {"expected_draft_spec_hash": expected_draft_spec_hash}
         with self.sessions.begin() as session:
-            job = self._visible_job(session, principal, job_id, lock=True)
             organization = self._lock_organization(session, principal.organization_id)
+            job = self._visible_job(session, principal, job_id, lock=True)
             replay = self._claim_idempotency(
                 session,
                 actor_id=principal.user_id,
@@ -2413,7 +2542,11 @@ class ControlService:
             )
             if replay is not None:
                 return OperationResult(
-                    JobVersionResponse.model_validate(replay.response_body),
+                    self._job_version_replay_response(
+                        session,
+                        record=replay,
+                        job_id=job.id,
+                    ),
                     replayed=True,
                 )
             if job.row_version != expected_version:
@@ -2498,9 +2631,7 @@ class ControlService:
                 target_datasource_revision_id=target_revision.id,
                 source_endpoint_policy_revision_id=source_revision.endpoint_policy_revision_id,
                 target_endpoint_policy_revision_id=target_revision.endpoint_policy_revision_id,
-                source_physical_table_identity_hash=report[
-                    "source_physical_table_identity_hash"
-                ],
+                source_physical_table_identity_hash=report["source_physical_table_identity_hash"],
                 target_namespace_id=target_namespace.id,
                 transfer_policy_id=policy.id,
                 transfer_policy_scope_hash=policy.scope_hash,
@@ -2637,12 +2768,25 @@ class ControlService:
         idempotency_key: str,
         audit: AuditContext,
     ) -> OperationResult[ExecutionResponse]:
+        replay = self._read_completed_execution_idempotency_replay(
+            principal=principal,
+            job_id=job_id,
+            idempotency_key=idempotency_key,
+            request_body=request.model_dump(mode="json"),
+        )
+        if replay is not None:
+            return replay
         now = utc_now()
         try:
             with self.sessions.begin() as session:
+                # SystemControl is globally ordered before Organization.  This
+                # keeps new-execution admission compatible with retention and
+                # runtime-validation C, which also need the control fact before
+                # organization audit work.
+                self._require_accepting_new_executions(session)
+                organization = self._lock_organization(session, principal.organization_id)
                 job = self._visible_job(session, principal, job_id, lock=True)
                 self._require_project_role(principal, job.project_id, {Role.OPERATOR})
-                organization = self._lock_organization(session, principal.organization_id)
                 replay = self._claim_idempotency(
                     session,
                     actor_id=principal.user_id,
@@ -2653,16 +2797,15 @@ class ControlService:
                 )
                 if replay is not None:
                     return OperationResult(
-                        ExecutionResponse.model_validate(replay.response_body),
+                        self._execution_replay_response(
+                            session,
+                            record=replay,
+                            job_id=job_id,
+                        ),
                         replayed=True,
                     )
-                self._require_accepting_new_executions(session)
                 version = session.get(JobVersion, request.job_version_id)
-                if (
-                    version is None
-                    or version.job_id != job.id
-                    or job.status != "PUBLISHED"
-                ):
+                if version is None or version.job_id != job.id or job.status != "PUBLISHED":
                     raise ProblemException(
                         status=409,
                         code="JOB_NOT_PUBLISHED",
@@ -2719,9 +2862,7 @@ class ControlService:
                         detail="同一物理目标表只能存在一个排队、活动或恢复中工作。",
                     )
                 queued_count = session.scalar(
-                    select(func.count(Execution.id)).where(
-                        Execution.process_state == "QUEUED"
-                    )
+                    select(func.count(Execution.id)).where(Execution.process_state == "QUEUED")
                 )
                 if (queued_count or 0) >= 200:
                     raise ProblemException(
@@ -2759,12 +2900,8 @@ class ControlService:
                     timeout_seconds=spec.execution_policy.timeout_seconds,
                     source_datasource_revision_id=version.source_datasource_revision_id,
                     target_datasource_revision_id=version.target_datasource_revision_id,
-                    source_endpoint_policy_revision_id=(
-                        version.source_endpoint_policy_revision_id
-                    ),
-                    target_endpoint_policy_revision_id=(
-                        version.target_endpoint_policy_revision_id
-                    ),
+                    source_endpoint_policy_revision_id=(version.source_endpoint_policy_revision_id),
+                    target_endpoint_policy_revision_id=(version.target_endpoint_policy_revision_id),
                     target_namespace_id=version.target_namespace_id,
                     source_quiescence_confirmation=(
                         request.source_quiescence_confirmation.model_dump(mode="json")
@@ -2788,9 +2925,7 @@ class ControlService:
                 target_lock = TargetCopyLock(
                     id=uuid4(),
                     target_namespace_id=target_namespace.id,
-                    physical_table_identity_hash=(
-                        target_namespace.physical_table_identity_hash
-                    ),
+                    physical_table_identity_hash=(target_namespace.physical_table_identity_hash),
                     execution_id=execution.id,
                     state="RESERVED",
                     reserved_at=now,
@@ -2945,39 +3080,25 @@ class ControlService:
             if data_effects:
                 statement = statement.where(Execution.data_effect.in_(data_effects))
             if verification_states:
-                statement = statement.where(
-                    Execution.verification_state.in_(verification_states)
-                )
+                statement = statement.where(Execution.verification_state.in_(verification_states))
             if target_exclusivity_statuses:
                 statement = statement.where(
-                    Execution.target_exclusivity_status.in_(
-                        target_exclusivity_statuses
-                    )
+                    Execution.target_exclusivity_status.in_(target_exclusivity_statuses)
                 )
             if job_id is not None:
                 statement = statement.where(Execution.job_id == job_id)
             if job_version_id is not None:
-                statement = statement.where(
-                    Execution.job_version_id == job_version_id
-                )
+                statement = statement.where(Execution.job_version_id == job_version_id)
             if requested_by is not None:
                 statement = statement.where(Execution.requested_by == requested_by)
             if queued_from is not None:
-                statement = statement.where(
-                    Execution.queued_at >= ensure_aware(queued_from)
-                )
+                statement = statement.where(Execution.queued_at >= ensure_aware(queued_from))
             if queued_to is not None:
-                statement = statement.where(
-                    Execution.queued_at < ensure_aware(queued_to)
-                )
+                statement = statement.where(Execution.queued_at < ensure_aware(queued_to))
             if is_rerun is True:
-                statement = statement.where(
-                    Execution.rerun_of_execution_id.is_not(None)
-                )
+                statement = statement.where(Execution.rerun_of_execution_id.is_not(None))
             elif is_rerun is False:
-                statement = statement.where(
-                    Execution.rerun_of_execution_id.is_(None)
-                )
+                statement = statement.where(Execution.rerun_of_execution_id.is_(None))
             if unresolved_failure is not None:
                 unresolved = select(TargetCopyLock.execution_id).where(
                     TargetCopyLock.state == "RECOVERY_REQUIRED"
@@ -2993,28 +3114,14 @@ class ControlService:
                     "process_state": sorted(process_states or []),
                     "data_effect": sorted(data_effects or []),
                     "verification_state": sorted(verification_states or []),
-                    "target_exclusivity_status": sorted(
-                        target_exclusivity_statuses or []
-                    ),
+                    "target_exclusivity_status": sorted(target_exclusivity_statuses or []),
                     "job_id": str(job_id) if job_id is not None else None,
-                    "job_version_id": (
-                        str(job_version_id)
-                        if job_version_id is not None
-                        else None
-                    ),
-                    "requested_by": (
-                        str(requested_by) if requested_by is not None else None
-                    ),
+                    "job_version_id": (str(job_version_id) if job_version_id is not None else None),
+                    "requested_by": (str(requested_by) if requested_by is not None else None),
                     "from": (
-                        _rfc3339(ensure_aware(queued_from))
-                        if queued_from is not None
-                        else None
+                        _rfc3339(ensure_aware(queued_from)) if queued_from is not None else None
                     ),
-                    "to": (
-                        _rfc3339(ensure_aware(queued_to))
-                        if queued_to is not None
-                        else None
-                    ),
+                    "to": (_rfc3339(ensure_aware(queued_to)) if queued_to is not None else None),
                     "is_rerun": is_rerun,
                     "unresolved_failure": unresolved_failure,
                 },
@@ -3085,7 +3192,11 @@ class ControlService:
             )
             if replay is not None:
                 return OperationResult(
-                    CancelRequestResponse.model_validate(replay.response_body),
+                    self._cancel_request_replay_response(
+                        session,
+                        record=replay,
+                        execution_id=execution.id,
+                    ),
                     replayed=True,
                 )
             if execution.process_state in _TERMINAL_STATES:
@@ -3171,7 +3282,11 @@ class ControlService:
             )
             if replay is not None:
                 return OperationResult(
-                    ExecutionResponse.model_validate(replay.response_body),
+                    self._exact_execution_replay_response(
+                        session,
+                        record=replay,
+                        execution_id=execution.id,
+                    ),
                     replayed=True,
                 )
             if execution.process_state in _TERMINAL_STATES:
@@ -3182,10 +3297,9 @@ class ControlService:
                     detail="历史结论不会被墙上时钟或后续请求改写。",
                 )
             confirmation = execution.target_exclusivity_confirmation
-            if (
-                request.responsible_party != confirmation.get("responsible_party")
-                or request.statement_version != confirmation.get("statement_version")
-            ):
+            if request.responsible_party != confirmation.get(
+                "responsible_party"
+            ) or request.statement_version != confirmation.get("statement_version"):
                 raise ProblemException(
                     status=422,
                     code="TARGET_EXCLUSIVITY_CONFIRMATION_MISMATCH",
@@ -3303,9 +3417,7 @@ class ControlService:
             # claim cannot pass a stale `draining=false` observation and then
             # commit after stop preflight has checked for active work.
             control = session.scalar(
-                select(SystemControl)
-                .where(SystemControl.singleton_id == 1)
-                .with_for_update()
+                select(SystemControl).where(SystemControl.singleton_id == 1).with_for_update()
             )
             if control is None or control.draining:
                 raise ProblemException(
@@ -3394,10 +3506,7 @@ class ControlService:
                 or execution.target_exclusivity_revocation_reason is not None
                 or valid_until <= now
             ):
-                if (
-                    execution.target_exclusivity_status == "ACTIVE"
-                    and valid_until <= now
-                ):
+                if execution.target_exclusivity_status == "ACTIVE" and valid_until <= now:
                     self._ensure_target_exclusivity_termination(
                         session,
                         execution=execution,
@@ -3424,36 +3533,9 @@ class ControlService:
                     detail="Worker 不会在没有匹配 RESERVED 锁时启动外部连接。",
                 )
             version = session.get(JobVersion, execution.job_version_id)
-            policy = (
-                session.scalar(
-                    select(TransferPolicy)
-                    .where(TransferPolicy.id == version.transfer_policy_id)
-                    .with_for_update()
-                )
-                if version
-                else None
-            )
-            if (
-                version is None
-                or policy is None
-                or policy.status != "ACTIVE"
-                or policy.scope_hash != version.transfer_policy_scope_hash
-            ):
+            if version is None:
                 execution.queue_eligibility_state = "BLOCKED"
                 execution.queue_block_reason = "TRANSFER_POLICY_NOT_ACTIVE"
-                execution.queue_state_changed_at = now
-                execution.state_version += 1
-                return None
-            try:
-                self.require_job_version_plugin_certification(
-                    version=version,
-                    now=now,
-                )
-            except ProblemException as exc:
-                if exc.code != "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED":
-                    raise
-                execution.queue_eligibility_state = "BLOCKED"
-                execution.queue_block_reason = "PLUGIN_E4_CERTIFICATION_BLOCKED"
                 execution.queue_state_changed_at = now
                 execution.state_version += 1
                 return None
@@ -3484,40 +3566,10 @@ class ControlService:
                 execution.queue_state_changed_at = now
                 execution.state_version += 1
                 return None
-            endpoint_policy_ids = {
-                source_policy_revision.endpoint_policy_id,
-                target_policy_revision.endpoint_policy_id,
-            }
-            endpoint_policies = {
-                item.id: item
-                for item in session.scalars(
-                    select(EndpointPolicy)
-                    .where(EndpointPolicy.id.in_(endpoint_policy_ids))
-                    .order_by(EndpointPolicy.id)
-                    .with_for_update()
-                )
-            }
-            source_endpoint_policy = endpoint_policies.get(
-                source_policy_revision.endpoint_policy_id
-            )
-            target_endpoint_policy = endpoint_policies.get(
-                target_policy_revision.endpoint_policy_id
-            )
-            if (
-                source_endpoint_policy is None
-                or target_endpoint_policy is None
-                or source_endpoint_policy.status != "ACTIVE"
-                or target_endpoint_policy.status != "ACTIVE"
-                or source_endpoint_policy.current_revision_id
-                != source_policy_revision.id
-                or target_endpoint_policy.current_revision_id
-                != target_policy_revision.id
-            ):
-                execution.queue_eligibility_state = "BLOCKED"
-                execution.queue_block_reason = "ENDPOINT_POLICY_NOT_ACTIVE"
-                execution.queue_state_changed_at = now
-                execution.state_version += 1
-                return None
+            # Job validation locks runtime before Datasource and then follows
+            # Datasource -> EndpointPolicy -> TransferPolicy.  Keep claim on
+            # that same order after its SystemControl/queue locks so a real
+            # PostgreSQL worker cannot form a policy/datasource cycle with C.
             datasource_ids = {
                 source_revision.datasource_id,
                 target_revision.datasource_id,
@@ -3554,6 +3606,66 @@ class ControlService:
                 execution.queue_state_changed_at = now
                 execution.state_version += 1
                 return None
+            endpoint_policy_ids = {
+                source_policy_revision.endpoint_policy_id,
+                target_policy_revision.endpoint_policy_id,
+            }
+            endpoint_policies = {
+                item.id: item
+                for item in session.scalars(
+                    select(EndpointPolicy)
+                    .where(EndpointPolicy.id.in_(endpoint_policy_ids))
+                    .order_by(EndpointPolicy.id)
+                    .with_for_update()
+                )
+            }
+            source_endpoint_policy = endpoint_policies.get(
+                source_policy_revision.endpoint_policy_id
+            )
+            target_endpoint_policy = endpoint_policies.get(
+                target_policy_revision.endpoint_policy_id
+            )
+            if (
+                source_endpoint_policy is None
+                or target_endpoint_policy is None
+                or source_endpoint_policy.status != "ACTIVE"
+                or target_endpoint_policy.status != "ACTIVE"
+                or source_endpoint_policy.current_revision_id != source_policy_revision.id
+                or target_endpoint_policy.current_revision_id != target_policy_revision.id
+            ):
+                execution.queue_eligibility_state = "BLOCKED"
+                execution.queue_block_reason = "ENDPOINT_POLICY_NOT_ACTIVE"
+                execution.queue_state_changed_at = now
+                execution.state_version += 1
+                return None
+            policy = session.scalar(
+                select(TransferPolicy)
+                .where(TransferPolicy.id == version.transfer_policy_id)
+                .with_for_update()
+            )
+            if (
+                policy is None
+                or policy.status != "ACTIVE"
+                or policy.scope_hash != version.transfer_policy_scope_hash
+            ):
+                execution.queue_eligibility_state = "BLOCKED"
+                execution.queue_block_reason = "TRANSFER_POLICY_NOT_ACTIVE"
+                execution.queue_state_changed_at = now
+                execution.state_version += 1
+                return None
+            try:
+                self.require_job_version_plugin_certification(
+                    version=version,
+                    now=now,
+                )
+            except ProblemException as exc:
+                if exc.code != "PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED":
+                    raise
+                execution.queue_eligibility_state = "BLOCKED"
+                execution.queue_block_reason = "PLUGIN_E4_CERTIFICATION_BLOCKED"
+                execution.queue_state_changed_at = now
+                execution.state_version += 1
+                return None
             try:
                 credential_binding = credential_selector(
                     session,
@@ -3585,10 +3697,8 @@ class ControlService:
             if (
                 source_datasource.status != "ACTIVE"
                 or target_datasource.status != "ACTIVE"
-                or source_datasource.current_secret_id
-                != credential_binding.source_secret_id
-                or target_datasource.current_secret_id
-                != credential_binding.target_secret_id
+                or source_datasource.current_secret_id != credential_binding.source_secret_id
+                or target_datasource.current_secret_id != credential_binding.target_secret_id
             ):
                 execution.queue_eligibility_state = "BLOCKED"
                 execution.queue_block_reason = "CREDENTIAL_BINDING_NOT_ACTIVE"
@@ -3627,12 +3737,8 @@ class ControlService:
             execution.attempt_count = attempt_no
             execution.source_secret_id = credential_binding.source_secret_id
             execution.target_secret_id = credential_binding.target_secret_id
-            execution.source_secret_envelope_id = (
-                credential_binding.source_secret_envelope_id
-            )
-            execution.target_secret_envelope_id = (
-                credential_binding.target_secret_envelope_id
-            )
+            execution.source_secret_envelope_id = credential_binding.source_secret_envelope_id
+            execution.target_secret_envelope_id = credential_binding.target_secret_envelope_id
             execution.source_secret_version = credential_binding.source_secret_version
             execution.target_secret_version = credential_binding.target_secret_version
             eligible_since = ensure_aware(execution.queue_state_changed_at)
@@ -3806,12 +3912,8 @@ class ControlService:
                 target_evidence_id=preflight.target_connection_evidence_id,
                 source_revision_id=source_revision.id,
                 target_revision_id=target_revision.id,
-                source_policy_revision_id=(
-                    execution.source_endpoint_policy_revision_id
-                ),
-                target_policy_revision_id=(
-                    execution.target_endpoint_policy_revision_id
-                ),
+                source_policy_revision_id=(execution.source_endpoint_policy_revision_id),
+                target_policy_revision_id=(execution.target_endpoint_policy_revision_id),
             )
             (
                 snapshot,
@@ -4048,14 +4150,11 @@ class ControlService:
                 "INCONCLUSIVE" if verification_inconclusive else "NOT_STARTED"
             )
             execution.exit_code = (
-                attempt.exit_code
-                if attempt.exit_code is not None
-                else execution.exit_code
+                attempt.exit_code if attempt.exit_code is not None else execution.exit_code
             )
             execution.failure_code = failure_code
             execution.failure_message = (
-                "A safety termination request stopped this execution; "
-                "manual recovery is required."
+                "A safety termination request stopped this execution; manual recovery is required."
             )
             if from_state != "STARTING":
                 execution.summary_parse_status = "FAILED"
@@ -4190,8 +4289,7 @@ class ControlService:
             if active_terminations and not (
                 new_state == "SUCCEEDED"
                 and all(
-                    item.reason_code
-                    in {"TARGET_EXCLUSIVITY_REVOKED", "TARGET_EXCLUSIVITY_EXPIRED"}
+                    item.reason_code in {"TARGET_EXCLUSIVITY_REVOKED", "TARGET_EXCLUSIVITY_EXPIRED"}
                     for item in active_terminations
                 )
             ):
@@ -4224,9 +4322,7 @@ class ControlService:
             if expiration_termination is not None and new_state != "SUCCEEDED":
                 return "TERMINATION_PENDING"
             parsed_run_summary = (
-                RunSummary.model_validate(run_summary)
-                if run_summary is not None
-                else None
+                RunSummary.model_validate(run_summary) if run_summary is not None else None
             )
             active_cancel = None
             if new_state in _TERMINAL_STATES:
@@ -4234,9 +4330,7 @@ class ControlService:
                     select(ExecutionCancelRequest)
                     .where(
                         ExecutionCancelRequest.execution_id == execution.id,
-                        ExecutionCancelRequest.status.in_(
-                            ("PENDING", "ACKNOWLEDGED")
-                        ),
+                        ExecutionCancelRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
                     )
                     .with_for_update()
                 )
@@ -4263,10 +4357,7 @@ class ControlService:
                     raise ValueError("parsed run summary is required")
                 if summary_parse_status != "SUCCEEDED" and parsed_run_summary is not None:
                     raise ValueError("run summary requires successful parsing")
-                if (
-                    parsed_run_summary is not None
-                    and parsed_run_summary.records_failed != 0
-                ):
+                if parsed_run_summary is not None and parsed_run_summary.records_failed != 0:
                     raise ValueError("V1 dirty-data tolerance is zero")
                 execution.summary_parse_status = summary_parse_status
                 execution.run_summary = (
@@ -4334,12 +4425,9 @@ class ControlService:
                         or exit_code != 0
                         or not verification_report
                         or verification_evidence_hash is None
-                        or execution.summary_parse_status
-                        not in {"SUCCEEDED", "FAILED"}
+                        or execution.summary_parse_status not in {"SUCCEEDED", "FAILED"}
                     ):
-                        raise ValueError(
-                            "SUCCEEDED requires confirmed independent verification"
-                        )
+                        raise ValueError("SUCCEEDED requires confirmed independent verification")
                     summary = self._validate_successful_verification(
                         execution=execution,
                         target_lock=target_lock,
@@ -4352,12 +4440,9 @@ class ControlService:
                     )
                     if (
                         summary.target_snapshot_finished_at is None
-                        or summary.target_snapshot_finished_at
-                        > confirmation_valid_until
+                        or summary.target_snapshot_finished_at > confirmation_valid_until
                     ):
-                        raise ValueError(
-                            "target snapshot must finish within exclusivity window"
-                        )
+                        raise ValueError("target snapshot must finish within exclusivity window")
                     target_lock.state = "RELEASED"
                     target_lock.released_at = now
             elif new_state in _TERMINAL_STATES:
@@ -4381,9 +4466,7 @@ class ControlService:
             execution.verification_report = verification_report
             execution.verification_evidence_hash = verification_evidence_hash
             execution.failure_code = failure_code
-            execution.failure_message = (
-                failure_message[:2000] if failure_message else None
-            )
+            execution.failure_message = failure_message[:2000] if failure_message else None
             execution.state_version += 1
             if new_state in _TERMINAL_STATES:
                 execution.finished_at = now
@@ -4562,12 +4645,15 @@ class ControlService:
                 or target_lock.fence_epoch != claim.fence_epoch
             ):
                 self._fence_lost()
-            if self._ensure_target_exclusivity_termination(
-                session,
-                execution=execution,
-                now=now,
-                attempt_id=attempt.id,
-            ) is not None:
+            if (
+                self._ensure_target_exclusivity_termination(
+                    session,
+                    execution=execution,
+                    now=now,
+                    attempt_id=attempt.id,
+                )
+                is not None
+            ):
                 return True
             execution.verification_state = "VERIFYING"
             execution.state_version += 1
@@ -4692,9 +4778,7 @@ class ControlService:
                 from_state="QUEUED",
                 to_state="CANCELED",
                 payload={
-                    "target_exclusivity_status": (
-                        execution.target_exclusivity_status
-                    ),
+                    "target_exclusivity_status": (execution.target_exclusivity_status),
                     "target_lock_state": "RELEASED",
                 },
                 now=now,
@@ -4852,9 +4936,7 @@ class ControlService:
             path="verification_evidence",
         )
         identity_scheme = (
-            "MYSQL_SERVER_UUID"
-            if engine == "MYSQL_8"
-            else "POSTGRES_SYSTEM_IDENTIFIER"
+            "MYSQL_SERVER_UUID" if engine == "MYSQL_8" else "POSTGRES_SYSTEM_IDENTIFIER"
         )
         server_identity_hash = hashlib.sha256(
             (
@@ -4874,12 +4956,10 @@ class ControlService:
             organization = self._lock_organization(session, principal.organization_id)
             existing = session.scalar(
                 select(PhysicalEndpointIdentity).where(
-                    PhysicalEndpointIdentity.organization_id
-                    == principal.organization_id,
+                    PhysicalEndpointIdentity.organization_id == principal.organization_id,
                     PhysicalEndpointIdentity.engine == engine,
                     PhysicalEndpointIdentity.identity_scheme == identity_scheme,
-                    PhysicalEndpointIdentity.server_identity_hash
-                    == server_identity_hash,
+                    PhysicalEndpointIdentity.server_identity_hash == server_identity_hash,
                 )
             )
             if existing is not None:
@@ -4958,6 +5038,9 @@ class ControlService:
         _reject_connection_option_secrets(options)
         now = utc_now()
         with self.sessions.begin() as session:
+            # Job validation obtains Organization before Project.  This
+            # trusted helper can race it, so preserve that product-wide order.
+            organization = self._lock_organization(session, principal.organization_id)
             project = self._visible_project(session, principal, project_id, lock=True)
             if project.status != "ACTIVE":
                 raise ProblemException(
@@ -4966,7 +5049,6 @@ class ControlService:
                     title="项目已归档",
                     detail="归档项目不能新增数据源。",
                 )
-            organization = self._lock_organization(session, principal.organization_id)
             policy_revision = session.get(
                 EndpointPolicyRevision,
                 endpoint_policy_revision_id,
@@ -5185,12 +5267,8 @@ class ControlService:
         window_to: datetime | None,
         scope_prefix: str,
     ) -> AuditPage:
-        normalized_from = (
-            ensure_aware(window_from) if window_from is not None else None
-        )
-        normalized_to = (
-            ensure_aware(window_to) if window_to is not None else None
-        )
+        normalized_from = ensure_aware(window_from) if window_from is not None else None
+        normalized_to = ensure_aware(window_to) if window_to is not None else None
         if (
             normalized_from is not None
             and normalized_to is not None
@@ -5210,36 +5288,24 @@ class ControlService:
             "from": _rfc3339(normalized_from) if normalized_from else None,
             "to": _rfc3339(normalized_to) if normalized_to else None,
         }
-        cursor_scope = (
-            f"{scope_prefix}:"
-            f"{_domain_hash('DXAUDITFILTERv1', filter_document)}"
-        )
+        cursor_scope = f"{scope_prefix}:{_domain_hash('DXAUDITFILTERv1', filter_document)}"
         statement = select(AuditEvent).where(
             AuditEvent.organization_id == principal.organization_id
         )
         if project_id is not None:
             statement = statement.where(AuditEvent.project_id == project_id)
         if action is not None:
-            statement = statement.where(
-                AuditEvent.event_json["action"].as_string() == action
-            )
+            statement = statement.where(AuditEvent.event_json["action"].as_string() == action)
         if outcome is not None:
-            statement = statement.where(
-                AuditEvent.event_json["outcome"].as_string() == outcome
-            )
+            statement = statement.where(AuditEvent.event_json["outcome"].as_string() == outcome)
         if actor_id is not None:
             statement = statement.where(
-                AuditEvent.event_json["actor"]["user_id"].as_string()
-                == str(actor_id)
+                AuditEvent.event_json["actor"]["user_id"].as_string() == str(actor_id)
             )
         if normalized_from is not None:
-            statement = statement.where(
-                AuditEvent.occurred_at >= normalized_from
-            )
+            statement = statement.where(AuditEvent.occurred_at >= normalized_from)
         if normalized_to is not None:
-            statement = statement.where(
-                AuditEvent.occurred_at < normalized_to
-            )
+            statement = statement.where(AuditEvent.occurred_at < normalized_to)
         if cursor is not None:
             occurred_at, event_id = self._decode_cursor(
                 cursor,
@@ -5294,10 +5360,7 @@ class ControlService:
             Project.id == project_id,
             Project.organization_id == principal.organization_id,
         )
-        if (
-            not principal.is_admin
-            and project_id not in self._visible_project_ids(principal)
-        ):
+        if not principal.is_admin and project_id not in self._visible_project_ids(principal):
             self._not_found()
         if lock:
             statement = statement.with_for_update()
@@ -5346,8 +5409,7 @@ class ControlService:
             for assignment in principal.role_assignments
             if assignment.scope_type == ScopeType.PROJECT
             and any(
-                role in {Role.DEVELOPER, Role.OPERATOR, Role.VIEWER}
-                for role in assignment.roles
+                role in {Role.DEVELOPER, Role.OPERATOR, Role.VIEWER} for role in assignment.roles
             )
         }
 
@@ -5405,9 +5467,7 @@ class ControlService:
         organization_id: UUID,
     ) -> Organization:
         organization = session.scalar(
-            select(Organization)
-            .where(Organization.id == organization_id)
-            .with_for_update()
+            select(Organization).where(Organization.id == organization_id).with_for_update()
         )
         if organization is None or organization.status != "ACTIVE":
             self._not_found()
@@ -5506,12 +5566,8 @@ class ControlService:
         source_snapshot: dict[str, Any],
         target_snapshot: dict[str, Any],
     ) -> None:
-        source_columns = {
-            item["name"]: item for item in source_snapshot["columns"]
-        }
-        target_columns = {
-            item["name"]: item for item in target_snapshot["columns"]
-        }
+        source_columns = {item["name"]: item for item in source_snapshot["columns"]}
+        target_columns = {item["name"]: item for item in target_snapshot["columns"]}
         for mapping in spec.mappings:
             source = source_columns.get(mapping.source_column)
             target = target_columns.get(mapping.target_column)
@@ -5520,10 +5576,8 @@ class ControlService:
                 or target is None
                 or source["ordinal_position"] != mapping.source_ordinal
                 or target["ordinal_position"] != mapping.target_ordinal
-                or str(source["native_type"]).casefold()
-                != mapping.source_type.casefold()
-                or str(target["native_type"]).casefold()
-                != mapping.target_type.casefold()
+                or str(source["native_type"]).casefold() != mapping.source_type.casefold()
+                or str(target["native_type"]).casefold() != mapping.target_type.casefold()
                 or source["nullable"] != mapping.source_nullable
                 or target["nullable"] != mapping.target_nullable
                 or source["logical_type"] != mapping.oracle_logical_type
@@ -5596,10 +5650,8 @@ class ControlService:
         spec: JobSpecV1,
     ) -> None:
         if (
-            policy.source_datasource_revision_id
-            != spec.source.datasource_revision_id
-            or policy.target_datasource_revision_id
-            != spec.target.datasource_revision_id
+            policy.source_datasource_revision_id != spec.source.datasource_revision_id
+            or policy.target_datasource_revision_id != spec.target.datasource_revision_id
         ):
             raise ProblemException(
                 status=409,
@@ -5646,9 +5698,7 @@ class ControlService:
         now: datetime,
     ) -> None:
         source_confirmed_at = request.source_quiescence_confirmation.confirmed_at.astimezone(UTC)
-        target_confirmed_at = (
-            request.target_exclusivity_confirmation.confirmed_at.astimezone(UTC)
-        )
+        target_confirmed_at = request.target_exclusivity_confirmation.confirmed_at.astimezone(UTC)
         valid_until = request.target_exclusivity_confirmation.valid_until.astimezone(UTC)
         future_tolerance = now + timedelta(minutes=5)
         if source_confirmed_at > future_tolerance or target_confirmed_at > future_tolerance:
@@ -5690,10 +5740,8 @@ class ControlService:
         if (
             runtime_preflight.datax_release != version.datax_release
             or runtime_preflight.runtime_sha256 != version.runtime_sha256
-            or runtime_preflight.reader_plugin_sha256
-            != version.reader_plugin_sha256
-            or runtime_preflight.writer_plugin_sha256
-            != version.writer_plugin_sha256
+            or runtime_preflight.reader_plugin_sha256 != version.reader_plugin_sha256
+            or runtime_preflight.writer_plugin_sha256 != version.writer_plugin_sha256
         ):
             raise ProblemException(
                 status=409,
@@ -5727,8 +5775,7 @@ class ControlService:
             or target_empty.target_namespace_id != target_namespace.id
             or target_empty.physical_table_identity_hash
             != target_namespace.physical_table_identity_hash
-            or target_empty.connection_evidence_id
-            != target_connection_evidence_id
+            or target_empty.connection_evidence_id != target_connection_evidence_id
             or checked_at < confirmed_at
             or checked_at > observed_at + timedelta(seconds=5)
             or checked_at > valid_until
@@ -5746,28 +5793,18 @@ class ControlService:
             target_schema_hash=version.target_schema_hash,
             source_datasource_revision_id=source_revision.id,
             target_datasource_revision_id=target_revision.id,
-            source_endpoint_policy_revision_id=(
-                execution.source_endpoint_policy_revision_id
-            ),
-            target_endpoint_policy_revision_id=(
-                execution.target_endpoint_policy_revision_id
-            ),
-            source_physical_endpoint_identity_id=(
-                source_revision.physical_endpoint_identity_id
-            ),
+            source_endpoint_policy_revision_id=(execution.source_endpoint_policy_revision_id),
+            target_endpoint_policy_revision_id=(execution.target_endpoint_policy_revision_id),
+            source_physical_endpoint_identity_id=(source_revision.physical_endpoint_identity_id),
             target_namespace=TargetNamespaceSnapshot(
                 target_namespace_id=target_namespace.id,
-                physical_endpoint_identity_id=(
-                    target_namespace.physical_endpoint_identity_id
-                ),
+                physical_endpoint_identity_id=(target_namespace.physical_endpoint_identity_id),
                 engine=target_namespace.engine,
                 normalized_catalog_name=target_namespace.normalized_catalog_name,
                 normalized_schema_name=target_namespace.normalized_schema_name,
                 normalized_table_name=target_namespace.normalized_table_name,
                 normalization_version=target_namespace.normalization_version,
-                physical_table_identity_hash=(
-                    target_namespace.physical_table_identity_hash
-                ),
+                physical_table_identity_hash=(target_namespace.physical_table_identity_hash),
             ),
             transfer_policy_scope_hash=version.transfer_policy_scope_hash,
             source_secret_version=credential_binding.source_secret_version,
@@ -5788,13 +5825,9 @@ class ControlService:
             source_quiescence_confirmed_by=execution.requested_by,
             source_quiescence_accepted_at=accepted_at,
             target_exclusivity_confirmed_by=execution.requested_by,
-            target_exclusivity_responsible_party=confirmation[
-                "responsible_party"
-            ],
+            target_exclusivity_responsible_party=confirmation["responsible_party"],
             target_exclusivity_accepted_at=accepted_at,
-            target_exclusivity_statement_version=confirmation[
-                "statement_version"
-            ],
+            target_exclusivity_statement_version=confirmation["statement_version"],
             target_exclusivity_valid_until=valid_until,
             target_exclusivity_confirmation_sha256=_domain_hash(
                 "DXTARGETEXCLUSIVITYv1",
@@ -5864,9 +5897,7 @@ class ControlService:
         )
         artifact_payload = dict(report)
         artifact_payload.pop("artifact_sha256")
-        computed_artifact_hash = hashlib.sha256(
-            rfc8785.dumps(artifact_payload)
-        ).hexdigest()
+        computed_artifact_hash = hashlib.sha256(rfc8785.dumps(artifact_payload)).hexdigest()
         if (
             claimed_artifact_hash != computed_artifact_hash
             or verification_evidence_hash != computed_artifact_hash
@@ -5965,25 +5996,20 @@ class ControlService:
             != _parse_timestamp(source_confirmation["confirmed_at"])
             or source_quiescence["unchanged"] is not True
             or source_preflight_hash != source_post_hash
-            or oracle_target_lock["lock_key_hash"]
-            != target_lock.physical_table_identity_hash
+            or oracle_target_lock["lock_key_hash"] != target_lock.physical_table_identity_hash
             or oracle_target_lock["fence_epoch"] != execution.fence_epoch
             or oracle_target_lock["held_through_verification"] is not True
             or target_exclusivity["mode"] != "OPERATOR_OR_DBA_CONFIRMED"
-            or target_exclusivity["statement_version"]
-            != confirmation["statement_version"]
-            or target_exclusivity["responsible_party"]
-            != confirmation["responsible_party"]
+            or target_exclusivity["statement_version"] != confirmation["statement_version"]
+            or target_exclusivity["responsible_party"] != confirmation["responsible_party"]
             or target_exclusivity["status"] != "ACTIVE"
             or target_exclusivity["revoked_at"] is not None
             or target_exclusivity["revocation_reason"] is not None
             or target_exclusivity["valid_through_target_snapshot"] is not True
             or target_exclusivity["confirmation_evidence_sha256"]
             != runtime.target_exclusivity_confirmation_sha256
-            or target_result["snapshot_mode"]
-            != "SINGLE_CONSISTENT_READ_TRANSACTION"
-            or target_exclusivity["target_snapshot_id"]
-            != target_result["snapshot_id"]
+            or target_result["snapshot_mode"] != "SINGLE_CONSISTENT_READ_TRANSACTION"
+            or target_exclusivity["target_snapshot_id"] != target_result["snapshot_id"]
         ):
             raise ValueError("verification preconditions are not preserved")
         if (
@@ -6014,8 +6040,7 @@ class ControlService:
             or any(
                 not isinstance(mapping, dict)
                 or mapping.get("ordinal") != index
-                or set(mapping)
-                != {"ordinal", "source_column", "target_column", "logical_type"}
+                or set(mapping) != {"ordinal", "source_column", "target_column", "logical_type"}
                 for index, mapping in enumerate(mappings, start=1)
             )
         ):
@@ -6039,15 +6064,9 @@ class ControlService:
         report_finished_at = _parse_timestamp(report["finished_at"])
         target_confirmed_at = _parse_timestamp(target_exclusivity["confirmed_at"])
         target_valid_until = _parse_timestamp(target_exclusivity["valid_until"])
-        target_empty_checked_at = _parse_timestamp(
-            target_exclusivity["target_empty_checked_at"]
-        )
-        target_snapshot_started_at = _parse_timestamp(
-            target_result["snapshot_started_at"]
-        )
-        target_snapshot_finished_at = _parse_timestamp(
-            target_result["snapshot_finished_at"]
-        )
+        target_empty_checked_at = _parse_timestamp(target_exclusivity["target_empty_checked_at"])
+        target_snapshot_started_at = _parse_timestamp(target_result["snapshot_started_at"])
+        target_snapshot_finished_at = _parse_timestamp(target_result["snapshot_finished_at"])
         target_read_started_at = _parse_timestamp(target_result["read_started_at"])
         target_read_finished_at = _parse_timestamp(target_result["read_finished_at"])
         if (
@@ -6165,9 +6184,7 @@ class ControlService:
     ) -> WorkTerminationRequest | None:
         """Persist expiry/revocation before a Worker acts on the safety stop."""
 
-        valid_until = _parse_timestamp(
-            execution.target_exclusivity_confirmation["valid_until"]
-        )
+        valid_until = _parse_timestamp(execution.target_exclusivity_confirmation["valid_until"])
         if (
             execution.target_exclusivity_status == "ACTIVE"
             and execution.target_exclusivity_revoked_at is None
@@ -6209,9 +6226,7 @@ class ControlService:
         *,
         lock: bool = False,
     ) -> TargetCopyLock:
-        statement = select(TargetCopyLock).where(
-            TargetCopyLock.execution_id == execution_id
-        )
+        statement = select(TargetCopyLock).where(TargetCopyLock.execution_id == execution_id)
         if lock:
             statement = statement.with_for_update()
         target_lock = session.scalar(statement)
@@ -6256,9 +6271,7 @@ class ControlService:
         if lock:
             statement = statement.with_for_update()
         execution = session.scalar(statement)
-        attempt_statement = select(ExecutionAttempt).where(
-            ExecutionAttempt.id == claim.attempt_id
-        )
+        attempt_statement = select(ExecutionAttempt).where(ExecutionAttempt.id == claim.attempt_id)
         if lock:
             attempt_statement = attempt_statement.with_for_update()
         attempt = session.scalar(attempt_statement)
@@ -6443,24 +6456,16 @@ class ControlService:
                 latest_version.version_no if latest_version is not None else None
             ),
             latest_published_reader_plugin=(
-                latest_version.reader_plugin_name
-                if latest_version is not None
-                else None
+                latest_version.reader_plugin_name if latest_version is not None else None
             ),
             latest_published_writer_plugin=(
-                latest_version.writer_plugin_name
-                if latest_version is not None
-                else None
+                latest_version.writer_plugin_name if latest_version is not None else None
             ),
             latest_execution_process_state=(
-                latest_execution.process_state
-                if latest_execution is not None
-                else None
+                latest_execution.process_state if latest_execution is not None else None
             ),
             latest_execution_at=(
-                ensure_aware(latest_execution.queued_at)
-                if latest_execution is not None
-                else None
+                ensure_aware(latest_execution.queued_at) if latest_execution is not None else None
             ),
             row_version=job.row_version,
             created_at=ensure_aware(job.created_at),
@@ -6477,15 +6482,9 @@ class ControlService:
             version_artifact_hash=version.version_artifact_hash,
             source_datasource_revision_id=version.source_datasource_revision_id,
             target_datasource_revision_id=version.target_datasource_revision_id,
-            source_endpoint_policy_revision_id=(
-                version.source_endpoint_policy_revision_id
-            ),
-            target_endpoint_policy_revision_id=(
-                version.target_endpoint_policy_revision_id
-            ),
-            source_physical_table_identity_hash=(
-                version.source_physical_table_identity_hash
-            ),
+            source_endpoint_policy_revision_id=(version.source_endpoint_policy_revision_id),
+            target_endpoint_policy_revision_id=(version.target_endpoint_policy_revision_id),
+            source_physical_table_identity_hash=(version.source_physical_table_identity_hash),
             target_namespace_id=version.target_namespace_id,
             transfer_policy_id=version.transfer_policy_id,
             transfer_policy_scope_hash=version.transfer_policy_scope_hash,
@@ -6525,31 +6524,21 @@ class ControlService:
                 if execution.target_exclusivity_revoked_at
                 else None
             ),
-            target_exclusivity_revocation_reason=(
-                execution.target_exclusivity_revocation_reason
-            ),
+            target_exclusivity_revocation_reason=(execution.target_exclusivity_revocation_reason),
             source_datasource_revision_id=execution.source_datasource_revision_id,
             target_datasource_revision_id=execution.target_datasource_revision_id,
-            source_endpoint_policy_revision_id=(
-                execution.source_endpoint_policy_revision_id
-            ),
-            target_endpoint_policy_revision_id=(
-                execution.target_endpoint_policy_revision_id
-            ),
+            source_endpoint_policy_revision_id=(execution.source_endpoint_policy_revision_id),
+            target_endpoint_policy_revision_id=(execution.target_endpoint_policy_revision_id),
             target_namespace_id=execution.target_namespace_id,
             target_copy_lock=TargetCopyLockSummary(
                 target_namespace_id=target_lock.target_namespace_id,
                 state=target_lock.state,
                 reserved_at=ensure_aware(target_lock.reserved_at),
                 activated_at=(
-                    ensure_aware(target_lock.acquired_at)
-                    if target_lock.acquired_at
-                    else None
+                    ensure_aware(target_lock.acquired_at) if target_lock.acquired_at else None
                 ),
                 released_at=(
-                    ensure_aware(target_lock.released_at)
-                    if target_lock.released_at
-                    else None
+                    ensure_aware(target_lock.released_at) if target_lock.released_at else None
                 ),
                 fence_epoch=target_lock.fence_epoch,
             ),
@@ -6578,12 +6567,8 @@ class ControlService:
                 version,
             ),
             queued_at=ensure_aware(execution.queued_at),
-            started_at=(
-                ensure_aware(execution.started_at) if execution.started_at else None
-            ),
-            finished_at=(
-                ensure_aware(execution.finished_at) if execution.finished_at else None
-            ),
+            started_at=(ensure_aware(execution.started_at) if execution.started_at else None),
+            finished_at=(ensure_aware(execution.finished_at) if execution.finished_at else None),
             exit_code=execution.exit_code,
             failure_code=execution.failure_code,
             failure_message=execution.failure_message,
@@ -6652,9 +6637,8 @@ class ControlService:
             session.flush()
             existing = None
         if existing is not None:
-            if (
-                existing.request_hash_scheme != IDEMPOTENCY_HASH_SCHEME
-                or not hmac.compare_digest(existing.request_hash, request_hash)
+            if existing.request_hash_scheme != IDEMPOTENCY_HASH_SCHEME or not hmac.compare_digest(
+                existing.request_hash, request_hash
             ):
                 raise ProblemException(
                     status=409,
@@ -6686,6 +6670,225 @@ class ControlService:
         )
         session.flush()
         return None
+
+    def _read_completed_execution_idempotency_replay(
+        self,
+        *,
+        principal: Principal,
+        job_id: UUID,
+        idempotency_key: str,
+        request_body: dict[str, Any],
+    ) -> OperationResult[ExecutionResponse] | None:
+        """Read a completed execution replay before new-work admission.
+
+        A completed idempotency response represents no new execution work, so
+        it remains available while ``SystemControl.draining`` blocks fresh
+        admissions.  The read lives in a short, isolated transaction: it never
+        holds Organization and SystemControl locks together, preserving the
+        global ``SystemControl -> Organization`` order used by real execution
+        admission.
+        """
+
+        now = utc_now()
+        scope = "POST /jobs/{job_id}/executions"
+        request_hash = self._idempotency_request_hash(
+            actor_id=principal.user_id,
+            scope=scope,
+            body=request_body,
+        )
+        with self.sessions.begin() as session:
+            self._lock_organization(session, principal.organization_id)
+            job = self._visible_job(session, principal, job_id, lock=True)
+            self._require_project_role(principal, job.project_id, {Role.OPERATOR})
+            record = session.scalar(
+                select(IdempotencyRecord)
+                .where(
+                    IdempotencyRecord.actor_id == principal.user_id,
+                    IdempotencyRecord.scope == scope,
+                    IdempotencyRecord.idempotency_key == idempotency_key,
+                )
+                .with_for_update()
+            )
+            if record is None or ensure_aware(record.expires_at) <= now:
+                return None
+            if record.request_hash_scheme != IDEMPOTENCY_HASH_SCHEME or not hmac.compare_digest(
+                record.request_hash,
+                request_hash,
+            ):
+                raise ProblemException(
+                    status=409,
+                    code="IDEMPOTENCY_CONFLICT",
+                    title="Idempotency-Key 已用于不同请求",
+                    detail="请为新的业务意图使用新的 Idempotency-Key。",
+                )
+            if record.response_status is None or record.response_body is None:
+                raise ProblemException(
+                    status=409,
+                    code="IDEMPOTENCY_IN_PROGRESS",
+                    title="相同请求仍在处理中",
+                    detail="请稍后使用相同 Idempotency-Key 重试。",
+                    retryable=True,
+                    headers={"Retry-After": "1"},
+                )
+            return OperationResult(
+                self._execution_replay_response(
+                    session,
+                    record=record,
+                    job_id=job_id,
+                ),
+                replayed=True,
+            )
+
+    @staticmethod
+    def _idempotency_resource_conflict(detail: str) -> ProblemException:
+        """Fail closed when a template-scoped key points at another resource."""
+
+        return ProblemException(
+            status=409,
+            code="IDEMPOTENCY_CONFLICT",
+            title="Idempotency-Key 已用于不同请求",
+            detail=detail,
+        )
+
+    @staticmethod
+    def _execution_replay_conflict() -> ProblemException:
+        """Fail closed when an execution-create replay is bound to another Job."""
+
+        return ControlService._idempotency_resource_conflict(
+            "该 Idempotency-Key 已绑定到另一任务的执行请求。"
+        )
+
+    def _created_job_replay_response(
+        self,
+        session: Session,
+        *,
+        record: IdempotencyRecord,
+        project_id: UUID,
+    ) -> JobResponse:
+        """Bind a job-create replay to its requested Project."""
+
+        def conflict() -> ProblemException:
+            return self._idempotency_resource_conflict(
+                "该 Idempotency-Key 已绑定到另一项目的任务创建请求。"
+            )
+        if record.resource_type != "SYNC_JOB" or record.resource_id is None:
+            raise conflict()
+        job = session.get(SyncJob, record.resource_id)
+        if job is None or job.project_id != project_id:
+            raise conflict()
+        try:
+            response = JobResponse.model_validate(record.response_body)
+        except (TypeError, ValueError) as exc:
+            raise conflict() from exc
+        if response.id != job.id or response.project_id != project_id:
+            raise conflict()
+        return response
+
+    def _job_version_replay_response(
+        self,
+        session: Session,
+        *,
+        record: IdempotencyRecord,
+        job_id: UUID,
+    ) -> JobVersionResponse:
+        """Bind a publish replay to the requested Job."""
+
+        def conflict() -> ProblemException:
+            return self._idempotency_resource_conflict(
+                "该 Idempotency-Key 已绑定到另一任务的发布请求。"
+            )
+        if record.resource_type != "JOB_VERSION" or record.resource_id is None:
+            raise conflict()
+        version = session.get(JobVersion, record.resource_id)
+        if version is None or version.job_id != job_id:
+            raise conflict()
+        try:
+            response = JobVersionResponse.model_validate(record.response_body)
+        except (TypeError, ValueError) as exc:
+            raise conflict() from exc
+        if response.id != version.id or response.job_id != job_id:
+            raise conflict()
+        return response
+
+    def _cancel_request_replay_response(
+        self,
+        session: Session,
+        *,
+        record: IdempotencyRecord,
+        execution_id: UUID,
+    ) -> CancelRequestResponse:
+        """Bind a cancel replay to the requested Execution."""
+
+        def conflict() -> ProblemException:
+            return self._idempotency_resource_conflict(
+                "该 Idempotency-Key 已绑定到另一执行的取消请求。"
+            )
+        if record.resource_type != "EXECUTION_CANCEL_REQUEST" or record.resource_id is None:
+            raise conflict()
+        cancel = session.get(ExecutionCancelRequest, record.resource_id)
+        if cancel is None or cancel.execution_id != execution_id:
+            raise conflict()
+        try:
+            response = CancelRequestResponse.model_validate(record.response_body)
+        except (TypeError, ValueError) as exc:
+            raise conflict() from exc
+        if response.id != cancel.id or response.execution_id != execution_id:
+            raise conflict()
+        return response
+
+    def _exact_execution_replay_response(
+        self,
+        session: Session,
+        *,
+        record: IdempotencyRecord,
+        execution_id: UUID,
+    ) -> ExecutionResponse:
+        """Bind an execution-mutating replay to the exact path execution."""
+
+        def conflict() -> ProblemException:
+            return self._idempotency_resource_conflict(
+                "该 Idempotency-Key 已绑定到另一执行的操作请求。"
+            )
+        if record.resource_type != "EXECUTION" or record.resource_id is None:
+            raise conflict()
+        execution = session.get(Execution, record.resource_id)
+        if execution is None or execution.id != execution_id:
+            raise conflict()
+        try:
+            response = ExecutionResponse.model_validate(record.response_body)
+        except (TypeError, ValueError) as exc:
+            raise conflict() from exc
+        if response.id != execution_id:
+            raise conflict()
+        return response
+
+    def _execution_replay_response(
+        self,
+        session: Session,
+        *,
+        record: IdempotencyRecord,
+        job_id: UUID,
+    ) -> ExecutionResponse:
+        """Bind a replay record to the requested Job before exposing it.
+
+        The generic idempotency scope is shared by the route template.  A
+        caller with access to another Job must never receive a historical
+        execution merely because the body hash and key happen to match.
+        Verify both the durable resource pointer and the stored response.
+        """
+
+        if record.resource_type != "EXECUTION" or record.resource_id is None:
+            raise self._execution_replay_conflict()
+        execution = session.get(Execution, record.resource_id)
+        if execution is None or execution.job_id != job_id:
+            raise self._execution_replay_conflict()
+        try:
+            response = ExecutionResponse.model_validate(record.response_body)
+        except (TypeError, ValueError) as exc:
+            raise self._execution_replay_conflict() from exc
+        if response.id != execution.id or response.job_id != job_id:
+            raise self._execution_replay_conflict()
+        return response
 
     def _idempotency_request_hash(
         self,
@@ -6758,16 +6961,13 @@ class ControlService:
         if outcome not in {"SUCCEEDED", "DENIED", "FAILED"}:
             raise ValueError("audit outcome is invalid")
         if reason_code is not None and (
-            len(reason_code) > 64
-            or re.fullmatch(r"[A-Z0-9_]+", reason_code) is None
+            len(reason_code) > 64 or re.fullmatch(r"[A-Z0-9_]+", reason_code) is None
         ):
             raise ValueError("audit reason code is invalid")
         # The organization row is the single serialization point shared with the
         # authentication service's audit writer.
         session.execute(
-            select(Organization.id)
-            .where(Organization.id == organization.id)
-            .with_for_update()
+            select(Organization.id).where(Organization.id == organization.id).with_for_update()
         ).scalar_one()
         previous = session.scalar(
             select(AuditEvent)
@@ -6856,8 +7056,7 @@ class ControlService:
             return None
         digest = hmac.new(
             self._integrity_hmac_key,
-            _AUDIT_USER_AGENT_HASH_DOMAIN
-            + user_agent.encode("utf-8", errors="replace"),
+            _AUDIT_USER_AGENT_HASH_DOMAIN + user_agent.encode("utf-8", errors="replace"),
             hashlib.sha256,
         ).hexdigest()
         return f"hmac-sha256-v1:{digest}"
@@ -6988,11 +7187,7 @@ def _dashboard_group_counts(
 
 
 def _contains_pattern(value: str) -> str:
-    escaped = (
-        value.replace("\\", "\\\\")
-        .replace("%", "\\%")
-        .replace("_", "\\_")
-    )
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
 
 
@@ -7008,16 +7203,8 @@ def _dashboard_verified_record_count(
     missing = 0
     for report in reports:
         target_result = report.get("target_result") if isinstance(report, dict) else None
-        row_count = (
-            target_result.get("row_count")
-            if isinstance(target_result, dict)
-            else None
-        )
-        if (
-            not isinstance(row_count, int)
-            or isinstance(row_count, bool)
-            or row_count < 0
-        ):
+        row_count = target_result.get("row_count") if isinstance(target_result, dict) else None
+        if not isinstance(row_count, int) or isinstance(row_count, bool) or row_count < 0:
             missing += 1
             continue
         total += row_count
@@ -7038,14 +7225,10 @@ def _dashboard_execution_item(
         verification_state=execution.verification_state,
         queued_at=ensure_aware(execution.queued_at),
         started_at=(
-            ensure_aware(execution.started_at)
-            if execution.started_at is not None
-            else None
+            ensure_aware(execution.started_at) if execution.started_at is not None else None
         ),
         finished_at=(
-            ensure_aware(execution.finished_at)
-            if execution.finished_at is not None
-            else None
+            ensure_aware(execution.finished_at) if execution.finished_at is not None else None
         ),
         failure_code=execution.failure_code,
     )
@@ -7146,10 +7329,7 @@ def _snapshot_schema_binding_matches(
     snapshot_schema_name: str,
 ) -> bool:
     if engine == "MYSQL_8":
-        return (
-            spec_schema_name == database_name
-            and snapshot_schema_name == ""
-        )
+        return spec_schema_name == database_name and snapshot_schema_name == ""
     if engine == "POSTGRESQL_15":
         return snapshot_schema_name == spec_schema_name
     return False

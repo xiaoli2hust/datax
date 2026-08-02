@@ -55,6 +55,36 @@ class SchemaProbeError(RuntimeError):
     code = "SCHEMA_ATTESTATION_UNAVAILABLE"
 
 
+class _StatementBudgetCursor:
+    """Run a caller-supplied budget hook immediately before every SQL call.
+
+    ``control_callback`` deliberately runs both before and after execute/fetch
+    so Worker cancellation is noticed promptly.  A timeout-setting SQL command
+    cannot safely run in its *after execute* half, because a result set may not
+    yet have been fetched.  This narrow proxy therefore supplies a separate,
+    pre-statement hook for callers that must refresh a shared query deadline.
+    """
+
+    def __init__(
+        self,
+        cursor: Cursor,
+        before_statement: Callable[[], None] | None,
+    ) -> None:
+        self._cursor = cursor
+        self._before_statement = before_statement
+
+    def execute(self, query: str, parameters: Sequence[object] = ()) -> object:
+        if self._before_statement is not None:
+            self._before_statement()
+        return self._cursor.execute(query, parameters)
+
+    def fetchone(self) -> Sequence[Any] | None:
+        return self._cursor.fetchone()
+
+    def fetchall(self) -> list[Sequence[Any]]:
+        return self._cursor.fetchall()
+
+
 @dataclass(frozen=True)
 class TableIdentity:
     physical_endpoint_identity_id: UUID
@@ -161,18 +191,21 @@ def probe_schema_snapshot(
     engine: EngineName,
     identity: TableIdentity,
     control_callback: Callable[[], None] | None = None,
+    statement_callback: Callable[[], None] | None = None,
 ) -> SchemaSnapshot:
     if engine == "MYSQL_8":
         return _probe_mysql(
             connection,
             identity,
             control_callback=control_callback,
+            statement_callback=statement_callback,
         )
     if engine == "POSTGRESQL_15":
         return _probe_postgres(
             connection,
             identity,
             control_callback=control_callback,
+            statement_callback=statement_callback,
         )
     raise SchemaProbeError("unsupported schema probe engine")
 
@@ -182,8 +215,10 @@ def _probe_mysql(
     identity: TableIdentity,
     *,
     control_callback: Callable[[], None] | None,
+    statement_callback: Callable[[], None] | None,
 ) -> SchemaSnapshot:
-    with connection.cursor() as cursor:
+    with connection.cursor() as raw_cursor:
+        cursor = _StatementBudgetCursor(raw_cursor, statement_callback)
         _controlled_execute(
             cursor,
             "SELECT @@lower_case_table_names",
@@ -480,8 +515,10 @@ def _probe_postgres(
     identity: TableIdentity,
     *,
     control_callback: Callable[[], None] | None,
+    statement_callback: Callable[[], None] | None,
 ) -> SchemaSnapshot:
-    with connection.cursor() as cursor:
+    with connection.cursor() as raw_cursor:
+        cursor = _StatementBudgetCursor(raw_cursor, statement_callback)
         _controlled_execute(
             cursor,
             """

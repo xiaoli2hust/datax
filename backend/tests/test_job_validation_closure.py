@@ -14,13 +14,16 @@ from test_core_control_plane import (
     core_stack,
 )
 
-from datax_studio.auth.db import AuditEvent
+import datax_studio.credentials.service as credentials_service_module
+from datax_studio.auth.db import AuditEvent, AuthSession
 from datax_studio.core.db import (
     Datasource,
     DatasourceRevision,
     JobVersion,
+    Project,
     SyncJob,
     SystemControl,
+    TransferPolicy,
 )
 from datax_studio.credentials.connectors import DatabaseConnector
 from datax_studio.credentials.db import EndpointConnectionEvidence
@@ -30,6 +33,7 @@ from datax_studio.credentials.network import (
     EndpointPolicyGuard,
     ResolvedEndpoint,
 )
+from datax_studio.credentials.operation_boundary import OperationDeadlineExpired
 from datax_studio.credentials.routes import get_credential_service
 from datax_studio.credentials.service import CredentialService
 from datax_studio.egress_attestation import EgressVerification
@@ -40,6 +44,28 @@ __all__ = ["core_stack"]
 _RUNTIME_SHA256 = "d" * 64
 _MYSQL_READER_SHA256 = "b" * 64
 _POSTGRES_WRITER_SHA256 = "c" * 64
+
+
+class _MutableValidationDeadline:
+    """Synthetic deadline used to expire a validation C transaction on demand."""
+
+    latest: _MutableValidationDeadline | None = None
+
+    def __init__(self, total_seconds: float) -> None:
+        del total_seconds
+        self.expired = False
+        type(self).latest = self
+
+    def check_expired(self) -> float:
+        if self.expired:
+            raise OperationDeadlineExpired("DATASOURCE_OPERATION_DEADLINE_EXCEEDED")
+        return 1.0
+
+    def remaining_seconds(self) -> float:
+        return 0.0 if self.expired else 1.0
+
+    def bounded_timeout(self, configured_seconds: float) -> float:
+        return min(configured_seconds, self.check_expired())
 
 
 @dataclass(frozen=True)
@@ -54,8 +80,9 @@ class _BoundaryResolver:
         *,
         timeout_seconds: float,
         ttl_ceiling_seconds: int,
+        deadline: object | None = None,
     ) -> DnsResolution:
-        del timeout_seconds
+        del timeout_seconds, deadline
         return DnsResolution(
             cname_chain=(),
             addresses=(self.addresses_by_hostname[hostname],),
@@ -92,32 +119,20 @@ class _ContractSchemaProbeBoundary(DatabaseConnector):
         schema_name: str | None,
         table_name: str | None,
         limit: int,
+        deadline: object | None = None,
     ) -> tuple[list[SchemaSnapshot], str, bool]:
+        del deadline
         snapshot = self._snapshots[revision.id]
         assert limit == 1
         assert resolved.egress_enforcement_status == "VERIFIED"
         assert physical_endpoint_identity_id == snapshot.physical_endpoint_identity_id
         assert table_name == snapshot.table_name
         assert schema_name == (
-            revision.database_name
-            if revision.engine == "MYSQL_8"
-            else snapshot.schema_name
+            revision.database_name if revision.engine == "MYSQL_8" else snapshot.schema_name
         )
         assert hmac.compare_digest(password, self._passwords[revision.id])
         self.calls.append(revision.id)
         return [snapshot.model_copy(deep=True)], resolved.selected_ip, False
-
-
-class _NeverCollectMetadata:
-    def __init__(self) -> None:
-        self.calls = 0
-
-    def collect_job_validation_material(self, **kwargs: object) -> None:
-        del kwargs
-        self.calls += 1
-        raise AssertionError(
-            "invalid Worker attestation must fail before metadata collection"
-        )
 
 
 class _FixedEgressVerifier:
@@ -159,21 +174,9 @@ def _persist_worker_attestation(
     now = datetime.now(UTC)
     control_epoch = uuid4()
     worker_epoch = uuid4() if fault == "reconcile_epoch" else control_epoch
-    worker_reconciled_at = (
-        now - timedelta(seconds=1)
-        if fault == "reconciled_at"
-        else now
-    )
-    updated_at = (
-        now - timedelta(minutes=1)
-        if fault == "stale"
-        else now
-    )
-    runtime_sha256 = (
-        "not-a-runtime-hash"
-        if fault == "runtime_hash"
-        else _RUNTIME_SHA256
-    )
+    worker_reconciled_at = now - timedelta(seconds=1) if fault == "reconciled_at" else now
+    updated_at = now - timedelta(minutes=1) if fault == "stale" else now
+    runtime_sha256 = "not-a-runtime-hash" if fault == "runtime_hash" else _RUNTIME_SHA256
     with core_stack.sessions.begin() as session:
         control = session.get(SystemControl, 1)
         assert control is not None
@@ -337,6 +340,168 @@ def _credential_service_at_database_boundary(
     return service, connector
 
 
+def _validation_inputs(
+    core_stack: CoreStack,
+    *,
+    job_version_id: UUID,
+) -> tuple[DatasourceRevision, DatasourceRevision, SchemaSnapshot, SchemaSnapshot]:
+    with core_stack.sessions() as session:
+        version = session.get(JobVersion, job_version_id)
+        assert version is not None
+        source_revision = session.get(
+            DatasourceRevision,
+            version.source_datasource_revision_id,
+        )
+        target_revision = session.get(
+            DatasourceRevision,
+            version.target_datasource_revision_id,
+        )
+        assert source_revision is not None
+        assert target_revision is not None
+        return (
+            source_revision,
+            target_revision,
+            SchemaSnapshot.model_validate(version.source_schema_snapshot),
+            SchemaSnapshot.model_validate(version.target_schema_snapshot),
+        )
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_code"),
+    [("PUBLISHED", "JOB_PUBLISHED"), ("ARCHIVED", "JOB_ARCHIVED")],
+)
+def test_validate_rejects_terminal_job_without_external_work(
+    core_stack: CoreStack,
+    tmp_path: Path,
+    status: str,
+    expected_code: str,
+) -> None:
+    """Published/archived jobs cannot be silently regressed by validation."""
+
+    seeded = _seed_published_job(core_stack, f"terminal-{status.casefold()}")
+    if status == "ARCHIVED":
+        with core_stack.sessions.begin() as session:
+            job = session.get(SyncJob, seeded.job_id)
+            assert job is not None
+            job.status = "ARCHIVED"
+            job.archived_by = core_stack.principal.user_id
+            job.archived_at = datetime.now(UTC)
+            job.updated_at = datetime.now(UTC)
+            job.row_version += 1
+    (
+        source_revision,
+        target_revision,
+        source_snapshot,
+        target_snapshot,
+    ) = _validation_inputs(core_stack, job_version_id=seeded.job_version_id)
+    credential_service, connector = _credential_service_at_database_boundary(
+        core_stack,
+        tmp_path,
+        source_revision=source_revision,
+        target_revision=target_revision,
+        source_snapshot=source_snapshot,
+        target_snapshot=target_snapshot,
+    )
+    core_stack.client.app.dependency_overrides[get_credential_service] = lambda: credential_service
+    with core_stack.sessions() as session:
+        job = session.get(SyncJob, seeded.job_id)
+        assert job is not None
+        expected_row_version = job.row_version
+        expected_validation_report = job.validation_report
+        expected_validated_spec_hash = job.validated_spec_hash
+        evidence_before = {item.id for item in session.scalars(select(EndpointConnectionEvidence))}
+        audit_before = {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        }
+
+    validation = core_stack.client.post(f"/api/v1/jobs/{seeded.job_id}/validate")
+
+    assert validation.status_code == 409, validation.text
+    assert validation.json()["code"] == expected_code
+    assert connector.calls == []
+    with core_stack.sessions() as session:
+        job = session.get(SyncJob, seeded.job_id)
+        assert job is not None
+        assert job.status == status
+        assert job.row_version == expected_row_version
+        assert job.validated_spec_hash == expected_validated_spec_hash
+        assert job.validation_report == expected_validation_report
+        assert {
+            item.id for item in session.scalars(select(EndpointConnectionEvidence))
+        } == evidence_before
+        assert {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        } == audit_before
+
+
+def test_validate_phase_a_failure_never_persists_an_old_report(
+    core_stack: CoreStack,
+    tmp_path: Path,
+) -> None:
+    """A rejection without an A-time token must leave every draft untouched."""
+
+    seeded = _seed_published_job(core_stack, "phase-a-failure")
+    draft_row_version = _prepare_draft(core_stack, seeded.job_id)
+    _persist_worker_attestation(core_stack)
+    with core_stack.sessions.begin() as session:
+        version = session.get(JobVersion, seeded.job_version_id)
+        assert version is not None
+        policy = session.get(TransferPolicy, version.transfer_policy_id)
+        assert policy is not None
+        policy.status = "REVOKED"
+        policy.revoked_by = core_stack.principal.user_id
+        policy.revoked_at = datetime.now(UTC)
+        policy.updated_at = datetime.now(UTC)
+        policy.row_version += 1
+    (
+        source_revision,
+        target_revision,
+        source_snapshot,
+        target_snapshot,
+    ) = _validation_inputs(core_stack, job_version_id=seeded.job_version_id)
+    credential_service, connector = _credential_service_at_database_boundary(
+        core_stack,
+        tmp_path,
+        source_revision=source_revision,
+        target_revision=target_revision,
+        source_snapshot=source_snapshot,
+        target_snapshot=target_snapshot,
+    )
+    core_stack.client.app.dependency_overrides[get_credential_service] = lambda: credential_service
+    with core_stack.sessions() as session:
+        evidence_before = {item.id for item in session.scalars(select(EndpointConnectionEvidence))}
+        audit_before = {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        }
+
+    validation = core_stack.client.post(f"/api/v1/jobs/{seeded.job_id}/validate")
+
+    assert validation.status_code == 409, validation.text
+    assert validation.json()["code"] == "TRANSFER_POLICY_NOT_ACTIVE"
+    assert connector.calls == []
+    with core_stack.sessions() as session:
+        job = session.get(SyncJob, seeded.job_id)
+        assert job is not None
+        assert job.status == "DRAFT"
+        assert job.row_version == draft_row_version
+        assert job.validated_spec_hash is None
+        assert job.validation_report is None
+        assert {
+            item.id for item in session.scalars(select(EndpointConnectionEvidence))
+        } == evidence_before
+        assert {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        } == audit_before
+
+
 def test_validate_persists_real_service_boundary_facts_and_can_publish(
     core_stack: CoreStack,
     tmp_path: Path,
@@ -359,12 +524,8 @@ def test_validate_persists_real_service_boundary_facts_and_can_publish(
         )
         assert source_revision is not None
         assert target_revision is not None
-        source_snapshot = SchemaSnapshot.model_validate(
-            prior_version.source_schema_snapshot
-        )
-        target_snapshot = SchemaSnapshot.model_validate(
-            prior_version.target_schema_snapshot
-        )
+        source_snapshot = SchemaSnapshot.model_validate(prior_version.source_schema_snapshot)
+        target_snapshot = SchemaSnapshot.model_validate(prior_version.target_schema_snapshot)
     credential_service, connector = _credential_service_at_database_boundary(
         core_stack,
         tmp_path,
@@ -374,13 +535,9 @@ def test_validate_persists_real_service_boundary_facts_and_can_publish(
         target_snapshot=target_snapshot,
     )
     assert type(credential_service) is CredentialService
-    core_stack.client.app.dependency_overrides[
-        get_credential_service
-    ] = lambda: credential_service
+    core_stack.client.app.dependency_overrides[get_credential_service] = lambda: credential_service
 
-    validation = core_stack.client.post(
-        f"/api/v1/jobs/{seeded.job_id}/validate"
-    )
+    validation = core_stack.client.post(f"/api/v1/jobs/{seeded.job_id}/validate")
     assert validation.status_code == 200, validation.text
     validation_payload = validation.json()
     assert validation_payload == {
@@ -403,18 +560,10 @@ def test_validate_persists_real_service_boundary_facts_and_can_publish(
         assert report is not None
         assert report["valid"] is True
         assert report["draft_spec_hash"] == job.draft_spec_hash
-        assert report["source_schema_snapshot"] == source_snapshot.model_dump(
-            mode="json"
-        )
-        assert report["target_schema_snapshot"] == target_snapshot.model_dump(
-            mode="json"
-        )
-        assert report["source_schema_hash"] == schema_snapshot_hash(
-            source_snapshot
-        )
-        assert report["target_schema_hash"] == schema_snapshot_hash(
-            target_snapshot
-        )
+        assert report["source_schema_snapshot"] == source_snapshot.model_dump(mode="json")
+        assert report["target_schema_snapshot"] == target_snapshot.model_dump(mode="json")
+        assert report["source_schema_hash"] == schema_snapshot_hash(source_snapshot)
+        assert report["target_schema_hash"] == schema_snapshot_hash(target_snapshot)
         assert report["runtime_sha256"] == _RUNTIME_SHA256
         assert report["reader_plugin_sha256"] == _MYSQL_READER_SHA256
         assert report["writer_plugin_sha256"] == _POSTGRES_WRITER_SHA256
@@ -427,18 +576,16 @@ def test_validate_persists_real_service_boundary_facts_and_can_publish(
         )
         assert len(evidence) == 2
         assert {item.operation_kind for item in evidence} == {"METADATA"}
-        assert {item.egress_enforcement_status for item in evidence} == {
-            "VERIFIED"
-        }
+        assert {item.egress_enforcement_status for item in evidence} == {"VERIFIED"}
         audit_actions = {
             row.event_json["action"]
             for row in session.scalars(select(AuditEvent))
             if row.event_json["target"]["id"] == str(seeded.job_id)
         }
-        assert {
-            "JOB_VALIDATION_SCHEMA_COLLECTED",
-            "JOB_VALIDATED",
-        }.issubset(audit_actions)
+        # Evidence and the accepted validation state are one C transaction;
+        # there is no independently committed "schema collected" audit row.
+        assert "JOB_VALIDATED" in audit_actions
+        assert "JOB_VALIDATION_SCHEMA_COLLECTED" not in audit_actions
         validated_row_version = job.row_version
 
     published = core_stack.client.post(
@@ -460,15 +607,549 @@ def test_validate_persists_real_service_boundary_facts_and_can_publish(
         assert job.status == "PUBLISHED"
         assert job.latest_published_version_id == version.id
         assert version.spec_hash == job.validated_spec_hash == "b" * 64
-        assert version.source_schema_hash == schema_snapshot_hash(
-            source_snapshot
-        )
-        assert version.target_schema_hash == schema_snapshot_hash(
-            target_snapshot
-        )
+        assert version.source_schema_hash == schema_snapshot_hash(source_snapshot)
+        assert version.target_schema_hash == schema_snapshot_hash(target_snapshot)
         assert version.runtime_sha256 == _RUNTIME_SHA256
         assert version.reader_plugin_sha256 == _MYSQL_READER_SHA256
         assert version.writer_plugin_sha256 == _POSTGRES_WRITER_SHA256
+
+
+def test_validate_success_c_deadline_after_response_rolls_back_facts_and_audit(
+    core_stack: CoreStack,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deadline after C writes cannot commit evidence, validation or audit."""
+
+    seeded = _seed_published_job(core_stack, "validation-c-deadline-success")
+    draft_row_version = _prepare_draft(core_stack, seeded.job_id)
+    _persist_worker_attestation(core_stack)
+    (
+        source_revision,
+        target_revision,
+        source_snapshot,
+        target_snapshot,
+    ) = _validation_inputs(core_stack, job_version_id=seeded.job_version_id)
+    credential_service, connector = _credential_service_at_database_boundary(
+        core_stack,
+        tmp_path,
+        source_revision=source_revision,
+        target_revision=target_revision,
+        source_snapshot=source_snapshot,
+        target_snapshot=target_snapshot,
+    )
+    core_stack.client.app.dependency_overrides[get_credential_service] = lambda: credential_service
+    with core_stack.sessions() as session:
+        evidence_before = {item.id for item in session.scalars(select(EndpointConnectionEvidence))}
+        audit_before = {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        }
+
+    # Arm expiration only after Core has assembled its response.  The next
+    # configure hook is the terminal hook, which must flush all pending writes
+    # and then reject the transaction before its context manager commits.
+    terminal_refresh_armed = False
+    terminal_refresh_fired = False
+    original_job_response = core_stack.service._job_response
+
+    def arm_after_response(*args: object, **kwargs: object) -> object:
+        nonlocal terminal_refresh_armed
+        response = original_job_response(*args, **kwargs)
+        terminal_refresh_armed = True
+        return response
+
+    original_configure = credential_service._configure_deadline_transaction
+
+    def expire_after_terminal_refresh(
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal terminal_refresh_armed, terminal_refresh_fired
+        original_configure(*args, **kwargs)
+        if terminal_refresh_armed:
+            terminal_refresh_armed = False
+            terminal_refresh_fired = True
+            assert _MutableValidationDeadline.latest is not None
+            _MutableValidationDeadline.latest.expired = True
+
+    monkeypatch.setattr(core_stack.service, "_job_response", arm_after_response)
+    monkeypatch.setattr(
+        credential_service,
+        "_configure_deadline_transaction",
+        expire_after_terminal_refresh,
+    )
+    monkeypatch.setattr(
+        credentials_service_module,
+        "OperationDeadline",
+        _MutableValidationDeadline,
+    )
+
+    validation = core_stack.client.post(f"/api/v1/jobs/{seeded.job_id}/validate")
+
+    assert validation.status_code == 503, validation.text
+    assert validation.json()["code"] == "DATASOURCE_OPERATION_DEADLINE_EXCEEDED"
+    assert terminal_refresh_fired
+    assert connector.calls == [source_revision.id, target_revision.id]
+    with core_stack.sessions() as session:
+        job = session.get(SyncJob, seeded.job_id)
+        assert job is not None
+        assert job.status == "DRAFT"
+        assert job.row_version == draft_row_version
+        assert job.validated_spec_hash is None
+        assert job.validation_report is None
+        assert {
+            item.id for item in session.scalars(select(EndpointConnectionEvidence))
+        } == evidence_before
+        assert {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        } == audit_before
+
+
+def test_validate_failure_c_deadline_after_audit_rolls_back_report_and_audit(
+    core_stack: CoreStack,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A deadline while recording a mapped B failure cannot commit a report."""
+
+    seeded = _seed_published_job(core_stack, "validation-c-deadline-failure")
+    draft_row_version = _prepare_draft(core_stack, seeded.job_id)
+    _persist_worker_attestation(core_stack)
+    (
+        source_revision,
+        target_revision,
+        source_snapshot,
+        target_snapshot,
+    ) = _validation_inputs(core_stack, job_version_id=seeded.job_version_id)
+    credential_service, connector = _credential_service_at_database_boundary(
+        core_stack,
+        tmp_path,
+        source_revision=source_revision,
+        target_revision=target_revision,
+        source_snapshot=source_snapshot,
+        target_snapshot=target_snapshot,
+    )
+    core_stack.client.app.dependency_overrides[get_credential_service] = lambda: credential_service
+    with core_stack.sessions() as session:
+        evidence_before = {item.id for item in session.scalars(select(EndpointConnectionEvidence))}
+        audit_before = {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        }
+
+    # Force a B result that maps to the C failure-report path.  The deadline
+    # is armed after that report's audit is pending, so the terminal C hook is
+    # responsible for rolling the whole transaction back.
+    def force_mapping_drift(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("forced mapping drift")
+
+    terminal_refresh_armed = False
+    terminal_refresh_fired = False
+    original_append_audit = core_stack.service._append_audit
+
+    def arm_after_failure_audit(*args: object, **kwargs: object) -> None:
+        nonlocal terminal_refresh_armed
+        original_append_audit(*args, **kwargs)
+        terminal_refresh_armed = True
+
+    original_configure = credential_service._configure_deadline_transaction
+
+    def expire_after_terminal_refresh(
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        nonlocal terminal_refresh_armed, terminal_refresh_fired
+        original_configure(*args, **kwargs)
+        if terminal_refresh_armed:
+            terminal_refresh_armed = False
+            terminal_refresh_fired = True
+            assert _MutableValidationDeadline.latest is not None
+            _MutableValidationDeadline.latest.expired = True
+
+    monkeypatch.setattr(
+        credentials_service_module,
+        "assert_snapshot_matches_job",
+        force_mapping_drift,
+    )
+    monkeypatch.setattr(core_stack.service, "_append_audit", arm_after_failure_audit)
+    monkeypatch.setattr(
+        credential_service,
+        "_configure_deadline_transaction",
+        expire_after_terminal_refresh,
+    )
+    monkeypatch.setattr(
+        credentials_service_module,
+        "OperationDeadline",
+        _MutableValidationDeadline,
+    )
+
+    validation = core_stack.client.post(f"/api/v1/jobs/{seeded.job_id}/validate")
+
+    assert validation.status_code == 503, validation.text
+    assert validation.json()["code"] == "DATASOURCE_OPERATION_DEADLINE_EXCEEDED"
+    assert terminal_refresh_fired
+    assert connector.calls == [source_revision.id, target_revision.id]
+    with core_stack.sessions() as session:
+        job = session.get(SyncJob, seeded.job_id)
+        assert job is not None
+        assert job.status == "DRAFT"
+        assert job.row_version == draft_row_version
+        assert job.validated_spec_hash is None
+        assert job.validation_report is None
+        assert {
+            item.id for item in session.scalars(select(EndpointConnectionEvidence))
+        } == evidence_before
+        assert {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        } == audit_before
+
+
+def test_validate_discards_b_time_schema_when_job_changes_before_c(
+    core_stack: CoreStack,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A B-time schema result must not update a changed job or leave evidence."""
+
+    seeded = _seed_published_job(core_stack, "validationstale")
+    draft_row_version = _prepare_draft(core_stack, seeded.job_id)
+    _persist_worker_attestation(core_stack)
+    with core_stack.sessions() as session:
+        prior_version = session.get(JobVersion, seeded.job_version_id)
+        assert prior_version is not None
+        source_revision = session.get(
+            DatasourceRevision,
+            prior_version.source_datasource_revision_id,
+        )
+        target_revision = session.get(
+            DatasourceRevision,
+            prior_version.target_datasource_revision_id,
+        )
+        assert source_revision is not None
+        assert target_revision is not None
+        source_snapshot = SchemaSnapshot.model_validate(prior_version.source_schema_snapshot)
+        target_snapshot = SchemaSnapshot.model_validate(prior_version.target_schema_snapshot)
+        evidence_before = {item.id for item in session.scalars(select(EndpointConnectionEvidence))}
+        job_audit_before = {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        }
+    credential_service, connector = _credential_service_at_database_boundary(
+        core_stack,
+        tmp_path,
+        source_revision=source_revision,
+        target_revision=target_revision,
+        source_snapshot=source_snapshot,
+        target_snapshot=target_snapshot,
+    )
+    core_stack.client.app.dependency_overrides[get_credential_service] = lambda: credential_service
+
+    original_schema_snapshots = connector.schema_snapshots
+    mutated = False
+
+    def mutate_job_after_first_probe(*args: object, **kwargs: object) -> object:
+        nonlocal mutated
+        result = original_schema_snapshots(*args, **kwargs)
+        if not mutated:
+            mutated = True
+            with core_stack.sessions.begin() as session:
+                job = session.get(SyncJob, seeded.job_id)
+                assert job is not None
+                job.row_version += 1
+                job.updated_at = datetime.now(UTC)
+        return result
+
+    monkeypatch.setattr(
+        connector,
+        "schema_snapshots",
+        mutate_job_after_first_probe,
+    )
+    validation = core_stack.client.post(f"/api/v1/jobs/{seeded.job_id}/validate")
+    assert validation.status_code == 409, validation.text
+    payload = validation.json()
+    assert payload["code"] == "DATASOURCE_OPERATION_STALE"
+    assert "source_schema_hash" not in payload
+    assert "target_schema_hash" not in payload
+
+    with core_stack.sessions() as session:
+        job = session.get(SyncJob, seeded.job_id)
+        assert job is not None
+        assert job.status == "DRAFT"
+        assert job.validated_spec_hash is None
+        assert job.validation_report is None
+        assert job.row_version == draft_row_version + 1
+        evidence_after = {item.id for item in session.scalars(select(EndpointConnectionEvidence))}
+        job_audit_after = {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        }
+        assert evidence_after == evidence_before
+        assert job_audit_after == job_audit_before
+
+
+def test_validate_discards_b_time_schema_when_runtime_proof_generation_changes(
+    core_stack: CoreStack,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Identical runtime JAR hashes cannot hide a new boot/reconcile proof."""
+
+    seeded = _seed_published_job(core_stack, "validation-runtime-proof-stale")
+    draft_row_version = _prepare_draft(core_stack, seeded.job_id)
+    _persist_worker_attestation(core_stack)
+    (
+        source_revision,
+        target_revision,
+        source_snapshot,
+        target_snapshot,
+    ) = _validation_inputs(core_stack, job_version_id=seeded.job_version_id)
+    credential_service, connector = _credential_service_at_database_boundary(
+        core_stack,
+        tmp_path,
+        source_revision=source_revision,
+        target_revision=target_revision,
+        source_snapshot=source_snapshot,
+        target_snapshot=target_snapshot,
+    )
+    core_stack.client.app.dependency_overrides[get_credential_service] = lambda: credential_service
+    with core_stack.sessions() as session:
+        evidence_before = {item.id for item in session.scalars(select(EndpointConnectionEvidence))}
+        audit_before = {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        }
+
+    original_schema_snapshots = connector.schema_snapshots
+    advanced = False
+
+    def advance_runtime_proof_after_first_probe(*args: object, **kwargs: object) -> object:
+        nonlocal advanced
+        result = original_schema_snapshots(*args, **kwargs)
+        if not advanced:
+            advanced = True
+            now = datetime.now(UTC)
+            epoch = uuid4()
+            with core_stack.sessions.begin() as session:
+                control = session.get(SystemControl, 1)
+                assert control is not None
+                control.host_boot_id = "boot-validation-closure-next"
+                control.reconcile_epoch = epoch
+                control.reconciled_at = now
+                control.updated_at = now
+                session.execute(
+                    text(
+                        """
+                        UPDATE worker_heartbeats
+                        SET host_boot_id = :host_boot_id,
+                            reconcile_epoch = :reconcile_epoch,
+                            reconciled_at = :reconciled_at,
+                            updated_at = :updated_at
+                        WHERE worker_id = 'worker-1'
+                        """
+                    ),
+                    {
+                        "host_boot_id": "boot-validation-closure-next",
+                        "reconcile_epoch": epoch.hex,
+                        "reconciled_at": now,
+                        "updated_at": now,
+                    },
+                )
+        return result
+
+    monkeypatch.setattr(connector, "schema_snapshots", advance_runtime_proof_after_first_probe)
+    validation = core_stack.client.post(f"/api/v1/jobs/{seeded.job_id}/validate")
+
+    assert validation.status_code == 409, validation.text
+    assert validation.json()["code"] == "DATASOURCE_OPERATION_STALE"
+    with core_stack.sessions() as session:
+        job = session.get(SyncJob, seeded.job_id)
+        assert job is not None
+        assert job.status == "DRAFT"
+        assert job.row_version == draft_row_version
+        assert job.validated_spec_hash is None
+        assert job.validation_report is None
+        assert {
+            item.id for item in session.scalars(select(EndpointConnectionEvidence))
+        } == evidence_before
+        assert {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        } == audit_before
+
+
+def test_validate_discards_b_time_schema_when_session_revokes_before_c(
+    core_stack: CoreStack,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """C must not accept metadata captured before the actor session was revoked."""
+
+    seeded = _seed_published_job(core_stack, "validationsessionstale")
+    draft_row_version = _prepare_draft(core_stack, seeded.job_id)
+    _persist_worker_attestation(core_stack)
+    (
+        source_revision,
+        target_revision,
+        source_snapshot,
+        target_snapshot,
+    ) = _validation_inputs(core_stack, job_version_id=seeded.job_version_id)
+    credential_service, connector = _credential_service_at_database_boundary(
+        core_stack,
+        tmp_path,
+        source_revision=source_revision,
+        target_revision=target_revision,
+        source_snapshot=source_snapshot,
+        target_snapshot=target_snapshot,
+    )
+    core_stack.client.app.dependency_overrides[get_credential_service] = lambda: credential_service
+    with core_stack.sessions() as session:
+        evidence_before = {item.id for item in session.scalars(select(EndpointConnectionEvidence))}
+        audit_before = {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        }
+
+    original_schema_snapshots = connector.schema_snapshots
+    revoked = False
+
+    def revoke_session_after_first_probe(*args: object, **kwargs: object) -> object:
+        nonlocal revoked
+        result = original_schema_snapshots(*args, **kwargs)
+        if not revoked:
+            revoked = True
+            with core_stack.sessions.begin() as session:
+                auth_session = session.get(
+                    AuthSession,
+                    core_stack.principal.session_id,
+                )
+                assert auth_session is not None
+                auth_session.revoked_at = datetime.now(UTC)
+                auth_session.revoke_reason = "TEST_SESSION_REVOKED"
+        return result
+
+    monkeypatch.setattr(
+        connector,
+        "schema_snapshots",
+        revoke_session_after_first_probe,
+    )
+    validation = core_stack.client.post(f"/api/v1/jobs/{seeded.job_id}/validate")
+
+    assert validation.status_code == 409, validation.text
+    assert validation.json()["code"] == "DATASOURCE_OPERATION_STALE"
+    assert connector.calls == [source_revision.id, target_revision.id]
+    with core_stack.sessions() as session:
+        job = session.get(SyncJob, seeded.job_id)
+        assert job is not None
+        assert job.status == "DRAFT"
+        assert job.row_version == draft_row_version
+        assert job.validated_spec_hash is None
+        assert job.validation_report is None
+        assert {
+            item.id for item in session.scalars(select(EndpointConnectionEvidence))
+        } == evidence_before
+        assert {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        } == audit_before
+
+
+def test_validate_discards_b_time_schema_when_project_archives_before_c(
+    core_stack: CoreStack,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An archived project cannot accept a schema captured before the archive."""
+
+    seeded = _seed_published_job(core_stack, "validationprojectstale")
+    draft_row_version = _prepare_draft(core_stack, seeded.job_id)
+    _persist_worker_attestation(core_stack)
+    with core_stack.sessions() as session:
+        prior_version = session.get(JobVersion, seeded.job_version_id)
+        assert prior_version is not None
+        source_revision = session.get(
+            DatasourceRevision,
+            prior_version.source_datasource_revision_id,
+        )
+        target_revision = session.get(
+            DatasourceRevision,
+            prior_version.target_datasource_revision_id,
+        )
+        assert source_revision is not None
+        assert target_revision is not None
+        source_snapshot = SchemaSnapshot.model_validate(prior_version.source_schema_snapshot)
+        target_snapshot = SchemaSnapshot.model_validate(prior_version.target_schema_snapshot)
+        evidence_before = {item.id for item in session.scalars(select(EndpointConnectionEvidence))}
+        job_audit_before = {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        }
+    credential_service, connector = _credential_service_at_database_boundary(
+        core_stack,
+        tmp_path,
+        source_revision=source_revision,
+        target_revision=target_revision,
+        source_snapshot=source_snapshot,
+        target_snapshot=target_snapshot,
+    )
+    core_stack.client.app.dependency_overrides[get_credential_service] = lambda: credential_service
+
+    original_schema_snapshots = connector.schema_snapshots
+    archived = False
+
+    def archive_project_after_first_probe(*args: object, **kwargs: object) -> object:
+        nonlocal archived
+        result = original_schema_snapshots(*args, **kwargs)
+        if not archived:
+            archived = True
+            with core_stack.sessions.begin() as session:
+                project = session.get(Project, seeded.project_id)
+                assert project is not None
+                project.status = "ARCHIVED"
+                project.row_version += 1
+                project.updated_at = datetime.now(UTC)
+        return result
+
+    monkeypatch.setattr(
+        connector,
+        "schema_snapshots",
+        archive_project_after_first_probe,
+    )
+    validation = core_stack.client.post(f"/api/v1/jobs/{seeded.job_id}/validate")
+    assert validation.status_code == 409, validation.text
+    assert validation.json()["code"] == "DATASOURCE_OPERATION_STALE"
+
+    with core_stack.sessions() as session:
+        project = session.get(Project, seeded.project_id)
+        job = session.get(SyncJob, seeded.job_id)
+        assert project is not None
+        assert project.status == "ARCHIVED"
+        assert job is not None
+        assert job.status == "DRAFT"
+        assert job.validated_spec_hash is None
+        assert job.validation_report is None
+        assert job.row_version == draft_row_version
+        evidence_after = {item.id for item in session.scalars(select(EndpointConnectionEvidence))}
+        job_audit_after = {
+            item.id
+            for item in session.scalars(select(AuditEvent))
+            if item.event_json["target"]["id"] == str(seeded.job_id)
+        }
+        assert evidence_after == evidence_before
+        assert job_audit_after == job_audit_before
 
 
 @pytest.mark.parametrize(
@@ -483,21 +1164,40 @@ def test_validate_persists_real_service_boundary_facts_and_can_publish(
 def test_invalid_worker_attestation_never_reaches_metadata_or_valid_state(
     core_stack: CoreStack,
     fault: str,
+    tmp_path: Path,
 ) -> None:
     seeded = _seed_published_job(core_stack, f"invalid{fault}")
     draft_row_version = _prepare_draft(core_stack, seeded.job_id)
     _persist_worker_attestation(core_stack, fault=fault)
-    never_collect = _NeverCollectMetadata()
-    core_stack.client.app.dependency_overrides[
-        get_credential_service
-    ] = lambda: never_collect
-
-    validation = core_stack.client.post(
-        f"/api/v1/jobs/{seeded.job_id}/validate"
+    with core_stack.sessions() as session:
+        prior_version = session.get(JobVersion, seeded.job_version_id)
+        assert prior_version is not None
+        source_revision = session.get(
+            DatasourceRevision,
+            prior_version.source_datasource_revision_id,
+        )
+        target_revision = session.get(
+            DatasourceRevision,
+            prior_version.target_datasource_revision_id,
+        )
+        assert source_revision is not None
+        assert target_revision is not None
+        source_snapshot = SchemaSnapshot.model_validate(prior_version.source_schema_snapshot)
+        target_snapshot = SchemaSnapshot.model_validate(prior_version.target_schema_snapshot)
+    credential_service, connector = _credential_service_at_database_boundary(
+        core_stack,
+        tmp_path,
+        source_revision=source_revision,
+        target_revision=target_revision,
+        source_snapshot=source_snapshot,
+        target_snapshot=target_snapshot,
     )
+    core_stack.client.app.dependency_overrides[get_credential_service] = lambda: credential_service
+
+    validation = core_stack.client.post(f"/api/v1/jobs/{seeded.job_id}/validate")
     assert validation.status_code == 503
     assert validation.json()["code"] == "RUNTIME_ATTESTATION_UNAVAILABLE"
-    assert never_collect.calls == 0
+    assert connector.calls == []
     with core_stack.sessions() as session:
         job = session.get(SyncJob, seeded.job_id)
         assert job is not None

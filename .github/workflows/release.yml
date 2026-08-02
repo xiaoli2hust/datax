@@ -834,6 +834,7 @@ jobs:
               MakensisPath = $env:MAKENSIS_PATH
               SigntoolPath = $env:SIGNTOOL_PATH
               SigningCertificateThumbprint = $env:SIGNER_THUMBPRINT
+              AllowedSignerFile = $env:SIGNER_ALLOWLIST_PATH
               TimestampUrl = $env:TIMESTAMP_URL
           }
           & .\scripts\windows\build-installer.ps1 @parameters

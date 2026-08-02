@@ -63,6 +63,39 @@ export function isEndpointUnavailable(value: unknown): boolean {
   return isApiError(value) && value.problem.code === "ENDPOINT_NOT_IMPLEMENTED";
 }
 
+/**
+ * These responses are explicitly retryable at the product level, but never
+ * safe for a client-side replay.  The original external operation may have
+ * used a short-lived credential, grant, policy, cursor, or draft snapshot.
+ * A user must wait/refresh as appropriate and deliberately initiate it again.
+ */
+export function requiresManualDatasourceOperationRetry(
+  problem: Pick<Problem, "code"> | null | undefined,
+): boolean {
+  return (
+    problem?.code === "DATASOURCE_OPERATION_ADMISSION_LIMITED" ||
+    problem?.code === "DATASOURCE_OPERATION_STALE" ||
+    problem?.code === "DATASOURCE_OPERATION_DEADLINE_EXCEEDED"
+  );
+}
+
+export function datasourceOperationManualRetryGuidance(
+  problem: Pick<Problem, "code"> | null | undefined,
+  retryAfter: number | null,
+): string | null {
+  if (problem?.code === "DATASOURCE_OPERATION_ADMISSION_LIMITED") {
+    const wait = retryAfter === null ? "请稍后" : `请至少等待约 ${retryAfter} 秒后`;
+    return `${wait}从原操作按钮手动重试。页面不会自动重放这次数据库外部操作。`;
+  }
+  if (problem?.code === "DATASOURCE_OPERATION_STALE") {
+    return "连接配置、凭据、权限、元数据范围或任务草稿可能已变化。请刷新相关信息后，从原操作按钮手动重试；页面不会自动重放旧请求。";
+  }
+  if (problem?.code === "DATASOURCE_OPERATION_DEADLINE_EXCEEDED") {
+    return "本次数据库外部操作已超过总时限，未采用这次结果。请确认目标可达后，从原操作按钮手动重试；页面不会自动重放旧请求。";
+  }
+  return null;
+}
+
 function canReplay(method: string, idempotencyKey?: string): boolean {
   return method === "GET" || method === "HEAD" || method === "OPTIONS" || idempotencyKey !== undefined;
 }
@@ -206,6 +239,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
 
   const problem = normalizedProblem(response, payload, requestPath);
   const shouldRefresh =
+    !requiresManualDatasourceOperationRetry(problem) &&
     options.allowRefresh !== false &&
     response.status === 401 &&
     problem.code === "AUTH_TOKEN_EXPIRED" &&
@@ -246,6 +280,7 @@ export async function apiDownload(
   const payload = await readPayload(response);
   const problem = normalizedProblem(response, payload, requestPath);
   if (
+    !requiresManualDatasourceOperationRetry(problem) &&
     options.allowRefresh !== false &&
     response.status === 401 &&
     problem.code === "AUTH_TOKEN_EXPIRED"

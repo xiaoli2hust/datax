@@ -65,8 +65,9 @@ class _LeaseClient:
         policy_hash: str,
         selected_ip: str,
         port: int,
+        timeout_seconds: float | None = None,
     ) -> EgressLease:
-        del selected_ip
+        del selected_ip, timeout_seconds
         self.created += 1
         return self._lease(
             revision_id=revision_id,
@@ -74,7 +75,13 @@ class _LeaseClient:
             port=port,
         )
 
-    def renew_lease(self, lease: EgressLease) -> EgressLease:
+    def renew_lease(
+        self,
+        lease: EgressLease,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> EgressLease:
+        del timeout_seconds
         self.renewed += 1
         if self.fail_renew:
             raise EgressAttestationError("LEASE_POLICY_NOT_ACTIVE")
@@ -85,8 +92,13 @@ class _LeaseClient:
             lease_id=lease.lease_id,
         )
 
-    def release_lease(self, lease: EgressLease) -> None:
-        del lease
+    def release_lease(
+        self,
+        lease: EgressLease,
+        *,
+        timeout_seconds: float | None = None,
+    ) -> None:
+        del lease, timeout_seconds
         self.released += 1
 
     def _lease(
