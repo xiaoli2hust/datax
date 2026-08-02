@@ -18,11 +18,12 @@
 > 已新增的 Windows E4 scenario profile/result Schema 只是在 source 层精确规定 23 个
 > test/profile ID、25 个 requirement/test 对和 candidate/commit/environment/harness/assertion-hash
 > 绑定；没有受保护 harness 产生的 result catalog，故它是 E1 反伪造语义控制，不是 E4 证据。
-> 同轮新增的 P/QH parser、私有 payload/runtime/job binding 与 PostgreSQL Phase-A nonce/grant
+> 同轮新增的 P/QH parser、私有 payload/runtime/job binding 与 PostgreSQL Phase-A nonce/grant/PEA
 > 账本同样仅是 E1：`20260802_0021` 已有无登录 ledger owner / issuer / consumer、最小
-> `SECURITY DEFINER` issue/revoke/read 函数与未接入标准路径的 private adapter，但没有 protected
-> harness credential provisioning、private API/Worker/Compose override、Execution authorization、受保护
-> harness、QR reader 或真实 E3/E4；普通产品路径继续 deny-all。
+> `SECURITY DEFINER` issue/revoke/read 函数与未接入标准路径的 private adapter；`20260802_0022`
+> 已有 private PEA table、issuer authorize/consumer read 及普通 API/Worker/recovery 仅处理 `STANDARD` 的边界。
+> 仍没有 protected harness credential provisioning、私有 Execution 创建/rerun、private API/Worker/Compose
+> override、四检查点、受保护 harness、QR reader 或真实 E3/E4；普通产品路径继续 deny-all。
 
 ## 1. 安全目标与非目标
 
@@ -49,7 +50,7 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
 | JobVersion、Execution、核验证据 | Integrity critical | 不可变版本、哈希、围栏、追加事件 |
 | 审计事件；未来公钥 keyring 与外部锚点 | Integrity critical | 当前为精确事件前像/同库哈希链；双签轮换、外部锚定和双人恢复仍是发布门禁 |
 | Runtime、插件与镜像 | Supply-chain critical | digest/SHA-256、SBOM、签名/来源验证 |
-| P binding/PAG 私有 qualification 元数据；原始 QH 与 nonce | Integrity critical；原始 QH/nonce 为 Secret | 原始 QH/nonce 不进入普通产品、公开制品、日志或数据库；ledger 只保存 nonce SHA-256 与不可变 binding 元数据，位于 closed-default `des_phase_a_qualification` schema。标准 API/Worker/egress 无直接权限；无登录 issuer/consumer 只可执行各自的 `SECURITY DEFINER` entrypoint，且标准 backup/diagnostics/restore 不得携带该 schema 或其 authority |
+| P binding/PAG/PEA 私有 qualification 元数据；原始 QH 与 nonce | Integrity critical；原始 QH/nonce 为 Secret | 原始 QH/nonce 不进入普通产品、公开制品、日志或数据库；当前 ledger 只保存 nonce SHA-256、不可变 grant binding 和 PEA 的 nonce SHA-256/nonsecret cross-check facts，均位于 closed-default `des_phase_a_qualification` schema。标准 API/Worker/egress 无直接权限；无登录 issuer/consumer 只可执行各自的 `SECURITY DEFINER` entrypoint，且标准 backup/diagnostics/restore 不得携带该 schema 或其 authority |
 | `Setup.exe`、`launcher.exe`、升级清单 | Supply-chain critical | Authenticode 信任链、固定发布证书 DER SHA-256、离线 SHA-256、版本/降级策略、发布 SBOM |
 | Windows 配置/导出备份与 `des-postgres-data`/`des-log-data`/`des-workspace-data` | Confidential / Integrity critical | 用户 ACL、named volume 隔离、卸载默认保留、备份加密、异机恢复演练 |
 
@@ -73,13 +74,19 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
   pool=4/无 overflow/5 秒超时的 Engine；角色 cap=12 和 30 秒空闲/15 秒空闲事务超时是
   对异常重启残留的服务器端有界回收，不是高可用或无限重试保证。
 - Phase-A qualification ledger（仅 E1）：`20260802_0020` 的 closed-default
-  `des_phase_a_qualification` schema 中两表只记录 QH nonce hash 和精确
+  `des_phase_a_qualification` schema 中 nonce/grant 记录 QH nonce SHA-256 和精确
   P/harness/Reader-Writer binding；`20260802_0021` 将 ownership 移给无登录 ledger owner，创建
-  无登录 issuer/consumer 及最小 `SECURITY DEFINER` issue/revoke/read entrypoints。它撤销
-  `PUBLIC`、标准运行角色和 issuer/consumer 对 schema/table/sequence 的直接权限；entrypoint 固定
-  `search_path=pg_catalog,pg_temp` 并以 `session_user` 复核 caller。它们没有标准 API/Worker/Compose
-  路径、角色凭据、`execution_id` 或 DataX start 能力，也不影响普通执行门禁。migration owner/
-  数据库管理员、一个将来可登录的 issuer 帐户或 private adapter 都不是 HQA/RQA 的替代信任根。
+  无登录 issuer/consumer 及最小 `SECURITY DEFINER` issue/revoke/read entrypoints。`20260802_0022`
+  增加第三张 append-only PEA 表：`grant_id`/`execution_id` 各自唯一，保存**仅 nonce SHA-256**和
+  existing PAG/Execution/JobVersion/revision/policy/namespace/P/runtime/harness/QH nonsecret facts；
+  issuer authorize 在锁定的 pending `PHASE_A_HARNESS` Execution 上原子写入，consumer read 只在
+  PAG `ACTIVE`、QH 时间窗及所有 current facts 一致时返回。它撤销 `PUBLIC`、标准运行角色和
+  issuer/consumer 对 schema/table/sequence 的直接权限；entrypoint 固定 `search_path=pg_catalog,pg_temp`
+  并以 `session_user` 复核 caller。普通 API、Worker 与 recovery/reconciler 只处理 `STANDARD`，
+  因此不能读取、修改、领取或推进 PEA。它仍没有
+  标准 API/Worker/Compose 路径、角色凭据、私有创建/rerun 或 DataX start 能力，也不影响普通执行
+  deny-all。migration owner/数据库管理员、一个将来可登录的 issuer 帐户、private adapter 或 PEA JSON
+  都不是 HQA/RQA 的替代信任根。
   0021 对预存私有角色名或成员关系失败关闭，不尝试就地规范化，并撤销 ledger owner 后续新建函数的
   全局 `PUBLIC EXECUTE` 默认权。
 - 外部 MySQL/PostgreSQL、DNS、镜像仓库和备份系统均跨越信任边界。
@@ -88,9 +95,9 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
   Web/API/Worker 容器访问 Docker Socket、Windows 命名管道或宿主敏感目录。
 - ADR-0011 的 HQA、RQA、受保护 Windows qualification harness、Authenticode 签名服务与
   hosted candidate-root attestor 是彼此分离的发布 TCB。当前 P/QH parser、私有
-  payload/runtime/job binding、nonce/grant 账本及其 0021 role/function/adapter 已是 E1 代码/迁移
-  基础件，但 HQA/RQA、protected harness credential provisioning、private override、immutable
-  Execution authorization、harness、QR reader 与真实外部证据均未实现。QH 未来只能跨越至受保护 harness；QR 未来只能作为被安装包
+  payload/runtime/job binding、nonce/grant/PEA 账本及其 0021/0022 role/function/adapter 已是 E1
+  代码/迁移基础件；HQA/RQA、protected harness credential provisioning、私有 Execution 创建/rerun、
+  private override、四检查点、harness、QR reader 与真实外部证据均未实现。QH 未来只能跨越至受保护 harness；QR 未来只能作为被安装包
   哈希约束的只读资源进入私有最终候选；GitHub OIDC provenance 只跨越候选根来源边界，不能
   替代 Windows/数据库行为边界。不得由普通用户设置或产品运行时网络调用替代。
 
@@ -124,14 +131,32 @@ V1 不承诺抵抗已完全控制宿主机内核和独立密钥保管系统的�
 | TM-23 | 卸载、Docker 重置、首次初始化中断或磁盘故障导致数据丢失 | 卸载误删 named volumes/密钥/备份；先建卷后生成密钥时崩溃导致不可恢复；Docker 重置后静默创建空卷；卷部分丢失；磁盘不足时迁移或日志写入半完成 | 当前：程序/三卷分离；ACL 受控初始化日志；先完整 secret、后卷、提交旧 installation-id，再以不可覆盖的单一 `LEGACY` 指针整组绑定身份/secret/卷并清除日志；仅在无产品/数据卷容器且日志/secret/卷标签一致时补齐；既有卷缺密钥、指针篡改或状态矛盾 fail closed，绝不自动删卷；DATA/SECRETS 导出、双包认证 journal 与空 staging 已达到 E1。异机恢复、新空卷 `pg_restore`、证据重算、`RESTORE` 代际提交与覆盖升级仍是发布缺口 | 初始化各提交点断电/进程终止、容器存在、缺 secret、部分卷、错标签、Docker reset 负例；journal/staging/代际指针中断与篡改负例；发布前补安装→数据→卸载→重装、磁盘不足、真实 Windows 导出和异机恢复证据 |
 | TM-24 | 出口租约伪造、未授权创建、重放或守卫死亡后残留 | 客户端自报 lease ID、token 被记录/重放；普通调用者复用 API/Worker 共享 netns 对 `POST /v1/leases` 申请 ACTIVE 策略内任意 IP+port；API/Worker 不在守卫 netns；守卫死亡后旧 allow 无限存活，或 nft 原子替换的无语义 runtime metadata 触发错误漂移 | lease ID 与 32-byte bearer 均由守卫生成；`POST /v1/leases` 必须恰好携带 Launcher 由 32 个 OS CSPRNG 原始字节生成的 64 字符小写十六进制 Docker-secret 能力，guard 在 body/策略/controller/nftables 前用常量时间比较；能力只挂载给 guard/API/Worker，缺失/重复/错误统一 `401 LEASE_CREATION_AUTH_INVALID` 且不得记录/回显/传给 Job 或 DataX 环境。它阻断不能读 secret 的普通同 netns 调用者，不是同 UID Worker/DataX RCE sandbox。token 仅首次响应且内存只存域分离摘要；create/renew 重读 ACTIVE view；逻辑 30 秒、5 秒续租、nft 元素最多 15 秒；ruleset hash 只排除内核重新分配的 `handle` 与 `expires` 倒计时，仍绑定 timeout、地址、端口、表达式、hook 和 policy；真实规则漂移锁存 base-deny；Launcher 实测三容器 netns 相等 | 缺失/错误/重复能力头在 body/策略读取前统一 401；secret mount target、响应/日志/Job/DataX 环境泄漏负例；普通 netns 调用者不得创建租约；有效 API/Worker 正例；错误 token、token 日志扫描、netns 不等、guard kill 15 秒、DB 失败、nft `handle`/expires 变化不误降级、timeout/规则变化和撤策故障注入；同 UID RCE 只记录为残余风险，不能宣称被此控制消除 |
 
-| TM-26 | 资格自举、签名替代、ledger 越权或发布哈希循环 | 将测试注入/环境变量/自申报 JSON 作为生产资格；重放 QH nonce、篡改/删除 PAG，或让 QH 进入普通包；让 QR 回写 Worker 镜像，或让 QR 与 Setup/manifest 互相绑定后仍宣称同一候选 | ADR-0011 固定 `P → QH → PAG → QR → F → PR` 的单向链。E1 parser 核对 P/QH；0020 ledger 拒绝 nonce 重放、修改/删除/截断与非单调 lifecycle；0021 用无登录 owner / issuer / consumer 和最小 `SECURITY DEFINER` issue/revoke/read 函数禁止标准运行角色、issuer/consumer 直接 DML。它拒绝预存私有角色名/成员关系，不尝试就地规范化，并撤销 ledger owner future-function `PUBLIC EXECUTE` 默认权。issue 原子写 nonce+PAG，read 不产生 Execution/DataX start。**这仍只是基础约束**：标准 Settings/Compose/Launcher/API/Worker 没有角色凭据、QH/PAG override 或 adapter 接线；没有 protected harness credential provisioning、Execution authorization、harness 或 QR reader，普通路径继续 deny-all。未来 HQA 只能签短期 QH，RQA 才能签 QR；标准 Compose 必须拒绝 QH/PAG 资源，QR 必须是 detached 资源且不绑定包含自身的 F；受信 reader 对签名、purpose、有效期和 P/commit/image/runtime/JAR/依赖/许可证逐项失败关闭；公开发布还须 ADR-0010 provenance。标准 backup/diagnostics/restore 必须排除 ledger，恢复后的 protected issuer/consumer 还须以非恢复的 post-restore issuance epoch 拒绝旧 grant | 当前：parser/binding，及 disposable real PostgreSQL 15 `22 passed` 的 0021 upgrade/downgrade/re-upgrade、实际 issuer/consumer function boundary、Python issuer → consumer preflight → revoke、schema exclusion/TOC/restore probe、预存角色失败关闭和 future-function `PUBLIC EXECUTE` 默认权负例；它仅为 E2。关闭前：QH/QR 篡改、未知 key/purpose、过期、nonce 重放、所有 payload 错配、标准 Compose 注入、资源替换、自引用、同版本不同候选、私有 role/function/issuer 旁路、backup/diagnostic 泄露或 restore authority revival、self-hosted provenance 混淆和真实 Phase A/B 证据；当前 E3/E4/发布全部 BLOCKED |
+| TM-26 | 资格自举、签名替代、ledger 越权或发布哈希循环 | 将测试注入/环境变量/自申报 JSON 作为生产资格；重放 QH nonce、篡改/删除 PAG，重用 PEA `grant_id`/`execution_id`、把 PEA 复制到不同 Execution、以 snapshot 错配绕过四检查点，或让 QH 进入普通包；让 QR 回写 Worker 镜像，或让 QR 与 Setup/manifest 互相绑定后仍宣称同一候选 | ADR-0011 固定 `P → QH → PAG → QR → F → PR` 的单向链；PEA 只是 PAG→一条私有 Execution 的内部边。0020/0021 拒绝 nonce 重放、grant 修改/删除/截断及非单调 grant lifecycle；0021 用无登录 owner/issuer/consumer 和最小 `SECURITY DEFINER` issue/revoke/read 函数禁止标准运行角色、issuer/consumer 直接 DML。0022 新增 append-only PEA，`grant_id`/`execution_id` 各自唯一，只保存 nonce SHA-256；issuer authorize 只对锁定的 pending `PHASE_A_HARNESS` Execution 和有效 PAG 原子写入，consumer read 只在 PAG `ACTIVE`、QH 时间窗和 Execution/JobVersion/revision/policy/namespace/P/runtime/harness/QH 全量 current-fact 相等时返回。普通 Worker 只领取 `STANDARD`。**当前仍只是数据库基础约束**：标准 Settings/Compose/Launcher/API/Worker 没有角色凭据、QH/PAG/PEA override 或 adapter 接线，也没有私有创建/rerun、四检查点、harness 或 QR reader；普通路径继续 deny-all。future HQA 只能签短期 QH，RQA 才能签 QR；标准 Compose 必须拒绝 QH/PAG/PEA 资源，QR 必须是 detached 资源且不绑定包含自身的 F；受信 reader 对签名、purpose、有效期和 P/commit/image/runtime/JAR/依赖/许可证逐项失败关闭；公开发布还须 ADR-0010 provenance。标准 backup/diagnostics/restore 必须排除 ledger，恢复后的 protected issuer/consumer 还须以非恢复的 post-restore issuance epoch 拒绝旧 grant/PEA；保护 public `executions` trigger 的 mode guard 必须留在标准 dump，仍由无登录 ledger owner 持有并撤销普通调用者执行权 | 当前：parser/binding，及本轮 disposable real PostgreSQL 15 `scripts/test-postgres-e2.sh` 退出 `0`、PostgreSQL pytest `29 passed`：0021 upgrade/downgrade/re-upgrade、actual issuer/consumer function boundary、Python issuer → consumer preflight → revoke、预存角色失败关闭和 future-function `PUBLIC EXECUTE` 默认权负例，以及 0022 PEA authorization、普通路径拒绝、API/Worker runtime-role RLS、schema exclusion/TOC/空库 `pg_restore` probe。它仅为数据库 E2，不是完整 restore/E3/E4。关闭前：QH/PEA/QR 篡改、未知 key/purpose、过期、raw nonce 持久化或读取、nonce/grant/PEA grant_id/execution_id/rerun 重放、append-only/lifecycle/派生有效性旁路、所有 payload/Execution/JobVersion/revision/policy/namespace 错配、标准 Compose 注入、资源替换、自引用、同版本不同候选、私有 role/function/issuer 旁路、backup/diagnostic 泄露或 restore authority revival、self-hosted provenance 混淆和真实 Phase A/B 证据；当前 E3/E4/发布全部 BLOCKED |
 | TM-27 | 数据源外部操作持锁造成控制面 DoS 与陈旧结果 | 获授权用户让允许端点缓慢响应，或高并发执行 datasource create/update probe、test、metadata、job validation；外部 DNS/JDBC/schema I/O 若持有 Organization/Project/Datasource/Job 锁，会阻塞取消、凭据 revoke、目标独占撤回；I/O 后变更 revision/secret/grant/policy 时旧结果又可能覆盖/泄露 | **候选源码/E1 与局部 PostgreSQL E2 已实施，未关闭：** ADR-0014 五入口 A/B/C。A 只短事务授权并绑定 immutable datasource/policy/secret/envelope/grant/job/transfer/namespace/runtime/AuthSession snapshot；已有凭据的 B 先以极短 barrier 锁定、复制、提交，随后无产品 DB 锁做 resolve/egress/解密/connector（创建使用候选请求凭据），受总 deadline；C 重新授权并比较全部 security binding，漂移统一 409 stale、无旧 metadata/evidence/audit/last-test 副作用。PUBLISHED/ARCHIVED Job 在外部 I/O 前拒绝。已有 datasource/job 仅在 A 验证后才进入单 API 进程非阻塞 admission（global=4、organization/datasource=1、TEST 60 秒），未知 UUID 不得污染 retained state；429 在外部 I/O/audit 前返回，deadline 503 不持久化 B 结果。隔离 PostgreSQL E2 已证明阻塞 B probe 不持有同一 Organization 行锁；完整并发矩阵与真实 E3 未验证，`ASR-013=IN_PROGRESS`，不得声称连接测试限速已关闭 | 关闭前：五入口 source/contract 回归；AuthSession/revision/secret/envelope/grant/policy/job/project/scope/namespace/runtime 漂移负例；429 无 connector/DNS/decrypt/audit；真实 PostgreSQL `pg_locks`/时间界限证明阻塞 connector 不持有 Organization lock，并发 cancel/revoke/update 成功；真实 MySQL/PostgreSQL E3 deadline、DNS/egress、分页和恢复 |
+
+**TM-26 的 0022 动态 read 边界。** PEA consumer 不得仅相信 append-only row：它必须重验
+Project `ACTIVE`、Job `PUBLISHED`、source/target Datasource 与 EndpointPolicy 的 current/`ACTIVE` parent、
+Organization/Project/physical identity/TargetNamespace 的 scope+engine、active TransferPolicy 的 revision/
+physical scope/hash/row version、未撤回的目标独占及 engine→Reader/Writer 配对。普通 API、Worker、
+Recovery/reconciler 和日志路径只处理 `STANDARD`，不能把 `PHASE_A_HARNESS` 作为可读、可写、可领取、
+可对账或可展示对象。本轮真实 PostgreSQL E2 已验证该源代码/迁移控制；它不形成 private harness、E3 或 E4。
+0022 还将这一边界延伸至 `datax_api/datax_worker/datax_egress_guard` 的直接 DB 连接：`executions` 和任何
+execution/probe-linked attempt、lock、event、cancel、log、recovery、evidence、work-termination row 使用
+parent-linked RLS，标准角色不能藉由子表发现或写入 private execution。issuer authorize 只将该 row 置为
+`BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，不会授予 runnable 状态。RLS 已在本切片真实
+PostgreSQL E2 中验证；它仍是 E1 控制，不能替代 private harness、E3 或 E4。
+当前没有私有 Phase-A Worker/runner，任何试图经普通 Settings/Compose/API/maintenance 启动它的路径都是越权。
+未来 runner 启用必须先有 private execution lock/fence、源静默/目标独占 confirmation、execution/fence 关联的
+受保护 audit checkpoint、专用 credential/log/maintenance 边界和独立 protected backup/restore 设计；否则保持硬禁用。
 
 **TM-14/TM-26 Phase-A backup 与恢复边界。** 标准系统 backup、诊断包和 restore 输入必须
 固定排除完整 `des_phase_a_qualification` schema；不得只依赖“包已加密”或“普通 API/Worker 无表权限”
-来保留或转移 qualification authority。当前 dump 会恢复 `alembic_version=20260802_0021` 却排除该 schema，
+来保留或转移 qualification authority。0022 还使 private execution 的 metadata/log 路径位于 public
+`executions`/log volume，因此当前 Launcher 在 `pg_dump` 前后（PostgreSQL 停止前）固定重验无
+`PHASE_A_HARNESS` 行；存在或非 `t` 输出返回 `BACKUP_PHASE_A_PRIVATE_EXECUTION_PRESENT`，psql 完成但非零返回
+`BACKUP_PHASE_A_PRIVATE_EXECUTION_CHECK_FAILED`，底层命令错误同样失败关闭。不得靠 schema/table/log 过滤继续生成普通包。受保护 Phase-A backup/restore 未实现。当前 dump 会恢复 `alembic_version=20260802_0022` 却排除该 schema，
 所以真实 restore/bootstrap/start 必须失败关闭。恢复目标必须从无 Phase-A authority 的状态开始，未来
-protected issuer/consumer 要生成并强制检查一个不随备份恢复的 issuance epoch，旧 QH/PAG/grant 一律
+protected issuer/consumer 要生成并强制检查一个不随备份恢复的 issuance epoch，旧 QH/PAG/grant/PEA 一律
 不能复活。候选 schema exclusion、TOC 与临时库 probe 最多是 E2；没有完整 `pg_restore`、bootstrap/
 原子提交、实际 issuer/consumer 和干净 Windows 证据时，这一边界仍为 `BLOCKED`。
 
@@ -303,9 +328,9 @@ ACTIVE/SUPERSEDED，业务 ciphertext/nonce/AAD 不变。部署注入只读版�
 - `DXAUDITCHECKPOINTv1` 前像、公钥 keyring/双签轮换、外部锚点和篡改恢复；
 - 200 GiB 组合容量公式、绿黄红 admission、队列 SLO及重启后跨项目公平性。
 
-- ADR-0011 的 `P/QH/PAG/QR/F/PR` 链真实可验证：当前 parser、binding 与 nonce/grant
-  ledger 只构成 E1，不能替代 protected issuer/consumer；QH 必须未泄露至普通路径且已清理，
-  QR 必须由独立 RQA 为精确 P 签发，无 QH/PAG 的精确 F 必须完成 Phase B，最终候选根必须
+- ADR-0011 的 `P/QH/PAG/PEA/QR/F/PR` 绑定真实可验证：当前 parser、binding 与 nonce/grant/PEA
+  ledger 只构成 E1；0022 的 PEA issuer-authorize/consumer-read 不能替代 protected issuer/consumer 调用链；
+  QH/PAG/PEA 必须未泄露至普通路径且已清理，QR 必须由独立 RQA 为精确 P 签发，无 QH/PAG/PEA 的精确 F 必须完成 Phase B，最终候选根必须
   来自 hosted attestor；任何缺少 Windows/数据库/签名/OIDC 外部 TCB 的状态均为 BLOCKED。
 
 保留风险：源静默与目标外部独占都依赖系统所有者的外部变更冻结流程。平台无法仅靠 JDBC

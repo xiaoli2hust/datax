@@ -35,7 +35,7 @@ const COMPOSE_TIMEOUT: Duration = Duration::from_secs(180);
 const SYSTEM_BACKUP_TIMEOUT: Duration = Duration::from_secs(4 * 60 * 60);
 const LIVE_TIMEOUT: Duration = Duration::from_secs(90);
 const READY_TIMEOUT: Duration = Duration::from_secs(180);
-const SUPPORTED_MIGRATION_REVISION: &str = "20260802_0021";
+const SUPPORTED_MIGRATION_REVISION: &str = "20260802_0022";
 const IMAGE_ENV_FILE_NAME: &str = "images.release.env";
 const DOCKER_CLI_CONFIG_DIRECTORY_NAME: &str = "docker-cli-config";
 const DOCKER_CLI_CONFIG_FILE_NAME: &str = "config.json";
@@ -132,11 +132,14 @@ const HELPER_CONTAINER_ID_LABEL: &str = "com.xiaoli.datax.helper-id";
 const BACKUP_DATA_HELPER_ROLE: &str = "backup-data";
 const BACKUP_SECRETS_HELPER_ROLE: &str = "backup-secrets";
 // Phase-A QH/PAG records are deliberately outside the standard DATA backup
-// trust domain. Excluding the complete private schema keeps its tables,
-// trigger functions, and schema metadata out of the dump. A future protected
-// issuer must invalidate all pre-restore authority and reissue fresh QH/PAG;
+// trust domain. The ordinary backup must first reject any protected execution
+// (whose public execution/log rows would otherwise be inconsistent with this
+// excluded private ledger). Excluding the complete private schema then keeps
+// its tables, trigger functions, and schema metadata out of a STANDARD-only
+// dump. A future protected backup/restore path needs its own atomic contract;
 // this fixed value must never become a caller-configurable pg_dump pattern.
 const BACKUP_EXCLUDED_PHASE_A_QUALIFICATION_SCHEMA: &str = "des_phase_a_qualification";
+const STANDARD_BACKUP_PHASE_A_EXECUTION_ABSENCE_QUERY: &str = "SELECT NOT EXISTS (SELECT 1 FROM public.executions WHERE authorization_mode = 'PHASE_A_HARNESS');";
 const RESTORE_STAGE_HELPER_ROLE: &str = "restore-stage";
 const DOCKER_STORAGE_PROBE_HELPER_ROLE: &str = "storage-probe";
 const HELPER_CONTAINER_INSPECT_FORMAT: &str = r#"{{ index .Config.Labels "com.xiaoli.datax.helper-role" }}|{{ index .Config.Labels "com.xiaoli.datax.helper-id" }}"#;
@@ -4930,12 +4933,27 @@ fn perform_system_backup(
         ));
     }
     ensure_backup_migration_revision(tools, installation, image_lock, &prepared.active_runtime)?;
+    ensure_standard_backup_has_no_phase_a_execution(
+        tools,
+        installation,
+        image_lock,
+        &prepared.active_runtime,
+    )?;
     run_postgres_dump(
         tools,
         installation,
         image_lock,
         &prepared.active_runtime,
         &staging.postgres_dump,
+    )?;
+    // A future protected issuer is not part of the standard Compose stop
+    // set. Recheck while PostgreSQL is still live so a private public row can
+    // never be silently paired with a dump that excludes its PEA/PAG ledger.
+    ensure_standard_backup_has_no_phase_a_execution(
+        tools,
+        installation,
+        image_lock,
+        &prepared.active_runtime,
     )?;
     platform::ensure_regular_file(&staging.postgres_dump)?;
     restrict_file_acl(
@@ -5037,6 +5055,57 @@ fn ensure_backup_migration_revision(
         return Err(LauncherError::new(
             "BACKUP_MIGRATION_REVISION_UNSUPPORTED",
             "数据库迁移版本与当前备份 helper 不完全一致；已拒绝导出。",
+        ));
+    }
+    Ok(())
+}
+
+fn phase_a_execution_absence_confirmed(stdout: &[u8]) -> bool {
+    normalize_text(stdout).trim() == "t"
+}
+
+fn ensure_standard_backup_has_no_phase_a_execution(
+    tools: &Tools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+    active_runtime: &ActiveRuntimeSnapshot,
+) -> Result<(), LauncherError> {
+    let output = compose_owned_for_runtime(
+        tools,
+        installation,
+        image_lock,
+        active_runtime,
+        &["postgres"],
+        true,
+        &[
+            "exec",
+            "-T",
+            "postgres",
+            "psql",
+            "--no-psqlrc",
+            "--tuples-only",
+            "--no-align",
+            "--set",
+            "ON_ERROR_STOP=1",
+            "--username",
+            "datax_studio",
+            "--dbname",
+            "datax_studio",
+            "--command",
+            STANDARD_BACKUP_PHASE_A_EXECUTION_ABSENCE_QUERY,
+        ],
+        PROCESS_TIMEOUT,
+    )?;
+    if !output.status.success() {
+        return Err(LauncherError::new(
+            "BACKUP_PHASE_A_PRIVATE_EXECUTION_CHECK_FAILED",
+            "无法核验是否存在受保护 Phase-A 执行；标准备份不会猜测或导出可能不完整的私有链路。",
+        ));
+    }
+    if !phase_a_execution_absence_confirmed(&output.stdout) {
+        return Err(LauncherError::new(
+            "BACKUP_PHASE_A_PRIVATE_EXECUTION_PRESENT",
+            "检测到受保护 Phase-A 执行；标准 DATA/SECRETS 备份会排除其私有授权账本，因此已拒绝导出。受保护备份与恢复路径尚未实现。",
         ));
     }
     Ok(())
@@ -8382,6 +8451,15 @@ mod tests {
                 .iter()
                 .any(|value| value.starts_with("--exclude-table"))
         );
+    }
+
+    #[test]
+    fn standard_backup_requires_a_positive_phase_a_execution_absence_check() {
+        assert!(phase_a_execution_absence_confirmed(b"t\n"));
+        assert!(phase_a_execution_absence_confirmed(b"  t  \r\n"));
+        assert!(!phase_a_execution_absence_confirmed(b"f\n"));
+        assert!(!phase_a_execution_absence_confirmed(b""));
+        assert!(!phase_a_execution_absence_confirmed(b"unexpected\n"));
     }
 
     #[test]

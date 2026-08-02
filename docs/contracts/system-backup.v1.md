@@ -18,6 +18,11 @@ PostgreSQL named volume、`pg_restore`、数据库/审计链证据重算、日�
 提交、签名安装包集成、实际 Docker named volume 演练、异机 Windows 11 x64 恢复与
 RPO/RTO 仍为 `NOT_RUN/BLOCKED`。
 
+本轮 `scripts/test-postgres-e2.sh` 在 disposable PostgreSQL 15 退出 `0`，其 PostgreSQL pytest 段
+`29 passed`，并已让标准 `--exclude-schema=des_phase_a_qualification` dump 在空数据库 `pg_restore`
+成功。该探针只证明 schema-exclusion 的 dump/restore 引用完整性；它不创建产品 named volume、不会
+bootstrap 私有 ledger/issuance epoch，也不改变本节系统恢复仍为 `NOT_RUN/BLOCKED` 的结论。
+
 因此普通单包 `restore_package` 固定返回 `RESTORE_PAIR_REQUIRED`。内部
 `stage-restore-pair` 成功完成认证与解包后也必须返回非成功状态
 `RESTORE_STAGED_COMMIT_BLOCKED`。Launcher 的完整 restore 参数入口已接入这一 E1 helper：
@@ -30,12 +35,25 @@ journal 或 staging 文件存在都不能表述为“Windows 可恢复门禁已�
 - Launcher 先调用固定 lifecycle helper 进入 draining，证明没有活动 Execution 或
   RecoveryProbe，再停止 `web/api/worker/egress-guard`；PostgreSQL 只在生成逻辑备份时
   保持运行。
+- **Phase-A public-row backup gate。** 当前 Launcher 在 `pg_dump` 前，及 `pg_dump` 成功后但
+  PostgreSQL 尚在运行时，各执行一次固定的 `psql` 检查：`SELECT NOT EXISTS (SELECT 1 FROM
+  public.executions WHERE authorization_mode = 'PHASE_A_HARNESS')`。只有精确 `t` 才可继续；任一
+  `PHASE_A_HARNESS` 行（历史、排队、失败或终态行同样阻断）或任何非 `t` 输出返回
+  `BACKUP_PHASE_A_PRIVATE_EXECUTION_PRESENT`，`psql` 正常完成但退出非零返回
+  `BACKUP_PHASE_A_PRIVATE_EXECUTION_CHECK_FAILED`。子进程启动、等待或超时的底层 Launcher 错误也必须
+  直接阻断备份。两种检查结论都必须失败关闭，不能仅依赖
+  `--exclude-schema=des_phase_a_qualification` 后继续导出。前后双检避免 private public Execution
+  元数据或以 execution ID 命名的日志与被排除的 PEA/PAG ledger 静默配对。**受保护 Phase-A
+  backup/restore 目前未实现**；不得以跳过此 gate、按表名过滤或把标准包标为“私有备份”替代它。
 - 数据库必须由固定 PostgreSQL 容器执行参数数组形式的
   `pg_dump --format=custom --compress=0 --serializable-deferrable`
   `--exclude-schema=des_phase_a_qualification` 并取得单一一致性快照；该排除项是
-  Launcher 固定字面量，不能由用户、环境变量或备份请求改写。该 schema 包含 Phase-A 的两张
-  ledger 表、触发器、guard functions 及 0021 `SECURITY DEFINER` entrypoints；使用 schema 排除而不是 `--exclude-table-data`，以避免
-  custom dump 留下私有 schema/function metadata。禁用 dump 压缩是为了让导出前的部署 secret 精确 byte 扫描可执行。helper 只接受
+  Launcher 固定字面量，不能由用户、环境变量或备份请求改写。该私有 schema 当前包含 Phase-A 的三张
+  ledger 表、schema 内触发器、私有 ledger guard functions 和私有 0021/0022 `SECURITY DEFINER`
+  issuer/consumer entrypoints；PEA 已在同一完整 schema exclusion 范围内。保护 public `executions`
+  trigger 的 `public.des_phase_a_execution_mode_guard()` 则故意不被排除，必须随标准 dump/restore 保留；
+  它仍由无登录 ledger owner 持有，并向 `PUBLIC`、runtime、issuer 与 consumer 撤销执行权。使用 schema
+  排除而不是 `--exclude-table-data`，以避免 custom dump 留下私有 schema/function metadata。禁用 dump 压缩是为了让导出前的部署 secret 精确 byte 扫描可执行。helper 只接受
   以 `PGDMP` 开头的普通文件，不接受物理
   `des-postgres-data` volume 归档。
 - 逻辑 dump 的宿主 staging 文件必须位于 Launcher 创建的受限 ACL 随机目录；分包完成或
@@ -58,8 +76,8 @@ DATA 包只允许以下归档项：
 
 | 归档路径 | 来源 | 约束 |
 |---|---|---|
-| `database/postgres.dump` | 已排除完整 `des_phase_a_qualification` 私有 schema 的一致性 `pg_dump` custom-format 文件 | 普通文件、`PGDMP` magic、长度和 SHA-256 与清单一致 |
-| `logs/` | 只读活动 `RuntimeGeneration` 所指定的 log named volume（LEGACY 为 `des-log-data`） | 只允许 `<execution UUID>/<attempt UUID>.log` |
+| `database/postgres.dump` | 已通过 Phase-A public-row backup gate、且排除完整 `des_phase_a_qualification` 私有 schema 的一致性 `pg_dump` custom-format 文件 | 普通文件、`PGDMP` magic、长度和 SHA-256 与清单一致；任何 `PHASE_A_HARNESS` 行存在时不得创建 |
+| `logs/` | 只读活动 `RuntimeGeneration` 所指定的 log named volume（LEGACY 为 `des-log-data`） | 只允许 `<execution UUID>/<attempt UUID>.log`；只在同一轮 Phase-A public-row gate 通过时读取，不能导出 private execution 的日志 |
 | `metadata/compose.yaml` | 发布制品 | 固定文件、大小和 SHA-256 与清单一致 |
 | `metadata/images.release.env` | 发布制品 | 固定文件、大小和 SHA-256 与清单一致 |
 | `metadata/release-manifest.json` | 发布制品 | 固定文件、大小和 SHA-256 与清单一致 |
@@ -70,9 +88,11 @@ DATA 包只允许以下归档项：
 - `des-postgres-data` 物理卷、数据库数据目录、WAL 或 Docker volume tar；
 - Launcher keyring、数据库密码、`egress_lease_creation_capability`、JWT 私钥、HMAC、
   KEK、数据源明文凭据；
-- `des_phase_a_qualification` 整个 schema（`phase_a_qualification_nonces`、
-  `phase_a_qualification_grants`、触发器、guard functions、0021 `SECURITY DEFINER` entrypoints 及其记录），以及任何
-  QH/PAG/QR/private qualification source；标准 backup 与 diagnostics 均不得携带这些受保护
+- `des_phase_a_qualification` 整个私有 schema（当前 `phase_a_qualification_nonces`、
+  `phase_a_qualification_grants`、`phase_a_execution_authorizations`、schema 内触发器、私有 ledger guard
+  functions、私有 0021/0022 `SECURITY DEFINER` issuer/consumer entrypoints 及其记录；PEA 仅可含 nonce
+  SHA-256，绝不可含 raw nonce），以及任何
+  QH/PAG/PEA/QR/private qualification source；标准 backup 与 diagnostics 均不得携带这些受保护
   资格材料；
 - 未知元数据文件、链接、设备、FIFO、socket 或未声明归档路径。
 
@@ -134,13 +154,16 @@ DATA 包只允许以下归档项：
 5. staging secrets、installation-id 和目标 volumes 的原子提交；
 6. 中断后只允许使用同一包对和秘密继续，或只清理由 journal 记录的 staging 对象。
 
-由于标准 DATA dump 特意不含整个 `des_phase_a_qualification` schema，任何未来完整恢复也**不得**
-复活备份时存在的 QH/PAG 或重放防护状态。恢复后的数据库仍会携带 `alembic_version=20260802_0021`，
-却不会有该 schema、其 0021 `SECURITY DEFINER` entrypoints 或无登录 ledger roles；所以当前真实
+由于标准 backup 在任一 `PHASE_A_HARNESS` public Execution 存在时必须拒绝导出，并且标准 DATA dump
+特意不含整个 `des_phase_a_qualification` schema，任何未来完整恢复也**不得**复活备份时存在的
+QH/PAG/PEA 或重放防护状态。受保护 Phase-A backup/restore 是独立的未来能力，当前不存在。恢复后的数据库仍会携带 `alembic_version=20260802_0022`，
+却不会有该 schema、其私有 0021/0022 `SECURITY DEFINER` issuer/consumer entrypoints 或无登录 ledger roles；
+`public.des_phase_a_execution_mode_guard()` 会随 public trigger 保留；所以当前真实
 `pg_restore`、应用启动和迁移后的 ledger bootstrap 均保持
 `BLOCKED`，不得把空 probe restore 写成可恢复系统。未来完整恢复必须先在受保护的 restore
 bootstrap 中创建空 ledger、生成不随备份恢复的 issuance epoch，并只接受该 epoch 后重新验证
-P/QH、原子消费的新 nonce 与新 PAG。当前没有这种 issuer/source 或完整 restore，因此本规则
+P/QH、原子消费的新 nonce 与新 PAG，以及每条新 Execution 的新 PEA。当前没有这种 issuer/source
+或完整 restore，因此本规则
 只是失败关闭的设计约束，不是“已恢复资格”或 E3/E4 证据。
 
 以上门禁及干净 Windows 11 x64 异机演练完成前，恢复和覆盖升级必须保持失败关闭。普通

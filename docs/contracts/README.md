@@ -75,6 +75,14 @@
   `phase-a-qualification-grant.v1.schema.json`：ADR-0011 的不可变 P、短期 QH 与受保护私有
   Phase-A 单 pair 授权记录。后者固定 P/harness/QH/Reader-Writer 的精确绑定和生命周期形状，
   但不是普通 API、Worker、Compose 或用户可提交的契约，更不是 E3/E4 或发布结论。
+- `phase-a-execution-authorization.v1.schema.json`：J0b.1 的**E1 私有 PEA read-record**
+  形状，精确对应 0022 consumer `des_read_active_phase_a_execution_authorization` 的返回列。
+  0022 的 immutable PEA 对 `grant_id` 和 `execution_id` 各自唯一，绑定一个既有 PAG 到一个精确
+  Execution、JobVersion、两侧 Datasource/EndpointPolicy revision、TransferPolicy、TargetNamespace
+  和 P/runtime/harness/QH（仅 `nonce_sha256`，绝无 raw nonce）摘要。PEA 无独立 `state`，只在
+  PAG 当前 `ACTIVE`、QH 时间窗有效且全量 current-fact 联结相等时由 read 函数返回。该 Schema 不是
+  私有 API/Worker 通道；当前没有私有 Phase-A Worker/runner，保持硬禁用。私有 execution lock/fence、
+  confirmation、audit checkpoint 与凭据/日志/维护隔离未落地前，它不给普通用户能力，也不形成 E3/E4、QR 或发布结论。
 - `egress-guard-attestation.v1.schema.json`：共享网络命名空间内出口守卫的实时证明。
 - `egress-guard-lease.v1.schema.json`：精确 selected-IP `/32|/128 + TCP port` 短租约请求与响应。
 - `egress-guard.v1.md`：守卫只读数据库视图、loopback HTTP、nftables 和 fail-closed 边界。
@@ -87,10 +95,11 @@
   `ACCEPTED_BASELINE_NOT_GRANT_READY`；它记录 003A 的显式 grant/trigger/function 目标和
   pre-implementation blockers，管理面分组仍须展开为逐表/逐列 grant，不能被当作 PostgreSQL
   权限已生效或可直接生成迁移的证据。
-- `system-backup.v1.md`：Windows Launcher 调用备份 helper 的停机、加密、恢复 journal 与失败关闭边界。
+- `system-backup.v1.md`：Windows Launcher 调用备份 helper 的停机、加密、恢复 journal 与失败关闭边界；0022 后标准 backup 会在 `pg_dump` 前后重验无 `PHASE_A_HARNESS` public Execution，存在/非 `t` 输出或 psql 非零均拒绝导出，受保护 Phase-A backup/restore 未实现。
 
 ADR-0011 的 Phase-A 契约基础件现包括 `release-payload.v1.schema.json`、
-`harness-qualification.v1.schema.json` 与 `phase-a-qualification-grant.v1.schema.json`：前者
+`harness-qualification.v1.schema.json`、`phase-a-qualification-grant.v1.schema.json` 与
+`phase-a-execution-authorization.v1.schema.json`：前者
 定义不含 QH/PAG/QR/最终安装包的不可变 P 及其 `payload_root_sha256`，第二者定义最长 24 小时、
 一次性、域分隔 Ed25519 QH；PAG 则只记录一个受保护私有 Phase-A 授权的 `grant_id`、精确
 P/harness binding、完整 P binding 的 `payload_binding_sha256`、QH
@@ -117,24 +126,41 @@ persistence 基础件；它仍不是可运行的 qualification 通道。受保�
 只允许 `ACTIVE -> REVOKED|EXPIRED` 的单调终态，且其有效窗口必须落在 QH 有效窗口内。
 `20260802_0021` 新增无登录 ledger owner / issuer / consumer、最小 `SECURITY DEFINER`
 issue/revoke/read 函数和只接受未来 protected Engine 注入的 private adapter。issue 必须在一个事务写
-nonce 与 PAG；read 只返回 current `ACTIVE` grant。J0a 仍刻意不含 `execution_id` linkage；未来精确
-Execution authorization 必须由单独 protected atomic 纵向切片提供，不能事后把 grant 改为可变。没有
-private API/Worker/Compose override、受保护 harness、QR reader 或真实 E3/E4 证据。不得把 PAG 放入
-标准 Compose/Setup/Launcher、公开候选、备份/诊断包、环境变量、普通 API/UI、Plugin Manifest 或普通
-Worker 检查点；它不得改变
+nonce 与 PAG；read 只返回 current `ACTIVE` grant。J0a 刻意不含 `execution_id` linkage；`20260802_0022`
+以独立 PEA 补充它：issuer `des_authorize_phase_a_execution` 只能对一个已存在、pending 的
+`PHASE_A_HARNESS` Execution 和仍有效 PAG 进行锁定后原子写入；记录对 `grant_id`/`execution_id`
+各自唯一、append-only，冻结 `job_version_id/version_artifact_hash/spec_hash`、两侧
+DatasourceRevision/EndpointPolicyRevision 的 ID+hash、TransferPolicy `scope_hash/row_version`、
+TargetNamespace identity，以及 PAG/P/runtime/harness/QH 和**仅 nonce SHA-256**的交叉检查摘要。
+consumer `des_read_active_phase_a_execution_authorization` 只有在 PAG `ACTIVE`、QH 时窗和全部 current
+facts 仍相等时返回该 PEA；PEA 不存独立 `state`。0022 还令普通 Worker claim 只领取 `STANDARD`，
+绝不领取 `PHASE_A_HARNESS`。`qualification.execution_authorization` 的 private issuer/consumer adapter
+只调用这两个受限函数，并从 read record 重建、复检非秘密 binding；它不创建/claim/reconcile Execution、
+不解密凭据也不启动 DataX。普通 API、Worker 与 recovery/reconciler 都只处理 `STANDARD`，不能读取、
+修改、领取或推进 PEA/private Execution。每次未来 private rerun 都是新 Execution 和新 PEA，不得复制
+旧 PEA；Schema 不证明函数调用、跨对象相等、时钟、角色隔离或私有 Worker 接线。
+
+0022 source/migration 还为 `datax_api/datax_worker/datax_egress_guard` 在 `executions` 和 execution/probe-linked
+attempt/lock/event/cancel/log/recovery/evidence/work-termination descendants 启用 parent-linked RLS；普通 runtime DB
+直连不能从这些表读取或写入 private row。issuer authorize 后 row 仍为
+`BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`。本轮真实 PostgreSQL 15 E2 已以 API/Worker direct DB
+验证普通路径/RLS 边界（脚本退出 `0`，pytest `29 passed`），但它仍不是 private Worker/runner、E3 或 E4。
+
+没有私有 Execution 创建/rerun 入口、private API/Worker 四检查点、Compose credential provisioning、
+QH/PAG/PEA source/override、受保护 harness、QR reader 或真实 E3/E4 证据。不得把 PAG 或 PEA 放入标准 Compose/Setup/Launcher、公开候选、备份/诊断包、
+环境变量、普通 API/UI、Plugin Manifest 或普通 Worker 检查点；它们不得改变
 `ordinary_user_executable`、创建 E3/E4 PASS、`WINDOWS_E4_CERTIFIED`、QR 或公开发布批准。
 标准系统备份与诊断必须固定排除完整 `des_phase_a_qualification` schema；普通 restore 不得复制、
-恢复或重新激活任何 Phase-A nonce/grant authority。当前 dump 会保留 `alembic_version=20260802_0021` 却排除
+恢复或重新激活任何 Phase-A nonce/grant/PEA authority。当前 dump 会保留 `alembic_version=20260802_0022` 却排除
 该 schema，因此真实 restore/bootstrap/start 不是现有能力且继续 `BLOCKED`。若未来需要继续资格化，
 只能由独立受保护 issuer 在新 restore epoch 后重新验证 P/QH 并重新签发。
 
-`scripts/test-postgres-e2.sh` 已在临时、一次性真实 PostgreSQL 15 容器取得 `22 passed`：0021
-upgrade/downgrade/re-upgrade、标准运行角色及实际 issuer/consumer 的 direct-DML/function boundary、
-真实 Python issuer → consumer preflight → revoke 往返和 schema-exclusion TOC/临时库 restore probe。
-该次还覆盖预存私有角色名/成员关系失败关闭和 ledger owner future-function `PUBLIC EXECUTE` 默认权
-负例。这只是受限 PostgreSQL **E2**：不启动产品 Compose、API/Worker/DataX/MySQL 或独立数据 oracle，也不
-验证 restore bootstrap/start，因而不是 DataX E3、Windows E4、私有 harness 验收或任何发布结论；
-测试/脚本文件存在本身不能代替这次 `22 passed` 运行记录。
+本轮 `scripts/test-postgres-e2.sh` 已在临时、一次性真实 PostgreSQL 15 容器退出 `0`，PostgreSQL pytest
+取得 `29 passed`：覆盖 0021 role/function、issuer → consumer → revoke 与 role-collision fail-closed，和
+0022 PEA authorization、普通路径拒绝、API/Worker RLS；同轮验证 private schema exclusion 的 TOC 与空数据库
+`pg_restore` 探针。这只是受限 PostgreSQL **E2**：不启动产品 Compose、API/Worker/DataX/MySQL 或独立数据
+oracle，也不验证 restore bootstrap/start，因而不是 DataX E3、Windows E4、私有 harness 验收或任何发布结论；
+测试/脚本文件存在本身不能代替这次 `29 passed` 运行记录。
 
 `ReleasePayload`、`PhaseAHarnessAuthorization` 与 `PhaseAExecutionBinding` 的进程内 provenance
 marker 只能捕获同一 Python 进程中的意外构造或篡改；Python 内存不是 protected issuer/consumer
@@ -142,8 +168,8 @@ marker 只能捕获同一 Python 进程中的意外构造或篡改；Python 内�
 source 仍须由未来 protected harness 保护；不得反序列化调用方 dataclass、请求体或 marker 来授予资格。
 
 `release-qualification`、candidate-root.v2、受保护 qualification override、受信 reader、真实
-Phase-A/Phase-B harness、签名/OIDC 证据仍未实现；PAG 的 private API/Worker/Compose 接线与
-Execution authorization 也仍未实现。Windows E4 profile/result 的 E1 语义契约
+Phase-A/Phase-B harness、签名/OIDC 证据仍未实现；PAG/PEA 的 private API/Worker/Compose 接线与
+四检查点也仍未实现。Windows E4 profile/result 的 E1 语义契约
 不等于这些最终发布契约，也不提供其受信结果。现有 candidate-root.v1 继续只允许
 BLOCKED/release_approved=false；不得用新增可选字段、宽松 schema、测试注入、环境变量或自签
 公钥伪造资格。普通生产路径继续 deny-all。

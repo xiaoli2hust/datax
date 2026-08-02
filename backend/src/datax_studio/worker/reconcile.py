@@ -241,6 +241,7 @@ class WorkerReconciler:
                     .where(
                         WorkTerminationRequest.work_kind == "EXECUTION",
                         WorkTerminationRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
+                        Execution.authorization_mode == "STANDARD",
                         Execution.process_state == "QUEUED",
                         Execution.active_attempt_id.is_(None),
                     )
@@ -258,6 +259,7 @@ class WorkerReconciler:
                     .where(
                         WorkTerminationRequest.work_kind == "EXECUTION",
                         WorkTerminationRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
+                        Execution.authorization_mode == "STANDARD",
                         Execution.process_state.in_(_ACTIVE_EXECUTION_STATES),
                         Execution.active_attempt_id.is_not(None),
                     )
@@ -272,9 +274,12 @@ class WorkerReconciler:
                         RecoveryProbe,
                         RecoveryProbe.id == WorkTerminationRequest.work_id,
                     )
+                    .join(RecoveryGate, RecoveryGate.id == RecoveryProbe.recovery_gate_id)
+                    .join(Execution, Execution.id == RecoveryGate.execution_id)
                     .where(
                         WorkTerminationRequest.work_kind == "RECOVERY_PROBE",
                         WorkTerminationRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
+                        Execution.authorization_mode == "STANDARD",
                         RecoveryProbe.process_state == "QUEUED",
                         RecoveryProbe.active_attempt_id.is_(None),
                     )
@@ -289,9 +294,12 @@ class WorkerReconciler:
                         RecoveryProbe,
                         RecoveryProbe.id == WorkTerminationRequest.work_id,
                     )
+                    .join(RecoveryGate, RecoveryGate.id == RecoveryProbe.recovery_gate_id)
+                    .join(Execution, Execution.id == RecoveryGate.execution_id)
                     .where(
                         WorkTerminationRequest.work_kind == "RECOVERY_PROBE",
                         WorkTerminationRequest.status.in_(("PENDING", "ACKNOWLEDGED")),
+                        Execution.authorization_mode == "STANDARD",
                         RecoveryProbe.process_state.in_({"STARTING", "RUNNING"}),
                         RecoveryProbe.active_attempt_id.is_not(None),
                     )
@@ -326,6 +334,7 @@ class WorkerReconciler:
                     select(Execution.id)
                     .where(
                         Execution.process_state.in_(_ACTIVE_EXECUTION_STATES | {"QUEUED"}),
+                        Execution.authorization_mode == "STANDARD",
                         Execution.target_exclusivity_status == "ACTIVE",
                         Execution.target_exclusivity_revoked_at.is_(None),
                         Execution.target_exclusivity_revocation_reason.is_(None),
@@ -351,7 +360,11 @@ class WorkerReconciler:
                 if execution is not None and execution.active_attempt_id is not None
                 else None
             )
-            if execution is None or attempt is None:
+            if (
+                execution is None
+                or execution.authorization_mode != "STANDARD"
+                or attempt is None
+            ):
                 return 0
             expired = ensure_aware(attempt.lease_expires_at) <= now
             if (
@@ -438,7 +451,7 @@ class WorkerReconciler:
             execution = session.scalar(
                 select(Execution).where(Execution.id == execution_id).with_for_update()
             )
-            if execution is None:
+            if execution is None or execution.authorization_mode != "STANDARD":
                 return False
             return (
                 ensure_recovery_gate(
@@ -480,6 +493,7 @@ class WorkerReconciler:
                     )
                     .where(
                         ExecutionCancelRequest.status == "PENDING",
+                        Execution.authorization_mode == "STANDARD",
                         Execution.process_state == "QUEUED",
                         Execution.active_attempt_id.is_(None),
                     )
@@ -496,7 +510,10 @@ class WorkerReconciler:
             return list(
                 session.scalars(
                     select(Execution.id)
-                    .where(Execution.process_state.in_(_ACTIVE_EXECUTION_STATES))
+                    .where(
+                        Execution.authorization_mode == "STANDARD",
+                        Execution.process_state.in_(_ACTIVE_EXECUTION_STATES),
+                    )
                     .order_by(Execution.id)
                 )
             )
@@ -506,7 +523,12 @@ class WorkerReconciler:
             return list(
                 session.scalars(
                     select(RecoveryProbe.id)
-                    .where(RecoveryProbe.process_state.in_({"STARTING", "RUNNING"}))
+                    .join(RecoveryGate, RecoveryGate.id == RecoveryProbe.recovery_gate_id)
+                    .join(Execution, Execution.id == RecoveryGate.execution_id)
+                    .where(
+                        Execution.authorization_mode == "STANDARD",
+                        RecoveryProbe.process_state.in_({"STARTING", "RUNNING"}),
+                    )
                     .order_by(RecoveryProbe.id)
                 )
             )
@@ -526,6 +548,7 @@ class WorkerReconciler:
             )
             if (
                 execution is None
+                or execution.authorization_mode != "STANDARD"
                 or execution.process_state not in _ACTIVE_EXECUTION_STATES
                 or execution.active_attempt_id is None
             ):
@@ -690,6 +713,16 @@ class WorkerReconciler:
                 or probe.process_state not in {"STARTING", "RUNNING"}
                 or probe.active_attempt_id is None
             ):
+                return False
+            standard_execution_id = session.scalar(
+                select(Execution.id)
+                .join(RecoveryGate, RecoveryGate.execution_id == Execution.id)
+                .where(
+                    RecoveryGate.id == probe.recovery_gate_id,
+                    Execution.authorization_mode == "STANDARD",
+                )
+            )
+            if standard_execution_id is None:
                 return False
             attempt = session.scalar(
                 select(RecoveryProbeAttempt)

@@ -391,6 +391,7 @@ class RecoveryProbeWorker:
                 or probe.process_state != "STARTING"
                 or gate is None
                 or execution is None
+                or execution.authorization_mode != "STANDARD"
                 or version is None
                 or revision is None
                 or policy is None

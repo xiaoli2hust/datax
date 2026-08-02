@@ -46,13 +46,17 @@
 
 > ADR-0011 已接受未来的两阶段插件/Runtime qualification 与发布晋级链：不可变 payload
 > 先在受保护 Windows harness 中取得 Phase A 私有 qualification（不是 E4 或 Plugin Manifest
-> 状态），独立签发 detached QR 后才构建私有最终候选；再在无 QH 的 Phase B 中验证精确
+> 状态），独立签发 detached QR 后才构建私有最终候选；再在无 QH/PAG/PEA 的 Phase B 中验证精确
 > 安装包，才可派生 Windows E4 插件状态并交给 ADR-0010 hosted attestor/PR 公开晋级。
-> 当前已有 P/QH/PAG Schema、失败关闭 P/QH parser、私有 payload/runtime/job binding 与
-> PostgreSQL nonce/grant E1 基础账本；`20260802_0021` 还增加了无登录 ledger owner / issuer /
-> consumer、最小 `SECURITY DEFINER` 签发/撤回/读取函数和未接入标准路径的 private adapter。它们
+> 当前已有 P/QH/PAG/PEA Schema、失败关闭 P/QH parser、私有 payload/runtime/job binding 与
+> PostgreSQL nonce/grant/PEA E1 基础账本；`20260802_0021/0022` 增加了无登录 ledger owner / issuer /
+> consumer、最小 `SECURITY DEFINER` 签发/撤回/读取/PEA-authorize 函数和未接入标准路径的 private adapter。
+> 0022 令普通 API、Worker、recovery/reconciler 与公开日志路径只处理 `STANDARD`，并为三类 runtime DB role
+> 的 `executions` 及 execution-linked descendants 实现 parent-linked RLS；issuer authorize 后仍为
+> `BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，PEA 不能变成普通执行旁路。0022 RLS/authorization 已在本切片
+> 真实 PostgreSQL E2 中验证。它们
 > 不等于已签发 P/QH、可运行的 qualification workflow 或 release approval：没有标准角色凭据、
-> QH/PAG source/override、私有 API/Worker Execution authorization、受保护 harness、QR reader、
+> QH/PAG/PEA source/override、私有 Execution 创建/rerun、私有 API/Worker 四检查点、受保护 harness、QR reader、
 > candidate-root.v2 或真实 Windows/签名/OIDC 证据，发布仍只能生成显式 BLOCKED 候选。
 
 ## 1. 仓库目标
@@ -218,11 +222,18 @@ Windows release runner 或签名结果已经在线验证。Java 源码也没有�
 - 前端格式化、lint、类型检查、单元测试和构建。
 - 后端格式化、lint、类型检查、单元和 API 集成测试。
 - Alembic 从空库升级、前后版本兼容与恢复测试。
-- 改动 ADR-0011 Phase-A 基础件时，必须验证 P/QH/PAG Schema、失败关闭 parser/binding，及
-  PostgreSQL nonce/grant 的重放、不可变、生命周期、标准运行角色 direct-table-denial、issuer/consumer
-  的函数最小权限、原子 nonce+grant 签发与 current-grant 读取。它们不得被 Settings、标准 Compose、
+- 改动 ADR-0011 Phase-A 基础件时，必须验证 P/QH/PAG/PEA Schema、失败关闭 parser/binding，及
+  PostgreSQL nonce/grant/PEA 的重放、不可变、生命周期、标准运行角色 direct-table-denial、issuer/consumer
+  的函数最小权限、原子 nonce+grant 签发、PEA issuer-authorize/consumer-read 及 current-grant 读取。PEA 还必须验证
+  `grant_id`/`execution_id` 各自唯一、只持久化 nonce SHA-256（无 raw nonce）、PAG/QH/current-fact
+  错配时 read 失败关闭、issuer authorize 后保持 `BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，以及普通 API/Worker/Recovery/日志只处理 `STANDARD`。
+  真实 PostgreSQL E2 还必须用 runtime role DB URL 验证 parent-linked RLS 不能通过 attempt/lock/event/cancel/log/recovery/evidence/WTR 后代读写 private row。它们不得被 Settings、标准 Compose、
   API 或普通 Worker 接入；还必须验证预存私有角色名/成员关系失败关闭，以及 ledger owner 后续
   新建函数默认无 `PUBLIC EXECUTE`。
+  本轮 `scripts/test-postgres-e2.sh` 已在 disposable real PostgreSQL 15 退出 `0`，PostgreSQL pytest
+  `29 passed`，提供 0022 PEA authorization、普通路径拒绝、API/Worker runtime-role RLS、私有 schema
+  exclusion 与空库 `pg_restore` 探针的数据库 E2/负向验证；private create/rerun/claim/start 四检查点仍须再有
+  私有 harness 负向验证。
   该临时 PostgreSQL 容器检查最多是数据库 E2；未启动产品 Compose、API、Worker、DataX、
   MySQL 或独立 oracle 时，绝不能称为 Phase-A E3、Windows E4 或发布证据。
 - Docker 镜像构建、健康检查、非 root 和制品摘要检查。
@@ -297,15 +308,19 @@ Windows release runner 或签名结果已经在线验证。Java 源码也没有�
 
 ADR-0011 要求把未来 release workflow 拆成以下不可互相替代的阶段：
 
-1. 先以精确 commit 构建不可变 payload P，并在不含 QH/QR/最终 Setup 的情况下计算
+1. 先以精确 commit 构建不可变 payload P，并在不含 QH/PAG/PEA/QR/最终 Setup 的情况下计算
    payload root；改变镜像、Runtime、插件、内置公钥或锁即产生新 P。
 2. 受保护 HQA 仅为指定 P、固定 harness、一次性 nonce 和短有效期签发 QH。QH 只能经
    私有 override 给 Phase A harness，不能出现在标准 Compose、Setup、公开 artifact、
    settings 或普通用户能力目录。
-3. 真实 E3/私有 Windows harness/payload qualification（不是 E4）的独立复核通过后，独立
+3. 0022 的 protected issuer 已能以 immutable、`UNIQUE(grant_id)` + `UNIQUE(execution_id)` PEA 将既有
+   ACTIVE PAG 与一个已存在的 pending `PHASE_A_HARNESS` Execution/JobVersion/revision/policy/namespace/
+   P/runtime/harness/QH/nonce-SHA-256 facts 原子绑定；consumer read 已对有效 PAG/QH/current facts
+   失败关闭。private create/rerun/claim/start 四检查点尚未接线；只有它们完成后，真实 E3/私有 Windows harness/payload
+   qualification（不是 E4）的独立复核通过后，独立
    RQA 才能签发 detached QR。HQA、RQA、Authenticode 证书和 GitHub OIDC 不是同一把密钥或
    同一角色。
-4. QR 进入私有最终 F 后，Phase B 必须在无 QH 的标准 Launcher/Compose 上运行精确
+4. QR 进入私有最终 F 后，Phase B 必须在无 QH/PAG/PEA 的标准 Launcher/Compose 上运行精确
    Setup/Launcher 的 Windows E4；只有该证据才可派生 `WINDOWS_E4_CERTIFIED`，随后生成
    同时绑定 P、QR、F 和最终证据的 candidate-root v2，由 hosted attestor 验证来源并由
    发布 validator 形成 PR。E4 状态本身不等于公开晋级。
@@ -314,11 +329,13 @@ ADR-0011 要求把未来 release workflow 拆成以下不可互相替代的阶�
 把 QR 写进 Worker 镜像、让 QR 绑定包含它的 Setup/manifest、使用环境变量放行，或把
 self-hosted runner 的自述 JSON 当作公开 release 证明。
 
-当前的 E1 状态包括 P/QH parser、私有 payload/runtime/job binding 与 durable nonce/grant
-账本；`20260802_0021` 已用无登录 dedicated role 与精确 `SECURITY DEFINER` 函数把 atomic
-nonce+PAG issue/revoke 与 current-grant read 分离，并提供只接受未来受保护 Engine 注入的 private
-adapter。它没有 private override、Execution authorization、普通 API/Worker 接线或受保护 harness；
-因此不能产生 QH、普通运行路径的 PAG 消费、QR、E3/E4、普通用户能力或可发布候选。
+当前的 E1 状态包括 P/QH parser、私有 payload/runtime/job binding 与 durable nonce/grant/PEA
+账本；`20260802_0021/0022` 已用无登录 dedicated role 与精确 `SECURITY DEFINER` 函数把 atomic
+nonce+PAG issue/revoke、current-grant read 和 PEA issuer-authorize/consumer-read 分离，并提供只接受未来受保护 Engine
+注入的 private adapter。0022 的 PEA 是私有数据库 record，普通 API/Worker/Recovery/日志只处理 `STANDARD`，
+runtime DB role 的 parent-linked RLS 也拒绝 private row/后代直连访问；该 E1 migration 已在本切片真实 PostgreSQL E2 中验证。整体仍没有
+private override、私有 Execution 创建/rerun、四检查点、普通 API/Worker 接线或受保护 harness；因此不能产生
+QH、普通运行路径的 PAG/PEA 消费、QR、E3/E4、普通用户能力或可发布候选。
 
 ## 7. Issue 规范
 
@@ -344,7 +361,7 @@ Bug Issue 应包含版本、环境、复现步骤、预期/实际、脱敏日志
 
 - Git commit 和标签。
 - ADR-0011 的 payload root、私有 Phase A 非 E4 资格证据摘要和由独立 RQA 签发的 QR；
-  QH 只保留在受保护 harness 的短生命周期证据区，不进入公开候选或安装包。
+  QH/PAG/PEA 只保留在受保护 harness/authority 的短生命周期证据区，不进入公开候选或安装包。
 - 精确最终 F 与其 Phase B Windows E4 证据；它可派生插件 `WINDOWS_E4_CERTIFIED`，但普通
   用户可执行性和公开分发还必须有同一 F 的有效 PR。最终 candidate-root.v2 必须绑定 P、QR、
   F、acceptance/environment/scenario/SBOM/许可证和 hosted provenance。现有 v1 根只能表示

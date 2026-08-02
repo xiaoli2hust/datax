@@ -17,18 +17,26 @@ from test_core_control_plane import (
 
 from datax_studio.api.problems import ProblemException
 from datax_studio.auth.service import AuditContext
-from datax_studio.core.db import Datasource, Execution, TargetCopyLock, WorkTerminationRequest
+from datax_studio.core.db import (
+    Datasource,
+    Execution,
+    ExecutionAttempt,
+    TargetCopyLock,
+    WorkTerminationRequest,
+)
 from datax_studio.core.schemas import ClaimedExecution, CredentialBinding
 from datax_studio.core.service import ControlService
 from datax_studio.credentials.connectors import DatabaseConnector
-from datax_studio.credentials.db import CredentialSecret
+from datax_studio.credentials.db import CredentialSecret, EndpointConnectionEvidence
 from datax_studio.credentials.keyring import KekKeyring
 from datax_studio.credentials.network import EndpointPolicyGuard
 from datax_studio.credentials.schemas import CredentialSecretStatusChange
 from datax_studio.credentials.service import CredentialService
 from datax_studio.recovery.db import RecoveryGate, RecoveryProbe, RecoveryProbeAttempt
 from datax_studio.recovery.service import ClaimedRecoveryProbe, RecoveryService
+from datax_studio.worker.executor import ExecutionWorker
 from datax_studio.worker.reconcile import RuntimeIdentity, WorkerReconciler
+from datax_studio.worker.recovery_probe import RecoveryProbeWorker
 
 __all__ = ["core_stack"]
 
@@ -252,6 +260,111 @@ def _claim_recovery_probe(
     assert probe_claim is not None
     assert probe_claim.recovery_probe_id == probe_id
     return recovery, probe_id, probe_claim
+
+
+def test_standard_credential_paths_and_worker_contexts_reject_private_execution(
+    core_stack: CoreStack,
+    tmp_path: Path,
+) -> None:
+    """Normal secret/evidence/worker code cannot touch a private PEA row."""
+
+    suffix = "private-credential-and-worker-boundary"
+    published, execution_id, claim = _claim_execution(core_stack, suffix=suffix)
+    _persist_active_target_secret(core_stack, published=published)
+    evidence_id = uuid4()
+    now = datetime.now(UTC)
+    with core_stack.sessions.begin() as session:
+        execution = session.get(Execution, execution_id)
+        assert execution is not None
+        execution.authorization_mode = "PHASE_A_HARNESS"
+        session.add(
+            EndpointConnectionEvidence(
+                id=evidence_id,
+                operation_kind="DATAX",
+                datasource_revision_id=published.target_datasource_revision_id,
+                endpoint_policy_revision_id=published.target_endpoint_policy_revision_id,
+                execution_id=execution_id,
+                recovery_probe_id=None,
+                attempt_id=claim.attempt_id,
+                fence_epoch=claim.fence_epoch,
+                resolver_policy_version="resolver-v1",
+                cname_chain=[],
+                resolved_ips=["127.0.0.1"],
+                selected_ip="127.0.0.1",
+                dns_valid_until=now + timedelta(minutes=1),
+                egress_policy_version="egress-v1",
+                egress_enforcement_status="VERIFIED",
+                egress_evidence_hash="a" * 64,
+                peer_observation_status="OBSERVED",
+                peer_ip="127.0.0.1",
+                tls_peer_spki_sha256=None,
+                decision="ALLOWED",
+                evidence_hash="b" * 64,
+                observed_at=now,
+            )
+        )
+
+    service = _credential_service(core_stack, keyring_root=tmp_path)
+    with pytest.raises(ProblemException) as hidden_evidence:
+        service.get_endpoint_connection_evidence(
+            principal=core_stack.principal,
+            connection_evidence_id=evidence_id,
+        )
+    assert hidden_evidence.value.status == 404
+
+    worker = object.__new__(ExecutionWorker)
+    worker.control = core_stack.service
+    with pytest.raises(RuntimeError, match="claimed execution context is stale"):
+        worker._load_context(claim)  # noqa: SLF001
+    with pytest.raises(RuntimeError, match="verification control facts are missing"):
+        worker._verification_facts(claim)  # noqa: SLF001
+    worker._record_workspace_cleanup(claim=claim, succeeded=True)  # noqa: SLF001
+
+    _change_target_secret_status(
+        core_stack,
+        service=service,
+        published=published,
+        status="REVOKED",
+        suffix=suffix,
+    )
+    with core_stack.sessions() as session:
+        execution = session.get(Execution, execution_id)
+        attempt = session.get(ExecutionAttempt, claim.attempt_id)
+        request_count = session.scalar(
+            select(func.count(WorkTerminationRequest.id)).where(
+                WorkTerminationRequest.work_kind == "EXECUTION",
+                WorkTerminationRequest.work_id == execution_id,
+            )
+        )
+        assert execution is not None and execution.process_state == "STARTING"
+        assert execution.authorization_mode == "PHASE_A_HARNESS"
+        assert attempt is not None and attempt.workspace_deleted_at is None
+        assert request_count == 0
+
+
+def test_standard_recovery_probe_worker_context_rejects_private_parent_execution(
+    core_stack: CoreStack,
+) -> None:
+    published, execution_id, execution_claim = _claim_execution(
+        core_stack,
+        suffix="private-recovery-probe-worker-boundary",
+    )
+    _recovery, _probe_id, probe_claim = _claim_recovery_probe(
+        core_stack,
+        published=published,
+        execution_id=execution_id,
+        execution_claim=execution_claim,
+        suffix="private-recovery-probe-worker-boundary",
+    )
+    with core_stack.sessions.begin() as session:
+        execution = session.get(Execution, execution_id)
+        assert execution is not None
+        execution.authorization_mode = "PHASE_A_HARNESS"
+
+    worker = object.__new__(RecoveryProbeWorker)
+    worker.control = core_stack.service
+    with pytest.raises(RuntimeError, match="claimed recovery probe binding is stale"):
+        worker._load_context(probe_claim)  # noqa: SLF001
 
 
 def _queue_recovery_probe(

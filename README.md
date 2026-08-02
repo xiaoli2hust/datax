@@ -41,26 +41,63 @@ Reader/Writer；当前生产证据源为 deny-all，普通用户实际开放能�
 受保护 harness 中以短期签名资格取得真实取证，再以 detached 签名资格构建私有最终候选，
 最后对精确安装包完成 Windows E4、候选根与 hosted provenance。当前已有 `P → QH → PAG → QR`
 设计中的 P/QH Schema 与失败关闭 parser、PAG Schema，以及 private Phase-A
-payload/runtime/job binding + durable nonce/grant persistence 的 **E1、进行中**基础件。`20260802_0021`
+payload/runtime/job binding + durable nonce/grant/PEA persistence 的 **E1、进行中**基础件。`20260802_0021`
 新增了只供未来私有 harness 使用的 PostgreSQL ledger 边界：无登录的 ledger owner / issuer /
 consumer 角色、仅精确授权的 `SECURITY DEFINER` 签发/撤回/读取函数，以及不接入标准路径的
 private Engine adapter。签发函数在一个数据库事务中同时写 nonce 消费事实和不可变 PAG；读取函数
 只返回当前 `ACTIVE` grant，并不把它变成 Execution 授权。若私有角色名或成员关系预先存在，
 迁移失败关闭；ledger owner 后续新建函数默认没有 `PUBLIC EXECUTE`。
 
-这不是可运行的 qualification workflow：标准 Settings、Compose、Launcher、API、Worker 和公开
-Plugin Manifest 都没有这些角色的凭据、QH/PAG override 或读取入口；J0a 没有 `execution_id`、不会
-启动 DataX，也不会改变生产 deny-all。专用登录只能由未来受保护 harness 在标准产品之外临时配置；
-受保护 harness、QH/PAG private source/override、QR、受信 reader、已签发资格和真实外部 E3/E4
-证据仍不存在。发布继续 `BLOCKED`。
+J0b.1 的机器可读
+[`phase-a-execution-authorization.v1`](docs/contracts/phase-a-execution-authorization.v1.schema.json)
+现在精确描述 `20260802_0022` 的私有读取记录。该迁移新增
+`des_phase_a_qualification.phase_a_execution_authorizations`：PEA 不可变，并对 `grant_id` 与
+`execution_id` 各自唯一；私有 issuer 的 `des_authorize_phase_a_execution` 只能把一个仍有效的
+PAG 原子绑定到已存在的 `PHASE_A_HARNESS` Execution，私有 consumer 的
+`des_read_active_phase_a_execution_authorization` 只在 PAG/QH 时间窗和全部 JobVersion、revision、
+policy、namespace、P/runtime/harness/QH 事实仍相等时返回它；它只保存 nonce SHA-256，绝不保存
+raw nonce。PEA 自身**不存** `state`，有效性由
+PAG 的 `ACTIVE` 状态、QH 时间窗和该读取函数派生。0022 还把普通 Execution 固定为
+`authorization_mode=STANDARD`，普通 API、Worker claim、recovery/reconciler 与公开日志读取明确只处理
+`STANDARD`；它们不能读取、修改、领取、推进或展示 `PHASE_A_HARNESS`。这是一项 **E1 数据库授权基础**，不是公开 API 或普通用户 capability；PEA
+也不改写或复用 PAG。
 
-该基础件的数据库边界已在临时、一次性真实 PostgreSQL 15 中取得 `22 passed` 的受限 E2：含
-0021 升级/回滚/再升级、实际 issuer/consumer 函数边界、Python issuer → consumer preflight → revoke
-往返、预存私有角色失败关闭和 future-function `PUBLIC EXECUTE` 默认权负例。它不启动产品 Compose/API/Worker/DataX/MySQL/独立 oracle，
-不验证完整 restore 或 Windows，因此绝不是 E3、E4 或最终安装包验收。
-标准备份/诊断必须固定排除完整私有 schema `des_phase_a_qualification`（两张 ledger 表、触发器、
-guard functions 和 0021 `SECURITY DEFINER` entrypoints）；普通恢复不得复活 Phase-A authority。当前真实 restore/start/ledger bootstrap
-仍阻断：dump 会保留 `alembic_version=20260802_0021` 而不会保留私有 schema。未来只能由在
+0022 还为 `datax_api`、`datax_worker`、`datax_egress_guard` 在 `executions` 及 attempt/lock/event/
+cancel/log/recovery/evidence/work-termination 后代事实启用 parent-linked RLS：普通 runtime DB 直连也不能
+读取或修改 private execution/后代行。issuer authorize 成功后仍把该 execution 保持为 `BLOCKED`，原因
+`PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，绝不转为可领取。RLS 和该 blocker 已进入 migration/source，
+并已在本轮临时、一次性真实 PostgreSQL 15 E2 中，以 `datax_api`/`datax_worker` 直接数据库连接验证
+private Execution 不可读、其后代写入受拒绝（脚本退出 `0`，PostgreSQL pytest `29 passed`）。这是数据库
+边界 E2，绝不是 DataX E3、Windows E4 或产品交付验收。
+
+这仍不是可运行的 qualification workflow：标准 Settings、Compose、Launcher、API、Worker 和公开
+Plugin Manifest 都没有 issuer/consumer 登录凭据、QH/PAG/PEA override 或读取入口；也没有私有
+Execution 创建/`rerun` 入口来产生 `PHASE_A_HARNESS`、私有 Worker 领取/启动四检查点、受保护
+harness、QR、受信 reader、已签发资格或真实外部 E3/E4 证据。0022 的 database authorize/read
+boundary 不会自行启动 DataX，也不会解除生产普通路径的 deny-all。发布继续 `BLOCKED`。
+当前也没有任何私有 Phase-A Worker/runner；它是**硬禁用**的，不是可由配置打开的隐藏功能。未来启用前必须
+在单独的受保护纵向切片中补齐 private execution lock/fence、源静默/目标独占确认检查点、可关联 execution/fence 的
+审计检查点，以及专用凭据、日志、维护和备份隔离；详见 ADR-0011 §3.1。即使这些门禁完成，也只允许开始真实 E3 取证，绝不等于 E3/E4 已通过。
+
+本轮 `scripts/test-postgres-e2.sh` 在临时、一次性真实 PostgreSQL 15 中退出 `0`，PostgreSQL pytest
+取得 `29 passed` 的受限 E2：覆盖 0021 的升级/回滚/再升级、issuer/consumer 函数边界、Python issuer →
+consumer preflight → revoke、预存私有角色失败关闭和 future-function `PUBLIC EXECUTE` 默认权负例；也覆盖 0022
+PEA issuer-authorize/consumer-read、普通路径拒绝与 runtime-role parent-linked RLS。标准
+`pg_dump --exclude-schema=des_phase_a_qualification` 的 TOC 排除私有账本，并已成功对空数据库执行
+`pg_restore` 探针；私有角色预占冲突同样失败关闭。该 E2 不启动产品 Compose/API/Worker/DataX/MySQL/独立
+oracle，也不验证完整 restore/bootstrap/start 或 Windows，因此绝不是 E3、E4 或最终安装包验收。
+
+标准备份/诊断必须固定排除完整私有 schema `des_phase_a_qualification`：三张 ledger 表、schema 内
+触发器和私有 ledger guard 函数，以及 0021/0022 位于该 schema 的 `SECURITY DEFINER`
+issuer/consumer entrypoints。保护 public `executions` 触发器的
+`public.des_phase_a_execution_mode_guard()` 则必须随标准 dump/restore 保留；它仍为
+`SECURITY DEFINER`、由无登录 ledger owner 持有，并已向 `PUBLIC`、runtime、issuer 与 consumer
+撤销执行权，public 位置不放宽角色边界。当前 Launcher 在 `pg_dump` 前后（PostgreSQL 停止前）固定检查
+`public.executions` 是否不存在 `PHASE_A_HARNESS`：存在时返回
+`BACKUP_PHASE_A_PRIVATE_EXECUTION_PRESENT`，`psql` 正常完成但非零时返回
+`BACKUP_PHASE_A_PRIVATE_EXECUTION_CHECK_FAILED`，底层命令错误也失败关闭；不能把其 public Execution/日志元数据带入 DATA 包；受保护 Phase-A backup/restore 尚未实现。
+该空数据库 `pg_restore` 探针不等于系统完整恢复：普通恢复不得复活 Phase-A authority。当前真实 restore/start/ledger bootstrap
+仍阻断：dump 会保留 `alembic_version=20260802_0022` 而不会保留私有 schema。未来只能由在
 restore epoch 后重新验证 P/QH 的受保护 issuer 重新签发，而当前不存在该 runtime issuer 或其
 受保护凭据配置。
 

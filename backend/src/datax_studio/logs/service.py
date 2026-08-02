@@ -229,6 +229,10 @@ class ExecutionLogService:
                 principal,
                 execution_id,
             )
+            # The ordinary desktop log API has no private Phase-A
+            # authorization reader.  Reject before reading bodies or marking
+            # a corrupt private chunk unavailable.
+            self.control._require_standard_execution(execution)  # noqa: SLF001
             now = self.control._database_now(session)  # noqa: SLF001
             chunks = list(
                 session.scalars(
@@ -350,6 +354,10 @@ class ExecutionLogService:
                     principal,
                     execution_id,
                 )
+                # Keep the public download route from returning or mutating
+                # protected-harness logs.  A future private harness needs its
+                # own audited reader and retention path.
+                self.control._require_standard_execution(execution)  # noqa: SLF001
                 now = self.control._database_now(session)  # noqa: SLF001
                 chunks = list(
                     session.scalars(

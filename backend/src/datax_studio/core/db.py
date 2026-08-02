@@ -636,6 +636,10 @@ class Execution(Base):
             name="ck_executions_queue_eligibility",
         ),
         CheckConstraint(
+            "authorization_mode IN ('STANDARD','PHASE_A_HARNESS')",
+            name="ck_executions_authorization_mode",
+        ),
+        CheckConstraint(
             "summary_parse_status IN ('PENDING','SUCCEEDED','FAILED')",
             name="ck_executions_summary_parse_status",
         ),
@@ -689,6 +693,15 @@ class Execution(Base):
         ForeignKey("executions.id", ondelete="RESTRICT"),
     )
     trigger_type: Mapped[str] = mapped_column(String(16), nullable=False, default="MANUAL")
+    # Standard product flows always use ``STANDARD``.  ``PHASE_A_HARNESS`` is
+    # reserved for the separate protected qualification path and is excluded
+    # from the ordinary Worker claim query; it is not a user-selectable API
+    # option or a plugin-certification bypass.
+    authorization_mode: Mapped[str] = mapped_column(
+        String(24),
+        nullable=False,
+        default="STANDARD",
+    )
     requested_by: Mapped[UUID] = mapped_column(
         Uuid(as_uuid=True),
         ForeignKey("users.id", ondelete="RESTRICT"),
@@ -918,6 +931,97 @@ class PhaseAQualificationGrant(PhaseAQualificationBase):
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     revocation_reason: Mapped[str | None] = mapped_column(String(64))
     expired_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PhaseAExecutionAuthorization(PhaseAQualificationBase):
+    """Append-only private binding of one PAG to exactly one Execution.
+
+    This model intentionally belongs to the isolated Phase-A metadata rather
+    than the ordinary product metadata.  PostgreSQL migration 0022 is the
+    authority for its complete format checks, role boundary, and immutable
+    insert path.  In particular, neither an ordinary API request nor a normal
+    Worker may create or read this record.
+    """
+
+    __tablename__ = "phase_a_execution_authorizations"
+    __table_args__ = (
+        UniqueConstraint("grant_id", name="uq_phase_a_execution_authorizations_grant"),
+        UniqueConstraint(
+            "execution_id",
+            name="uq_phase_a_execution_authorizations_execution",
+        ),
+        Index(
+            "ix_phase_a_execution_authorizations_execution_created",
+            "execution_id",
+            "created_at",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), primary_key=True, default=uuid4)
+    # ``grant_id`` is a private-table foreign key in PostgreSQL.  Keep it as
+    # an opaque UUID here because this metadata deliberately cannot resolve
+    # foreign keys across the private and public metadata registries.
+    grant_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    execution_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    project_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    job_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    job_version_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    job_version_artifact_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    job_spec_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_datasource_revision_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    source_datasource_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_datasource_revision_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    target_datasource_config_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_endpoint_policy_revision_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=False,
+    )
+    source_endpoint_policy_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_endpoint_policy_revision_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=False,
+    )
+    target_endpoint_policy_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_physical_endpoint_identity_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=False,
+    )
+    source_server_identity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_physical_endpoint_identity_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        nullable=False,
+    )
+    target_server_identity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_physical_table_identity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_namespace_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    target_physical_table_identity_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    target_normalization_version: Mapped[str] = mapped_column(String(16), nullable=False)
+    transfer_policy_id: Mapped[UUID] = mapped_column(Uuid(as_uuid=True), nullable=False)
+    transfer_policy_scope_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    transfer_policy_row_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    payload_binding_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    payload_root_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    # One-way digest only; the raw QH nonce never enters this private record.
+    nonce_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    candidate_commit: Mapped[str] = mapped_column(String(40), nullable=False)
+    worker_image_digest: Mapped[str] = mapped_column(String(71), nullable=False)
+    datax_release: Mapped[str] = mapped_column(String(32), nullable=False)
+    runtime_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    reader_plugin_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    reader_plugin_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    writer_plugin_name: Mapped[str] = mapped_column(String(64), nullable=False)
+    writer_plugin_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    harness_identity: Mapped[str] = mapped_column(String(128), nullable=False)
+    harness_environment_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    harness_environment_manifest_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    harness_version: Mapped[str] = mapped_column(String(128), nullable=False)
+    qh_document_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    qh_qualification_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    qh_issuer_key_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    qh_issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    qh_not_before: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    qh_valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
 
 
 class ExecutionAttempt(Base):

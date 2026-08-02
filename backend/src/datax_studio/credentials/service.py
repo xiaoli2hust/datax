@@ -972,6 +972,30 @@ class CredentialService:
     ) -> EndpointConnectionEvidenceResponse:
         self._require_admin(principal)
         with self.sessions() as session:
+            # A public evidence row may be unbound (TEST/METADATA) or belong
+            # to standard work.  The ordinary Admin reader has no protected
+            # Phase-A authorization, so a private execution/probe owner must
+            # fail closed even when the caller knows the evidence UUID.
+            standard_execution_owner = (
+                select(Execution.id)
+                .where(
+                    Execution.id == EndpointConnectionEvidence.execution_id,
+                    Execution.project_id == Datasource.project_id,
+                    Execution.authorization_mode == "STANDARD",
+                )
+                .exists()
+            )
+            standard_probe_owner = (
+                select(RecoveryProbe.id)
+                .join(RecoveryGate, RecoveryGate.id == RecoveryProbe.recovery_gate_id)
+                .join(Execution, Execution.id == RecoveryGate.execution_id)
+                .where(
+                    RecoveryProbe.id == EndpointConnectionEvidence.recovery_probe_id,
+                    RecoveryProbe.project_id == Datasource.project_id,
+                    Execution.authorization_mode == "STANDARD",
+                )
+                .exists()
+            )
             evidence = session.scalar(
                 select(EndpointConnectionEvidence)
                 .join(
@@ -986,6 +1010,14 @@ class CredentialService:
                 .where(
                     EndpointConnectionEvidence.id == connection_evidence_id,
                     Project.organization_id == principal.organization_id,
+                    or_(
+                        and_(
+                            EndpointConnectionEvidence.execution_id.is_(None),
+                            EndpointConnectionEvidence.recovery_probe_id.is_(None),
+                        ),
+                        standard_execution_owner,
+                        standard_probe_owner,
+                    ),
                 )
             )
             if evidence is None:
@@ -6130,7 +6162,10 @@ class CredentialService:
         executions = list(
             session.scalars(
                 select(Execution)
-                .where(or_(bound_execution_reference, queued_execution_reference))
+                .where(
+                    Execution.authorization_mode == "STANDARD",
+                    or_(bound_execution_reference, queued_execution_reference),
+                )
                 .order_by(Execution.id)
                 .with_for_update()
             )
@@ -6148,9 +6183,14 @@ class CredentialService:
         probes = list(
             session.scalars(
                 select(RecoveryProbe)
-                .where(or_(bound_probe_reference, queued_probe_reference))
+                .join(RecoveryGate, RecoveryGate.id == RecoveryProbe.recovery_gate_id)
+                .join(Execution, Execution.id == RecoveryGate.execution_id)
+                .where(
+                    Execution.authorization_mode == "STANDARD",
+                    or_(bound_probe_reference, queued_probe_reference),
+                )
                 .order_by(RecoveryProbe.id)
-                .with_for_update()
+                .with_for_update(of=RecoveryProbe)
             )
         )
         return executions, probes
@@ -6176,6 +6216,7 @@ class CredentialService:
             session.scalars(
                 select(Execution)
                 .where(
+                    Execution.authorization_mode == "STANDARD",
                     Execution.process_state.not_in(_TERMINAL_EXECUTION_STATES),
                     (Execution.source_secret_id == secret_id)
                     | (Execution.target_secret_id == secret_id),
@@ -6186,7 +6227,10 @@ class CredentialService:
         probes = list(
             session.scalars(
                 select(RecoveryProbe)
+                .join(RecoveryGate, RecoveryGate.id == RecoveryProbe.recovery_gate_id)
+                .join(Execution, Execution.id == RecoveryGate.execution_id)
                 .where(
+                    Execution.authorization_mode == "STANDARD",
                     RecoveryProbe.process_state.in_(_ACTIVE_RECOVERY_PROBE_STATES),
                     RecoveryProbe.target_secret_id == secret_id,
                 )
@@ -6217,6 +6261,7 @@ class CredentialService:
             session.scalars(
                 select(Execution)
                 .where(
+                    Execution.authorization_mode == "STANDARD",
                     Execution.process_state == "QUEUED",
                     Execution.active_attempt_id.is_(None),
                     or_(
@@ -6230,7 +6275,10 @@ class CredentialService:
         probes = list(
             session.scalars(
                 select(RecoveryProbe)
+                .join(RecoveryGate, RecoveryGate.id == RecoveryProbe.recovery_gate_id)
+                .join(Execution, Execution.id == RecoveryGate.execution_id)
                 .where(
+                    Execution.authorization_mode == "STANDARD",
                     RecoveryProbe.process_state == "QUEUED",
                     RecoveryProbe.active_attempt_id.is_(None),
                     RecoveryProbe.target_datasource_revision_id.in_(revision_ids),

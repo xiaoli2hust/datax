@@ -1327,6 +1327,7 @@ class ExecutionWorker:
             execution = session.get(Execution, claim.execution_id)
             if (
                 execution is None
+                or execution.authorization_mode != "STANDARD"
                 or execution.active_attempt_id != claim.attempt_id
                 or execution.fence_epoch != claim.fence_epoch
                 or execution.process_state != "STARTING"
@@ -1448,7 +1449,11 @@ class ExecutionWorker:
             lock = session.scalar(
                 select(TargetCopyLock).where(TargetCopyLock.execution_id == claim.execution_id)
             )
-            if execution is None or lock is None:
+            if (
+                execution is None
+                or execution.authorization_mode != "STANDARD"
+                or lock is None
+            ):
                 raise RuntimeError("verification control facts are missing")
             lock_held = (
                 execution.process_state == "VERIFYING"
@@ -1601,7 +1606,11 @@ class ExecutionWorker:
             now = self.control._database_now(session)  # noqa: SLF001
             execution = session.get(Execution, claim.execution_id)
             attempt = session.get(ExecutionAttempt, claim.attempt_id)
-            if execution is None or attempt is None:
+            if (
+                execution is None
+                or execution.authorization_mode != "STANDARD"
+                or attempt is None
+            ):
                 return
             if succeeded:
                 attempt.workspace_deleted_at = now

@@ -87,17 +87,28 @@ OS 状态及 Windows release runner 尚无在线验证结果。
 当前 Launcher 已有候选备份导出路径：在受控停机后，将 `.dxdata` 与 `.dxkeys` 分别写入
 用户选择的两个不同本地目录，并使用两把不同密钥加密；DATA 包只含 PostgreSQL
 custom-format 逻辑 dump、脱敏日志和固定发布元数据。该 dump 固定以
-`--exclude-schema=des_phase_a_qualification` 排除完整私有资格 schema（包括表、触发器、
-guard functions 和 0021 `SECURITY DEFINER` entrypoints），SECRETS 包含本机基础设施 secret。
+`--exclude-schema=des_phase_a_qualification` 排除完整私有资格 schema（三张 ledger 表、schema 内触发器、
+私有 ledger guard functions 和私有 0021/0022 `SECURITY DEFINER` issuer/consumer entrypoints；PEA 仅含
+nonce SHA-256，绝不含 raw nonce）。保护 public `executions` trigger 的
+`public.des_phase_a_execution_mode_guard()` 必须留在 dump 中；它仍由无登录 ledger owner 持有且向普通调用者
+撤销执行权。SECRETS 包含本机基础设施 secret。
+这项 schema exclusion 不足以安全导出 0022 的 public execution/log 残留：当前 Launcher 在 `pg_dump`
+前后（PostgreSQL 停止前）固定重验 `authorization_mode=PHASE_A_HARNESS` 不存在；存在时返回
+`BACKUP_PHASE_A_PRIVATE_EXECUTION_PRESENT`，psql 完成但非零时返回
+`BACKUP_PHASE_A_PRIVATE_EXECUTION_CHECK_FAILED`，其他命令错误也不能生成普通 `.dxdata/.dxkeys`。受保护 Phase-A
+backup/restore 尚未实现，不能以筛选表或日志目录替代该门禁。
 Launcher 已在确认无旧身份、代际、产品容器和产品卷的干净目标后，以固定无网络 helper
 完整认证/配对双包、用两把恢复秘密认证 journal，并只解包到受 ACL 保护的空 staging；
 成功仍返回 `RESTORE_STAGED_COMMIT_BLOCKED`，只达到 E1。新空 PostgreSQL
 volume、真实 `pg_restore`、数据库/审计链/日志/密钥证据重算、卷/secret/
 installation-id 原子提交和升级路径仍未实现，必须失败关闭。即使以后执行普通 dump restore，
-它会恢复 `alembic_version=20260802_0021` 却不恢复私有 schema、其中的 0021 专用函数或其
-无登录 ledger roles；因此 restore/bootstrap/start 当前仍必须 `BLOCKED`，直至受保护 bootstrap
-创建新空 ledger 和 issuance epoch，并拒绝旧 authority。标准安装和 SECRETS 包不携带 issuer/
-consumer 登录凭据，不能用普通 Launcher 把它们配置成 qualification 通道。
+它会恢复 `alembic_version=20260802_0022` 却不恢复私有 schema、其中的私有 0021/0022 issuer/consumer
+entrypoints 或其无登录 ledger roles；`public.des_phase_a_execution_mode_guard()` 则会随 public trigger 保留。
+因此 restore/bootstrap/start 当前仍必须 `BLOCKED`，直至受保护 bootstrap
+创建新空 ledger 和 issuance epoch，并拒绝旧 nonce/grant/PEA authority。J0b.1 的 0022 已有私有
+PEA ledger 与 issuer authorize/consumer read 数据库边界，但没有 PEA 登录凭据 provisioning 或私有
+Worker 调用链。标准安装和 SECRETS 包不携带 issuer/consumer/PEA 登录凭据、QH/PAG/PEA 资源或 override，不能用
+普通 Launcher 把它们配置成 qualification 通道，也不能改变 standard deny-all。
 该候选尚未经过真实
 Windows 11 备份/完整恢复验收，具体边界见
 [`../../docs/contracts/system-backup.v1.md`](../../docs/contracts/system-backup.v1.md)。

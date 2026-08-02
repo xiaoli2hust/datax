@@ -22,12 +22,13 @@ from test_execution_logs import _persist_redacted_log
 from datax_studio.auth.db import AuditEvent, IdempotencyRecord
 from datax_studio.core.db import (
     Execution,
+    ExecutionAttempt,
     ExecutionEvent,
     TargetCopyLock,
     WorkTerminationRequest,
 )
 from datax_studio.credentials.db import CredentialSecret
-from datax_studio.logs.db import ExecutionLogChunk
+from datax_studio.logs.db import ExecutionLogChunk, ExecutionLogGap
 from datax_studio.maintenance.db import RetentionHold
 from datax_studio.maintenance.retention import (
     RetentionMaintenanceError,
@@ -41,9 +42,14 @@ __all__ = ["core_stack"]
 def _service(
     core_stack: CoreStack,
     tmp_path: Path,
+    *,
+    retention_batch_size: int | None = None,
 ) -> RetentionMaintenanceService:
+    settings_update: dict[str, object] = {"log_volume_path": tmp_path / "logs"}
+    if retention_batch_size is not None:
+        settings_update["retention_batch_size"] = retention_batch_size
     settings = core_stack.client.app.state.settings.model_copy(
-        update={"log_volume_path": tmp_path / "logs"}
+        update=settings_update
     )
     core_stack.client.app.state.settings = settings
     return RetentionMaintenanceService(
@@ -433,6 +439,188 @@ def test_log_body_is_deleted_after_30_days_but_summary_and_gate_survive(
         assert execution is not None
         assert execution.log_stored_bytes > 0
         assert gate is not None and gate.status == "VERIFIED"
+
+
+def test_retention_never_mutates_phase_a_harness_execution_evidence(
+    core_stack: CoreStack,
+    tmp_path: Path,
+) -> None:
+    """Ordinary retention must not touch protected qualification evidence."""
+
+    claim, log_path = _persist_redacted_log(
+        core_stack,
+        tmp_path,
+        suffix="phase-a-protected",
+        content=b"x" * 5000 + b"\n" + b"safe line\n" * 500,
+        maximum_bytes=1024,
+        maximum_line_bytes=128,
+    )
+    core_stack.service.transition_claimed_execution(
+        claim=claim,
+        expected_state="STARTING",
+        new_state="FAILED",
+        data_effect="NONE",
+        verification_state="NOT_STARTED",
+        failure_code="TEST_PRE_DATA_FAILURE",
+    )
+    now = datetime.now(UTC)
+    with core_stack.sessions.begin() as session:
+        execution = session.get(Execution, claim.execution_id)
+        lock = session.scalar(
+            select(TargetCopyLock).where(TargetCopyLock.execution_id == claim.execution_id)
+        )
+        gate = session.scalar(
+            select(RecoveryGate).where(RecoveryGate.execution_id == claim.execution_id)
+        )
+        assert execution is not None
+        assert lock is not None
+        assert gate is not None
+        # Make this an otherwise eligible ordinary-retention candidate.  The
+        # protected authorization mode must be the sole reason its execution
+        # group and log body remain intact.
+        session.delete(gate)
+        lock.state = "RELEASED"
+        lock.released_at = now
+        execution.authorization_mode = "PHASE_A_HARNESS"
+
+    with core_stack.sessions() as session:
+        chunk_ids = set(
+            session.scalars(
+                select(ExecutionLogChunk.id).where(
+                    ExecutionLogChunk.execution_id == claim.execution_id
+                )
+            )
+        )
+        gap_ids = set(
+            session.scalars(
+                select(ExecutionLogGap.id).where(
+                    ExecutionLogGap.execution_id == claim.execution_id
+                )
+            )
+        )
+        attempt_ids = set(
+            session.scalars(
+                select(ExecutionAttempt.id).where(
+                    ExecutionAttempt.execution_id == claim.execution_id
+                )
+            )
+        )
+        event_ids = set(
+            session.scalars(
+                select(ExecutionEvent.id).where(
+                    ExecutionEvent.execution_id == claim.execution_id
+                )
+            )
+        )
+        lock_ids = set(
+            session.scalars(
+                select(TargetCopyLock.id).where(
+                    TargetCopyLock.execution_id == claim.execution_id
+                )
+            )
+        )
+        assert chunk_ids
+        assert gap_ids
+        assert attempt_ids
+        assert event_ids
+        assert lock_ids
+
+    result = _service(core_stack, tmp_path).run(now=now + timedelta(days=366))
+
+    assert result.status == "SUCCEEDED"
+    assert result.log_bodies_deleted == 0
+    assert result.log_bodies_blocked == 0
+    assert result.executions_deleted == 0
+    assert result.executions_blocked == 0
+    assert result.execution_events_deleted == 0
+    assert "PHASE_A_HARNESS_RETENTION_PROTECTED" not in result.block_reasons
+    assert log_path.exists()
+    with core_stack.sessions() as session:
+        execution = session.get(Execution, claim.execution_id)
+        assert execution is not None
+        assert execution.authorization_mode == "PHASE_A_HARNESS"
+        chunks = list(
+            session.scalars(
+                select(ExecutionLogChunk).where(
+                    ExecutionLogChunk.execution_id == claim.execution_id
+                )
+            )
+        )
+        assert {chunk.id for chunk in chunks} == chunk_ids
+        assert all(chunk.body_available and chunk.deleted_at is None for chunk in chunks)
+        assert set(
+            session.scalars(
+                select(ExecutionLogGap.id).where(
+                    ExecutionLogGap.execution_id == claim.execution_id
+                )
+            )
+        ) == gap_ids
+        assert set(
+            session.scalars(
+                select(ExecutionAttempt.id).where(
+                    ExecutionAttempt.execution_id == claim.execution_id
+                )
+            )
+        ) == attempt_ids
+        assert set(
+            session.scalars(
+                select(ExecutionEvent.id).where(
+                    ExecutionEvent.execution_id == claim.execution_id
+                )
+            )
+        ) == event_ids
+        locks = list(
+            session.scalars(
+                select(TargetCopyLock).where(
+                    TargetCopyLock.execution_id == claim.execution_id
+                )
+            )
+        )
+        assert {lock.id for lock in locks} == lock_ids
+        assert all(lock.state == "RELEASED" for lock in locks)
+
+
+def test_phase_a_harness_rows_do_not_starve_standard_retention_batch(
+    core_stack: CoreStack,
+    tmp_path: Path,
+) -> None:
+    standard_execution_id = _create_canceled_execution(
+        core_stack,
+        suffix="standard-behind-phase-a",
+    )
+    phase_a_execution_id = _create_canceled_execution(
+        core_stack,
+        suffix="phase-a-ahead-of-standard",
+    )
+    now = datetime.now(UTC)
+    with core_stack.sessions.begin() as session:
+        standard_execution = session.get(Execution, standard_execution_id)
+        phase_a_execution = session.get(Execution, phase_a_execution_id)
+        assert standard_execution is not None
+        assert phase_a_execution is not None
+        # Execution retention is newest-first.  With a one-item batch, the
+        # protected row would have starved the standard row if filtering were
+        # only performed inside the loop.
+        standard_execution.finished_at = now - timedelta(seconds=1)
+        phase_a_execution.finished_at = now
+        phase_a_execution.authorization_mode = "PHASE_A_HARNESS"
+
+    result = _service(
+        core_stack,
+        tmp_path,
+        retention_batch_size=1,
+    ).run(now=now + timedelta(days=366))
+
+    assert result.status == "SUCCEEDED"
+    assert result.executions_deleted == 1
+    assert result.executions_blocked == 0
+    assert result.log_bodies_blocked == 0
+    assert "PHASE_A_HARNESS_RETENTION_PROTECTED" not in result.block_reasons
+    with core_stack.sessions() as session:
+        assert session.get(Execution, standard_execution_id) is None
+        phase_a_execution = session.get(Execution, phase_a_execution_id)
+        assert phase_a_execution is not None
+        assert phase_a_execution.authorization_mode == "PHASE_A_HARNESS"
 
 
 def test_recovery_gate_blocks_execution_deletion(

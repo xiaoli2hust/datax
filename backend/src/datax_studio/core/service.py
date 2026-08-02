@@ -530,6 +530,7 @@ class ControlService:
             )
             execution_window = (
                 Execution.project_id == project_id,
+                Execution.authorization_mode == "STANDARD",
                 Execution.queued_at >= window_from,
                 Execution.queued_at < window_to,
             )
@@ -626,6 +627,7 @@ class ControlService:
                     )
                     .where(
                         Execution.project_id == project_id,
+                        Execution.authorization_mode == "STANDARD",
                         Execution.queued_at >= bucket_start,
                         Execution.queued_at < bucket_end,
                     )
@@ -1714,7 +1716,10 @@ class ControlService:
             if latest_execution_state is not None:
                 latest_state = (
                     select(Execution.process_state)
-                    .where(Execution.job_id == SyncJob.id)
+                    .where(
+                        Execution.job_id == SyncJob.id,
+                        Execution.authorization_mode == "STANDARD",
+                    )
                     .order_by(Execution.queued_at.desc(), Execution.id.desc())
                     .limit(1)
                     .correlate(SyncJob)
@@ -2862,7 +2867,14 @@ class ControlService:
                         detail="同一物理目标表只能存在一个排队、活动或恢复中工作。",
                     )
                 queued_count = session.scalar(
-                    select(func.count(Execution.id)).where(Execution.process_state == "QUEUED")
+                    select(func.count(Execution.id)).where(
+                        Execution.process_state == "QUEUED",
+                        # A protected qualification row is never capacity for
+                        # the ordinary product queue.  Counting it here would
+                        # let a disabled/private harness starve normal manual
+                        # work and disclose its presence through admission.
+                        Execution.authorization_mode == "STANDARD",
+                    )
                 )
                 if (queued_count or 0) >= 200:
                     raise ProblemException(
@@ -2880,6 +2892,7 @@ class ControlService:
                     job_version_id=version.id,
                     rerun_of_execution_id=None,
                     trigger_type="MANUAL",
+                    authorization_mode="STANDARD",
                     requested_by=principal.user_id,
                     process_state="QUEUED",
                     data_effect="NONE",
@@ -3028,6 +3041,7 @@ class ControlService:
     ) -> ExecutionResponse:
         with self.sessions() as session:
             execution = self._visible_execution(session, principal, execution_id)
+            self._require_standard_execution(execution)
             version = session.get(JobVersion, execution.job_version_id)
             if version is None:
                 raise RuntimeError("Execution JobVersion is missing")
@@ -3059,7 +3073,10 @@ class ControlService:
     ) -> ExecutionPage:
         with self.sessions() as session:
             self._visible_project(session, principal, project_id)
-            statement = select(Execution).where(Execution.project_id == project_id)
+            statement = select(Execution).where(
+                Execution.project_id == project_id,
+                Execution.authorization_mode == "STANDARD",
+            )
             normalized_query = query.strip().casefold() if query is not None else None
             if normalized_query:
                 pattern = _contains_pattern(normalized_query)
@@ -3180,6 +3197,7 @@ class ControlService:
         now = utc_now()
         with self.sessions.begin() as session:
             execution = self._visible_execution(session, principal, execution_id, lock=True)
+            self._require_standard_execution(execution)
             self._require_project_role(principal, execution.project_id, {Role.OPERATOR})
             organization = self._lock_organization(session, principal.organization_id)
             replay = self._claim_idempotency(
@@ -3270,6 +3288,7 @@ class ControlService:
         now = utc_now()
         with self.sessions.begin() as session:
             execution = self._visible_execution(session, principal, execution_id, lock=True)
+            self._require_standard_execution(execution)
             self._require_project_role(principal, execution.project_id, {Role.OPERATOR})
             organization = self._lock_organization(session, principal.organization_id)
             replay = self._claim_idempotency(
@@ -3448,6 +3467,12 @@ class ControlService:
             claimable = (
                 Execution.process_state == "QUEUED",
                 Execution.active_attempt_id.is_(None),
+                # A Phase-A private harness authorization is intentionally
+                # invisible to the ordinary Worker.  That path will have its
+                # own dedicated claim/preflight/start gates; accepting it here
+                # would turn a protected qualification record into a standard
+                # desktop execution bypass.
+                Execution.authorization_mode == "STANDARD",
                 Execution.queue_eligibility_state == "ELIGIBLE",
                 Execution.target_exclusivity_status == "ACTIVE",
                 ~pending_cancel,
@@ -4685,6 +4710,7 @@ class ControlService:
             )
             if (
                 execution is None
+                or execution.authorization_mode != "STANDARD"
                 or execution.process_state != "QUEUED"
                 or execution.active_attempt_id is not None
             ):
@@ -4756,6 +4782,7 @@ class ControlService:
             )
             if (
                 execution is None
+                or execution.authorization_mode != "STANDARD"
                 or execution.process_state != "QUEUED"
                 or execution.active_attempt_id is not None
             ):
@@ -4821,7 +4848,11 @@ class ControlService:
             execution = session.scalar(
                 select(Execution).where(Execution.id == execution_id).with_for_update()
             )
-            if execution is None or execution.process_state in _TERMINAL_STATES:
+            if (
+                execution is None
+                or execution.authorization_mode != "STANDARD"
+                or execution.process_state in _TERMINAL_STATES
+            ):
                 return False
             return (
                 self._ensure_target_exclusivity_termination(
@@ -4848,6 +4879,7 @@ class ControlService:
             )
             if (
                 execution is None
+                or execution.authorization_mode != "STANDARD"
                 or execution.process_state != "QUEUED"
                 or execution.active_attempt_id is not None
             ):
@@ -5402,6 +5434,19 @@ class ControlService:
             self._not_found()
         self._visible_project(session, principal, execution.project_id)
         return execution
+
+    def _require_standard_execution(self, execution: Execution) -> None:
+        """Keep ordinary API reads and writes out of the private Phase-A path.
+
+        The public product has neither the private authorization reader nor
+        the four checkpoint lifecycle.  Treat a non-standard row as absent so
+        a normal API caller cannot inspect or mutate it by guessing an ID.
+        A future protected harness must expose its own deliberately scoped
+        interface instead of reusing these routes.
+        """
+
+        if execution.authorization_mode != "STANDARD":
+            self._not_found()
 
     def _visible_project_ids(self, principal: Principal) -> set[UUID]:
         return {
@@ -6279,6 +6324,7 @@ class ControlService:
         if (
             execution is None
             or attempt is None
+            or execution.authorization_mode != "STANDARD"
             or execution.active_attempt_id != attempt.id
             or execution.fence_epoch != claim.fence_epoch
             or attempt.fence_epoch != claim.fence_epoch
@@ -6438,7 +6484,10 @@ class ControlService:
         )
         latest_execution = session.execute(
             select(Execution.process_state, Execution.queued_at)
-            .where(Execution.job_id == job.id)
+            .where(
+                Execution.job_id == job.id,
+                Execution.authorization_mode == "STANDARD",
+            )
             .order_by(Execution.queued_at.desc(), Execution.id.desc())
             .limit(1)
         ).first()

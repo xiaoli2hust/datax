@@ -148,7 +148,8 @@ PYTHONDONTWRITEBYTECODE=1 \
     backend/tests/test_audit_append_only_postgres.py \
     backend/tests/test_audit_readiness_postgres.py \
     backend/tests/test_credentials_postgres.py \
-    backend/tests/test_auth_postgres_concurrency.py
+    backend/tests/test_auth_postgres_concurrency.py \
+    backend/tests/test_phase_a_execution_authorization_postgres.py
 
 # The standard Launcher uses this exact fixed schema exclusion. Prove on a
 # disposable real PostgreSQL database that the protected ledger tables, their
@@ -260,4 +261,4 @@ docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
 run_alembic upgrade head
 
 printf '%s\n' \
-  'POSTGRES_E2_SUBSET_PASSED: real disposable PostgreSQL migrations, pre-existing-private-role fail-closed rejection, runtime-role boundaries, Phase-A issuer/consumer SECURITY DEFINER function boundaries and ledger guards, standard-backup complete-private-schema exclusion, audit append-only/readiness replay, credential concurrency, and auth concurrency passed. This is E2 subset evidence only; it is not full restore, DataX E3, Windows E4, or product-Compose acceptance.'
+  'POSTGRES_E2_SUBSET_PASSED: real disposable PostgreSQL migrations, pre-existing-private-role fail-closed rejection, runtime-role boundaries, Phase-A issuer/consumer SECURITY DEFINER grant and immutable Execution-authorization boundaries, ledger guards, standard-backup complete-private-schema exclusion, audit append-only/readiness replay, credential concurrency, and auth concurrency passed. This is E2 subset evidence only; it is not full restore, DataX E3, Windows E4, or product-Compose acceptance.'

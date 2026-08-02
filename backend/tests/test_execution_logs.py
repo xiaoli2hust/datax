@@ -169,6 +169,49 @@ def test_redacted_log_cursor_and_download_use_only_persisted_content(
         ).validate(audit.event_json)
 
 
+def test_public_log_routes_do_not_read_or_mutate_private_phase_a_execution(
+    core_stack: CoreStack,
+    tmp_path: Path,
+) -> None:
+    """A direct test-only mode change simulates a protected PEA row.
+
+    The SQLite unit stack has no PostgreSQL authorization trigger; this test
+    therefore proves the public route itself fails closed before it can read a
+    body or turn a corrupt chunk into a public maintenance write.
+    """
+
+    claim, path = _persist_redacted_log(
+        core_stack,
+        tmp_path,
+        suffix="private-route-boundary",
+        content=b"INFO protected harness output\n",
+    )
+    with core_stack.sessions.begin() as session:
+        execution = session.get(Execution, claim.execution_id)
+        chunk = session.scalar(
+            select(ExecutionLogChunk).where(
+                ExecutionLogChunk.execution_id == claim.execution_id
+            )
+        )
+        assert execution is not None and chunk is not None
+        execution.authorization_mode = "PHASE_A_HARNESS"
+        stored_bytes = execution.log_stored_bytes
+        chunk_id = chunk.id
+
+    page = core_stack.client.get(f"/api/v1/executions/{claim.execution_id}/logs")
+    download = core_stack.client.get(
+        f"/api/v1/executions/{claim.execution_id}/logs/download"
+    )
+    assert page.status_code == 404
+    assert download.status_code == 404
+    assert path.exists()
+    with core_stack.sessions() as session:
+        execution = session.get(Execution, claim.execution_id)
+        chunk = session.get(ExecutionLogChunk, chunk_id)
+        assert execution is not None and execution.log_stored_bytes == stored_bytes
+        assert chunk is not None and chunk.body_available is True
+
+
 def test_truncation_gaps_survive_cursor_and_download(
     core_stack: CoreStack,
     tmp_path: Path,

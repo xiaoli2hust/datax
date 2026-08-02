@@ -47,7 +47,7 @@ MySQL 8/PostgreSQL 15 的四个 Reader/Writer manifest 声明为认证能力。
 | `PACKAGED` | JAR、依赖、SBOM、许可证和 SHA-256 已进入固定 Worker 镜像 | 否 |
 | `CONTRACTED` | 参数、秘密、端点策略、JobSpec、日志、取消和结果语义已有机器契约 | 否 |
 | `E3_CERTIFIED` | 对受支持版本的真实外部系统完成成功/失败/取消和独立 oracle E3 | 否 |
-| `WINDOWS_E4_CERTIFIED` | 已绑定同一不可变 Runtime payload 的精确最终 F（Setup/Launcher）在无 QH 的正常模式通过 Phase B Windows E4；受信 reader 才可据此派生插件状态 | 仅当同一 F 另有有效 PR 时可；E4 状态本身不可 |
+| `WINDOWS_E4_CERTIFIED` | 已绑定同一不可变 Runtime payload 的精确最终 F（Setup/Launcher）在无 QH/PAG/PEA 的正常模式通过 Phase B Windows E4；受信 reader 才可据此派生插件状态 | 仅当同一 F 另有有效 PR 时可；E4 状态本身不可 |
 | `BLOCKED` | 因许可、不可重现依赖、安全模型、外部环境或上游缺陷阻断 | 否，必须显示原因 |
 
 状态必须由发布制品摘要和证据包派生，不能由前端常量、文件名或人工勾选直接提升。任何
@@ -127,12 +127,16 @@ UI 从目录渲染 Reader/Writer 并对非 E4 能力显示阻断原因。明确�
 依赖注入可验证门禁正路，但不能通过公开 Schema 或 `/plugins` 冒充发布事实。
 
 受信的生产发布证明读取器尚未实现，当前 `WINDOWS_E4_CERTIFIED=0`。ADR-0011 的
-`release-payload.v1`、`harness-qualification.v1`、`phase-a-qualification-grant.v1` Schema，
-失败关闭 P/QH parser、私有 payload/runtime/job binding 与 durable nonce/grant 账本已作为
-E1 基础件进入源码；`20260802_0021` 还把 private ledger 交给无登录 owner，并以无登录
-issuer/consumer 的最小 `SECURITY DEFINER` 函数分离 atomic issue/revoke 与 current-grant read。
-该 adapter 没有标准 API/Worker/Compose/Settings 接线，也没有 `execution_id` 或 DataX start
-能力。仍没有受保护 harness 凭据配置、private override、QR schema/reader、真实 E3/E4 或最终
+`release-payload.v1`、`harness-qualification.v1`、`phase-a-qualification-grant.v1` 与
+`phase-a-execution-authorization.v1` Schema，失败关闭 P/QH parser、私有 payload/runtime/job binding 与
+durable nonce/grant/PEA 账本已作为 E1 基础件进入源码；`20260802_0021/0022` 还把 private ledger 交给无登录
+owner，并以无登录 issuer/consumer 的最小 `SECURITY DEFINER` 函数分离 atomic issue/revoke/current-grant
+read 与 PEA issuer-authorize/consumer-read。0022 的 PEA 对 `grant_id`/`execution_id` 双唯一、仅保存 nonce SHA-256，
+普通 API/Worker/Recovery/公开日志路径只走 `STANDARD`；`datax_api/datax_worker/datax_egress_guard` 的 direct DB access
+还受 parent-linked RLS 限制，不能通过 execution descendants 读取/写入 private row。issuer authorize 后仍是
+`BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，所以它没有普通 DataX start 能力。RLS/0022 已在本切片真实 PostgreSQL E2
+中验证。仍没有受保护 harness
+凭据配置、private Execution 创建/rerun、private override、QR schema/reader、真实 E3/E4 或最终
 promotion validator，也不会改变公开 `plugin-manifest.v2`、普通用户状态或 production deny-all。
 因此该切片仍只证明“不会把未取证能力当成已认证能力运行”，不证明四方向 DataX E3、
 Windows E4 或全部 DataX 功能已完成。

@@ -46,6 +46,9 @@ _TERMINAL_EXECUTION_STATES = frozenset({"SUCCEEDED", "FAILED", "TIMED_OUT", "CAN
 _OPEN_RECOVERY_GATE_STATES = frozenset({"OPEN", "REMEDIATION_SUBMITTED", "REJECTED"})
 _ACTIVE_CANCEL_REQUEST_STATES = frozenset({"PENDING", "ACKNOWLEDGED"})
 _ACTIVE_WORK_TERMINATION_REQUEST_STATES = frozenset({"PENDING", "ACKNOWLEDGED"})
+_STANDARD_EXECUTION_AUTHORIZATION_MODE = "STANDARD"
+_PHASE_A_HARNESS_AUTHORIZATION_MODE = "PHASE_A_HARNESS"
+_PHASE_A_HARNESS_RETENTION_BLOCK_REASON = "PHASE_A_HARNESS_RETENTION_PROTECTED"
 _REASON_PATTERN = re.compile(r"^[A-Z0-9_]{1,64}$")
 _AUDIT_DOMAIN = "DXAUDITv1"
 _QUARANTINE_DIRECTORY = ".retention-quarantine"
@@ -344,6 +347,7 @@ class RetentionMaintenanceService:
                 )
                 .join(Project, Project.id == Execution.project_id)
                 .where(
+                    Execution.authorization_mode == _STANDARD_EXECUTION_AUTHORIZATION_MODE,
                     ExecutionLogChunk.body_available.is_(True),
                     ExecutionLogChunk.expires_at <= now,
                     ExecutionLogChunk.created_at <= cutoff,
@@ -356,6 +360,12 @@ class RetentionMaintenanceService:
             )
         )
         for chunk, execution, organization_id in rows:
+            # The query is deliberately STANDARD-only before its batch limit.
+            # Retain this defense-in-depth check so a future query change
+            # cannot move protected evidence, but do not report it through the
+            # ordinary maintenance result or audit trail.
+            if execution.authorization_mode == _PHASE_A_HARNESS_AUTHORIZATION_MODE:
+                continue
             if (
                 execution.process_state not in _TERMINAL_EXECUTION_STATES
                 or execution.finished_at is None
@@ -422,6 +432,7 @@ class RetentionMaintenanceService:
                 select(Execution, Project.organization_id)
                 .join(Project, Project.id == Execution.project_id)
                 .where(
+                    Execution.authorization_mode == _STANDARD_EXECUTION_AUTHORIZATION_MODE,
                     Execution.process_state.in_(_TERMINAL_EXECUTION_STATES),
                     Execution.finished_at.is_not(None),
                     Execution.finished_at <= cutoff,
@@ -431,6 +442,10 @@ class RetentionMaintenanceService:
             )
         )
         for execution, organization_id in rows:
+            # As above, avoid turning an unexpected protected row into public
+            # maintenance counts or audit metadata.
+            if execution.authorization_mode == _PHASE_A_HARNESS_AUTHORIZATION_MODE:
+                continue
             deleted_events = 0
             try:
                 with session.begin_nested():
@@ -543,6 +558,11 @@ class RetentionMaintenanceService:
         organization_id: UUID,
         now: datetime,
     ) -> str | None:
+        # A Phase-A harness execution can only be retained or disposed of by
+        # its protected qualification lifecycle.  This check must precede all
+        # ordinary group cleanup, including logs, attempts, events, and locks.
+        if execution.authorization_mode == _PHASE_A_HARNESS_AUTHORIZATION_MODE:
+            return _PHASE_A_HARNESS_RETENTION_BLOCK_REASON
         if (
             execution.process_state not in _TERMINAL_EXECUTION_STATES
             or execution.finished_at is None

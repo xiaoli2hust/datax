@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -8,8 +9,9 @@ from uuid import UUID, uuid4
 
 import pytest
 import rfc8785
+from sqlalchemy import event as sqlalchemy_event
 from sqlalchemy import func, select
-from sqlalchemy.orm import object_session
+from sqlalchemy.orm import Session, object_session
 from test_core_control_plane import (
     CoreStack,
     PublishedJob,
@@ -24,8 +26,18 @@ from test_core_control_plane import (
 )
 
 from datax_studio.core import service as core_service_module
-from datax_studio.core.db import Execution, JobVersion, TargetCopyLock
-from datax_studio.core.schemas import ClaimedExecution, CredentialBinding
+from datax_studio.core.db import (
+    Execution,
+    JobVersion,
+    TargetCopyLock,
+    WorkTerminationRequest,
+)
+from datax_studio.core.schemas import (
+    ClaimedExecution,
+    CredentialBinding,
+    ExecutionCreate,
+    JobSpecV1,
+)
 from datax_studio.core.service import ControlService
 from datax_studio.credentials.db import EndpointConnectionEvidence
 from datax_studio.recovery.db import RecoveryGate, RecoveryProbe
@@ -149,6 +161,30 @@ def _rerun_state_snapshot(
             "recovery_gate": _row_snapshot(gate),
             "target_copy_lock": _row_snapshot(target_lock),
         }
+
+
+def _parent_lock_order_recorder(lock_order: list[str]) -> Callable[[object], None]:
+    """Record only the two parent row-lock intents relevant to recovery.
+
+    SQLite intentionally does not provide PostgreSQL row locking, so this is a
+    regression check for the ORM statements' order.  Real contention remains a
+    PostgreSQL integration concern.
+    """
+
+    def record_for_update(orm_execute_state: object) -> None:
+        statement = getattr(orm_execute_state, "statement", None)
+        if statement is None or getattr(statement, "_for_update_arg", None) is None:
+            return
+        entities = {
+            description.get("entity")
+            for description in getattr(statement, "column_descriptions", ())
+        }
+        if Execution in entities:
+            lock_order.append("EXECUTION")
+        elif RecoveryGate in entities:
+            lock_order.append("RECOVERY_GATE")
+
+    return record_for_update
 
 
 def test_remediation_idempotency_replay_is_bound_to_exact_execution(
@@ -747,6 +783,200 @@ def test_recovery_rerun_rechecks_e4_before_mutating_recovery_state(
     assert accepted.status_code == 202, accepted.text
     assert accepted.headers.get("Idempotency-Replayed") is None
     assert accepted.json()["rerun_of_execution_id"] == str(execution_id)
+
+
+def test_recovery_rerun_capacity_ignores_private_phase_a_queue(
+    core_stack: CoreStack,
+) -> None:
+    """Private harness rows cannot starve or disclose through standard admission."""
+
+    published, execution_id, gate_id = _prepare_verified_rerun(
+        core_stack,
+        suffix="rerun-private-capacity",
+    )
+    now = datetime.now(UTC)
+    with core_stack.sessions.begin() as session:
+        original = session.get(Execution, execution_id)
+        version = session.get(JobVersion, published.job_version_id)
+        assert original is not None
+        assert version is not None
+        execution_request = ExecutionCreate.model_validate(
+            _execution_request(published.job_version_id)
+        )
+        spec = JobSpecV1.model_validate(version.spec_json)
+        for _ in range(200):
+            private_execution = RecoveryService._new_rerun_execution(
+                original=original,
+                requested_by=core_stack.principal.user_id,
+                request=execution_request,
+                spec=spec,
+                now=now,
+            )
+            private_execution.authorization_mode = "PHASE_A_HARNESS"
+            session.add(private_execution)
+
+    body = _execution_request(published.job_version_id)
+    body.pop("job_version_id")
+    body["recovery_gate_id"] = str(gate_id)
+    rerun = core_stack.client.post(
+        f"/api/v1/executions/{execution_id}/rerun",
+        headers={"Idempotency-Key": "rerun-private-capacity-001"},
+        json=body,
+    )
+
+    assert rerun.status_code == 202, rerun.text
+    assert rerun.json()["rerun_of_execution_id"] == str(execution_id)
+
+
+def test_ordinary_recovery_rerun_hides_private_phase_a_execution_as_not_found(
+    core_stack: CoreStack,
+) -> None:
+    """The standard rerun route must not confirm a private execution exists."""
+
+    published, execution_id, gate_id = _prepare_verified_rerun(
+        core_stack,
+        suffix="phase-a-private-rerun-rejected",
+    )
+    with core_stack.sessions.begin() as session:
+        original = session.get(Execution, execution_id)
+        assert original is not None
+        original.authorization_mode = "PHASE_A_HARNESS"
+    before = _rerun_state_snapshot(core_stack, execution_id=execution_id)
+    body = _execution_request(published.job_version_id)
+    body.pop("job_version_id")
+    body["recovery_gate_id"] = str(gate_id)
+
+    rejected = core_stack.client.post(
+        f"/api/v1/executions/{execution_id}/rerun",
+        headers={"Idempotency-Key": "phase-a-private-rerun-rejected-001"},
+        json=body,
+    )
+    missing = core_stack.client.post(
+        f"/api/v1/executions/{uuid4()}/rerun",
+        headers={"Idempotency-Key": "phase-a-private-rerun-missing-001"},
+        json=body,
+    )
+
+    assert rejected.status_code == missing.status_code == 404
+    assert rejected.json()["code"] == missing.json()["code"] == "NOT_FOUND"
+    assert _rerun_state_snapshot(core_stack, execution_id=execution_id) == before
+
+
+def test_remediation_locks_execution_before_recovery_gate(
+    core_stack: CoreStack,
+) -> None:
+    """The submit path establishes the canonical parent lock order."""
+
+    _published, execution_id, claim = _claim_execution(
+        core_stack,
+        suffix="remediation-parent-lock-order",
+    )
+    core_stack.service.transition_claimed_execution(
+        claim=claim,
+        expected_state="STARTING",
+        new_state="FAILED",
+        data_effect="NONE",
+        verification_state="NOT_STARTED",
+        failure_code="PREFLIGHT_FAILED",
+        failure_message="prepare recovery lock-order test",
+    )
+    lock_order: list[str] = []
+    recorder = _parent_lock_order_recorder(lock_order)
+    sqlalchemy_event.listen(Session, "do_orm_execute", recorder)
+    try:
+        submitted = core_stack.client.post(
+            f"/api/v1/executions/{execution_id}/recovery",
+            headers={"Idempotency-Key": "remediation-parent-lock-order-001"},
+            json={
+                "action": "NO_CLEANUP_REQUIRED",
+                "cleanup_performed": False,
+                "reason": "Record the normal parent row-lock order.",
+                "confirmed_at": datetime.now(UTC).isoformat(),
+            },
+        )
+    finally:
+        sqlalchemy_event.remove(Session, "do_orm_execute", recorder)
+
+    assert submitted.status_code == 202, submitted.text
+    assert "EXECUTION" in lock_order
+    assert "RECOVERY_GATE" in lock_order
+    assert lock_order.index("EXECUTION") < lock_order.index("RECOVERY_GATE")
+
+
+def test_probe_termination_locks_execution_before_recovery_gate(
+    core_stack: CoreStack,
+) -> None:
+    """Termination uses the same parent lock order as remediation submission."""
+
+    published, execution_id, execution_claim = _claim_execution(
+        core_stack,
+        suffix="probe-termination-parent-lock-order",
+    )
+    core_stack.service.transition_claimed_execution(
+        claim=execution_claim,
+        expected_state="STARTING",
+        new_state="FAILED",
+        data_effect="NONE",
+        verification_state="NOT_STARTED",
+        failure_code="PREFLIGHT_FAILED",
+        failure_message="prepare probe termination lock-order test",
+    )
+    submitted = core_stack.client.post(
+        f"/api/v1/executions/{execution_id}/recovery",
+        headers={"Idempotency-Key": "probe-termination-parent-lock-order-001"},
+        json={
+            "action": "NO_CLEANUP_REQUIRED",
+            "cleanup_performed": False,
+            "reason": "Create a probe whose termination completes under the lock order.",
+            "confirmed_at": datetime.now(UTC).isoformat(),
+        },
+    )
+    assert submitted.status_code == 202, submitted.text
+    probe_id = UUID(submitted.json()["recovery_probe"]["id"])
+    recovery = RecoveryService(core_stack.service)
+    probe_claim = recovery.claim_next_probe(
+        worker_id="worker-probe-termination-parent-lock-order",
+        host_boot_id="boot-probe-termination-parent-lock-order",
+        cgroup_identity="container:probe-termination-parent-lock-order",
+        credential_selector=lambda _session, **_kwargs: CredentialBinding(
+            source_secret_id=published.target_secret_id,
+            target_secret_id=published.target_secret_id,
+            source_secret_envelope_id=uuid4(),
+            target_secret_envelope_id=uuid4(),
+            source_secret_version=1,
+            target_secret_version=1,
+        ),
+    )
+    assert probe_claim is not None
+    assert probe_claim.recovery_probe_id == probe_id
+    requested_at = datetime.now(UTC)
+    with core_stack.sessions.begin() as session:
+        session.add(
+            WorkTerminationRequest(
+                id=uuid4(),
+                work_kind="RECOVERY_PROBE",
+                work_id=probe_id,
+                credential_secret_id=published.target_secret_id,
+                reason_code="SECRET_REVOKED",
+                status="PENDING",
+                requested_at=requested_at,
+                acknowledged_at=None,
+                completed_at=None,
+            )
+        )
+
+    lock_order: list[str] = []
+    recorder = _parent_lock_order_recorder(lock_order)
+    sqlalchemy_event.listen(Session, "do_orm_execute", recorder)
+    try:
+        completed = recovery.complete_claimed_probe_termination(probe_claim)
+    finally:
+        sqlalchemy_event.remove(Session, "do_orm_execute", recorder)
+
+    assert completed is True
+    assert "EXECUTION" in lock_order
+    assert "RECOVERY_GATE" in lock_order
+    assert lock_order.index("EXECUTION") < lock_order.index("RECOVERY_GATE")
 
 
 def test_unclaimed_cancellation_has_no_recovery_gate(

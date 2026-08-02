@@ -660,6 +660,112 @@ def test_project_dashboard_has_fixed_window_complete_zero_counts_and_drilldowns(
     assert overlong.json()["code"] == "VALIDATION_ERROR"
 
 
+def test_public_execution_views_exclude_private_phase_a_rows(
+    core_stack: CoreStack,
+) -> None:
+    """Ordinary project views must not disclose protected-harness activity."""
+
+    published = _seed_published_job(core_stack, "private-public-view-boundary")
+    created = core_stack.client.post(
+        f"/api/v1/jobs/{published.job_id}/executions",
+        headers={"Idempotency-Key": "private-public-view-boundary-001"},
+        json=_execution_request(published.job_version_id),
+    )
+    assert created.status_code == 202, created.text
+    execution_id = UUID(created.json()["id"])
+    with core_stack.sessions.begin() as session:
+        execution = session.get(Execution, execution_id)
+        assert execution is not None
+        execution.authorization_mode = "PHASE_A_HARNESS"
+
+    now = datetime.now(UTC)
+    dashboard = core_stack.client.get(
+        f"/api/v1/projects/{published.project_id}/dashboard",
+        params={
+            "from": (now - timedelta(hours=1)).isoformat(),
+            "to": (now + timedelta(hours=1)).isoformat(),
+        },
+    )
+    assert dashboard.status_code == 200, dashboard.text
+    assert dashboard.json()["execution_total"] == 0
+    assert all(
+        value == 0 for value in dashboard.json()["execution_state_counts"].values()
+    )
+    assert dashboard.json()["recent_executions"] == []
+
+    executions = core_stack.client.get(
+        f"/api/v1/projects/{published.project_id}/executions"
+    )
+    assert executions.status_code == 200, executions.text
+    assert executions.json()["items"] == []
+    direct = core_stack.client.get(f"/api/v1/executions/{execution_id}")
+    assert direct.status_code == 404
+
+    jobs = core_stack.client.get(f"/api/v1/projects/{published.project_id}/jobs")
+    assert jobs.status_code == 200, jobs.text
+    summary = next(
+        item for item in jobs.json()["items"] if item["id"] == str(published.job_id)
+    )
+    assert summary["latest_execution_process_state"] is None
+    assert summary["latest_execution_at"] is None
+    filtered_jobs = core_stack.client.get(
+        f"/api/v1/projects/{published.project_id}/jobs",
+        params={"latest_execution_state": "QUEUED"},
+    )
+    assert filtered_jobs.status_code == 200, filtered_jobs.text
+    assert filtered_jobs.json()["items"] == []
+
+
+def test_standard_execution_create_capacity_ignores_private_phase_a_queue(
+    core_stack: CoreStack,
+) -> None:
+    """Private harness rows cannot starve standard manual execution admission."""
+
+    private_job = _seed_published_job(core_stack, "private-capacity")
+    private_seed = core_stack.client.post(
+        f"/api/v1/jobs/{private_job.job_id}/executions",
+        headers={"Idempotency-Key": "private-capacity-seed-001"},
+        json=_execution_request(private_job.job_version_id),
+    )
+    assert private_seed.status_code == 202, private_seed.text
+    private_execution_id = UUID(private_seed.json()["id"])
+    with core_stack.sessions.begin() as session:
+        private_execution = session.get(Execution, private_execution_id)
+        assert private_execution is not None
+        private_execution.authorization_mode = "PHASE_A_HARNESS"
+        duplicate_fields = {
+            column.name: getattr(private_execution, column.name)
+            for column in Execution.__table__.columns
+            if column.name != "id"
+        }
+        session.add_all(
+            [
+                Execution(id=uuid4(), **duplicate_fields)
+                for _ in range(199)
+            ]
+        )
+        private_queued_count = session.scalar(
+            select(func.count(Execution.id)).where(
+                Execution.process_state == "QUEUED",
+                Execution.authorization_mode == "PHASE_A_HARNESS",
+            )
+        )
+        assert private_queued_count == 200
+
+    standard_job = _seed_published_job(core_stack, "standard-capacity")
+    standard_created = core_stack.client.post(
+        f"/api/v1/jobs/{standard_job.job_id}/executions",
+        headers={"Idempotency-Key": "standard-capacity-001"},
+        json=_execution_request(standard_job.job_version_id),
+    )
+
+    assert standard_created.status_code == 202, standard_created.text
+    with core_stack.sessions() as session:
+        standard_execution = session.get(Execution, UUID(standard_created.json()["id"]))
+        assert standard_execution is not None
+        assert standard_execution.authorization_mode == "STANDARD"
+
+
 def test_execution_api_only_queues_reserves_and_records_cancel_or_revoke(
     core_stack: CoreStack,
 ) -> None:

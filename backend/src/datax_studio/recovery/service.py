@@ -107,6 +107,7 @@ class RecoveryService:
                 principal,
                 execution_id,
             )
+            self.control._require_standard_execution(execution)  # noqa: SLF001
             gate = session.scalar(
                 select(RecoveryGate).where(RecoveryGate.execution_id == execution.id)
             )
@@ -131,6 +132,7 @@ class RecoveryService:
                 execution_id,
                 lock=True,
             )
+            self.control._require_standard_execution(execution)  # noqa: SLF001
             self.control._require_project_role(  # noqa: SLF001
                 principal,
                 execution.project_id,
@@ -334,6 +336,8 @@ class RecoveryService:
                 principal,
                 probe.project_id,
             )
+            if self._standard_execution_for_probe(session, probe) is None:
+                self.control._not_found()  # noqa: SLF001
             attempt = (
                 session.get(RecoveryProbeAttempt, probe.active_attempt_id)
                 if probe.active_attempt_id
@@ -358,6 +362,12 @@ class RecoveryService:
                 execution_id,
                 lock=True,
             )
+            # The ordinary recovery route has neither the private authorization
+            # reader nor the four-checkpoint Worker path.  Follow the shared
+            # standard-route rule: a private execution is indistinguishable
+            # from an absent execution, rather than exposing a specialized
+            # conflict that confirms its existence.
+            self.control._require_standard_execution(original)  # noqa: SLF001
             self.control._require_project_role(  # noqa: SLF001
                 principal,
                 original.project_id,
@@ -473,8 +483,13 @@ class RecoveryService:
                 source_revision_id=version.source_datasource_revision_id,
                 target_revision_id=version.target_datasource_revision_id,
             )
+            # The standard admission queue has no authorization to observe or
+            # account for private Phase-A harness executions.
             queued_count = session.scalar(
-                select(func.count(Execution.id)).where(Execution.process_state == "QUEUED")
+                select(func.count(Execution.id)).where(
+                    Execution.process_state == "QUEUED",
+                    Execution.authorization_mode == "STANDARD",
+                )
             )
             if (queued_count or 0) >= 200:
                 raise ProblemException(
@@ -598,10 +613,13 @@ class RecoveryService:
             )
             probe = session.scalar(
                 select(RecoveryProbe)
+                .join(RecoveryGate, RecoveryGate.id == RecoveryProbe.recovery_gate_id)
+                .join(Execution, Execution.id == RecoveryGate.execution_id)
                 .where(
                     RecoveryProbe.process_state == "QUEUED",
                     RecoveryProbe.active_attempt_id.is_(None),
                     RecoveryProbe.queue_eligibility_state == "ELIGIBLE",
+                    Execution.authorization_mode == "STANDARD",
                     ~pending_termination,
                 )
                 .order_by(RecoveryProbe.queued_at, RecoveryProbe.id)
@@ -664,6 +682,7 @@ class RecoveryService:
                 or gate.status != "REMEDIATION_SUBMITTED"
                 or gate.latest_recovery_probe_id != probe.id
                 or execution is None
+                or execution.authorization_mode != "STANDARD"
                 or target_lock is None
                 or target_lock.state != "RECOVERY_REQUIRED"
                 or revision is None
@@ -857,6 +876,7 @@ class RecoveryService:
                 probe is None
                 or probe.process_state != "QUEUED"
                 or probe.active_attempt_id is not None
+                or self._standard_execution_for_probe(session, probe) is None
             ):
                 return False
             requests = self._acknowledge_probe_termination_requests(
@@ -1041,12 +1061,22 @@ class RecoveryService:
         requests: list[WorkTerminationRequest],
         now: datetime,
     ) -> None:
+        # Keep the parent lock order identical to ``submit_remediation``:
+        # Execution first, then RecoveryGate.  A simultaneous remediation
+        # submission holds Execution while waiting for its gate; taking the
+        # reverse order here would form a PostgreSQL row-lock deadlock.
+        execution = self._standard_execution_for_probe(session, probe, lock=True)
         gate = session.scalar(
             select(RecoveryGate)
             .where(RecoveryGate.id == probe.recovery_gate_id)
             .with_for_update()
         )
-        if gate is None or gate.latest_recovery_probe_id != probe.id:
+        if (
+            execution is None
+            or gate is None
+            or gate.execution_id != execution.id
+            or gate.latest_recovery_probe_id != probe.id
+        ):
             self._probe_fence_lost()
         primary = min(
             requests,
@@ -1104,6 +1134,7 @@ class RecoveryService:
         if (
             probe is None
             or attempt is None
+            or self._standard_execution_for_probe(session, probe) is None
             or probe.active_attempt_id != attempt.id
             or probe.fence_epoch != claim.fence_epoch
             or attempt.recovery_probe_id != probe.id
@@ -1113,6 +1144,38 @@ class RecoveryService:
         ):
             self._probe_fence_lost()
         return probe, attempt
+
+    @staticmethod
+    def _standard_execution_for_probe(
+        session: Session,
+        probe: RecoveryProbe,
+        *,
+        lock: bool = False,
+    ) -> Execution | None:
+        """Return only the standard execution behind a normal RecoveryProbe.
+
+        RecoveryProbe has no independent authorization-mode field.  Its gate
+        is therefore the authoritative bridge to its owning Execution.  The
+        ordinary Recovery API/Worker must neither read nor advance a future
+        private Phase-A probe; that future path needs its own checker.
+        """
+
+        statement = (
+            select(Execution)
+            .join(RecoveryGate, RecoveryGate.execution_id == Execution.id)
+            .where(
+                RecoveryGate.id == probe.recovery_gate_id,
+                Execution.authorization_mode == "STANDARD",
+            )
+        )
+        if lock:
+            # This query joins RecoveryGate only to establish the parent
+            # relationship.  Restrict FOR UPDATE to Execution so callers can
+            # intentionally acquire the parent before separately locking the
+            # gate, rather than relying on PostgreSQL's multi-relation lock
+            # behavior for a joined SELECT.
+            statement = statement.with_for_update(of=Execution)
+        return session.scalar(statement)
 
     @staticmethod
     def _new_rerun_execution(
@@ -1130,6 +1193,10 @@ class RecoveryService:
             job_version_id=original.job_version_id,
             rerun_of_execution_id=original.id,
             trigger_type="MANUAL",
+            # Keep the normal rerun invariant explicit rather than relying on
+            # the ORM default.  ``rerun`` above rejects every non-STANDARD
+            # original; a private rerun must be designed as a new path.
+            authorization_mode="STANDARD",
             requested_by=requested_by,
             process_state="QUEUED",
             data_effect="NONE",
