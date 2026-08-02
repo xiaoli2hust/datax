@@ -15,7 +15,7 @@
 > GitHub REST 的 `security_and_analysis.dependabot_security_updates.status` 仍为 `disabled`；
 > 漏洞告警与 Dependabot security updates 是不同控制，后者必须由 Repository Owner 在管理面启用
 > 并保存证据，当前为 `BLOCKED_EXTERNAL`。
-> `windows-candidate-signing` GitHub Environment 当前尚未配置（2026-08-02 API 返回 0 个
+> `windows-candidate-signing` GitHub Environment 当前尚未配置（2026-08-03 API 返回 0 个
 > environment）；引用不存在的名称会被 GitHub 自动创建为无保护环境。发布工作流先由一个
 > 不声明 `environment`、不读取 signing secrets/发布 variables 的 GitHub-hosted preflight GET
 > 该 Environment，并只输出 immutable ID 与 canonical protection SHA-256；签名 job `needs` 此
@@ -37,6 +37,9 @@
 > 在决策前，签名 job 保持只路由到该 group 与
 > `self-hosted/windows/x64/datax-release-windows11` labels 的交集，缺组或缺 runner 保持阻断，
 > 不能回退到任意同标签 runner。
+> 2026-08-03 的复核还显示 Actions runner 总数为 0，根 `LICENSE` REST 端点返回 404；因此即使
+> PR 的普通 CI 全绿，也没有可执行签名 job 的受控机器、可用的受保护环境或候选组装所需的
+> 所有者许可证决策。上述 REST 结果是当次外部状态证据，不是签名、安装或 Windows E4 证据。
 > 同一线上快照还显示仓库 Actions policy 为 `allowed_actions=all`、`sha_pinning_required=false`，
 > `main` 的 required approving review count 为 0 且未要求 CODEOWNERS review；源码中 action 已固定
 > SHA，但远端没有强制这些供应链/独立复核治理。迁入 Organization 后，Repository Owner 必须以
