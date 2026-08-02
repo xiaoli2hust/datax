@@ -110,7 +110,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_environment_preflight_precedes_any_signing_job_environment_reference(self) -> None:
         preflight = self.workflow["jobs"]["signing-environment-preflight"]
         self.assertEqual(preflight["runs-on"], "ubuntu-24.04")
-        self.assertEqual(preflight["needs"], "linux-images")
+        self.assertNotIn("needs", preflight)
         self.assertEqual(
             preflight["permissions"],
             {"actions": "read", "contents": "read"},
@@ -132,7 +132,19 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("verify_signing_environment.py", preflight_script)
         self.assertIn("environment_id", preflight_script)
         self.assertIn("protection_sha256", preflight_script)
+        self.assertIn("deployment-branch-policies?per_page=100", preflight_script)
+        self.assertIn("--selector-mode", preflight_script)
+        self.assertIn("--deployment-branch-policies-json", preflight_script)
+        self.assertIn("branch_policies_path", preflight_script)
+        self.assertIn("branch_policies_uri", preflight_script)
         self.assertNotIn("reviewers", preflight_script)
+
+        linux_job = self.workflow["jobs"]["linux-images"]
+        self.assertEqual(linux_job["needs"], "signing-environment-preflight")
+        self.assertEqual(
+            linux_job["if"],
+            "needs.signing-environment-preflight.outputs.ready == 'true'",
+        )
 
         job = self.workflow["jobs"]["windows-signed-candidate"]
         self.assertEqual(
@@ -160,6 +172,11 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("EXPECTED_PROTECTION_SHA256", script)
         self.assertIn("finally", script)
         self.assertIn("Remove-Item -LiteralPath $environmentPath -Force", script)
+        self.assertIn("Remove-Item -LiteralPath $branchPoliciesPath -Force", script)
+        self.assertIn("deployment-branch-policies?per_page=100", script)
+        self.assertIn("--selector-mode", script)
+        self.assertIn("--deployment-branch-policies-json", script)
+        self.assertIn("$branchPoliciesUri", script)
         self.assertNotIn("Write-Output $response.Content", script)
         self.assertIn("prevent", (REPOSITORY_ROOT / "scripts/release/verify_signing_environment.py").read_text(encoding="utf-8"))
 

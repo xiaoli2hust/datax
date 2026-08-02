@@ -96,6 +96,19 @@ secrets 或发布环境 variables，因而不会先通过 job-level Environment 
   Environment 缺失、规则为空/重复/畸形、允许自审或 API 读取失败时，均在导入证书、设置
   signing 变量或调用签名工具前终止。
 
+当 `custom_branch_policies=true` 时，Environment 响应本身不携带具体 pattern。两次预检都必须
+额外读取 `GET /repos/{owner}/{repo}/environments/{environment}/deployment-branch-policies?per_page=100`，
+校验 `total_count` 与返回数组精确相等且不超过该完整页上限，并把每个 selector 的正整数 REST
+ID、精确 `name` 与（若 GitHub 返回）`type` 规范排序后纳入 hash；未知字段、重复 ID/name、畸形
+响应、分页溢出或 selector 读取失败均失败关闭。`protected_branches=true` 时该 endpoint 不是
+selector 事实源，不得由调用方伪造一个空 selector JSON 代替。
+
+`protected_branches=true` 只把 GitHub 当时的“受保护分支”选择模式本身纳入 hash；REST
+Environment 响应不能枚举实际受保护分支、ruleset 或 tag 规则。若仓库没有分支保护，GitHub
+会把该模式视为允许所有分支。因此它不能单独证明只允许 `main` 与精确 semver tag：Release Owner
+必须另留分支/ruleset/tag 治理证据，或采用可完整 hash 的 custom selectors。两种模式均为本 ADR
+允许的配置；若要在源码中强制 custom-only，必须先更新本 ADR。
+
 GitHub 默认允许管理员绕过 Environment protection rules。Release Owner 必须在 GitHub Settings UI
 显式取消 **Allow administrators to bypass configured protection rules**，并保存含 Environment 名称、
 时间、设置值与操作者的 UI 配置证据；仓库迁入 Organization 后，还必须保存
@@ -105,7 +118,8 @@ GitHub 默认允许管理员绕过 Environment protection rules。Release Owner 
 响应和当前 GraphQL `Environment` 类型均不公开这个开关；`verify_signing_environment.py` 只能验证
 其可见规则/身份/hash，**不得**声称校验了管理员绕过禁用状态。
 
-签名 job 必须 `needs` 该 preflight，只有 `ready=true` 才能进入执行并在运行时引用该 Environment。即使 preflight
+任何会产生候选副作用的 job（包括 Linux 镜像构建/推送）和签名 job 都必须 `needs` 这个 root
+preflight，只有 `ready=true` 才能进入执行；这样缺失或失配 Environment 不会先发布 GHCR 候选。即使 preflight
 与签名 job 之间发生删除、重建或策略修改，签名 job 也必须在导入 PFX 前再次 GET，并要求当前
 `environment_id` 与 `protection_sha256` 精确等于 preflight 输出；任一不匹配、空输出或 API 错误
 均失败关闭。这样既阻止“先引用而后检查”的隐式创建时序漏洞，也不把两次读取之间的远端变更
@@ -229,9 +243,10 @@ release qualification、最终安装包和公开晋级拆开。这里的双重�
 - Windows signing job 现在还固定选择 `datax-release-signing` runner group 与四个精确标签，
   并要求发布环境给出 `CARGO_PATH`、`MAKENSIS_PATH`、`RUSTC_PATH`、`SIGNTOOL_PATH`；它在
   导入 PFX 前检查 checkout 和工具路径，工具执行后重查 tracked source。新增的 hosted
-  `signing-environment-preflight` 不声明 Environment、不读取 signing secrets，只输出预先存在的
-  Environment immutable ID 与 canonical protection SHA-256；Windows signing job 在 PFX 前再读
-  REST 并精确比对。当前远端没有该 Environment、runner，也因 User-owned repo 没有可配置该
+  `signing-environment-preflight` 是 root job，不声明 Environment、不读取 signing secrets，并在
+  `custom_branch_policies=true` 时读取、规范化部署 selector；它只输出预先存在的 Environment
+  immutable ID 与 canonical protection SHA-256。Linux 镜像构建和 Windows signing job 都被其
+  `ready=true` 失败关闭，后者在 PFX 前再读 REST 并精确比对。当前远端没有该 Environment、runner，也因 User-owned repo 没有可配置该
   custom runner group 的 Organization 边界，因此这只是静态 E1 fail-closed 控制和
   `BLOCKED_DECISION/BLOCKED_EXTERNAL` 记录。绝对路径不等于工具身份或不可替换性，仍不是受控
   runner、工具 hash/ACL、TOCTOU 防护、不可导出证书或 Windows E4 证据。

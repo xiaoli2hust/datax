@@ -3,8 +3,9 @@
 The GitHub Actions ``environment`` key is only a name.  GitHub creates a missing
 environment when a workflow references it, and that implicit environment has no
 protection rules.  This verifier is deliberately small and uses only the public
-environment representation returned by GitHub's REST API.  It is not a substitute
-for an isolated runner, non-exportable signing keys, or final Windows E4 evidence.
+Environment and deployment-branch-policy representations returned by GitHub's
+REST API.  It is not a substitute for an isolated runner, non-exportable signing
+keys, or final Windows E4 evidence.
 """
 
 from __future__ import annotations
@@ -20,7 +21,9 @@ from typing import Any
 
 EXPECTED_ENVIRONMENT = "windows-candidate-signing"
 MAX_REQUIRED_REVIEWERS = 6
+MAX_DEPLOYMENT_BRANCH_POLICIES = 100
 PROTECTION_HASH_PATTERN = re.compile(r"[0-9a-f]{64}\Z")
+_SELECTOR_NAME_PATTERN = re.compile(r"[^\x00-\x1f\x7f]{1,255}\Z")
 
 
 def _reject_duplicate_object_pairs(
@@ -53,12 +56,120 @@ def _positive_integer(value: object, *, subject: str) -> int:
     return value
 
 
+def _deployment_branch_policy_flags(value: object) -> tuple[bool, bool]:
+    if not isinstance(value, dict):
+        raise TypeError("GitHub signing environment deployment branch policy is malformed")
+    protected_branches = value.get("protected_branches")
+    custom_branch_policies = value.get("custom_branch_policies")
+    if (
+        not isinstance(protected_branches, bool)
+        or not isinstance(custom_branch_policies, bool)
+    ):
+        raise TypeError("GitHub signing environment deployment branch policy is malformed")
+    if protected_branches == custom_branch_policies:
+        raise ValueError(
+            "GitHub signing environment deployment branch policy must enable "
+            "exactly one branch selector"
+        )
+    return protected_branches, custom_branch_policies
+
+
+def deployment_branch_selector_mode(document: object) -> str:
+    """Return whether the caller must fetch GitHub's custom selector list.
+
+    GitHub exposes protected-branch selection in the Environment response but
+    exposes custom branch/tag patterns only through the separate
+    ``deployment-branch-policies`` endpoint.  The workflow uses this small
+    parser before issuing that second read; the full verifier still validates
+    the Environment identity and protection rules afterwards.
+    """
+
+    if not isinstance(document, dict):
+        raise TypeError("GitHub environment response must be a JSON object")
+    policy = document.get("deployment_branch_policy")
+    if policy is None:
+        raise ValueError(
+            "GitHub signing environment has no readable deployment branch policy"
+        )
+    _protected_branches, custom_branch_policies = _deployment_branch_policy_flags(policy)
+    return "custom" if custom_branch_policies else "not-custom"
+
+
+def _canonical_deployment_branch_selectors(document: object) -> list[dict[str, object]]:
+    """Validate and normalize a complete custom branch/tag selector response.
+
+    The workflow requests ``per_page=100``. More results are deliberately
+    rejected instead of silently hashing only the first page. ``node_id`` is
+    transport metadata; the positive REST id, exact selector name, and an
+    optional documented branch/tag type form the protected semantic snapshot.
+    """
+
+    if not isinstance(document, dict):
+        raise TypeError("GitHub deployment branch policy response must be a JSON object")
+    if set(document) != {"total_count", "branch_policies"}:
+        raise ValueError("GitHub deployment branch policy response has unsupported fields")
+    total_count = document.get("total_count")
+    if isinstance(total_count, bool) or not isinstance(total_count, int) or total_count < 0:
+        raise ValueError("GitHub deployment branch policy total count is malformed")
+    if total_count > MAX_DEPLOYMENT_BRANCH_POLICIES:
+        raise ValueError(
+            "GitHub deployment branch policy response exceeds the complete page limit"
+        )
+    if total_count == 0:
+        raise ValueError("GitHub deployment branch policy has no custom selectors")
+    policies = document.get("branch_policies")
+    if not isinstance(policies, list) or len(policies) != total_count:
+        raise ValueError("GitHub deployment branch policy response is incomplete")
+
+    identifiers: set[int] = set()
+    names: set[str] = set()
+    canonical: list[dict[str, object]] = []
+    for policy in policies:
+        if not isinstance(policy, dict):
+            raise TypeError("GitHub deployment branch policy entry must be an object")
+        if set(policy) - {"id", "node_id", "name", "type"}:
+            raise ValueError("GitHub deployment branch policy entry has unsupported fields")
+        identifier = _positive_integer(
+            policy.get("id"),
+            subject="GitHub deployment branch policy identity",
+        )
+        name = policy.get("name")
+        if not isinstance(name, str) or _SELECTOR_NAME_PATTERN.fullmatch(name) is None:
+            raise ValueError("GitHub deployment branch policy selector is malformed")
+        if identifier in identifiers or name in names:
+            raise ValueError("GitHub deployment branch policy selectors are duplicated")
+        raw_type = policy.get("type")
+        if raw_type is not None and raw_type not in {"branch", "tag"}:
+            raise ValueError("GitHub deployment branch policy selector type is malformed")
+        if "node_id" in policy and (
+            not isinstance(policy["node_id"], str) or not policy["node_id"]
+        ):
+            raise ValueError("GitHub deployment branch policy node identity is malformed")
+
+        selector: dict[str, object] = {"id": identifier, "name": name}
+        if raw_type is not None:
+            selector["type"] = raw_type
+        canonical.append(selector)
+        identifiers.add(identifier)
+        names.add(name)
+
+    return sorted(
+        canonical,
+        key=lambda selector: (
+            str(selector["name"]),
+            str(selector.get("type", "")),
+            int(selector["id"]),
+        ),
+    )
+
+
 def _canonical_protection_snapshot(
     *,
     environment_id: int,
     expected_environment: str,
     rules: list[object],
     deployment_branch_policy: object,
+    deployment_branch_policies: object | None,
 ) -> tuple[int, str]:
     """Return a non-secret, stable representation of the protection policy.
 
@@ -142,38 +253,36 @@ def _canonical_protection_snapshot(
         raise ValueError("GitHub signing environment has duplicate branch-policy rules")
 
     if deployment_branch_policy is None:
-        if branch_policy_rule_count != 0:
-            raise ValueError(
-                "GitHub signing environment branch-policy rule has no readable "
-                "deployment branch policy"
-            )
-        canonical_branch_policy: dict[str, bool] | None = None
-    else:
-        if not isinstance(deployment_branch_policy, dict):
-            raise TypeError("GitHub signing environment deployment branch policy is malformed")
-        protected_branches = deployment_branch_policy.get("protected_branches")
-        custom_branch_policies = deployment_branch_policy.get(
-            "custom_branch_policies"
+        raise ValueError(
+            "GitHub signing environment has no readable deployment branch policy"
         )
-        if (
-            not isinstance(protected_branches, bool)
-            or not isinstance(custom_branch_policies, bool)
-        ):
-            raise ValueError("GitHub signing environment deployment branch policy is malformed")
-        if protected_branches == custom_branch_policies:
+    protected_branches, custom_branch_policies = _deployment_branch_policy_flags(
+        deployment_branch_policy
+    )
+    if branch_policy_rule_count != 1:
+        raise ValueError(
+            "GitHub signing environment deployment branch policy and "
+            "branch-policy rule are inconsistent"
+        )
+    canonical_branch_policy: dict[str, bool] = {
+        "protected_branches": protected_branches,
+        "custom_branch_policies": custom_branch_policies,
+    }
+    if custom_branch_policies:
+        if deployment_branch_policies is None:
             raise ValueError(
-                "GitHub signing environment deployment branch policy must enable "
-                "exactly one branch selector"
+                "GitHub signing environment custom branch selectors are unavailable"
             )
-        if branch_policy_rule_count != 1:
+        canonical_branch_selectors: list[dict[str, object]] | None = (
+            _canonical_deployment_branch_selectors(deployment_branch_policies)
+        )
+    else:
+        if deployment_branch_policies is not None:
             raise ValueError(
-                "GitHub signing environment deployment branch policy and "
-                "branch-policy rule are inconsistent"
+                "GitHub signing environment protected-branch policy has unexpected "
+                "custom selectors"
             )
-        canonical_branch_policy = {
-            "protected_branches": protected_branches,
-            "custom_branch_policies": custom_branch_policies,
-        }
+        canonical_branch_selectors = None
 
     # Identity is included in the preflight hash as a defense in depth measure;
     # the caller also compares it directly before importing the PFX.
@@ -186,6 +295,7 @@ def _canonical_protection_snapshot(
             key=lambda rule: json.dumps(rule, sort_keys=True, separators=(",", ":")),
         ),
         "deployment_branch_policy": canonical_branch_policy,
+        "deployment_branch_selectors": canonical_branch_selectors,
     }
     canonical_json = json.dumps(
         canonical_document,
@@ -203,6 +313,7 @@ def validate_signing_environment(
     expected_environment: str = EXPECTED_ENVIRONMENT,
     expected_environment_id: int | None = None,
     expected_protection_sha256: str | None = None,
+    deployment_branch_policies: object | None = None,
 ) -> dict[str, object]:
     """Validate the minimum reviewer gate required before any signing step.
 
@@ -229,6 +340,7 @@ def validate_signing_environment(
         expected_environment=expected_environment,
         rules=rules,
         deployment_branch_policy=document.get("deployment_branch_policy"),
+        deployment_branch_policies=deployment_branch_policies,
     )
 
     if (expected_environment_id is None) != (expected_protection_sha256 is None):
@@ -269,18 +381,37 @@ def _arguments() -> argparse.Namespace:
         description="Validate the GitHub approval gate used by the Windows signing job."
     )
     parser.add_argument("--environment-json", type=Path, required=True)
+    parser.add_argument("--deployment-branch-policies-json", type=Path)
     parser.add_argument("--expected-environment", default=EXPECTED_ENVIRONMENT)
     parser.add_argument("--expected-environment-id", type=int)
     parser.add_argument("--expected-protection-sha256")
+    parser.add_argument(
+        "--selector-mode",
+        action="store_true",
+        help="print whether the Environment requires the custom selector endpoint",
+    )
     return parser.parse_args()
+
+
+def _read_json_document(path: Path) -> object:
+    return json.loads(
+        path.read_text(encoding="utf-8"),
+        object_pairs_hook=_reject_duplicate_object_pairs,
+    )
 
 
 def main() -> int:
     arguments = _arguments()
     try:
-        document = json.loads(
-            arguments.environment_json.read_text(encoding="utf-8"),
-            object_pairs_hook=_reject_duplicate_object_pairs,
+        document = _read_json_document(arguments.environment_json)
+        if getattr(arguments, "selector_mode", False):
+            print(deployment_branch_selector_mode(document))
+            return 0
+        branch_policy_path = getattr(arguments, "deployment_branch_policies_json", None)
+        deployment_branch_policies = (
+            _read_json_document(branch_policy_path)
+            if branch_policy_path is not None
+            else None
         )
         result = validate_signing_environment(
             document,
@@ -291,6 +422,7 @@ def main() -> int:
                 "expected_protection_sha256",
                 None,
             ),
+            deployment_branch_policies=deployment_branch_policies,
         )
     except (
         OSError,

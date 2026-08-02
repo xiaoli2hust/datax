@@ -85,12 +85,23 @@
   权限已生效或可直接生成迁移的证据。
 - `system-backup.v1.md`：Windows Launcher 调用备份 helper 的停机、加密、恢复 journal 与失败关闭边界。
 
-ADR-0011 已规定未来需要独立的 release-payload、harness-qualification、
-release-qualification 与 candidate-root.v2 契约，但它们尚未创建或被任何运行时代码消费。
-Windows E4 profile/result 的 E1 语义契约不等于这些最终发布契约，也不提供其受信结果。
-现有 candidate-root.v1 继续只允许 BLOCKED/release_approved=false；不得用新增可选字段、
-宽松 schema、测试注入、环境变量或自签公钥伪造资格。实现这些新契约前，普通生产路径
-继续 deny-all。
+ADR-0011 的 Phase-A 源码基础件现包括 `release-payload.v1.schema.json` 与
+`harness-qualification.v1.schema.json`：前者定义不含 QH/QR/最终安装包的不可变 P 及其
+`payload_root_sha256`，后者定义最长 24 小时、一次性、域分隔 Ed25519 QH。对应的
+`datax_studio.release_qualification` 只接受 raw UTF-8/JCS、独立传入且与 P 自身 root 一致的
+预期 payload root；QH 的 signed binding 必须与 P 的 identity、平台、全部镜像、Runtime、
+插件和 artifacts 精确相等，且 root 同时承诺 P 内未重复的 HQA keyring。公钥只能从该 P 的
+`hqa_keyring` 按 `issuer_key_id` 取得；P key ID 的排序/唯一性、QH 的 `(issuer_key_id, nonce)`
+一次性 ledger 语义、最大 JSON 深度和跨字段时间窗口由 parser 失败关闭，nonce 只能在所有
+签名/绑定检查后原子消费。它没有设置项、环境变量、Compose/API/Worker 接线或普通用户认证
+source，因此仍不能产生 E3/E4、插件状态、普通执行能力或公开发布结论；仓库也尚无可用的
+HQA keyring/P/QH 实例。
+
+`release-qualification`、candidate-root.v2、受保护 qualification override、受信 reader、真实
+Phase-A/Phase-B harness、签名/OIDC 证据仍未实现。Windows E4 profile/result 的 E1 语义契约
+不等于这些最终发布契约，也不提供其受信结果。现有 candidate-root.v1 继续只允许
+BLOCKED/release_approved=false；不得用新增可选字段、宽松 schema、测试注入、环境变量或自签
+公钥伪造资格。普通生产路径继续 deny-all。
 
 截至 2026-08-01，Datasource、Job、Execution、日志与恢复处置契约已有候选代码消费方，
 但真实四方向 DataX（E3）和 Windows 11 安装链路（E4）仍为 `NOT_RUN/BLOCKED`。

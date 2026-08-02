@@ -20,6 +20,8 @@ concurrency:
 jobs:
   linux-images:
     name: Build immutable Linux images and evidence
+    needs: signing-environment-preflight
+    if: needs.signing-environment-preflight.outputs.ready == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     permissions:
@@ -233,7 +235,6 @@ jobs:
 
   signing-environment-preflight:
     name: Verify the pre-existing signing gate before a signing job can reference it
-    needs: linux-images
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -272,11 +273,13 @@ jobs:
           environment_name="$(python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "${EXPECTED_ENVIRONMENT}")"
           environment_uri="${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/environments/${environment_name}"
           environment_path="${RUNNER_TEMP}/signing-environment-preflight-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
-          if [[ -e "${environment_path}" ]]; then
+          branch_policies_uri="${environment_uri}/deployment-branch-policies?per_page=100"
+          branch_policies_path="${RUNNER_TEMP}/signing-environment-branch-policies-preflight-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.json"
+          if [[ -e "${environment_path}" || -e "${branch_policies_path}" ]]; then
             echo "Signing-environment response path already exists." >&2
             exit 1
           fi
-          trap 'rm -f -- "${environment_path:-}"' EXIT
+          trap 'rm -f -- "${environment_path:-}" "${branch_policies_path:-}"' EXIT
           curl \
             --fail \
             --silent \
@@ -292,10 +295,39 @@ jobs:
             --header "X-GitHub-Api-Version: 2022-11-28" \
             --output "${environment_path}" \
             "${environment_uri}"
+          selector_mode="$("${VERIFIER_PYTHON}" \
+            scripts/release/verify_signing_environment.py \
+            --environment-json "${environment_path}" \
+            --selector-mode)"
+          branch_policy_arguments=()
+          if [[ "${selector_mode}" == "custom" ]]; then
+            curl \
+              --fail \
+              --silent \
+              --show-error \
+              --location \
+              --proto '=https' \
+              --proto-redir '=https' \
+              --tlsv1.2 \
+              --max-time 20 \
+              --request GET \
+              --header "Accept: application/vnd.github+json" \
+              --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+              --header "X-GitHub-Api-Version: 2022-11-28" \
+              --output "${branch_policies_path}" \
+              "${branch_policies_uri}"
+            branch_policy_arguments=(
+              --deployment-branch-policies-json "${branch_policies_path}"
+            )
+          elif [[ "${selector_mode}" != "not-custom" ]]; then
+            echo "Signing-environment selector mode is invalid." >&2
+            exit 1
+          fi
           verification_json="$("${VERIFIER_PYTHON}" \
             scripts/release/verify_signing_environment.py \
             --environment-json "${environment_path}" \
-            --expected-environment "${EXPECTED_ENVIRONMENT}")"
+            --expected-environment "${EXPECTED_ENVIRONMENT}" \
+            "${branch_policy_arguments[@]}")"
           VERIFICATION_JSON="${verification_json}" \
             "${VERIFIER_PYTHON}" - "${GITHUB_OUTPUT}" <<'PY'
           import json
@@ -380,8 +412,12 @@ jobs:
           $environmentPath = Join-Path `
               $env:RUNNER_TEMP `
               "signing-environment-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.json"
-          if (Test-Path -LiteralPath $environmentPath) {
-              throw "Signing-environment response path already exists."
+          $branchPoliciesPath = Join-Path `
+              $env:RUNNER_TEMP `
+              "signing-environment-branch-policies-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT.json"
+          if ((Test-Path -LiteralPath $environmentPath) -or
+              (Test-Path -LiteralPath $branchPoliciesPath)) {
+            throw "Signing-environment response path already exists."
           }
           $headers = @{
               Accept = "application/vnd.github+json"
@@ -398,12 +434,41 @@ jobs:
                   $response.Content,
                   [Text.UTF8Encoding]::new($false)
               )
+              $selectorMode = @(& $env:VERIFIER_PYTHON `
+                  scripts/release/verify_signing_environment.py `
+                  --environment-json $environmentPath `
+                  --selector-mode)
+              if ($LASTEXITCODE -ne 0 -or
+                  $selectorMode.Count -ne 1 -or
+                  $selectorMode[0] -notin @("custom", "not-custom")) {
+                  throw "GitHub signing environment selector-mode preflight failed."
+              }
+              $branchPolicyArguments = @()
+              if ($selectorMode[0] -eq "custom") {
+                  $branchPoliciesUri = (
+                      "$environmentUri/deployment-branch-policies?per_page=100"
+                  )
+                  $branchPoliciesResponse = Invoke-WebRequest `
+                      -Uri $branchPoliciesUri `
+                      -Headers $headers `
+                      -UseBasicParsing
+                  [IO.File]::WriteAllText(
+                      $branchPoliciesPath,
+                      $branchPoliciesResponse.Content,
+                      [Text.UTF8Encoding]::new($false)
+                  )
+                  $branchPolicyArguments = @(
+                      "--deployment-branch-policies-json",
+                      $branchPoliciesPath
+                  )
+              }
               & $env:VERIFIER_PYTHON `
                   scripts/release/verify_signing_environment.py `
                   --environment-json $environmentPath `
                   --expected-environment $env:EXPECTED_ENVIRONMENT `
                   --expected-environment-id $env:EXPECTED_ENVIRONMENT_ID `
-                  --expected-protection-sha256 $env:EXPECTED_PROTECTION_SHA256
+                  --expected-protection-sha256 $env:EXPECTED_PROTECTION_SHA256 `
+                  @branchPolicyArguments
               if ($LASTEXITCODE -ne 0) {
                   throw "GitHub signing environment protection preflight failed."
               }
@@ -411,6 +476,9 @@ jobs:
           finally {
               if (Test-Path -LiteralPath $environmentPath) {
                   Remove-Item -LiteralPath $environmentPath -Force -ErrorAction Stop
+              }
+              if (Test-Path -LiteralPath $branchPoliciesPath) {
+                  Remove-Item -LiteralPath $branchPoliciesPath -Force -ErrorAction Stop
               }
           }
 
