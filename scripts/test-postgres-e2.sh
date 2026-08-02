@@ -124,39 +124,6 @@ run_alembic upgrade head
 run_alembic downgrade 20260802_0016
 run_alembic upgrade head
 
-# 0021/0023 deliberately leave these privileged roles NOLOGIN in the standard
-# product. Give them disposable E2-only logins only after migration cycling;
-# they are never exposed to Compose, Settings, or the Windows launcher.
-docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
-  psql --no-psqlrc --set ON_ERROR_STOP=1 \
-  --username=datax_migration_test --dbname=datax_e2_test \
-  --command "ALTER ROLE datax_phase_a_issuer LOGIN PASSWORD '$issuer_password';
-             ALTER ROLE datax_phase_a_consumer LOGIN PASSWORD '$consumer_password';
-             ALTER ROLE datax_phase_a_runner LOGIN PASSWORD '$runner_password';" \
-  >/dev/null
-
-cd "$repository_root"
-DATAX_MIGRATION_POSTGRES_TEST_URL="$owner_url" \
-DATAX_API_POSTGRES_TEST_URL="$api_url" \
-DATAX_WORKER_POSTGRES_TEST_URL="$worker_url" \
-DATAX_EGRESS_GUARD_POSTGRES_TEST_URL="$guard_url" \
-DATAX_PHASE_A_ISSUER_POSTGRES_TEST_URL="$issuer_url" \
-DATAX_PHASE_A_CONSUMER_POSTGRES_TEST_URL="$consumer_url" \
-DATAX_PHASE_A_RUNNER_POSTGRES_TEST_URL="$runner_url" \
-DATAX_CREDENTIAL_POSTGRES_TEST_URL="$owner_url" \
-DATAX_AUTH_POSTGRES_TEST_URL="$owner_url" \
-PYTHONDONTWRITEBYTECODE=1 \
-  "$python" -m pytest -q -p no:cacheprovider \
-    backend/tests/test_runtime_database_roles_postgres.py \
-    backend/tests/test_phase_a_authorization.py \
-    backend/tests/test_phase_a_qualification_postgres.py \
-    backend/tests/test_egress_guard_postgres.py \
-    backend/tests/test_audit_append_only_postgres.py \
-    backend/tests/test_audit_readiness_postgres.py \
-    backend/tests/test_credentials_postgres.py \
-    backend/tests/test_auth_postgres_concurrency.py \
-    backend/tests/test_phase_a_execution_authorization_postgres.py
-
 # The standard Launcher uses this exact fixed schema exclusion. Prove on a
 # disposable real PostgreSQL database that the protected ledger tables, their
 # sentinel rows, and their trigger-function/schema metadata are absent from
@@ -266,5 +233,53 @@ docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
   >/dev/null
 run_alembic upgrade head
 
+# 0021/0023 deliberately leave these privileged roles NOLOGIN in the standard
+# product. Give them disposable E2-only logins only after every migration
+# rollback/collision probe. They are never exposed to Compose, Settings, or
+# the Windows launcher.
+docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
+  psql --no-psqlrc --set ON_ERROR_STOP=1 \
+  --username=datax_migration_test --dbname=datax_e2_test \
+  --command "ALTER ROLE datax_phase_a_issuer LOGIN PASSWORD '$issuer_password';
+             ALTER ROLE datax_phase_a_consumer LOGIN PASSWORD '$consumer_password';
+             ALTER ROLE datax_phase_a_runner LOGIN PASSWORD '$runner_password';" \
+  >/dev/null
+
+cd "$repository_root"
+DATAX_MIGRATION_POSTGRES_TEST_URL="$owner_url" \
+DATAX_API_POSTGRES_TEST_URL="$api_url" \
+DATAX_WORKER_POSTGRES_TEST_URL="$worker_url" \
+DATAX_EGRESS_GUARD_POSTGRES_TEST_URL="$guard_url" \
+DATAX_PHASE_A_ISSUER_POSTGRES_TEST_URL="$issuer_url" \
+DATAX_PHASE_A_CONSUMER_POSTGRES_TEST_URL="$consumer_url" \
+DATAX_PHASE_A_RUNNER_POSTGRES_TEST_URL="$runner_url" \
+DATAX_CREDENTIAL_POSTGRES_TEST_URL="$owner_url" \
+DATAX_AUTH_POSTGRES_TEST_URL="$owner_url" \
+PYTHONDONTWRITEBYTECODE=1 \
+  "$python" -m pytest -q -p no:cacheprovider \
+    backend/tests/test_runtime_database_roles_postgres.py \
+    backend/tests/test_phase_a_authorization.py \
+    backend/tests/test_phase_a_qualification_postgres.py \
+    backend/tests/test_egress_guard_postgres.py \
+    backend/tests/test_audit_append_only_postgres.py \
+    backend/tests/test_audit_readiness_postgres.py \
+    backend/tests/test_credentials_postgres.py \
+    backend/tests/test_auth_postgres_concurrency.py \
+    backend/tests/test_phase_a_execution_authorization_postgres.py
+
+# Once 0024 has committed a protected public/private bundle, downgrading
+# would discard the checkpoint/PEA boundary and eventually expose its public
+# counterpart to an older standard runtime. The migration must refuse before
+# any drop. This intentionally runs last because the disposable database now
+# contains Phase-A state by design.
+lifecycle_downgrade_output="$temporary_directory/phase-a-lifecycle-downgrade.out"
+if run_alembic downgrade 20260802_0023 >"$lifecycle_downgrade_output" 2>&1
+then
+  fail "Phase-A lifecycle downgrade accepted protected execution state"
+fi
+grep -Fq 'Phase-A protected execution state blocks lifecycle downgrade' \
+  "$lifecycle_downgrade_output" \
+  || fail "Phase-A lifecycle downgrade rejection was not explicit"
+
 printf '%s\n' \
-  'POSTGRES_E2_SUBSET_PASSED: real disposable PostgreSQL migrations, pre-existing-private-role fail-closed rejection, runtime-role boundaries, Phase-A issuer/consumer SECURITY DEFINER grant and immutable Execution-authorization boundaries, ledger guards, standard-backup complete-private-schema exclusion, audit append-only/readiness replay, credential concurrency, and auth concurrency passed. This is E2 subset evidence only; it is not full restore, DataX E3, Windows E4, or product-Compose acceptance.'
+  'POSTGRES_E2_SUBSET_PASSED: real disposable PostgreSQL migrations, pre-existing-private-role fail-closed rejection, runtime-role boundaries, Phase-A issuer/consumer SECURITY DEFINER grant, atomic private create/PEA/global-lock reservation, protected-state downgrade rejection, ledger guards, standard-backup complete-private-schema exclusion, audit append-only/readiness replay, credential concurrency, and auth concurrency passed. This is E2 subset evidence only; it is not full restore, DataX E3, Windows E4, or product-Compose acceptance.'

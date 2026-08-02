@@ -259,15 +259,24 @@ attestation 服务上运行，因而没有真实 bundle/反向验证证据；虽
 `validate_acceptance_manifest.py --require-pass`；正式发布仍稳定返回
 `TRUSTED_RELEASE_ATTESTATION_NOT_IMPLEMENTED`。
 
-ADR-0011 在 2026-08-02 已落地 P/QH/PAG/PEA Schema、失败关闭 P/QH parser、私有
-payload/runtime/job binding 与 durable nonce/grant/PEA E1 基础件；`20260802_0021/0022` 还以无登录的
+ADR-0011 在 2026-08-02 已落地 P/QH/PAG/PEA/lifecycle Schema、失败关闭 P/QH parser、私有
+payload/runtime/job binding 与 durable nonce/grant/PEA/checkpoint E1 基础件；`20260802_0021/0022` 还以无登录的
 ledger owner / issuer / consumer 与最小 `SECURITY DEFINER` issue/revoke/read/PEA-authorize 函数建立了私有
 PostgreSQL role/function 边界，0022 的 PEA 对 `grant_id`/`execution_id` 双唯一、仅保存 nonce SHA-256，
-普通 Worker 只领取 `STANDARD`，adapter 只接受未来 harness 注入的 Engine。它不代表已有已签发
-P/QH、protected harness credential provisioning、私有 Execution 创建/rerun、private API/Worker/Compose
+普通 Worker 只领取 `STANDARD`，adapter 只接受未来 harness 注入的 Engine。0024 仅以 private issuer 的
+受保护事务（先锁 `SystemControl` row，与 draining 串行）创建 Execution→PEA→public `RESERVED`；成功仍
+`QUEUED/BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，错误完整回滚。创建函数在读 current facts 前先以
+`SELECT ... FOR UPDATE` 锁 `public.system_control(singleton_id=1)`，与本地 stop/drain 线性化；行锁所需
+`UPDATE(singleton_id)` 只授予无登录 ledger owner。downgrade 在检查前以 `ACCESS EXCLUSIVE` 锁 public
+`executions`、`execution_attempts`、`target_copy_locks` 和私有 grant、PEA、checkpoint，protected state 存在即
+fail-closed。其 2026-08-02 PostgreSQL E2 已通过；不等于 runner 或可运行 qualification workflow。标准产品没有
+issuer login/API 调用；protected disposition、runner、backup/restore 尚未完成。它不代表已有已签发
+P/QH、protected harness credential provisioning、私有 Execution rerun、private API/Worker/Compose
 override、四检查点、受保护 harness、QR schema/reader、candidate-root.v2 或 Phase A/Phase B workflow；也
 不能产生 E3/E4、改变 candidate-root.v1 的 BLOCKED 语义，或代替真实 Windows/签名/OIDC 证据。上述
 项目继续为 BLOCKED。
+当前没有 protected private disposition workflow；任一 private Execution 阻断标准 backup，私有
+backup/restore 继续 `BLOCKED`，不能以 migration rollback 或普通维护冒充处置。
 
 ## 后果
 

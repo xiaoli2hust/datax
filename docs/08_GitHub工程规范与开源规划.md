@@ -56,9 +56,14 @@
 > `BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，PEA 不能变成普通执行旁路。`20260802_0023` 进一步提供无登录
 > private runner 的 reserve/claim/heartbeat/recovery/release/read 数据库原语，复用全局 `TargetCopyLock` 与
 > `Execution` fence；它只是私有 runner 的 PostgreSQL E2 前置，并未配置 runner 凭据或接入 API、Worker、Compose、Launcher。
-> 0022 RLS/authorization 与 0023 lock/fence 原语已在本切片真实 PostgreSQL E2 中验证。它们
+> `20260802_0024` 仅加入 private issuer 的受保护数据库原子切片：create `PHASE_A_HARNESS` Execution → immutable
+> PEA → public `TargetCopyLock=RESERVED` 必须共同提交，任一授权、current-fact、确认或共享锁冲突时完整回滚；成功后仍
+> `QUEUED/BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，不是 claim/start 权限。0024 新增真实 PostgreSQL
+> E2 已在 2026-08-02 通过。该函数在读 current facts 前先锁定 `public.system_control(singleton_id=1)`，与
+> 本地 stop/drain 线性化；只有无登录 ledger owner 具有行锁所需的 `UPDATE(singleton_id)`，issuer/普通角色无
+> 直接权限。0022 RLS/authorization 与 0023 lock/fence 原语已在本切片真实 PostgreSQL E2 中验证。它们
 > 不等于已签发 P/QH、可运行的 qualification workflow 或 release approval：没有标准角色凭据、
-> QH/PAG/PEA source/override、私有 Execution 创建/rerun、私有 API/Worker 四检查点、受保护 harness、QR reader、
+> QH/PAG/PEA source/override、私有 rerun、私有 API/Worker 四检查点、受保护 harness、QR reader、
 > candidate-root.v2 或真实 Windows/签名/OIDC 证据，发布仍只能生成显式 BLOCKED 候选。
 
 ## 1. 仓库目标
@@ -232,11 +237,26 @@ Windows release runner 或签名结果已经在线验证。Java 源码也没有�
   真实 PostgreSQL E2 还必须用 runtime role DB URL 验证 parent-linked RLS 不能通过 attempt/lock/event/cancel/log/recovery/evidence/WTR 后代读写 private row。它们不得被 Settings、标准 Compose、
   API 或普通 Worker 接入；还必须验证预存私有角色名/成员关系失败关闭，以及 ledger owner 后续
   新建函数默认无 `PUBLIC EXECUTE`。
+  改动 0024 private-create 基础件时，还必须在真实 PostgreSQL 验证：issuer-only 的 create→PEA→同一 public
+  `TargetCopyLock=RESERVED` 成功端态；授权/事实/确认/重复 grant 或 execution/shared-lock 冲突时 Execution、PEA、
+  lock 与 checkpoint 零残留；STANDARD 与 private 同 TargetNamespace 只返回通用冲突且不泄露 private identity；
+  函数必须先 `SELECT ... FOR UPDATE` 锁定 `public.system_control(singleton_id=1)`，与 Launcher/Worker 本地
+  stop/drain 串行；只有无登录 ledger owner 获得 PostgreSQL 行锁所需的窄 `UPDATE(singleton_id)`，issuer 与
+  普通/runtime 角色没有直接权限；draining 或并发 drain 不得让创建在陈旧 admission 后提交；
+  真实两连接 E2 还必须记录 issuer `pg_backend_pid()`、用 `pg_locks` 观察 `NOT granted` 等待，并证明 owner
+  在释放行锁前提交 `draining=true` 后 issuer 以 `P0001` 失败且四类创建事实零残留；
+  API/Worker/egress/runner/普通用户没有函数或直接 DML 权；没有 Attempt、claim、Popen、DataX、凭据、日志、
+  audit/oracle 或普通 API/UI/Compose/Settings/Launcher 接线。最终 receipt 只能是 `LOCK_RESERVED`，内部 checkpoint
+  不能重放。已运行的 0024 切片必须记录受限 PostgreSQL E2，不得写成 E3/E4 或产品接线。
   本轮 `scripts/test-postgres-e2.sh` 已在 disposable real PostgreSQL 15 退出 `0`，PostgreSQL pytest
-  `30 passed`，提供 0022 PEA authorization、普通路径拒绝、API/Worker runtime-role RLS，以及 0023 无登录
+  `32 passed`，提供 0022 PEA authorization、普通路径拒绝、API/Worker runtime-role RLS，以及 0023 无登录
   private runner、全局 `TargetCopyLock` 互斥与 `Execution` fence 函数、私有 schema exclusion 与空库
-  `pg_restore` 探针的数据库 E2/负向验证；private create/rerun/claim/start 四检查点仍须再有私有 harness
-  负向验证。
+  `pg_restore` 探针的数据库 E2/负向验证；0024 的 issuer-only atomic create/rollback、lifecycle function、
+  所有运行角色/issuer/consumer/runner checkpoint direct-DML 拒绝，以及 downgrade 在**检查前**以
+  `ACCESS EXCLUSIVE` 锁住 public `executions`、`execution_attempts`、`target_copy_locks` 与私有 grant、PEA、
+  checkpoint 表，并在任一 protected `PHASE_A_HARNESS` Execution、PEA 或 checkpoint 存在时失败关闭；这些均在
+  本轮 E2 覆盖内。private rerun/claim/start 四检查点仍须再有私有 harness 负向验证。当前标准产品没有 issuer
+  login 或普通 API 调用；protected disposition、runner、backup/restore 是尚未完成的独立门槛。
   该临时 PostgreSQL 容器检查最多是数据库 E2；未启动产品 Compose、API、Worker、DataX、
   MySQL 或独立 oracle 时，绝不能称为 Phase-A E3、Windows E4 或发布证据。
 - Docker 镜像构建、健康检查、非 root 和制品摘要检查。
@@ -317,11 +337,12 @@ ADR-0011 要求把未来 release workflow 拆成以下不可互相替代的阶�
    私有 override 给 Phase A harness，不能出现在标准 Compose、Setup、公开 artifact、
    settings 或普通用户能力目录。
 3. 0022 的 protected issuer 已能以 immutable、`UNIQUE(grant_id)` + `UNIQUE(execution_id)` PEA 将既有
-   ACTIVE PAG 与一个已存在的 pending `PHASE_A_HARNESS` Execution/JobVersion/revision/policy/namespace/
+   ACTIVE PAG 与一个 pending `PHASE_A_HARNESS` Execution/JobVersion/revision/policy/namespace/
    P/runtime/harness/QH/nonce-SHA-256 facts 原子绑定；consumer read 已对有效 PAG/QH/current facts
    失败关闭。0023 只在数据库中为未来私有 runner 提供复用全局 `TargetCopyLock` 与 `Execution` fence 的
    reserve/claim/heartbeat/recovery/release/read 原语；没有 runner 凭据，也没有 API/Worker/Compose/Launcher
-   接线。private create/rerun/claim/start 四检查点尚未接线；只有它们完成后，真实 E3/私有 Windows harness/payload
+   接线。0024 仅在 private issuer 的同一事务原子创建 Execution→PEA→public `RESERVED` lock，任一失败完整回滚；
+   成功后仍 `QUEUED/BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，真实 PostgreSQL E2 已在 2026-08-02 随 `32 passed` 验证。private rerun/claim/start 四检查点尚未接线；只有它们完成后，真实 E3/私有 Windows harness/payload
    qualification（不是 E4）的独立复核通过后，独立
    RQA 才能签发 detached QR。HQA、RQA、Authenticode 证书和 GitHub OIDC 不是同一把密钥或
    同一角色。
@@ -337,10 +358,11 @@ self-hosted runner 的自述 JSON 当作公开 release 证明。
 当前的 E1 状态包括 P/QH parser、私有 payload/runtime/job binding 与 durable nonce/grant/PEA
 账本；`20260802_0021/0022` 已用无登录 dedicated role 与精确 `SECURITY DEFINER` 函数把 atomic
 nonce+PAG issue/revoke、current-grant read 和 PEA issuer-authorize/consumer-read 分离，并提供只接受未来受保护 Engine
-注入的 private adapter；0023 只增加 private runner 复用全局 `TargetCopyLock`/`Execution` fence 的数据库原语。
+注入的 private adapter；0023 只增加 private runner 复用全局 `TargetCopyLock`/`Execution` fence 的数据库原语；0024
+只增加 issuer-only atomic create→PEA→public `RESERVED` foundation，真实 PG E2 已在 2026-08-02 随 `32 passed` 验证。
 0022 的 PEA 是私有数据库 record，普通 API/Worker/Recovery/日志只处理 `STANDARD`，runtime DB role 的
-parent-linked RLS 也拒绝 private row/后代直连访问；0022/0023 migration 已在本切片真实 PostgreSQL E2 中验证。
-整体仍没有 runner 凭据、private override、私有 Execution 创建/rerun、四检查点、API/Worker/Compose/Launcher 接线或受保护 harness；因此不能产生
+parent-linked RLS 也拒绝 private row/后代直连访问；0022/0023/0024 migration 已在本切片真实 PostgreSQL E2 中验证。
+整体仍没有 runner 凭据、private override、私有 rerun、四检查点、API/Worker/Compose/Launcher 接线或受保护 harness；因此不能产生
 QH、普通运行路径的 PAG/PEA 消费、QR、E3/E4、普通用户能力或可发布候选。
 
 ## 7. Issue 规范

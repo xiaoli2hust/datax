@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
-from datetime import UTC, datetime
+import threading
+import time
+from datetime import UTC, datetime, timedelta
 from uuid import UUID, uuid4
 
 import pytest
@@ -11,10 +14,11 @@ from sqlalchemy.exc import DBAPIError
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import NullPool
 
-from datax_studio.auth.db import Organization, User
+from datax_studio.auth.db import Organization, OrganizationMember, RoleAssignment, User
 from datax_studio.core.db import (
     Datasource,
     DatasourceRevision,
+    DatasourceUsageGrant,
     EndpointPolicy,
     EndpointPolicyRevision,
     Execution,
@@ -35,6 +39,11 @@ RUNNER_POSTGRES_URL = os.getenv("DATAX_PHASE_A_RUNNER_POSTGRES_TEST_URL")
 
 _SCHEMA = "des_phase_a_qualification"
 _AUTHORIZATION_TABLE = f"{_SCHEMA}.phase_a_execution_authorizations"
+_CHECKPOINT_TABLE = f"{_SCHEMA}.phase_a_execution_create_checkpoints"
+_CREATE_LIFECYCLE_REGPROCEDURE = (
+    f"{_SCHEMA}.des_create_authorize_reserve_phase_a_execution("
+    "uuid,uuid,uuid,uuid,uuid,uuid,jsonb,jsonb)"
+)
 _AUTHORIZE_SQL = text(
     f"""
     SELECT {_SCHEMA}.des_authorize_phase_a_execution(
@@ -48,6 +57,21 @@ _READ_SQL = text(
     f"""
     SELECT *
     FROM {_SCHEMA}.des_read_active_phase_a_execution_authorization(:execution_id)
+    """
+)
+_CREATE_LIFECYCLE_SQL = text(
+    f"""
+    SELECT *
+    FROM {_SCHEMA}.des_create_authorize_reserve_phase_a_execution(
+        :execution_id,
+        :authorization_id,
+        :lock_id,
+        :grant_id,
+        :job_version_id,
+        :requested_by,
+        CAST(:source_quiescence_confirmation AS jsonb),
+        CAST(:target_exclusivity_confirmation AS jsonb)
+    )
     """
 )
 _ISSUE_SQL = text(
@@ -146,6 +170,7 @@ def _seed_pending_private_execution(
     engine_url: str,
     *,
     authorization_mode: str = "PHASE_A_HARNESS",
+    lifecycle_eligible: bool = False,
 ) -> tuple[UUID, dict[str, str]]:
     """Create the smallest valid public binding the private function accepts.
 
@@ -162,6 +187,7 @@ def _seed_pending_private_execution(
     label = uuid4().hex
     organization_id = uuid4()
     user_id = uuid4()
+    organization_member_id = uuid4()
     project_id = uuid4()
     source_identity_id = uuid4()
     target_identity_id = uuid4()
@@ -192,6 +218,9 @@ def _seed_pending_private_execution(
     runtime_sha256 = _hash(f"{label}:runtime")
     reader_plugin_sha256 = _hash(f"{label}:mysqlreader")
     writer_plugin_sha256 = _hash(f"{label}:postgresqlwriter")
+    spec_json: dict[str, object] = {"schema_version": "1.0", "label": label}
+    if lifecycle_eligible:
+        spec_json["execution_policy"] = {"timeout_seconds": 3600}
     try:
         with sessions.begin() as session:
             session.add_all(
@@ -199,11 +228,11 @@ def _seed_pending_private_execution(
                     Organization(
                         id=organization_id,
                         name=f"Phase-A authorization {label}",
-                        # This fixture exercises only the private SQL
-                        # boundary. Keeping its synthetic organization
-                        # SUSPENDED avoids consuming V1's one-ACTIVE-org test
-                        # invariant or appearing in later egress-view tests.
-                        status="SUSPENDED",
+                        # The lifecycle-specific fixture needs the same
+                        # active organization precondition as a manual
+                        # execution. Existing PEA-only tests stay suspended
+                        # so they do not consume their unrelated invariant.
+                        status="ACTIVE" if lifecycle_eligible else "SUSPENDED",
                         created_at=now,
                         updated_at=now,
                         row_version=1,
@@ -403,7 +432,7 @@ def _seed_pending_private_execution(
                         project_id=project_id,
                         name=f"copy {label}",
                         status="PUBLISHED",
-                        draft_spec_json={"schema_version": "1.0", "label": label},
+                        draft_spec_json=spec_json,
                         draft_spec_hash=spec_hash,
                         validated_spec_hash=spec_hash,
                         validation_report={"valid": True},
@@ -418,7 +447,7 @@ def _seed_pending_private_execution(
                         job_id=job_id,
                         version_no=1,
                         job_spec_schema_version="1.0",
-                        spec_json={"schema_version": "1.0", "label": label},
+                        spec_json=spec_json,
                         spec_hash=spec_hash,
                         source_datasource_revision_id=source_revision_id,
                         target_datasource_revision_id=target_revision_id,
@@ -564,8 +593,56 @@ def _seed_pending_private_execution(
             session.flush(
                 [record for record in session.new if isinstance(record, Execution)]
             )
+            if lifecycle_eligible:
+                session.add_all(
+                    [
+                        OrganizationMember(
+                            id=organization_member_id,
+                            organization_id=organization_id,
+                            user_id=user_id,
+                            status="ACTIVE",
+                            joined_at=now,
+                        ),
+                        RoleAssignment(
+                            id=uuid4(),
+                            organization_member_id=organization_member_id,
+                            scope_type="PROJECT",
+                            scope_id=project_id,
+                            role="OPERATOR",
+                            granted_by=user_id,
+                            created_at=now,
+                        ),
+                        DatasourceUsageGrant(
+                            id=uuid4(),
+                            datasource_id=source_datasource_id,
+                            organization_member_id=organization_member_id,
+                            usage="SOURCE_USE",
+                            status="ACTIVE",
+                            granted_by=user_id,
+                            granted_at=now,
+                            revoked_by=None,
+                            revoked_at=None,
+                            row_version=1,
+                        ),
+                        DatasourceUsageGrant(
+                            id=uuid4(),
+                            datasource_id=target_datasource_id,
+                            organization_member_id=organization_member_id,
+                            usage="TARGET_USE",
+                            status="ACTIVE",
+                            granted_by=user_id,
+                            granted_at=now,
+                            revoked_by=None,
+                            revoked_at=None,
+                            row_version=1,
+                        ),
+                    ]
+                )
+                session.flush()
         return execution_id, {
+            "organization_id": str(organization_id),
             "project_id": str(project_id),
+            "job_id": str(job_id),
             "user_id": str(user_id),
             "source_datasource_id": str(source_datasource_id),
             "source_policy_id": str(source_policy_id),
@@ -586,6 +663,7 @@ def _seed_pending_private_execution(
             "source_table_hash": source_table_hash,
             "target_table_hash": target_table_hash,
             "scope_hash": scope_hash,
+            "job_version_id": str(job_version_id),
         }
     finally:
         engine.dispose()
@@ -637,7 +715,7 @@ def test_phase_a_authorization_is_private_immutable_and_excludes_standard_worker
         with owner.connect() as connection:
             assert connection.execute(
                 text("SELECT version_num FROM alembic_version")
-            ).scalar_one() == "20260802_0023"
+            ).scalar_one() == "20260802_0024"
             for role in ("datax_api", "datax_worker", "datax_egress_guard"):
                 assert connection.execute(
                     text(
@@ -1194,4 +1272,476 @@ def test_phase_a_authorization_read_rejects_public_parent_drift(
     finally:
         consumer.dispose()
         issuer.dispose()
+        owner.dispose()
+
+
+@pytest.mark.skipif(
+    not all(
+        (
+            POSTGRES_URL,
+            API_POSTGRES_URL,
+            WORKER_POSTGRES_URL,
+            ISSUER_POSTGRES_URL,
+            CONSUMER_POSTGRES_URL,
+            RUNNER_POSTGRES_URL,
+        )
+    ),
+    reason=(
+        "migration owner, runtime, issuer, consumer, and runner PostgreSQL URLs are not configured"
+    ),
+)
+def test_phase_a_private_creation_is_atomic_and_keeps_the_execution_blocked() -> None:
+    """Exercise 0024 on PostgreSQL only; this is not an E3 product run."""
+
+    assert POSTGRES_URL is not None
+    assert API_POSTGRES_URL is not None
+    assert WORKER_POSTGRES_URL is not None
+    assert ISSUER_POSTGRES_URL is not None
+    assert CONSUMER_POSTGRES_URL is not None
+    assert RUNNER_POSTGRES_URL is not None
+    owner = create_engine(POSTGRES_URL, pool_pre_ping=True)
+    issuer = create_engine(ISSUER_POSTGRES_URL, pool_pre_ping=True, poolclass=NullPool)
+    previous_active_organizations: tuple[UUID, ...] = ()
+    previous_system_control: tuple[bool, str] | None = None
+    lifecycle_organization_id: UUID | None = None
+    try:
+        # The new entrypoint belongs to exactly the issuer.  A private schema
+        # usage grant cannot become hidden table DML or runner/API authority.
+        with owner.connect() as connection:
+            assert connection.execute(
+                text(
+                    "SELECT has_function_privilege("
+                    "'datax_phase_a_issuer', "
+                    "to_regprocedure(:function_name), 'EXECUTE')"
+                ),
+                {"function_name": _CREATE_LIFECYCLE_REGPROCEDURE},
+                ).scalar_one() is True
+            assert connection.execute(
+                text(
+                    "SELECT has_column_privilege("
+                    "'datax_phase_a_issuer', 'public.system_control', "
+                    "'draining', 'UPDATE')"
+                )
+            ).scalar_one() is False
+            assert connection.execute(
+                text(
+                    "SELECT has_column_privilege("
+                    "'datax_phase_a_ledger_owner', 'public.system_control', "
+                    "'singleton_id', 'UPDATE')"
+                )
+            ).scalar_one() is True
+            assert connection.execute(
+                text(
+                    "SELECT has_column_privilege("
+                    "'datax_phase_a_ledger_owner', 'public.system_control', "
+                    "'draining', 'UPDATE')"
+                )
+            ).scalar_one() is False
+            for role in (
+                "datax_api",
+                "datax_worker",
+                "datax_egress_guard",
+                "datax_phase_a_consumer",
+                "datax_phase_a_runner",
+            ):
+                assert connection.execute(
+                    text(
+                        "SELECT has_function_privilege("
+                        ":role, to_regprocedure(:function_name), 'EXECUTE')"
+                    ),
+                    {"role": role, "function_name": _CREATE_LIFECYCLE_REGPROCEDURE},
+                ).scalar_one() is False
+            for role in (
+                "datax_api",
+                "datax_worker",
+                "datax_egress_guard",
+                "datax_phase_a_issuer",
+                "datax_phase_a_consumer",
+                "datax_phase_a_runner",
+            ):
+                for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+                    assert connection.execute(
+                        text("SELECT has_table_privilege(:role, :table_name, :privilege)"),
+                        {
+                            "role": role,
+                            "table_name": _CHECKPOINT_TABLE,
+                            "privilege": privilege,
+                        },
+                    ).scalar_one() is False
+
+        # The disposable E2 database is shared by tests but V1 permits only
+        # one ACTIVE organization. Restore any prior active organization once
+        # this fixture has finished its isolated eligibility checks.
+        with owner.begin() as connection:
+            system_control = connection.execute(
+                text(
+                    "SELECT draining, reason FROM public.system_control "
+                    "WHERE singleton_id = 1"
+                )
+            ).mappings().one()
+            previous_system_control = (
+                system_control["draining"],
+                system_control["reason"],
+            )
+            connection.execute(
+                text(
+                    "UPDATE public.system_control SET draining = false, "
+                    "reason = 'PHASE_A_E2_LIFECYCLE_TEST' "
+                    "WHERE singleton_id = 1"
+                )
+            )
+            previous_active_organizations = tuple(
+                connection.execute(
+                    text("SELECT id FROM public.organizations WHERE status = 'ACTIVE'")
+                ).scalars()
+            )
+            if previous_active_organizations:
+                connection.execute(
+                    text(
+                        "UPDATE public.organizations SET status = 'SUSPENDED' "
+                        "WHERE status = 'ACTIVE'"
+                    )
+                )
+
+        seeded_execution_id, facts = _seed_pending_private_execution(
+            POSTGRES_URL,
+            lifecycle_eligible=True,
+        )
+        lifecycle_organization_id = UUID(facts["organization_id"])
+        requested_by = UUID(facts["user_id"])
+        job_version_id = UUID(facts["job_version_id"])
+        with owner.begin() as connection:
+            connection.execute(
+                text("DELETE FROM public.executions WHERE id = :execution_id"),
+                {"execution_id": seeded_execution_id},
+            )
+
+        now = datetime.now(UTC)
+        confirmed_at = now.isoformat().replace("+00:00", "Z")
+        valid_until = (now + timedelta(minutes=15)).isoformat().replace("+00:00", "Z")
+        source_confirmation = json.dumps(
+            {
+                "confirmed": True,
+                "confirmed_at": confirmed_at,
+                "note": "phase-a-e2",
+            }
+        )
+        target_confirmation = json.dumps(
+            {
+                "statement_version": "1.0",
+                "confirmed": True,
+                "confirmed_at": confirmed_at,
+                "valid_until": valid_until,
+                "responsible_party": "OPERATOR",
+                "note": "phase-a-e2",
+            }
+        )
+        grant_id = uuid4()
+        execution_id = uuid4()
+        authorization_id = uuid4()
+        lock_id = uuid4()
+        parameters = {
+            "execution_id": execution_id,
+            "authorization_id": authorization_id,
+            "lock_id": lock_id,
+            "grant_id": grant_id,
+            "job_version_id": job_version_id,
+            "requested_by": requested_by,
+            "source_quiescence_confirmation": source_confirmation,
+            "target_exclusivity_confirmation": target_confirmation,
+        }
+        with issuer.begin() as connection:
+            assert connection.execute(
+                _ISSUE_SQL,
+                _issue_parameters(
+                    grant_id=grant_id,
+                    nonce_id=uuid4(),
+                    facts=facts,
+                ),
+            ).scalar_one() == grant_id
+            receipt = dict(
+                connection.execute(_CREATE_LIFECYCLE_SQL, parameters).mappings().one()
+            )
+
+        assert receipt["execution_id"] == execution_id
+        assert receipt["authorization_id"] == authorization_id
+        assert receipt["grant_id"] == grant_id
+        assert receipt["lock_id"] == lock_id
+        assert receipt["job_id"] == UUID(facts["job_id"])
+        assert receipt["job_version_id"] == job_version_id
+        assert receipt["target_namespace_id"] == UUID(facts["target_namespace_id"])
+        assert receipt["checkpoint"] == "LOCK_RESERVED"
+        assert receipt["execution_process_state"] == "QUEUED"
+        assert receipt["queue_eligibility_state"] == "BLOCKED"
+        assert receipt["queue_block_reason"] == "PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED"
+        assert receipt["target_lock_state"] == "RESERVED"
+        assert type(receipt["occurred_at"]) is datetime
+        assert receipt["occurred_at"].tzinfo is not None
+
+        with owner.connect() as connection:
+            execution = dict(
+                connection.execute(
+                    text(
+                        "SELECT authorization_mode, process_state, active_attempt_id, "
+                        "attempt_count, fence_epoch, queue_eligibility_state, "
+                        "queue_block_reason FROM public.executions "
+                        "WHERE id = :execution_id"
+                    ),
+                    {"execution_id": execution_id},
+                ).mappings().one()
+            )
+            checkpoints = tuple(
+                connection.execute(
+                    text(
+                        "SELECT checkpoint, state, lock_state FROM "
+                        "des_phase_a_qualification.phase_a_execution_create_checkpoints "
+                        "WHERE execution_id = :execution_id "
+                        "ORDER BY CASE checkpoint "
+                        "WHEN 'EXECUTION_CREATED' THEN 1 "
+                        "WHEN 'PEA_BOUND' THEN 2 WHEN 'LOCK_RESERVED' THEN 3 END"
+                    ),
+                    {"execution_id": execution_id},
+                )
+            )
+        assert execution == {
+            "authorization_mode": "PHASE_A_HARNESS",
+            "process_state": "QUEUED",
+            "active_attempt_id": None,
+            "attempt_count": 0,
+            "fence_epoch": 0,
+            "queue_eligibility_state": "BLOCKED",
+            "queue_block_reason": "PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED",
+        }
+        assert checkpoints == (
+            ("EXECUTION_CREATED", "BLOCKED", None),
+            ("PEA_BOUND", "BLOCKED", None),
+            ("LOCK_RESERVED", "RESERVED", "RESERVED"),
+        )
+
+        conflicting_grant_id = uuid4()
+        conflicting_parameters = {
+            **parameters,
+            "execution_id": uuid4(),
+            "authorization_id": uuid4(),
+            "lock_id": uuid4(),
+            "grant_id": conflicting_grant_id,
+        }
+        with issuer.begin() as connection:
+            assert connection.execute(
+                _ISSUE_SQL,
+                _issue_parameters(
+                    grant_id=conflicting_grant_id,
+                    nonce_id=uuid4(),
+                    facts=facts,
+                ),
+            ).scalar_one() == conflicting_grant_id
+        with pytest.raises(DBAPIError) as failure, issuer.begin() as connection:
+            connection.execute(_CREATE_LIFECYCLE_SQL, conflicting_parameters).mappings().one()
+        _assert_sqlstate(failure.value, "23505")
+        with owner.connect() as connection:
+            residue = tuple(
+                connection.execute(
+                    text(
+                        "SELECT "
+                        "(SELECT count(*) FROM public.executions WHERE id = :execution_id), "
+                        "(SELECT count(*) FROM des_phase_a_qualification."
+                        "phase_a_execution_authorizations WHERE id = :authorization_id), "
+                        "(SELECT count(*) FROM public.target_copy_locks WHERE id = :lock_id), "
+                        "(SELECT count(*) FROM des_phase_a_qualification."
+                        "phase_a_execution_create_checkpoints "
+                        "WHERE execution_id = :execution_id)"
+                    ),
+                    {
+                        "execution_id": conflicting_parameters["execution_id"],
+                        "authorization_id": conflicting_parameters["authorization_id"],
+                        "lock_id": conflicting_parameters["lock_id"],
+                    },
+                ).one()
+            )
+        assert residue == (0, 0, 0, 0)
+    finally:
+        with owner.begin() as connection:
+            if previous_system_control is not None:
+                connection.execute(
+                    text(
+                        "UPDATE public.system_control SET draining = :draining, "
+                        "reason = :reason "
+                        "WHERE singleton_id = 1"
+                    ),
+                    {
+                        "draining": previous_system_control[0],
+                        "reason": previous_system_control[1],
+                    },
+                )
+            if lifecycle_organization_id is not None:
+                connection.execute(
+                    text("UPDATE public.organizations SET status = 'SUSPENDED' WHERE id = :id"),
+                    {"id": lifecycle_organization_id},
+                )
+            if previous_active_organizations:
+                connection.execute(
+                    text("UPDATE public.organizations SET status = 'ACTIVE' WHERE id = :id"),
+                    {"id": previous_active_organizations[0]},
+                )
+        issuer.dispose()
+        owner.dispose()
+
+
+@pytest.mark.skipif(
+    not all((POSTGRES_URL, ISSUER_POSTGRES_URL)),
+    reason="migration owner and private Phase-A issuer PostgreSQL URLs are not configured",
+)
+def test_phase_a_private_creation_serializes_with_the_system_drain_transition() -> None:
+    """A drain committed while creation waits must reject the new creation.
+
+    This is a two-connection PostgreSQL E2 regression for the lifecycle
+    admission lock.  It neither starts a worker nor exercises DataX.
+    """
+
+    assert POSTGRES_URL is not None
+    assert ISSUER_POSTGRES_URL is not None
+    owner = create_engine(POSTGRES_URL, pool_pre_ping=True, poolclass=NullPool)
+    creation_started = threading.Event()
+    creation_finished = threading.Event()
+    creation_outcome: list[BaseException] = []
+    creation_backend_pids: list[int] = []
+    previous_system_control: tuple[bool, str] | None = None
+    creation_thread: threading.Thread | None = None
+    now = datetime.now(UTC)
+    source_confirmation = json.dumps(
+        {
+            "confirmed": True,
+            "confirmed_at": now.isoformat().replace("+00:00", "Z"),
+            "note": "phase-a-drain-race-e2",
+        }
+    )
+    target_confirmation = json.dumps(
+        {
+            "statement_version": "1.0",
+            "confirmed": True,
+            "confirmed_at": now.isoformat().replace("+00:00", "Z"),
+            "valid_until": (now + timedelta(minutes=15)).isoformat().replace("+00:00", "Z"),
+            "responsible_party": "OPERATOR",
+            "note": "phase-a-drain-race-e2",
+        }
+    )
+    parameters = {
+        "execution_id": uuid4(),
+        "authorization_id": uuid4(),
+        "lock_id": uuid4(),
+        "grant_id": uuid4(),
+        "job_version_id": uuid4(),
+        "requested_by": uuid4(),
+        "source_quiescence_confirmation": source_confirmation,
+        "target_exclusivity_confirmation": target_confirmation,
+    }
+
+    def invoke_creation() -> None:
+        issuer = create_engine(
+            ISSUER_POSTGRES_URL,
+            pool_pre_ping=True,
+            poolclass=NullPool,
+        )
+        try:
+            with issuer.begin() as connection:
+                creation_backend_pids.append(
+                    connection.execute(text("SELECT pg_backend_pid()")).scalar_one()
+                )
+                creation_started.set()
+                connection.execute(_CREATE_LIFECYCLE_SQL, parameters).mappings().one()
+        except BaseException as error:  # Captured for the calling test thread.
+            creation_outcome.append(error)
+        finally:
+            issuer.dispose()
+            creation_finished.set()
+
+    try:
+        with owner.begin() as connection:
+            previous = connection.execute(
+                text(
+                    "SELECT draining, reason FROM public.system_control "
+                    "WHERE singleton_id = 1 FOR UPDATE"
+                )
+            ).mappings().one()
+            previous_system_control = (previous["draining"], previous["reason"])
+            connection.execute(
+                text(
+                    "UPDATE public.system_control SET draining = false, "
+                    "reason = 'PHASE_A_E2_RACE_BASELINE' WHERE singleton_id = 1"
+                )
+            )
+
+        with owner.begin() as connection:
+            connection.execute(
+                text(
+                    "SELECT singleton_id FROM public.system_control "
+                    "WHERE singleton_id = 1 FOR UPDATE"
+                )
+            )
+            creation_thread = threading.Thread(target=invoke_creation, daemon=True)
+            creation_thread.start()
+            assert creation_started.wait(timeout=5)
+            assert len(creation_backend_pids) == 1
+
+            deadline = time.monotonic() + 5
+            saw_row_lock_wait = False
+            while time.monotonic() < deadline:
+                blocked = connection.execute(
+                    text(
+                        "SELECT EXISTS ("
+                        "SELECT 1 FROM pg_locks WHERE pid = :pid AND NOT granted"
+                        ")"
+                    ),
+                    {"pid": creation_backend_pids[0]},
+                ).scalar_one()
+                if blocked:
+                    saw_row_lock_wait = True
+                    break
+                time.sleep(0.05)
+            assert saw_row_lock_wait
+            assert not creation_finished.is_set()
+            connection.execute(
+                text(
+                    "UPDATE public.system_control SET draining = true, "
+                    "reason = 'PHASE_A_E2_DRAIN_RACE' WHERE singleton_id = 1"
+                )
+            )
+
+        assert creation_finished.wait(timeout=5)
+        assert creation_thread is not None
+        creation_thread.join(timeout=1)
+        assert creation_thread.is_alive() is False
+        assert len(creation_outcome) == 1
+        assert isinstance(creation_outcome[0], DBAPIError)
+        _assert_sqlstate(creation_outcome[0], "P0001")
+
+        with owner.connect() as connection:
+            residue = connection.execute(
+                text(
+                    "SELECT "
+                    "(SELECT count(*) FROM public.executions WHERE id = :execution_id), "
+                    "(SELECT count(*) FROM des_phase_a_qualification."
+                    "phase_a_execution_authorizations WHERE id = :authorization_id), "
+                    "(SELECT count(*) FROM public.target_copy_locks WHERE id = :lock_id), "
+                    "(SELECT count(*) FROM des_phase_a_qualification."
+                    "phase_a_execution_create_checkpoints WHERE execution_id = :execution_id)"
+                ),
+                parameters,
+            ).one()
+        assert residue == (0, 0, 0, 0)
+    finally:
+        if creation_thread is not None and creation_thread.is_alive():
+            creation_thread.join(timeout=5)
+        if previous_system_control is not None:
+            with owner.begin() as connection:
+                connection.execute(
+                    text(
+                        "UPDATE public.system_control SET draining = :draining, "
+                        "reason = :reason WHERE singleton_id = 1"
+                    ),
+                    {
+                        "draining": previous_system_control[0],
+                        "reason": previous_system_control[1],
+                    },
+                )
         owner.dispose()

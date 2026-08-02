@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/phase-a-execution-lifecycle.v1.schema.json",
+  "title": "DataX Enterprise Studio Private Phase-A Atomic Lifecycle Receipt V1",
+  "description": "受 ADR-0011 约束的私有 Phase-A create -> PEA -> global TargetCopyLock RESERVED 原子事务的最终回执形状。它只表达一个已经成功完成的、最小非秘密关联事实：同一事务内创建 private Execution、绑定 immutable PEA/PAG，并取得全局目标 RESERVED lock。它绝不表达或允许单独提交的 EXECUTION_CREATED 或 PEA_BOUND 外部回执；这些中间检查点若存在，只能是私有 append-only 数据库 audit，且不是本机器交互契约。它不是公开 API/UI/Plugin Manifest/Settings/Compose/Launcher 契约，不是普通用户 capability，也不是私有 runner、DataX 启动授权、E3/E4、QR、Windows 认证或发布批准。当前普通路径继续 deny-all；本 Schema 不能证明数据库函数调用、事务原子性、角色隔离、PEA/PAG/QH/current-fact、源静默/目标独占确认、audit、凭据、进程或 oracle 已实际完成。顶层严格拒绝任何未列字段，故不得序列化 raw nonce、任何 QH 文档/内容、凭据、DSN/连接串、命令、完整 DataX 配置、日志、结果或证据载荷。固定的 Execution/queue/lock 状态只描述该原子事务提交后的最小数据库事实，RESERVED 绝不表示可 claim、Popen 或普通路径授权。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "purpose",
+    "visibility",
+    "ordinary_path_authorized",
+    "evidence_conclusion",
+    "execution_id",
+    "authorization_id",
+    "grant_id",
+    "lock_id",
+    "job_id",
+    "job_version_id",
+    "target_namespace_id",
+    "checkpoint",
+    "execution_process_state",
+    "queue_eligibility_state",
+    "queue_block_reason",
+    "target_lock_state",
+    "occurred_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_kind": { "const": "PHASE_A_EXECUTION_LIFECYCLE_RECEIPT" },
+    "purpose": { "const": "PRIVATE_PHASE_A_EXECUTION_LIFECYCLE" },
+    "visibility": { "const": "PROTECTED_PRIVATE" },
+    "ordinary_path_authorized": { "const": false },
+    "evidence_conclusion": { "const": "NOT_E3_OR_E4" },
+    "execution_id": { "$ref": "#/$defs/uuid" },
+    "authorization_id": { "$ref": "#/$defs/uuid" },
+    "grant_id": { "$ref": "#/$defs/uuid" },
+    "lock_id": { "$ref": "#/$defs/uuid" },
+    "job_id": { "$ref": "#/$defs/uuid" },
+    "job_version_id": { "$ref": "#/$defs/uuid" },
+    "target_namespace_id": { "$ref": "#/$defs/uuid" },
+    "checkpoint": { "const": "LOCK_RESERVED" },
+    "execution_process_state": { "const": "QUEUED" },
+    "queue_eligibility_state": { "const": "BLOCKED" },
+    "queue_block_reason": { "const": "PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED" },
+    "target_lock_state": { "const": "RESERVED" },
+    "occurred_at": { "$ref": "#/$defs/rfc3339Timestamptz" }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "rfc3339Timestamptz": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|[+-]\\d{2}:\\d{2})$"
+    }
+  }
+}

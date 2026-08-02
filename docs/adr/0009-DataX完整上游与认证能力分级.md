@@ -127,17 +127,27 @@ UI 从目录渲染 Reader/Writer 并对非 E4 能力显示阻断原因。明确�
 依赖注入可验证门禁正路，但不能通过公开 Schema 或 `/plugins` 冒充发布事实。
 
 受信的生产发布证明读取器尚未实现，当前 `WINDOWS_E4_CERTIFIED=0`。ADR-0011 的
-`release-payload.v1`、`harness-qualification.v1`、`phase-a-qualification-grant.v1` 与
-`phase-a-execution-authorization.v1` Schema，失败关闭 P/QH parser、私有 payload/runtime/job binding 与
-durable nonce/grant/PEA 账本已作为 E1 基础件进入源码；`20260802_0021/0022` 还把 private ledger 交给无登录
+`release-payload.v1`、`harness-qualification.v1`、`phase-a-qualification-grant.v1`、
+`phase-a-execution-authorization.v1` 与 `phase-a-execution-lifecycle.v1` Schema，失败关闭 P/QH parser、私有 payload/runtime/job binding 与
+durable nonce/grant/PEA/checkpoint 账本已作为 E1 基础件进入源码；`20260802_0021/0022` 还把 private ledger 交给无登录
 owner，并以无登录 issuer/consumer 的最小 `SECURITY DEFINER` 函数分离 atomic issue/revoke/current-grant
 read 与 PEA issuer-authorize/consumer-read。0022 的 PEA 对 `grant_id`/`execution_id` 双唯一、仅保存 nonce SHA-256，
 普通 API/Worker/Recovery/公开日志路径只走 `STANDARD`；`datax_api/datax_worker/datax_egress_guard` 的 direct DB access
 还受 parent-linked RLS 限制，不能通过 execution descendants 读取/写入 private row。issuer authorize 后仍是
 `BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，所以它没有普通 DataX start 能力。RLS/0022 已在本切片真实 PostgreSQL E2
-中验证。仍没有受保护 harness
-凭据配置、private Execution 创建/rerun、private override、QR schema/reader、真实 E3/E4 或最终
+中验证。0024 仅让 private issuer 在一个受保护事务中、先锁定 `SystemControl` singleton row 与 Launcher/Worker
+draining 更新串行，再 create Execution→immutable PEA→public `TargetCopyLock=RESERVED`；成功仍为
+`QUEUED/BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，任一失败完整回滚。创建函数在读取 business current facts
+前先锁定 `public.system_control(singleton_id=1)`，与本地 stop/drain 线性化；行锁所需
+`UPDATE(singleton_id)` 仅无登录 ledger owner 可用，issuer/普通角色没有直接权限。downgrade 在检查前以
+`ACCESS EXCLUSIVE` 锁 public `executions`、`execution_attempts`、`target_copy_locks` 和私有 grant、PEA、checkpoint，
+任一 protected state 存在即 fail-closed。2026-08-02 的受限 PostgreSQL E2 已通过，包括 lifecycle、checkpoint
+direct-DML 拒绝与 protected-state downgrade fail-closed；这不提供 runner、普通路径或 DataX start。标准产品没有
+issuer login/API 调用；protected disposition、runner、backup/restore 仍未完成。仍没有受保护 harness
+凭据配置、private Execution rerun、private override、QR schema/reader、真实 E3/E4 或最终
 promotion validator，也不会改变公开 `plugin-manifest.v2`、普通用户状态或 production deny-all。
+当前也没有 protected private disposition workflow；任一 private Execution 阻断标准 backup，私有
+backup/restore 仍 `BLOCKED`，不能以 rollback 或普通维护替代。
 因此该切片仍只证明“不会把未取证能力当成已认证能力运行”，不证明四方向 DataX E3、
 Windows E4 或全部 DataX 功能已完成。
 

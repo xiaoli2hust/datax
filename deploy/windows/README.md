@@ -87,12 +87,12 @@ OS 状态及 Windows release runner 尚无在线验证结果。
 当前 Launcher 已有候选备份导出路径：在受控停机后，将 `.dxdata` 与 `.dxkeys` 分别写入
 用户选择的两个不同本地目录，并使用两把不同密钥加密；DATA 包只含 PostgreSQL
 custom-format 逻辑 dump、脱敏日志和固定发布元数据。该 dump 固定以
-`--exclude-schema=des_phase_a_qualification` 排除完整私有资格 schema（三张 ledger 表、schema 内触发器、
-私有 ledger guard functions 和私有 0021/0022 `SECURITY DEFINER` issuer/consumer entrypoints；PEA 仅含
-nonce SHA-256，绝不含 raw nonce）。保护 public `executions` trigger 的
+`--exclude-schema=des_phase_a_qualification` 排除完整私有资格 schema（四张 ledger/checkpoint 表、schema 内触发器、
+私有 ledger guard functions 和私有 0021/0022/0023/0024 `SECURITY DEFINER` issuer/consumer/runner/private-create
+entrypoints；PEA 仅含 nonce SHA-256，绝不含 raw nonce）。保护 public `executions` trigger 的
 `public.des_phase_a_execution_mode_guard()` 必须留在 dump 中；它仍由无登录 ledger owner 持有且向普通调用者
 撤销执行权。SECRETS 包含本机基础设施 secret。
-这项 schema exclusion 不足以安全导出 0022 的 public execution/log 残留：当前 Launcher 在 `pg_dump`
+这项 schema exclusion 不足以安全导出 0022/0023/0024 的 public execution/target-lock/log 残留：当前 Launcher 在 `pg_dump`
 前后（PostgreSQL 停止前）固定重验 `authorization_mode=PHASE_A_HARNESS` 不存在；存在时返回
 `BACKUP_PHASE_A_PRIVATE_EXECUTION_PRESENT`，psql 完成但非零时返回
 `BACKUP_PHASE_A_PRIVATE_EXECUTION_CHECK_FAILED`，其他命令错误也不能生成普通 `.dxdata/.dxkeys`。受保护 Phase-A
@@ -102,13 +102,22 @@ Launcher 已在确认无旧身份、代际、产品容器和产品卷的干净�
 成功仍返回 `RESTORE_STAGED_COMMIT_BLOCKED`，只达到 E1。新空 PostgreSQL
 volume、真实 `pg_restore`、数据库/审计链/日志/密钥证据重算、卷/secret/
 installation-id 原子提交和升级路径仍未实现，必须失败关闭。即使以后执行普通 dump restore，
-它会恢复 `alembic_version=20260802_0022` 却不恢复私有 schema、其中的私有 0021/0022 issuer/consumer
-entrypoints 或其无登录 ledger roles；`public.des_phase_a_execution_mode_guard()` 则会随 public trigger 保留。
+它会恢复 `alembic_version=20260802_0024` 却不恢复私有 schema、其中的私有 0021/0022/0023/0024
+issuer/consumer/runner/private-create entrypoints 或其无登录 ledger roles；`public.des_phase_a_execution_mode_guard()` 则会随 public trigger 保留。
 因此 restore/bootstrap/start 当前仍必须 `BLOCKED`，直至受保护 bootstrap
-创建新空 ledger 和 issuance epoch，并拒绝旧 nonce/grant/PEA authority。J0b.1 的 0022 已有私有
-PEA ledger 与 issuer authorize/consumer read 数据库边界，但没有 PEA 登录凭据 provisioning 或私有
+创建新空 ledger 和 issuance epoch，并拒绝旧 nonce/grant/PEA/checkpoint authority。J0b.1 的 0022 已有私有
+PEA ledger 与 issuer authorize/consumer read 数据库边界；0024 仅可由 private issuer 原子创建
+Execution→PEA→public `RESERVED`，成功后仍为 `QUEUED/BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`。它们没有登录凭据 provisioning 或私有
 Worker 调用链。标准安装和 SECRETS 包不携带 issuer/consumer/PEA 登录凭据、QH/PAG/PEA 资源或 override，不能用
 普通 Launcher 把它们配置成 qualification 通道，也不能改变 standard deny-all。
+即使未来受保护 issuer 被单独 provision，0024 也必须在读取业务 current facts **前**对
+`public.system_control(singleton_id=1)` 执行 `SELECT ... FOR UPDATE`，与 Launcher/Worker 的本地 stop/drain
+更新线性化，不能在陈旧 admission 观察后提交创建。PostgreSQL 行锁所需 `UPDATE(singleton_id)` 只授予
+无登录 ledger owner；issuer 和普通/runtime 角色没有直接权限。downgrade 在检查前对 public `executions`、
+`execution_attempts`、`target_copy_locks` 及私有 grant、PEA、checkpoint 表取得 `ACCESS EXCLUSIVE` 锁；任一
+protected `PHASE_A_HARNESS` Execution、PEA 或 checkpoint 存在即失败关闭。当前没有 private disposition/backup，
+标准 backup 仍由上述任一 public row gate 阻断，普通 restore 继续 `BLOCKED`。标准安装/Launcher/Compose/API 没有
+issuer login 或普通调用私有函数的路径；protected disposition、runner、backup/restore 是尚未完成门槛。
 该候选尚未经过真实
 Windows 11 备份/完整恢复验收，具体边界见
 [`../../docs/contracts/system-backup.v1.md`](../../docs/contracts/system-backup.v1.md)。

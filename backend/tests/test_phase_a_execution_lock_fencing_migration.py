@@ -50,7 +50,7 @@ def test_0023_reuses_global_target_lock_for_private_fencing() -> None:
     rendered = "\n".join(operations.executed)
     assert module.revision == "20260802_0023"
     assert module.down_revision == "20260802_0022"
-    assert Settings().database_schema_revision == "20260802_0023"
+    assert Settings().database_schema_revision == "20260802_0024"
     assert "Phase-A execution lock migration requires a PostgreSQL superuser" in rendered
     assert "Phase-A private runner role must not pre-exist" in rendered
     assert "Phase-A private runner role membership is not allowed" in rendered

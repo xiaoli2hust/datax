@@ -21,7 +21,7 @@ PostgreSQL named volume、`pg_restore`、数据库/审计链证据重算、日�
 RPO/RTO 仍为 `NOT_RUN/BLOCKED`。
 
 本轮 `scripts/test-postgres-e2.sh` 在 disposable PostgreSQL 15 退出 `0`，其 PostgreSQL pytest 段
-`30 passed`，并已让标准 `--exclude-schema=des_phase_a_qualification` dump 在空数据库 `pg_restore`
+`32 passed`，并已让标准 `--exclude-schema=des_phase_a_qualification` dump 在空数据库 `pg_restore`
 成功。该探针只证明 schema-exclusion 的 dump/restore 引用完整性；它不创建产品 named volume、不会
 bootstrap 私有 ledger/issuance epoch，也不改变本节系统恢复仍为 `NOT_RUN/BLOCKED` 的结论。
 
@@ -47,12 +47,16 @@ journal 或 staging 文件存在都不能表述为“Windows 可恢复门禁已�
   `--exclude-schema=des_phase_a_qualification` 后继续导出。前后双检避免 private public Execution
   元数据或以 execution ID 命名的日志与被排除的 PEA/PAG ledger 静默配对。**受保护 Phase-A
   backup/restore 目前未实现**；不得以跳过此 gate、按表名过滤或把标准包标为“私有备份”替代它。
+  0024 即使只在 issuer 事务中留下 `QUEUED/BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED` 与 public
+  `RESERVED` lock，也属于该“任一 private Execution”条件；其新增真实 PostgreSQL E2 已在 2026-08-02
+  通过，不改变 backup gate 或 restore 的 `BLOCKED` 结论。标准产品没有 issuer login/API 调用，且当前没有
+  protected disposition；因此 private execution 不能由普通维护或 backup 流程清除。
 - 数据库必须由固定 PostgreSQL 容器执行参数数组形式的
   `pg_dump --format=custom --compress=0 --serializable-deferrable`
   `--exclude-schema=des_phase_a_qualification` 并取得单一一致性快照；该排除项是
-  Launcher 固定字面量，不能由用户、环境变量或备份请求改写。该私有 schema 当前包含 Phase-A 的三张
-  ledger 表、schema 内触发器、私有 ledger guard functions 和私有 0021/0022/0023 `SECURITY DEFINER`
-  issuer/consumer/lock-fence entrypoints；PEA 与未接线 runner lock primitive 已在同一完整 schema exclusion
+  Launcher 固定字面量，不能由用户、环境变量或备份请求改写。该私有 schema 当前包含 Phase-A 的四张
+  ledger/checkpoint 表、schema 内触发器、私有 ledger guard functions 和私有 0021/0022/0023/0024 `SECURITY DEFINER`
+  issuer/consumer/lock-fence/private-create entrypoints；PEA、0024 private checkpoint 与未接线 runner lock primitive 已在同一完整 schema exclusion
   范围内。保护 public `executions`
   trigger 的 `public.des_phase_a_execution_mode_guard()` 则故意不被排除，必须随标准 dump/restore 保留；
   它仍由无登录 ledger owner 持有，并向 `PUBLIC`、runtime、issuer 与 consumer 撤销执行权。使用 schema
@@ -92,8 +96,8 @@ DATA 包只允许以下归档项：
 - Launcher keyring、数据库密码、`egress_lease_creation_capability`、JWT 私钥、HMAC、
   KEK、数据源明文凭据；
 - `des_phase_a_qualification` 整个私有 schema（当前 `phase_a_qualification_nonces`、
-  `phase_a_qualification_grants`、`phase_a_execution_authorizations`、schema 内触发器、私有 ledger guard
-  functions、私有 0021/0022/0023 `SECURITY DEFINER` issuer/consumer/lock-fence entrypoints 及其记录；PEA 仅可含 nonce
+  `phase_a_qualification_grants`、`phase_a_execution_authorizations`、`phase_a_execution_create_checkpoints`、schema 内触发器、私有 ledger guard
+  functions、私有 0021/0022/0023/0024 `SECURITY DEFINER` issuer/consumer/lock-fence/private-create entrypoints 及其记录；PEA 仅可含 nonce
   SHA-256，绝不可含 raw nonce），以及任何
   QH/PAG/PEA/QR/private qualification source；标准 backup 与 diagnostics 均不得携带这些受保护
   资格材料；
@@ -159,8 +163,8 @@ DATA 包只允许以下归档项：
 
 由于标准 backup 在任一 `PHASE_A_HARNESS` public Execution 存在时必须拒绝导出，并且标准 DATA dump
 特意不含整个 `des_phase_a_qualification` schema，任何未来完整恢复也**不得**复活备份时存在的
-QH/PAG/PEA 或重放防护状态。受保护 Phase-A backup/restore 是独立的未来能力，当前不存在。恢复后的数据库仍会携带 `alembic_version=20260802_0023`，
-却不会有该 schema、其私有 0021/0022/0023 `SECURITY DEFINER` issuer/consumer/lock-fence entrypoints 或无登录 ledger roles；
+QH/PAG/PEA/checkpoint 或重放防护状态。受保护 Phase-A backup/restore 是独立的未来能力，当前不存在。恢复后的数据库仍会携带 current schema head `alembic_version=20260802_0024`，
+却不会有该 schema、其私有 0021/0022/0023/0024 `SECURITY DEFINER` issuer/consumer/lock-fence/private-create entrypoints 或无登录 ledger roles；
 `public.des_phase_a_execution_mode_guard()` 会随 public trigger 保留；所以当前真实
 `pg_restore`、应用启动和迁移后的 ledger bootstrap 均保持
 `BLOCKED`，不得把空 probe restore 写成可恢复系统。未来完整恢复必须先在受保护的 restore
@@ -168,6 +172,12 @@ bootstrap 中创建空 ledger、生成不随备份恢复的 issuance epoch，并
 P/QH、原子消费的新 nonce 与新 PAG，以及每条新 Execution 的新 PEA。当前没有这种 issuer/source
 或完整 restore，因此本规则
 只是失败关闭的设计约束，不是“已恢复资格”或 E3/E4 证据。
+
+0024 downgrade 同样不得成为清理捷径：它在检查前必须以 `ACCESS EXCLUSIVE` 锁定 public `executions`、
+`execution_attempts`、`target_copy_locks` 及私有 grant、PEA、create-checkpoint 表；只要仍有 protected
+`PHASE_A_HARNESS` Execution、PEA 或 create checkpoint，迁移即失败关闭（该 PostgreSQL E2 negative gate 已在
+2026-08-02 通过）。它不改变标准 backup/restore 的 `BLOCKED` 结论。未来 protected disposition、runner 和
+backup/restore 仍须独立设计、实现和验证。
 
 以上门禁及干净 Windows 11 x64 异机演练完成前，恢复和覆盖升级必须保持失败关闭。普通
 `start` 不得把部分恢复当作全新安装，也不得生成替代 KEK。当前 Launcher 已在

@@ -3,9 +3,9 @@
 | 项 | 值 |
 |---|---|
 | 审查日期 | 2026-08-02 |
-| 审查范围 | Windows Launcher/Setup、Compose/egress-guard、API 登录准入与审计 readiness、数据源外部操作、Worker 租约客户端、GitHub Windows 签名链，以及其权威契约与验收追踪 |
+| 审查范围 | Windows Launcher/Setup、Compose/egress-guard、API 登录准入与审计 readiness、数据源外部操作、Worker 租约客户端、GitHub Windows 签名链、Phase-A 私有 Execution 生命周期，以及其权威契约与验收追踪 |
 | 方法 | 从攻击者可控制的环境变量、同 netns 调用、同名容器、安装器参数、Runner 工具路径和工作区污染出发；每项都要求失败关闭或明确外部阻塞 |
-| 当前结论 | 已有源码修复仍只到 E1/E2；本轮完成数据源外部操作 ASR-013 的候选 A/B/C、准入、deadline、会话/状态陈旧结果防护，并保留真实 PostgreSQL/E3 验证为未关闭门禁。Windows 实机、真实签名和发布仍 `BLOCKED` |
+| 当前结论 | 已有源码修复仍只到 E1/E2；本轮补齐 0024 private create→PEA→global lock 的原子数据库边界、drain 串行化、失败关闭 downgrade、闭合 receipt 契约和跨语言 schema-head 同步。真实 DataX E3、Windows 实机、真实签名和发布仍 `BLOCKED` |
 
 ## 证据等级
 
@@ -243,6 +243,66 @@ blackhole 必须用可验证的 client-side cancel/close 或隔离进程边界�
 仅约束服务端 SQL，不能强制中断客户端 read/fetch/rollback/close。不能用 API 空闲事务 timeout、
 SQLite、mock 或“登录已限速”代替这些证据。
 
+### ASR-014 — High — private 创建可能在本机 stop/drain 后仍依据陈旧准入事实提交
+
+攻击路径：Phase-A create 是 `SECURITY DEFINER` 数据库事务。若它先读取“服务可接受新任务”再读取业务
+current facts，而 Launcher/Worker 同时把 `SystemControl.draining` 改为真，则二者可能都依据旧事实提交：
+本机进入停止/备份流程后仍出现新的 protected Execution/target lock。
+
+修复：0024 函数在任何业务事实读取前，以固定锁序对
+`public.system_control(singleton_id=1)` 执行 `SELECT ... FOR UPDATE`，并在锁内拒绝 `draining=true`。
+无登录 ledger owner 只获得 PostgreSQL 行锁必需的窄 `UPDATE(singleton_id)`；issuer、consumer、runner
+和普通 runtime role 均没有该列或该表的直接更新权。实现见
+`backend/migrations/versions/20260802_0024_phase_a_private_creation.py:L208-L232`、`L266-L292`、`L402-L415`。
+
+验证：真实 PostgreSQL 15 两连接 E2 由 owner 持有同一行锁、issuer 记录自身 `pg_backend_pid()` 后调用
+create；测试在 `pg_locks` 观察 issuer 的未授予锁，owner 提交 `draining=true` 后 issuer 必须返回 `P0001`，
+且 Execution/PEA/lock/checkpoint 均为零残留。见
+`backend/tests/test_phase_a_execution_authorization_postgres.py:L1590-L1747`。这是数据库 E2，未启动
+Worker 或 DataX。
+
+### ASR-015 — High — schema downgrade 可与 protected create 并发并删除仍有语义的私有状态
+
+攻击路径：若 downgrade 先做无锁存在性检查，issuer 可在检查和 `DROP` 之间提交 create→PEA→lock，
+使回退删除 checkpoint/entrypoint 后留下无法由旧模型安全解释的 public protected row。
+
+修复：0024 downgrade 在检查前以 `ACCESS EXCLUSIVE` 同时锁定 public executions/attempts/target locks 和
+private grant/PEA/checkpoint 表；任一 `PHASE_A_HARNESS`、PEA 或 checkpoint 存在即以 SQLSTATE `55000`
+失败关闭。实现见
+`backend/migrations/versions/20260802_0024_phase_a_private_creation.py:L780-L849`。这不是清理能力：
+当前没有 protected disposition，标准 backup/restore 仍必须拒绝有任何 private Execution 的数据库。
+
+验证：一次性 PostgreSQL E2 覆盖空库 downgrade/re-upgrade，并在持久 protected state 后验证 downgrade
+明确拒绝；脚本见 `scripts/test-postgres-e2.sh:L270-L282`。
+
+### ASR-016 — Medium — 私有 receipt 的机器契约曾不能由真实 adapter 完整产生
+
+风险：若 Schema 只存在于文档、adapter 却返回另一套字段，未来 protected harness 可能在不暴露凭据的
+前提下仍传递了无法验证、可漂移的状态包。
+
+修复：adapter 现在显式投影 closed `phase-a-execution-lifecycle.v1` envelope，只允许最终
+`LOCK_RESERVED`、固定 blocked execution/queue 状态和非秘密 UUID/timestamp；不使用通用 dataclass
+序列化，也不在不确定提交结果时重试。实现见
+`backend/src/datax_studio/qualification/execution_lifecycle.py:L49-L103`、`L124-L160`。
+迁移还显式撤销 issuer/consumer/runner/runtime 对 checkpoint table 与 guard function 的直接权限，避免
+未来默认 ACL 漂移；见 `20260802_0024_phase_a_private_creation.py:L208-L214`。
+
+验证：`backend/tests/test_phase_a_execution_lifecycle.py` 用真实 adapter 产物通过 Draft 2020-12
+Schema 校验并断言封闭字段集；静态 migration/contract tests 通过。该 receipt 不是公开 API 或启动权限。
+
+### ASR-017 — Medium — Windows Launcher 的 backup helper schema head 可落后数据库迁移
+
+风险：若 Launcher 仍要求 0023、后端 head 已为 0024，用户在数据库已迁移后会被错误地拒绝 backup；反过来若
+放宽检查则可能以不匹配的 helper 导出。
+
+修复：Launcher 的唯一 `SUPPORTED_MIGRATION_REVISION` 已与 Settings 和 Alembic head 同步为
+`20260802_0024`；backup helper 仍要求精确匹配，任何差异使用
+`BACKUP_MIGRATION_REVISION_UNSUPPORTED` 失败关闭。实现见
+`desktop/windows/src/lib.rs:L34-L42`、`L6009-L6048`。
+
+验证：`cargo test --locked --manifest-path desktop/windows/Cargo.toml` 为 89 passed。这是宿主 Rust 单元测试，
+不是 Windows Docker backup、Setup 或 E4。
+
 ## 未关闭的发布阻塞
 
 1. GitHub 当前 `environments` 数为 **0**，尚不存在受保护的 `windows-candidate-signing` Environment；源码的双阶段 ID/hash 流程只证明 E1 失败关闭，尚无该签名 Environment 的在线 preflight、审批或签名记录。无发布权限的 hosted Windows E1 已运行成功，但不能替代本项。即使未来 reviewer 规则可见，管理员 bypass 默认允许，且 REST/GraphQL verifier 无法读取 `can_admins_bypass`；UI/audit-log 禁用证据仍是独立阻塞项。
@@ -255,6 +315,10 @@ SQLite、mock 或“登录已限速”代替这些证据。
 8. 远端 Dependabot security updates、Actions/SHA policy、独立复核和 hosted E1 required-check 策略尚未由 Repository Owner 配置并取证。
 9. Docker 数据卷容量 probe 只有 E1；异盘 VHD、临界容量、运行中耗尽、Docker timeout/残留与实际
    backup/start 行为仍须在同一签名 Windows 候选上完成 E4。
+10. 0024 的 issuer 在标准产品中仍为 NOLOGIN，且没有 API/Settings/Compose/Launcher 调用路径；这是刻意
+    deny-all，而不是可交付的私有运行通道。以后若单独 provision protected issuer，必须先设计并验收
+    disposition、private runner 四检查点、凭据/日志、独立 backup/restore 及真实 DataX E3；在此之前任何
+    成功 create 仅能作为一次性 E2 数据库证据，不能用于持久产品数据库。
 
 因此不得发布 `Setup.exe`、不得声称“Windows 已稳定运行”或“企业级已完成”。下一次外部验收必须先由仓库所有者作出 Organization 迁移或新 ADR 的签名信任决策，再配置受保护 Environment、独立 reviewer、受控干净 Windows Runner、工具 hash/ACL 取证与不可导出签名能力，并运行同一精确候选的 E3/E4。
 
@@ -263,10 +327,10 @@ SQLite、mock 或“登录已限速”代替这些证据。
 | 检查 | 结果 | 证据等级 |
 |---|---|---|
 | `git diff --check` | 通过 | E1 |
-| 后端完整测试 | 464 通过、10 跳过；跳过项均要求未配置的真实 PostgreSQL URL | E1/E2 |
+| 后端完整测试 | 当前工作树 `pytest -q backend/tests` 退出 `0`；未配置真实 PostgreSQL URL 的项仍按条件跳过 | E1/E2 |
 | acceptance 测试 | 68/68 通过（含 hosted Windows 预检、安装器静默/重解析静态边界和本地 E4 前置观察器负向边界） | E1 |
-| `scripts/test-postgres-e2.sh` | disposable PostgreSQL migrations、角色边界、审计、credential/auth 并发 E2 子集通过 | E2；不是 DataX E3 或 Windows E4 |
-| Launcher Rust 库测试 | 75/75 通过 | E1 |
+| `scripts/test-postgres-e2.sh` | disposable PostgreSQL migrations、角色边界、0024 atomic create/drain race/downgrade、审计、credential/auth 并发 E2 子集 `32 passed` | E2；不是 DataX E3 或 Windows E4 |
+| Launcher Rust 库测试 | 89/89 通过 | E1 |
 | Rust format + Clippy | 通过 | E1 |
 | Ruff | 通过 | E1 |
 | requirements catalog + release YAML parse | 通过 | E1 |

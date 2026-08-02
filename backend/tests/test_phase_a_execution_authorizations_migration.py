@@ -145,7 +145,7 @@ def test_0022_creates_private_one_grant_one_execution_authorization_boundary() -
 
     assert module.revision == "20260802_0022"
     assert module.down_revision == "20260802_0021"
-    assert Settings().database_schema_revision == "20260802_0023"
+    assert Settings().database_schema_revision == "20260802_0024"
     assert "Phase-A execution authorization migration requires a PostgreSQL superuser" in "\n".join(
         operations.executed
     )

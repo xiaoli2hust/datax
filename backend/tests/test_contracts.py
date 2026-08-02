@@ -5,7 +5,7 @@ import json
 import re
 from pathlib import Path
 
-from jsonschema import Draft202012Validator
+from jsonschema import Draft202012Validator, FormatChecker
 from openapi_spec_validator import validate
 from openapi_spec_validator.readers import read_from_filename
 
@@ -331,6 +331,85 @@ def test_phase_a_execution_lock_contract_remains_private_and_fenced() -> None:
     assert not validator.is_valid({**active, "fence_epoch": 0})
     assert not validator.is_valid({**active, "lease_token_hash": "b" * 64})
     assert not validator.is_valid({**reserved, "state": "RESERVED", "fence_epoch": 1})
+
+
+def test_phase_a_execution_lifecycle_contract_is_private_atomic_receipt_only() -> None:
+    schema = json.loads(
+        (CONTRACT_ROOT / "phase-a-execution-lifecycle.v1.schema.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert schema["additionalProperties"] is False
+    assert set(schema["properties"]) == {
+        "schema_version",
+        "artifact_kind",
+        "purpose",
+        "visibility",
+        "ordinary_path_authorized",
+        "evidence_conclusion",
+        "execution_id",
+        "authorization_id",
+        "grant_id",
+        "lock_id",
+        "job_id",
+        "job_version_id",
+        "target_namespace_id",
+        "checkpoint",
+        "execution_process_state",
+        "queue_eligibility_state",
+        "queue_block_reason",
+        "target_lock_state",
+        "occurred_at",
+    }
+    validator = Draft202012Validator(schema, format_checker=FormatChecker())
+    reserved = {
+        "schema_version": "1.0",
+        "artifact_kind": "PHASE_A_EXECUTION_LIFECYCLE_RECEIPT",
+        "purpose": "PRIVATE_PHASE_A_EXECUTION_LIFECYCLE",
+        "visibility": "PROTECTED_PRIVATE",
+        "ordinary_path_authorized": False,
+        "evidence_conclusion": "NOT_E3_OR_E4",
+        "execution_id": "00000000-0000-4000-8000-000000000030",
+        "authorization_id": "00000000-0000-4000-8000-000000000034",
+        "grant_id": "00000000-0000-4000-8000-000000000035",
+        "lock_id": "00000000-0000-4000-8000-000000000036",
+        "job_id": "00000000-0000-4000-8000-000000000031",
+        "job_version_id": "00000000-0000-4000-8000-000000000032",
+        "target_namespace_id": "00000000-0000-4000-8000-000000000033",
+        "checkpoint": "LOCK_RESERVED",
+        "execution_process_state": "QUEUED",
+        "queue_eligibility_state": "BLOCKED",
+        "queue_block_reason": "PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED",
+        "target_lock_state": "RESERVED",
+        "occurred_at": "2026-08-03T12:00:00Z",
+    }
+    assert validator.is_valid(reserved)
+
+    assert not validator.is_valid({**reserved, "ordinary_path_authorized": True})
+    assert not validator.is_valid({**reserved, "evidence_conclusion": "E3"})
+    assert not validator.is_valid({**reserved, "checkpoint": "EXECUTION_CREATED"})
+    assert not validator.is_valid({**reserved, "checkpoint": "PEA_BOUND"})
+    assert not validator.is_valid({**reserved, "execution_process_state": "BLOCKED"})
+    assert not validator.is_valid({**reserved, "queue_eligibility_state": "READY"})
+    assert not validator.is_valid(
+        {**reserved, "queue_block_reason": "PHASE_A_AUTHORIZATION_PENDING"}
+    )
+    assert not validator.is_valid({**reserved, "target_lock_state": "ACTIVE"})
+    assert not validator.is_valid({**reserved, "authorization_id": None})
+    assert not validator.is_valid({**reserved, "grant_id": None})
+    assert not validator.is_valid({**reserved, "lock_id": None})
+    for forbidden_name in (
+        "nonce",
+        "nonce_sha256",
+        "qh_document",
+        "credential",
+        "dsn",
+        "command",
+        "datax_config",
+        "log",
+        "result",
+    ):
+        assert not validator.is_valid({**reserved, forbidden_name: "must-not-serialize"})
 
 
 def test_runtime_generation_schema_separates_legacy_and_generation_objects() -> None:

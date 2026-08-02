@@ -73,33 +73,58 @@ cancel/log/recovery/evidence/work-termination 后代事实启用 parent-linked R
 读取或修改 private execution/后代行。issuer authorize 成功后仍把该 execution 保持为 `BLOCKED`，原因
 `PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，绝不转为可领取。RLS 和该 blocker 已进入 migration/source，
 并已在本轮临时、一次性真实 PostgreSQL 15 E2 中，以 `datax_api`/`datax_worker` 直接数据库连接验证
-private Execution 不可读、其后代写入受拒绝（脚本退出 `0`，PostgreSQL pytest `30 passed`）。这是数据库
+private Execution 不可读、其后代写入受拒绝（脚本退出 `0`，PostgreSQL pytest `32 passed`）。这是数据库
 边界 E2，绝不是 DataX E3、Windows E4 或产品交付验收。
 
 这仍不是可运行的 qualification workflow：标准 Settings、Compose、Launcher、API、Worker 和公开
-Plugin Manifest 都没有 issuer/consumer/runner 登录凭据、QH/PAG/PEA override 或读取入口；也没有私有
-Execution 创建/`rerun` 入口来产生 `PHASE_A_HARNESS`、私有 Worker 领取/启动四检查点、受保护
-harness、QR、受信 reader、已签发资格或真实外部 E3/E4 证据。0022 的 database authorize/read
-boundary 不会自行启动 DataX，也不会解除生产普通路径的 deny-all。发布继续 `BLOCKED`。
+Plugin Manifest 都没有 issuer/consumer/runner 登录凭据、QH/PAG/PEA override 或读取入口，也没有私有
+`rerun`、私有 Worker 领取/启动四检查点、受保护 harness、QR、受信 reader、已签发资格或真实外部
+E3/E4 证据。0022 的 database authorize/read boundary 不会自行启动 DataX，也不会解除生产普通路径的
+deny-all。发布继续 `BLOCKED`。
+
 `20260802_0023` 只补入未接线的 private global lock/fence 前置原语：NOLOGIN runner 只能调用六个
 `SECURITY DEFINER` 函数，且复用标准 `TargetCopyLock`/`Execution.fence_epoch`，因此 private reservation
-与标准任务对同一 TargetNamespace 互斥。它没有产品凭据、Compose/API/Worker/Launcher 接线或 DataX 启动；
-私有 runner 仍是**硬禁用**的。未来启用前仍须完成完整 PEA/current-fact、源静默/目标独占确认、可关联
+与标准任务对同一 TargetNamespace 互斥。`20260802_0024` 在**只供 private issuer 的数据库边界**上新增
+E1/E2 开发基础：同一受保护事务才可创建 `PHASE_A_HARNESS` Execution、写入不可变 PEA，并在同一 public
+`TargetCopyLock` 写入 `RESERVED`；任一授权、current-fact、确认或全局锁冲突失败时三者完整回滚。成功提交后
+Execution 固定为 `QUEUED/BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED`，而 lock 仅为 `RESERVED`；这不表示
+可 claim、可启动或可重试。0024 的内部 append-only checkpoint 不构成公开 API 或可重放 capability，外部机器
+契约只表达已提交的最终 `LOCK_RESERVED` receipt。它没有产品凭据、Compose/API/Worker/Launcher 接线或 DataX
+启动；私有 runner 仍是**硬禁用**的。未来启用前仍须完成完整 PEA/current-fact、源静默/目标独占确认、可关联
 execution/fence 的审计、专用凭据、日志、进程树和崩溃对账维护隔离；详见 ADR-0011 §3.1。
+该函数的首个准入串行点是在读取任何业务 current fact 前，对
+`public.system_control(singleton_id=1)` 执行 `SELECT ... FOR UPDATE`；这与 Launcher/Worker 的本地
+stop/drain 更新线性化，故不能在陈旧 admission 观察后提交新 private Execution。为满足 PostgreSQL 的行锁
+规则，只有无登录 ledger owner 获得该表窄至 `UPDATE(singleton_id)` 的权限；issuer 和所有普通/runtime
+角色均没有这项直接权限，issuer 只能经固定 `SECURITY DEFINER` create 函数间接使用该串行点。
+0024 downgrade 在检查前对 public `executions`、`execution_attempts`、`target_copy_locks` 以及私有
+grant、PEA、create-checkpoint 表取得 `ACCESS EXCLUSIVE` 锁；任一 protected `PHASE_A_HARNESS`
+Execution、PEA 或 checkpoint 存在即失败关闭，绝不可丢弃 authority 后降级。当前没有 protected private
+disposition workflow；任一 private Execution 会继续阻断标准 backup，私有 backup/restore 仍为 `BLOCKED`，
+不得把 migration rollback 或普通维护当作清理替代。标准产品没有 issuer login 凭据，也没有普通 API 可调用
+该私有函数；protected disposition、runner 与 backup/restore 都是未来独立门槛，不能描述为现有运行路径。
 
 本轮 `scripts/test-postgres-e2.sh` 在临时、一次性真实 PostgreSQL 15 中退出 `0`，PostgreSQL pytest
-取得 `30 passed` 的受限 E2：覆盖 0021 的升级/回滚/再升级、issuer/consumer 函数边界、Python issuer →
+取得 `32 passed` 的受限 E2：覆盖 0021 的升级/回滚/再升级、issuer/consumer 函数边界、Python issuer →
 consumer preflight → revoke、预存私有角色失败关闭和 future-function `PUBLIC EXECUTE` 默认权负例；也覆盖 0022
 PEA issuer-authorize/consumer-read、普通路径拒绝与 runtime-role parent-linked RLS，以及 0023 的 global
 lock/fence、standard 同目标 unique-conflict、private lock/attempt RLS 隐藏、double claim/stale fence 和
-PAG revoke heartbeat fail-closed。标准
+PAG revoke heartbeat fail-closed，以及 0024 的 issuer-only atomic create、lifecycle function、所有运行角色及
+issuer/consumer/runner 对 checkpoint direct-DML 拒绝，并验证 downgrade 在任一 protected `PHASE_A_HARNESS`
+Execution、PEA 或 0024 checkpoint 存在时拒绝执行。标准
 `pg_dump --exclude-schema=des_phase_a_qualification` 的 TOC 排除私有账本，并已成功对空数据库执行
 `pg_restore` 探针；私有角色预占冲突同样失败关闭。该 E2 不启动产品 Compose/API/Worker/DataX/MySQL/独立
-oracle，也不验证完整 restore/bootstrap/start 或 Windows，因此绝不是 E3、E4 或最终安装包验收。
+oracle，也不验证完整 restore/bootstrap/start 或 Windows，因此绝不是 E3、E4 或最终安装包验收。0024 的新增
+真实 PostgreSQL migration/atomic-create/lifecycle 测试已在 2026-08-02 由这次 `32 passed` 覆盖；不得把该
+受限 E2 外推为 private runner、普通产品接线、E3 或 E4。
+其中新增的两连接 race E2 还以 owner connection 持有 `SystemControl` 行锁、issuer connection 记录
+`pg_backend_pid()` 并调用 create、owner 通过 `pg_locks` 观察该 PID 的 `NOT granted` 等待为证；owner 在释放锁前
+提交 `draining=true` 后，issuer 必须以 `P0001` 失败且 Execution/PEA/lock/checkpoint 零残留。它只验证数据库
+admission 串行化，不启动 Worker 或 DataX。
 
-标准备份/诊断必须固定排除完整私有 schema `des_phase_a_qualification`：三张 ledger 表、schema 内
-触发器和私有 ledger guard 函数，以及 0021/0022/0023 位于该 schema 的 `SECURITY DEFINER`
-issuer/consumer/runner entrypoints。保护 public `executions` 触发器的
+标准备份/诊断必须固定排除完整私有 schema `des_phase_a_qualification`：四张 ledger/checkpoint 表、schema 内
+触发器和私有 ledger guard 函数，以及 0021/0022/0023/0024 位于该 schema 的 `SECURITY DEFINER`
+issuer/consumer/runner/private-create entrypoints。保护 public `executions` 触发器的
 `public.des_phase_a_execution_mode_guard()` 则必须随标准 dump/restore 保留；它仍为
 `SECURITY DEFINER`、由无登录 ledger owner 持有，并已向 `PUBLIC`、runtime、issuer 与 consumer
 撤销执行权，public 位置不放宽角色边界。当前 Launcher 在 `pg_dump` 前后（PostgreSQL 停止前）固定检查
@@ -107,7 +132,7 @@ issuer/consumer/runner entrypoints。保护 public `executions` 触发器的
 `BACKUP_PHASE_A_PRIVATE_EXECUTION_PRESENT`，`psql` 正常完成但非零时返回
 `BACKUP_PHASE_A_PRIVATE_EXECUTION_CHECK_FAILED`，底层命令错误也失败关闭；不能把其 public Execution/日志元数据带入 DATA 包；受保护 Phase-A backup/restore 尚未实现。
 该空数据库 `pg_restore` 探针不等于系统完整恢复：普通恢复不得复活 Phase-A authority。当前真实 restore/start/ledger bootstrap
-仍阻断：dump 会保留 `alembic_version=20260802_0023` 而不会保留私有 schema。未来只能由在
+仍阻断：升级到当前 schema head `20260802_0024` 的 dump 会保留该 revision 却不会保留私有 schema。未来只能由在
 restore epoch 后重新验证 P/QH 的受保护 issuer 重新签发，而当前不存在该 runtime issuer 或其
 受保护凭据配置。
 
