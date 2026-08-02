@@ -39,6 +39,10 @@ ManifestDPIAware true
 !define UNINSTALL_KEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\DataXEnterpriseStudio"
 !define START_MENU_DIR "DataX Enterprise Studio"
 !define INSTALL_DIRECTORY "$LOCALAPPDATA\Programs\DataXEnterpriseStudio"
+!define DES_FILE_ATTRIBUTE_REPARSE_POINT 0x0400
+!define DES_INVALID_FILE_ATTRIBUTES -1
+!define DES_ERROR_FILE_NOT_FOUND 2
+!define DES_ERROR_PATH_NOT_FOUND 3
 
 Name "${PRODUCT_NAME}"
 Caption "${PRODUCT_NAME} ${PRODUCT_VERSION}"
@@ -70,6 +74,15 @@ VIAddVersionKey /LANG=2052 "LegalCopyright" "Copyright (c) DataX Enterprise Stud
 !insertmacro MUI_LANGUAGE "SimpChinese"
 
 Function .onInit
+  ; V1 needs explicit human confirmation for installation. IfSilent covers the
+  ; NSIS silent state itself (including /S), not a brittle command-line parse.
+  IfSilent installer_silent_rejected installer_interactive
+
+installer_silent_rejected:
+  SetErrorLevel 2
+  Abort
+
+installer_interactive:
   SetRegView 64
   SetShellVarContext current
   ; NSIS accepts /D=<path> by default. V1 has one fixed per-user installation
@@ -81,6 +94,10 @@ installer_directory_rejected:
   Abort
 
 installer_directory_verified:
+  ; Do not allow a pre-existing install tree to redirect file writes, repair,
+  ; launcher execution, or uninstall deletes through a junction/symlink.
+  Call AssertInstallationPathsNoReparse
+  Call AssertInstalledLeavesNoReparse
   ; The release verifier is extracted to $PLUGINSDIR below. Do not rely on an
   ; incidental plug-in invocation to create that directory first.
   InitPluginsDir
@@ -162,6 +179,8 @@ Function StopExistingSameVersion
     MessageBox MB_OK|MB_ICONSTOP "现有版本安装路径不是固定每用户目录，无法安全覆盖。"
     Abort
   ${EndIf}
+  Call AssertInstallationPathsNoReparse
+  Call AssertInstalledLeavesNoReparse
   IfFileExists "$1\launcher.exe" 0 existing_launcher_missing
   ExecWait '"$1\launcher.exe" stop' $2
   ${If} $2 != 0
@@ -205,20 +224,37 @@ Section "DataX Enterprise Studio" SEC_MAIN
   ; user to skip a resource whose replacement could not be written.
   Call NormalizeExistingResourceAttributes
 
+  Call AssertInstallationPathsNoReparse
+  Call AssertInstalledLeavesNoReparse
   SetOutPath "$INSTDIR"
+  ; SetOutPath can create a previously missing directory. Re-check the full
+  ; tree before the first File write. This is a stable-path guard only: an
+  ; NSIS path check cannot close a hostile same-user TOCTOU race.
+  Call AssertInstallationPathsNoReparse
+  Call AssertInstalledLeavesNoReparse
   File "/oname=launcher.exe" "${LAUNCHER_EXE}"
 
+  Call AssertInstallationPathsNoReparse
+  Call AssertInstalledLeavesNoReparse
   SetOutPath "$INSTDIR\resources"
+  Call AssertInstallationPathsNoReparse
+  Call AssertInstalledLeavesNoReparse
   File "/oname=compose.yaml" "${COMPOSE_FILE}"
   File "/oname=images.release.env" "${IMAGE_ENV_FILE}"
   File "/oname=secure-acl.ps1" "${ACL_SCRIPT}"
   File "/oname=release-manifest.json" "${RELEASE_MANIFEST}"
+  Call AssertInstallationPathsNoReparse
+  Call AssertInstalledLeavesNoReparse
   SetFileAttributes "$INSTDIR\resources\compose.yaml" READONLY
   SetFileAttributes "$INSTDIR\resources\images.release.env" READONLY
   SetFileAttributes "$INSTDIR\resources\secure-acl.ps1" READONLY
   SetFileAttributes "$INSTDIR\resources\release-manifest.json" READONLY
 
+  Call AssertInstallationPathsNoReparse
+  Call AssertInstalledLeavesNoReparse
   SetOutPath "$INSTDIR"
+  Call AssertInstallationPathsNoReparse
+  Call AssertInstalledLeavesNoReparse
   WriteUninstaller "$INSTDIR\Uninstall.exe"
 
   CreateDirectory "$SMPROGRAMS\${START_MENU_DIR}"
@@ -246,6 +282,15 @@ Section "DataX Enterprise Studio" SEC_MAIN
 SectionEnd
 
 Function un.onInit
+  ; Uninstall also requires an interactive acknowledgement before deleting
+  ; program files. Use the NSIS state, which includes the /S switch.
+  IfSilent uninstaller_silent_rejected uninstaller_interactive
+
+uninstaller_silent_rejected:
+  SetErrorLevel 2
+  Abort
+
+uninstaller_interactive:
   SetRegView 64
   SetShellVarContext current
 
@@ -258,6 +303,8 @@ Function un.onInit
     Abort
   ${EndIf}
   StrCpy $INSTDIR "${INSTALL_DIRECTORY}"
+  Call AssertInstallationPathsNoReparse
+  Call AssertInstalledLeavesNoReparse
 
   MessageBox MB_YESNO|MB_ICONEXCLAMATION|MB_DEFBUTTON2 \
     "卸载只删除当前用户的程序文件和快捷方式。$\r$\n$\r$\n以下内容会保留：$\r$\n%LOCALAPPDATA%\DataXEnterpriseStudio$\r$\nDocker named volumes（包括数据库、日志和工作目录）。$\r$\n$\r$\n继续前，卸载程序会尝试安全停止服务；存在活动 Attempt 时会拒绝卸载。是否继续？" \
@@ -294,6 +341,8 @@ launcher_stop_verified:
 FunctionEnd
 
 Function NormalizeExistingResourceAttributes
+  Call AssertInstallationPathsNoReparse
+  Call AssertInstalledLeavesNoReparse
   IfFileExists "$INSTDIR\resources\compose.yaml" 0 normalize_images
   ClearErrors
   SetFileAttributes "$INSTDIR\resources\compose.yaml" NORMAL
@@ -325,9 +374,92 @@ normalize_failed:
   Abort
 FunctionEnd
 
+Function AssertPathNotReparseOrMissing
+  ; Input: absolute path. Output: PRESENT or MISSING. Any other attribute
+  ; query failure or a reparse point aborts before a later path mutation.
+  Exch $0
+  Push $1
+  Push $2
+  System::Call 'kernel32::GetFileAttributesW(w r0)i .r1?e'
+  Pop $2
+
+  ${If} $1 == ${DES_INVALID_FILE_ATTRIBUTES}
+    ${If} $2 == ${DES_ERROR_FILE_NOT_FOUND}
+      StrCpy $0 "MISSING"
+      Goto assert_path_not_reparse_complete
+    ${ElseIf} $2 == ${DES_ERROR_PATH_NOT_FOUND}
+      StrCpy $0 "MISSING"
+      Goto assert_path_not_reparse_complete
+    ${Else}
+      MessageBox MB_OK|MB_ICONSTOP "无法安全读取安装路径属性。安装或卸载已终止。"
+      Abort
+    ${EndIf}
+  ${EndIf}
+
+  IntOp $2 $1 & ${DES_FILE_ATTRIBUTE_REPARSE_POINT}
+  ${If} $2 != 0
+    MessageBox MB_OK|MB_ICONSTOP "检测到安装目录或发布资源为重解析点（junction/symlink）。安装或卸载已终止。"
+    Abort
+  ${EndIf}
+  StrCpy $0 "PRESENT"
+
+assert_path_not_reparse_complete:
+  Pop $2
+  Pop $1
+  Exch $0
+FunctionEnd
+
+Function AssertInstallationPathsNoReparse
+  ; %LOCALAPPDATA% itself must be present. The child directories may be absent
+  ; on a first install and are re-checked after SetOutPath creates them.
+  Push "$LOCALAPPDATA"
+  Call AssertPathNotReparseOrMissing
+  Pop $0
+  ${If} $0 == "MISSING"
+    MessageBox MB_OK|MB_ICONSTOP "无法定位当前用户的 LocalAppData 目录。安装或卸载已终止。"
+    Abort
+  ${EndIf}
+
+  Push "$LOCALAPPDATA\Programs"
+  Call AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR"
+  Call AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\resources"
+  Call AssertPathNotReparseOrMissing
+  Pop $0
+FunctionEnd
+
+Function AssertInstalledLeavesNoReparse
+  ; Existing leaves can otherwise cause a repair File/WriteUninstaller write
+  ; or an uninstall operation to follow a reparse point outside the root.
+  Push "$INSTDIR\launcher.exe"
+  Call AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\resources\compose.yaml"
+  Call AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\resources\images.release.env"
+  Call AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\resources\secure-acl.ps1"
+  Call AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\resources\release-manifest.json"
+  Call AssertPathNotReparseOrMissing
+  Pop $0
+  Push "$INSTDIR\Uninstall.exe"
+  Call AssertPathNotReparseOrMissing
+  Pop $0
+FunctionEnd
+
 Section "Uninstall"
   SetRegView 64
   SetShellVarContext current
+
+  Call AssertInstallationPathsNoReparse
+  Call AssertInstalledLeavesNoReparse
 
   Delete "$DESKTOP\DataX Enterprise Studio.lnk"
   Delete "$SMPROGRAMS\${START_MENU_DIR}\启动 DataX Enterprise Studio.lnk"

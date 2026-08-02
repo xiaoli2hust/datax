@@ -44,7 +44,13 @@ paths:
     post:
       tags: [Auth]
       operationId: login
-      summary: 本地账号登录
+      summary: 本地账号登录（先入口准入，后认证）
+      description: |
+        在 Host/Origin 检查后、路由依赖、数据库、Argon2id 与审计之前，单一 API 进程以
+        全局、账号无关的准入控制保护本机登录入口。准入拒绝不是凭据决定：不会创建 session、
+        验证密码、改变失败计数或锁定状态、写入审计，也不会设置 Cookie 或 `WWW-Authenticate`。
+        V1 不支持把 API 扩展为多个 Uvicorn workers、Compose scale 或额外入口；若未来改变，
+        必须先定义共享准入控制。
       security: []
       requestBody:
         required: true
@@ -71,6 +77,39 @@ paths:
                 $ref: '#/components/schemas/AuthResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '429':
+          description: |
+            `AUTH_LOGIN_ADMISSION_LIMITED`：固定 60 秒的全局、账号无关登录入口准入拒绝。
+            这是尚未进入认证决策的响应；不创建 session、不验密码、不修改失败计数或锁定状态、
+            不写 AuditEvent，且不得设置 Cookie 或 `WWW-Authenticate`。客户端只能在等待后
+            要求用户重新输入密码并手动提交，不得自动重放。
+          headers:
+            Retry-After:
+              description: 固定的 delta-seconds 等待提示；不反映令牌或并发槽的内部状态。
+              schema:
+                type: integer
+                const: 60
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+            Cache-Control:
+              description: 防止浏览器或中间层缓存包含登录拒绝信息的响应。
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/LoginAdmissionLimitedProblem'
+              example:
+                type: https://datax-enterprise-studio.local/problems/auth-login-admission-limited
+                title: 登录尝试暂时受限
+                status: 429
+                code: AUTH_LOGIN_ADMISSION_LIMITED
+                detail: 请稍后重试。
+                instance: /api/v1/auth/login
+                request_id: 8a70a0eb-0f0d-4a26-a3e3-1b84ebbd92c4
+                retryable: true
+                field_errors: []
         '422':
           $ref: '#/components/responses/ValidationError'
 
@@ -2294,6 +2333,17 @@ paths:
         仅供 Windows launcher 和本机页面通过 127.0.0.1:17860 调用。Docker Desktop、
         WSL2、虚拟化、宿主端口和 ACL 由 launcher 在 Compose 启动前检查，不在此响应中
         伪装成 backend 能证明的状态。
+
+        `audit_chain` 以与 AuditEvent 同事务写入的持久水位线检查完整性。正常检查只读取
+        组织、水位线和每组织索引尾部；只有 `PASSED` 水位线、已验证 head 与真实尾部一致且
+        最近完整重放仍新鲜时，该组件才为 `UP`。空审计库是显式 bootstrap 例外。缺失/孤立
+        水位线、尾部漂移、过期/PENDING/FAILED 证明、篡改、超时或 CAS 竞争一律失败关闭。
+
+        当完整证明过期或尚未建立时，单 API 进程至多每 60 秒发起一次、最长 30 秒的完整
+        重放；新事件附加且完整证明新鲜时可只验证未验证后缀。失败/timeout 的完整重放仍占用
+        该 60 秒 cadence，窗口内返回 `AUDIT_CHAIN_FULL_REPLAY_THROTTLED/DOWN`。完整结果最多缓存
+        1 秒；正在计算时并发调用返回 `DOWN`，不排队等待。该行为只适用于 V1 的单 API 进程，不能证明
+        持续检测、数据库管理员无法篡改、真实 DataX E3 或 Windows E4。
       security: []
       responses:
         '200':
@@ -2306,7 +2356,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
         '503':
-          description: PostgreSQL、迁移、API 日志卷或审计链等管理平面关键组件不可用
+          description: PostgreSQL、迁移、API 日志卷、审计链当前证明或其他管理平面关键组件不可用
           content:
             application/json:
               schema:
@@ -2620,6 +2670,21 @@ components:
           oneOf:
             - $ref: '#/components/schemas/CapacityAdmissionDetails'
             - type: 'null'
+    LoginAdmissionLimitedProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            status:
+              const: 429
+            code:
+              const: AUTH_LOGIN_ADMISSION_LIMITED
+            title:
+              const: 登录尝试暂时受限
+            detail:
+              const: 请稍后重试。
+            retryable:
+              const: true
     CapacityAdmissionProblem:
       allOf:
         - $ref: '#/components/schemas/Problem'

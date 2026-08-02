@@ -8,7 +8,8 @@
 1. 取得 Windows named mutex，阻止并发 Launcher。
 2. 通过 Win32 原生架构和 ProductType 校验 Windows 11 客户端 AMD64，明确拒绝
    Windows Server 与 Windows on Arm 仿真；同时检查硬件虚拟化、SLAT、内存和 40 GiB
-   可用磁盘水位。
+   本地 Launcher 配置/备份目录的可用磁盘水位。该 40 GiB 不是 Docker Desktop 数据盘
+   或 named volume 容量的证明。
 3. 从 HKLM Docker Desktop 安装记录和受信 Program Files 根定位 `docker.exe`，逐级拒绝
    reparse point/当前用户可写目录，并校验 Authenticode 信任链与 Docker 发布者；不使用
    PATH/当前目录命中。Compose 也直接调用同一安装根中的已签名固定插件，不走用户插件
@@ -48,7 +49,31 @@
    会被重建并回读验证，只允许当前用户和 `SYSTEM`，拒绝 UNC/reparse point；已有数据卷
    缺失密钥、部分密钥束、公私钥不匹配、对称密钥相同或异常长度均 fail closed，不生成
    替代密钥。
-7. 以固定 image env、project name 和参数数组执行 Compose；渲染配置、Docker 实际绑定
+   `start` 与 `backup` 先确认五个锁定 Linux/amd64 镜像已缓存；仅缺失镜像通过匿名空
+   Docker config 按 immutable digest 拉取，已缓存不访问 registry。预取完成后所有产品 `docker run`
+   helper 与 `compose up` 都显式 `--pull=never`；缓存被并发 Docker 操作删除时必须失败关闭，
+   不会在容量 admission 后重新下载。`start` 在上述活动代际
+   和三卷 installation-id/role 以及 **local、无 options** driver 都已认证后、Compose `up`
+   前，`backup` 在创建 staging 前，以固定、带 opaque name/双标签的 `docker run` 参数检查三个
+   当前 generation named volume 的实际 `statvfs` 可用空间。探针只读挂载固定 `/probe/*`、
+   `network=none`、无 secret、只读根、`0:0`、`cap_drop=ALL` 后仅加
+   `DAC_READ_SEARCH` 以穿越 PostgreSQL `0700` 卷根、`no-new-privileges`、16 PID、64 MiB 与
+   0.25 CPU，并以 `--pull=never` 运行固定 Python 脚本；任一 Docker/协议失败或任一卷不足
+   200 GiB 均阻断。Linux 下该 capability 也可绕过普通文件读取和目录搜索权限，所以“脚本只执行
+   `statvfs`”不等于卷内容被内核隔离；无写入/网络/secret 与固定 Worker digest/脚本共同限制受信
+   probe 的行为。错误、超时或无效输出时仅按重新认证的 immutable ID 清理同名 probe 容器，不把
+   安装目录余量当作 Docker 容量。容量失败时受控初始化或镜像缓存可能已经存在，但 Compose/业务
+   数据库尚未启动。该控制当前只有 E1 单元/源码证据，尚未完成 Windows E4 的异盘、临界、耗尽、
+   `0700` 权限、超时、残留与 cleanup 竞争验证。
+7. 以固定 image env、project name 和参数数组执行 Compose；对任何已有同 project label
+   容器，Launcher 在 `up`、`exec`、`stop`、`down` 或 cleanup 前均逐 ID 复核 project/service
+   标签、仅允许且不重复的预期 service、精确锁定的 `Config.Image`，以及由已认证活动
+   `RuntimeGeneration` 导出的 named-volume source/target 和 volume
+   installation-id/role 标签。未知、重复、镜像/卷/代际不匹配或无法 inspect 时返回
+   `COMPOSE_PROJECT_OWNERSHIP_UNVERIFIED`，不触碰现有容器；`down` 不使用
+   `--remove-orphans`，启动失败 cleanup 也必须先重新认证。`exec` 与启动后的安全核验必须
+   另外见到完整的预期 service 集；受认证的部分集合只允许 `up`/`down` 用于失败恢复。
+   渲染配置、Docker 实际绑定
    和 Windows `netstat` IPv4/IPv6 监听都必须证明只有 Web 映射
    `127.0.0.1:17860`；渲染配置还必须逐项匹配每个 service 的 secret `source/target`，
    PEM target 不能退化成短语法。Launcher 还拒绝
@@ -90,7 +115,8 @@
 - `launcher.exe stop`：先调用
   `python -m datax_studio.lifecycle preflight-stop --json`；存在活动 Execution/
   RecoveryProbe 时 fail closed。停止路径不执行启动专用的 40 GiB、内存、虚拟化、WSL2
-  或 secret 生成门禁；固定 project 不存在时幂等成功。
+  或 secret 生成门禁；不存在任何同 project 容器时幂等成功，但只要检测到标签容器就必须先
+  通过上述归属认证，不能把未知容器当作“固定 project 已存在”后停止。
 - `launcher.exe stop --force`：显示不可跳过的风险确认，再执行不带
   `--volumes` 的 `compose down`。下次启动由 reconciler 处理 `LOST` 与恢复门禁。
 

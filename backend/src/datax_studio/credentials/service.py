@@ -23,6 +23,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from datax_studio.api.problems import ProblemException
+from datax_studio.audit_integrity import advance_audit_chain_watermark
 from datax_studio.auth.db import (
     AuditEvent,
     IdempotencyRecord,
@@ -4357,6 +4358,14 @@ class CredentialService:
         outcome: str = "SUCCEEDED",
         reason_code: str | None = None,
     ) -> None:
+        # This is the serialization point used by every audit writer.  It is
+        # intentionally taken before both the tail lookup and the watermark
+        # CAS so PostgreSQL and SQLite share the same append invariant.
+        session.execute(
+            select(Organization.id)
+            .where(Organization.id == organization.id)
+            .with_for_update()
+        ).scalar_one()
         previous = session.scalar(
             select(AuditEvent)
             .where(AuditEvent.organization_id == organization.id)
@@ -4414,6 +4423,15 @@ class CredentialService:
         ).encode()
         event_hash = hashlib.sha256(prefix + rfc8785.dumps(event)).hexdigest()
         event["integrity"]["event_hash"] = event_hash
+        advance_audit_chain_watermark(
+            session,
+            organization_id=organization.id,
+            previous_sequence=sequence - 1,
+            previous_hash=previous_hash,
+            sequence=sequence,
+            event_hash=event_hash,
+            updated_at=occurred_at,
+        )
         session.add(
             AuditEvent(
                 id=event_id,

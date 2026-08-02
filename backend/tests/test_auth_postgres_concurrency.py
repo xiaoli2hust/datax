@@ -13,6 +13,7 @@ from sqlalchemy.orm import sessionmaker
 
 from datax_studio.api.problems import ProblemException
 from datax_studio.auth.db import (
+    AuditChainWatermark,
     AuditEvent,
     AuthSession,
     Base,
@@ -37,6 +38,7 @@ AUTH_TABLES = [
     AuthSession.__table__,
     IdempotencyRecord.__table__,
     AuditEvent.__table__,
+    AuditChainWatermark.__table__,
 ]
 
 

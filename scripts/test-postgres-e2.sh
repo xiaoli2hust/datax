@@ -105,9 +105,10 @@ run_alembic() {
 }
 
 run_alembic upgrade head
-# Exercise the newest role-default migration in a real PostgreSQL engine;
-# its downgrade must remove both server-side session settings before upgrade
-# restores the release head used by the following integration tests.
+# Prove the new watermark table can be removed and recreated on real
+# PostgreSQL, then retain the prior Worker-session rollback coverage too.
+run_alembic downgrade 20260802_0017
+run_alembic upgrade head
 run_alembic downgrade 20260802_0016
 run_alembic upgrade head
 
@@ -123,8 +124,9 @@ PYTHONDONTWRITEBYTECODE=1 \
     backend/tests/test_runtime_database_roles_postgres.py \
     backend/tests/test_egress_guard_postgres.py \
     backend/tests/test_audit_append_only_postgres.py \
+    backend/tests/test_audit_readiness_postgres.py \
     backend/tests/test_credentials_postgres.py \
     backend/tests/test_auth_postgres_concurrency.py
 
 printf '%s\n' \
-  'POSTGRES_E2_SUBSET_PASSED: real disposable PostgreSQL migrations, role boundaries, audit append-only, credential concurrency, and auth concurrency passed. This is E2 subset evidence only; it is not DataX E3, Windows E4, or product-Compose acceptance.'
+  'POSTGRES_E2_SUBSET_PASSED: real disposable PostgreSQL migrations, role boundaries, audit append-only/readiness replay, credential concurrency, and auth concurrency passed. This is E2 subset evidence only; it is not DataX E3, Windows E4, or product-Compose acceptance.'

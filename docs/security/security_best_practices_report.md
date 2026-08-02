@@ -3,9 +3,9 @@
 | 项 | 值 |
 |---|---|
 | 审查日期 | 2026-08-02 |
-| 审查范围 | Windows Launcher/Setup、Compose/egress-guard、API/Worker 租约客户端、GitHub Windows 签名链，以及其权威契约与验收追踪 |
+| 审查范围 | Windows Launcher/Setup、Compose/egress-guard、API 登录准入与审计 readiness、Worker 租约客户端、GitHub Windows 签名链，以及其权威契约与验收追踪 |
 | 方法 | 从攻击者可控制的环境变量、同 netns 调用、同名容器、安装器参数、Runner 工具路径和工作区污染出发；每项都要求失败关闭或明确外部阻塞 |
-| 当前结论 | 源码层已修复 5 项可利用问题并补齐 1 项追踪闭包；Windows 实机、真实签名和发布仍 `BLOCKED` |
+| 当前结论 | 已有源码修复仍只到 E1/E2；本轮补齐登录入口与审计 readiness 的资源边界，并确认安装路径重解析、Compose 项目归属和 GitHub 发布治理缺口。Windows 实机、真实签名和发布仍 `BLOCKED` |
 
 ## 证据等级
 
@@ -32,7 +32,7 @@
 
 修复：Launcher 显式移除 Docker、Compose、BuildKit 和大小写 proxy 覆盖；备份/恢复 helper 使用由 role 与输入派生的不透明名称和双标签，失败后只按重新核验过标签的 immutable container ID 清理。名称重用、标签不匹配、枚举/inspect/remove 失败均升级为失败，不删除未验证容器或 named volume。实现见 `desktop/windows/src/lib.rs:L54-L112`、`L4260-L4480`、`L6046-L6058`。
 
-验证：Rust 格式检查、58 个 Launcher 库测试和 Clippy `-D warnings` 均通过。残余风险：未在真实 Docker Desktop/Windows 上测 timeout、ACL、重名竞争与容器清理，故仍不是 E4。
+验证：Rust 格式检查、70 个 Launcher 库测试和 Clippy `-D warnings` 均通过。残余风险：未在真实 Docker Desktop/Windows 上测 timeout、ACL、重名竞争与容器清理，故仍不是 E4。
 
 ### ASR-003 — High — Windows 签名链可受 PATH、Cargo 覆盖与 Runner 污染影响
 
@@ -42,21 +42,21 @@
 
 验证：release workflow、Environment verifier 与 Setup 源码的 16 个定向测试通过，release YAML BaseLoader 解析通过。残余风险：绝对路径只消除 PATH 选择，不证明工具字节身份、父目录 ACL、默认 Cargo profile/config、链接器、TOCTOU、私钥不可导出性或 source-to-binary provenance；这些仍要求受控 Runner/HSM/远程签名和 E3/E4 证据。
 
-### ASR-004 — Medium — NSIS 安装/repair/uninstall 路径可偏离固定根
+### ASR-004 — Medium — NSIS 安装/repair/uninstall 固定根与交互边界
 
-攻击路径：NSIS 默认 `/D` 可覆盖安装路径，`/NCRC` 可绕过 CRC；无效候选可能先停止旧服务；同版本 repair 和临时 self-copy 卸载可能处理错误路径。
+攻击路径：NSIS 默认 `/D` 可覆盖安装路径，`/NCRC` 可绕过 CRC，`/S` 可绕过交互确认；无效候选可能先停止旧服务；同版本 repair、临时 self-copy 卸载或重解析路径可能处理错误对象。
 
-修复：固定当前用户安装根，在 `.onInit` 拒绝 `/D`，以 `CRCCheck force` 拒绝 `/NCRC`；先核验临时候选再停止同版本服务；repair 禁止 skip 并显式解除受控资源只读属性；卸载从 HKCU 安装记录重新绑定固定根。实现见 `installer/windows/DataXEnterpriseStudio.nsi:L41-L95`、`L155-L206`、`L248-L326`。
+修复：固定当前用户安装根，在 `.onInit` 拒绝 `/D`，以 `CRCCheck force` 拒绝 `/NCRC`，以 NSIS `IfSilent` 让 install/uninstall 静默状态非零退出；先核验临时候选和稳定 reparse point 再停止同版本服务；repair 禁止 skip 并显式解除受控资源只读属性；卸载从 HKCU 安装记录重新绑定固定根。稳定 reparse 检查只降低 junction/symlink 风险，hardlink 与同用户 TOCTOU 仍见 ASR-008。
 
-验证：安装器源码负向测试 3/3 通过。CRC 仅检测损坏，不是 Authenticode 信任证明；本机没有 NSIS、PowerShell 或 Windows 11 x64 环境，因此尚未编译/运行已签名 Setup。
+验证：安装器源码负向测试 5/5 通过。旧版源码曾由 hosted Windows E1 编译，但本轮 guards 尚未在 Windows 上重新编译或以签名 Setup 运行；CRC 仅检测损坏，不是 Authenticode 信任证明。
 
 ### ASR-005 — Medium — 安全控制与验收追踪出现闭包缺口
 
 发现：新 secret 已加入运行面，但既有 Worker secret-closure 测试和两个 Worker settings fixture 最初没有同步。完整后端回归立即暴露该漂移。
 
-修复：将能力 secret 纳入 exact Compose closure、Worker settings fixture、备份固定 secret 集合、威胁模型、部署/架构契约和机器验收 catalog；新增 `SEC-EGRESS-LEASE-001`，catalog 现在是 81 个需求、91 个 requirement/test 对。
+修复：将能力 secret 纳入 exact Compose closure、Worker settings fixture、备份固定 secret 集合、威胁模型、部署/架构契约和机器验收 catalog；新增 `SEC-EGRESS-LEASE-001`，后续对抗式审查又把安装器、Compose、WSL、磁盘、本机登录准入和审计 readiness 测试纳入 catalog，当前为 81 个需求、102 个 requirement/test 对。
 
-验证：完整后端测试、48 个 acceptance 回归和 requirements catalog canonical check 通过，catalog SHA-256 为 `5c5e50bc98fb02a4cda9a7d066c7bb36e8150975db05d589d88ba90a8d072350`。
+验证：本轮 67 个 acceptance 回归已通过；requirements catalog canonical check 已重算，catalog SHA-256 为 `938d5b0ae1f1fb3b6325c04a55bed13db2b9a0f4ba6e9cd6458c369faa32af4e`。完整回归结果记录于本报告末尾；仍只代表 E1/E2。
 
 ### ASR-006 — High — Environment 保护检查发生在 signing job 已引用名称之后
 
@@ -79,7 +79,8 @@ canonical hash。重复、缺配对、双真/双假、畸形或其他未知 rule
 Environment 错误拒绝或静默放宽。
 
 验证：Environment verifier 的快照/身份/策略变更负向测试与 release workflow 静态拓扑测试通过（16
-个定向测试）；仅为 E1。残余风险：远端当前仍为 0 个 Environment、没有在线 workflow/审批记录，且
+个定向测试）；仅为 E1。残余风险：远端当前仍为 0 个 Environment、没有
+`windows-candidate-signing` 的在线 preflight/审批/签名记录，且
 `datax-release-signing` custom runner group 在当前 User-owned public repo 上需要所有权/ADR 决策；因此
 本修复不能声明真实签名或 E4。补充对抗发现：GitHub 默认允许管理员 bypass protection rules；官方
 REST Get Environment schema 和当前 GraphQL `Environment` 类型不公开 `can_admins_bypass`，所以
@@ -87,13 +88,117 @@ verifier/ID-hash 快照不能证明它已禁用。Release Owner 必须保存 Set
 迁入 Organization 后，还须保存 `environment.update_protection_rule` audit event 的
 `can_admins_bypass=false` 与签名窗口无反向修改查询。没有这组外部证据，reviewer gate 不可视为独立。
 
+### ASR-007 — High — Compose project label 可被外来容器伪造
+
+攻击路径：Launcher 曾仅以 `com.docker.compose.project=datax-enterprise-studio` 认定现有栈，随后
+对整个项目执行 lifecycle、`down --remove-orphans` 或启动失败清理。具有本机 Docker 控制权的
+进程可用相同 project label 放入外来容器，使产品错误执行、停止或删除不属于本安装的容器。
+
+修复：Launcher 现先枚举 project-labeled immutable ID，再严格 inspect 唯一预期 service、精确锁定
+image、project/service label、活动 `RuntimeGeneration` 派生的 named-volume source/target 与
+installation-id/role 标签；未知、重复、镜像/挂载/代际不符统一为
+`COMPOSE_PROJECT_OWNERSHIP_UNVERIFIED`，不触碰已有容器。`--remove-orphans` 已移除；`exec` 与
+启动后安全核验要求完整服务集，受认证部分集合只可用于恢复性 `up`/`down`。单元测试覆盖固定和
+FRESH/RESTORE 风格随机卷名。
+
+残余风险：这是源码 E1；真实 Windows E4 仍必须包含同 project label 外来容器、伪造/重复 service、
+镜像/卷身份不符、部分受信栈、cleanup 不删除未知容器与 Docker API TOCTOU 的负例。
+
+### ASR-008 — High — Setup/repair/uninstall 可沿重解析点写入或删除
+
+攻击路径：NSIS 安装器此前只比较 `$INSTDIR` 字符串；固定根、`resources` 或卸载目标若是 junction/
+symlink/reparse point，安装、repair 或删除会沿其重定向，甚至可能先停止现有服务再失败。
+
+修复：NSIS 3.11 现于 install、repair 和 uninstall 的停止服务、写入或删除前，拒绝固定根、
+`resources` 与既有目标文件的 stable reparse point；`IfSilent` 在 install/uninstall 入口以非零
+退出拒绝静默模式。安装器静态回归覆盖该源码边界。它只能降低稳定重解析攻击；NSIS 的“检查后按
+路径操作”仍有同用户 TOCTOU 上限，且不会检测 hardlink，不能写成强路径完整性保证。要完全关闭此类
+路径替换，需由受信原生 helper 以 non-reparse/handle-relative 语义实际完成写入和删除，并经 ADR、
+威胁模型和真实 E4 验收。
+
+### ASR-009 — High — 远端发布治理未强制供应链与独立复核
+
+当前线上快照显示：`Dependabot security updates=disabled`，Actions policy 为 `allowed_actions=all` 且
+`sha_pinning_required=false`，required approving review count 为 0、未要求 CODEOWNERS review，新增
+hosted Windows E1 也尚未列为 `main` 的 required check。源码 action SHA 固定并不能替代远端强制。
+
+当前状态：`BLOCKED_EXTERNAL`。Repository Owner 必须在确定 Organization/签名信任边界后，启用
+Dependabot security updates，配置受限 actions/SHA pinning 与安全敏感路径独立复核（或 Accepted ADR
+记录等效控制），并决定是否将 hosted E1 设为 required check；保留实际配置和负向证据。没有这些
+治理记录，不得把当前 CI 绿灯、12 个 required checks 或 PR 存在表述为发布供应链已闭合。
+
+### ASR-010 — Medium — 安装目录磁盘水位不能证明 Docker 实际数据容量
+
+攻击路径：Docker Desktop 的 VHD/named volumes 可以位于与 `%LOCALAPPDATA%` 不同的盘；若只看
+Launcher 配置目录余量，迁移、日志、复制或备份可能在真正持久卷已满时半途失败。
+
+修复：40 GiB host 检查现明确只保护 Launcher 自身配置/secret/本地备份元数据。`start` 与
+`backup` 先确认五个锁定 Linux/amd64 镜像已缓存；只在缺失时由 Launcher-owned 空 Docker config
+按 immutable digest 拉取。`start` 在当前 `RuntimeGeneration`/三卷身份认证后、Compose `up` 前，
+`backup` 在 staging 前，均运行带 opaque name/双标签的 release-locked Worker 容量探针：三个
+`local`/无 options 认证卷只读挂到固定 `/probe/*`，`network=none`、无 secret、只读根、`0:0`、
+`cap_drop=ALL` 后仅加 `DAC_READ_SEARCH`、16 PID/64 MiB/0.25 CPU、`--pull=never`；只允许固定
+行协议的 `statvfs` 输出，任一 Docker/协议异常或少于 200 GiB 均失败关闭。错误、超时或无效输出
+只按重新认证 immutable ID 清理同名 probe 容器。容量失败前受控初始化或镜像缓存可能保留，但
+Compose/业务数据库不会启动。
+
+验证与残余风险：Rust 单元覆盖五镜像集合、固定参数/标签、随机活动卷名、local driver/options、
+输出 schema/乱序/溢出和容量边界，属于 E1。尚未在 Windows Docker Desktop 上验证异盘 VHD、临界值、
+运行中耗尽、PostgreSQL `0700` 权限、Docker CLI timeout、残留 probe 容器或 cleanup TOCTOU，因而
+不是稳定容量或 E4 证据。
+
+### ASR-011 — High — 登录入口可在认证前放大本机资源耗尽
+
+攻击路径：`/auth/login` 虽只经 loopback 暴露，但不可信本机进程可高并发提交不存在邮箱。若每次
+请求先建立数据库会话、取得组织锁、执行 Argon2id dummy verify 并写失败审计，会抽干 API/数据库
+预算；按邮箱或 IP 分桶还会保存不必要的敏感输入并留下绕过、枚举面。
+
+修复：在 `request_id → TrustedHost → Origin` 后、router 之前加入单 API 进程的全局 admission
+guard：burst=5、5 次/分钟加一个非阻塞验证槽，不记录邮箱、密码、IP、User-Agent 或浏览器身份。
+拒绝一律是 `429 AUTH_LOGIN_ADMISSION_LIMITED`、固定 `Retry-After: 60`、Problem JSON、匹配
+request ID 和 `Cache-Control: no-store`，没有 Cookie/`WWW-Authenticate`。429 尚未进入认证决策，
+因此不得建立 DB session、运行 Argon2、修改失败计数/锁定、创建 session 或写 AuditEvent；前端清空
+密码且不自动重放。
+
+验证：定向 API/admission 回归覆盖 429 短路、request header、非法 Host 不耗额度、验证槽释放和
+已获准错误凭据原语义。该结果是 E1，真实 PostgreSQL/Windows 并发压力尚待执行。
+
+残余风险：控制是单进程内存状态，API 重启会清空它；V1 因此固定一个 API/Uvicorn 进程，不允许
+workers、API scale、额外 API 入口或旁路代理。多实例前必须先新增 ADR 定义共享、围栏的控制。
+
+### ASR-012 — High — readiness 全量审计链重放可把健康检查变成拒绝服务器
+
+攻击路径：公开 `/health/ready` 若每次都读取所有 `audit_events.event_json`、RFC8785 规范化并
+重新计算链，审计越多，每次 health poll 越占用 CPU 和小型数据库连接池；仅缓存旧成功结果又会
+掩盖新增 event、尾部漂移或历史篡改。
+
+修复：迁移 `20260802_0018` 新增 `audit_chain_watermarks`。所有 AuditEvent writer 以固定锁序在
+同一事务写 Event 与 head；迁移仅回填实际 head 并标记 `PENDING`。ready 正常路径只读取组织、
+watermark 和索引 tail；完整重放最多每 60 秒、单次 30 秒，suffix 重放以 head/hash/epoch CAS
+发布，FAILED sticky。缺 state、tail 漂移、过期证明、超时或竞争一律 `503/DOWN`；1 秒缓存与
+nonblocking singleflight 不让并发 health 请求排队。
+
+验证：SQLite migration/readiness 回归覆盖 PENDING 首次重放、常规路径不读取 `event_json`、篡改、
+state 缺失、CAS 竞争、concurrent check 与 timeout 后 cadence 限制；临时真实 PostgreSQL E2 已
+验证 `0018→0017→head` 迁移回退/重升，以及隔离 schema 的 pending watermark replay 和
+transaction-local statement-timeout 设置。它不启动产品 API/Worker health loop，也不做负载 timeout，
+故真实 health poll、压力行为与 Windows E4 仍需单独证据。
+
+残余风险：同库 watermark 可以检测普通应用路径的漂移，却不能阻止有数据库管理员权限的攻击者
+同时改写 AuditEvent、水位线和触发器。外部 WORM/签名锚点仍是独立发布阻塞，不能被本修复替代。
+
 ## 未关闭的发布阻塞
 
-1. GitHub 当前 `environments` 数为 **0**，尚不存在受保护的 `windows-candidate-signing` Environment；源码的双阶段 ID/hash 流程只证明 E1 失败关闭，尚无在线运行或审批记录。即使未来 reviewer 规则可见，管理员 bypass 默认允许，且 REST/GraphQL verifier 无法读取 `can_admins_bypass`；UI/audit-log 禁用证据仍是独立阻塞项。
+1. GitHub 当前 `environments` 数为 **0**，尚不存在受保护的 `windows-candidate-signing` Environment；源码的双阶段 ID/hash 流程只证明 E1 失败关闭，尚无该签名 Environment 的在线 preflight、审批或签名记录。无发布权限的 hosted Windows E1 已运行成功，但不能替代本项。即使未来 reviewer 规则可见，管理员 bypass 默认允许，且 REST/GraphQL verifier 无法读取 `can_admins_bypass`；UI/audit-log 禁用证据仍是独立阻塞项。
 2. 当前 public repo owner type 为 **User**；GitHub custom runner group 是 Organization/Enterprise 管理边界，强制的 `datax-release-signing` group 因此是 `BLOCKED_DECISION`。首选迁入/转让到 Organization；否则必须先接受新的 ADR，不能删除 group 回退到任意 runner。
 3. GitHub 当前 repository self-hosted runner 数为 **0**，不存在可承载 `datax-release-signing` group/labels 的 Windows 11 x64 Runner。
 4. 本机没有 `pwsh`、NSIS 或 Windows 11 x64 + Docker Desktop/WSL2，无法执行 PowerShell runtime、真实 PFX 签名、Setup 安装/卸载、宿主端口或 Docker helper 清理验收。
 5. 真实 MySQL 8/PostgreSQL 15 四方向 DataX、独立 oracle、恢复、睡眠/重启和 LAN 负例仍未达到 E3/E4。
+6. 安装器对稳定 reparse point 的最低防护即使落地，也不能消除同用户检查—使用竞争；强路径完整性边界仍需受信 native helper 架构和 E4。
+7. Compose 项目归属必须在源码中认证并在真实 Docker Desktop 上证明不会触碰同 project label 的外来容器；未完成前不得执行 `--remove-orphans` 或把标签当作所有权证明。
+8. 远端 Dependabot security updates、Actions/SHA policy、独立复核和 hosted E1 required-check 策略尚未由 Repository Owner 配置并取证。
+9. Docker 数据卷容量 probe 只有 E1；异盘 VHD、临界容量、运行中耗尽、Docker timeout/残留与实际
+   backup/start 行为仍须在同一签名 Windows 候选上完成 E4。
 
 因此不得发布 `Setup.exe`、不得声称“Windows 已稳定运行”或“企业级已完成”。下一次外部验收必须先由仓库所有者作出 Organization 迁移或新 ADR 的签名信任决策，再配置受保护 Environment、独立 reviewer、受控干净 Windows Runner、工具 hash/ACL 取证与不可导出签名能力，并运行同一精确候选的 E3/E4。
 
@@ -103,11 +208,11 @@ verifier/ID-hash 快照不能证明它已禁用。Release Owner 必须保存 Set
 |---|---|---|
 | `git diff --check` | 通过 | E1 |
 | guard 单元/HTTP 合约 | 21/21 通过 | E1 |
-| 后端完整测试 | 通过（含预期 skip） | E1/E2 |
-| acceptance 测试 | 64/64 通过（含 hosted Windows 预检和本地 E4 前置观察器负向边界） | E1 |
+| 后端完整测试 | 402 通过、9 跳过 | E1/E2 |
+| acceptance 测试 | 67/67 通过（含 hosted Windows 预检、安装器静默/重解析静态边界和本地 E4 前置观察器负向边界） | E1 |
 | GitHub-hosted Windows 预检 `30724285608` | Windows Server 上的 Launcher 测试/release 构建、固定 NSIS hash、临时 installer 编译与删除均通过；无签名、上传或安装 | E1 |
 | release/Environment/Setup 定向测试 | 20/20 通过 | E1 |
-| Launcher Rust 库测试 | 58/58 通过 | E1 |
+| Launcher Rust 库测试 | 70/70 通过 | E1 |
 | Rust format + Clippy | 通过 | E1 |
 | Ruff | 通过 | E1 |
 | requirements catalog + release YAML parse | 通过 | E1 |

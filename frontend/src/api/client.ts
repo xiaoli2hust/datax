@@ -7,11 +7,19 @@ let refreshPromise: Promise<AuthResponse> | null = null;
 
 export class ApiError extends Error {
   readonly problem: Problem;
+  /**
+   * A bounded delta-seconds value from a failed response's `Retry-After`
+   * header.  It deliberately does not retain the raw header or a response
+   * object, so views can offer human guidance without treating a failed
+   * request as something safe to replay.
+   */
+  readonly retryAfterSeconds: number | null;
 
-  constructor(problem: Problem) {
+  constructor(problem: Problem, retryAfterSeconds: number | null = null) {
     super(problem.title);
     this.name = "ApiError";
     this.problem = problem;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -117,6 +125,16 @@ function normalizedProblem(
   };
 }
 
+function retryAfterSeconds(response: Response): number | null {
+  const raw = response.headers.get("Retry-After")?.trim();
+  // The API emits delta-seconds.  Do not parse HTTP dates: using the client's
+  // clock for an admission-control decision would produce misleading advice.
+  if (!raw || !/^\d{1,4}$/.test(raw)) return null;
+  const seconds = Number(raw);
+  // Bound untrusted header input before it reaches a user-visible message.
+  return Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 3_600 ? seconds : null;
+}
+
 async function readPayload(response: Response): Promise<unknown> {
   if (response.status === 204) return null;
   const contentType = response.headers.get("content-type") ?? "";
@@ -143,7 +161,10 @@ async function refreshAccessToken(): Promise<AuthResponse> {
     const payload = await readPayload(response);
     if (!response.ok) {
       clearAccessToken();
-      throw new ApiError(normalizedProblem(response, payload, "/auth/refresh"));
+      throw new ApiError(
+        normalizedProblem(response, payload, "/auth/refresh"),
+        retryAfterSeconds(response),
+      );
     }
     const auth = payload as AuthResponse;
     setAccessToken(auth.access_token);
@@ -194,7 +215,7 @@ export async function apiRequest<T>(path: string, options: RequestOptions = {}):
     await refreshAccessToken();
     return apiRequest<T>(path, { ...options, allowRefresh: false });
   }
-  throw new ApiError(problem);
+  throw new ApiError(problem, retryAfterSeconds(response));
 }
 
 export async function apiDownload(
@@ -232,7 +253,7 @@ export async function apiDownload(
     await refreshAccessToken();
     return apiDownload(path, { ...options, allowRefresh: false });
   }
-  throw new ApiError(problem);
+  throw new ApiError(problem, retryAfterSeconds(response));
 }
 
 export function apiGet<T>(path: string, options: Omit<RequestOptions, "method"> = {}): Promise<T> {

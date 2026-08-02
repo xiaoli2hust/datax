@@ -11,7 +11,10 @@
 > 当前远端治理边界：截至 2026-08-02，`main` 已启用经典分支保护，严格要求分支最新、
 > 线性历史、PR、会话解决以及本文列出的 12 个 CI/安全检查，且禁止强推和删除；管理员
 > 同样受约束。当前仓库只有一名维护者，为避免自提交 PR 永久不可合并，审批数暂为 0，
-> 因而不能把该设置表述为独立人工复核。漏洞告警与 Dependabot security updates 已启用。
+> 因而不能把该设置表述为独立人工复核。`dependabot.yml` 已声明版本更新，但 2026-08-02
+> GitHub REST 的 `security_and_analysis.dependabot_security_updates.status` 仍为 `disabled`；
+> 漏洞告警与 Dependabot security updates 是不同控制，后者必须由 Repository Owner 在管理面启用
+> 并保存证据，当前为 `BLOCKED_EXTERNAL`。
 > `windows-candidate-signing` GitHub Environment 当前尚未配置（2026-08-02 API 返回 0 个
 > environment）；引用不存在的名称会被 GitHub 自动创建为无保护环境。发布工作流先由一个
 > 不声明 `environment`、不读取 signing secrets/发布 variables 的 GitHub-hosted preflight GET
@@ -19,7 +22,9 @@
 > 输出，再在导入 PFX 前二次 GET 并精确比对。这样不能由签名 job 自己的首次 Environment 引用
 > 伪造“已预先配置”事实；缺失、策略/API 读取失败、删除/重建或 hash 不符均失败关闭。该 E1
 > 接线不替代实际在 GitHub 配置审批人、分支/标签策略、环境专属 secrets 或管理员绕过禁用，
-> 也尚无在线运行证据。GitHub 默认允许管理员 bypass protection rules，而 REST Get Environment
+> 也尚无 `windows-candidate-signing` 的在线 preflight、审批或签名运行证据。无发布权限的
+> GitHub-hosted Windows E1 预检已有成功运行，但不能证明签名发布控制。GitHub 默认允许管理员
+> bypass protection rules，而 REST Get Environment
 > 与当前 GraphQL `Environment` 类型不返回 `can_admins_bypass`；verifier 不得声称验证它。
 > Release Owner 必须在 Settings UI 取消 **Allow administrators to bypass configured protection rules**
 > 并保存带时间/Environment/操作者的截图或等价配置记录；迁入 Organization 后还需保存
@@ -32,6 +37,11 @@
 > 在决策前，签名 job 保持只路由到该 group 与
 > `self-hosted/windows/x64/datax-release-windows11` labels 的交集，缺组或缺 runner 保持阻断，
 > 不能回退到任意同标签 runner。
+> 同一线上快照还显示仓库 Actions policy 为 `allowed_actions=all`、`sha_pinning_required=false`，
+> `main` 的 required approving review count 为 0 且未要求 CODEOWNERS review；源码中 action 已固定
+> SHA，但远端没有强制这些供应链/独立复核治理。迁入 Organization 后，Repository Owner 必须以
+> 规则集、允许动作策略、SHA pinning 和安全敏感路径独立复核（或 Accepted ADR 记录的等效控制）
+> 关闭该外部门禁；不得把当前 12 个必需检查或 PR 存在当作其替代。
 > 仓库发布工作流仍生成 `gate_result=BLOCKED` 且需求项为 `NOT_RUN/E0` 的候选证据，不批准公开发布。
 
 > ADR-0011 已接受未来的两阶段插件/Runtime qualification 与发布晋级链：不可变 payload
@@ -181,8 +191,9 @@ Docker Desktop 与 WSL2 是用户自行安装和按适用许可使用的 Windows
   `BLOCKED` 的候选证据。promotion 默认继续阻断，只有逐项精确且不超过 90 天的例外才
   可放行；这不是“镜像漏洞已清零”。
 - `dependabot.yml` 已配置 GitHub Actions、backend pip、security-tooling pip、npm 和
-  Windows Cargo 的每周版本更新；仓库漏洞告警与 Dependabot security updates 已于
-  2026-08-01 在线启用。
+  Windows Cargo 的每周版本更新。2026-08-02 线上 REST 显示漏洞告警可用，但
+  `Dependabot security updates` 为 `disabled`；Repository Owner 启用并留存配置证据前，
+  不得把配置文件存在写成线上自动安全更新已启用。
 
 最新 PR 的 CI、安全工作流与 CodeQL 聚合门禁已在线通过，PR 开放 CodeQL 告警为 0；
 `main` 的经典分支保护已强制上述检查。这不等于 candidate/release、Grype OS 状态、

@@ -280,3 +280,76 @@ class AuditEvent(Base):
     event_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AuditChainWatermark(Base):
+    """Durable, bounded readiness facts for one organization's audit chain.
+
+    ``head_*`` advances in the same transaction as every append.  ``verified``
+    records the latest complete or suffix verification, while ``full_*`` is
+    retained separately so readiness can force a periodic replay from sequence
+    one and detect a mutation below the current chain head within a bounded
+    interval.
+    """
+
+    __tablename__ = "audit_chain_watermarks"
+    __table_args__ = (
+        CheckConstraint("head_sequence >= 0", name="ck_audit_watermark_head_sequence"),
+        CheckConstraint(
+            "(head_sequence = 0 AND head_hash IS NULL) "
+            "OR (head_sequence > 0 AND head_hash IS NOT NULL)",
+            name="ck_audit_watermark_head_hash",
+        ),
+        CheckConstraint(
+            "verified_sequence >= 0 AND verified_sequence <= head_sequence",
+            name="ck_audit_watermark_verified_sequence",
+        ),
+        CheckConstraint(
+            "(verified_sequence = 0 AND verified_hash IS NULL) "
+            "OR (verified_sequence > 0 AND verified_hash IS NOT NULL)",
+            name="ck_audit_watermark_verified_hash",
+        ),
+        CheckConstraint(
+            "full_replay_sequence >= 0 AND full_replay_sequence <= verified_sequence",
+            name="ck_audit_watermark_full_replay_sequence",
+        ),
+        CheckConstraint(
+            "(full_replay_sequence = 0 AND full_replay_hash IS NULL) "
+            "OR (full_replay_sequence > 0 AND full_replay_hash IS NOT NULL)",
+            name="ck_audit_watermark_full_replay_hash",
+        ),
+        CheckConstraint(
+            "integrity_status IN ('PENDING', 'PASSED', 'FAILED')",
+            name="ck_audit_watermark_integrity_status",
+        ),
+        CheckConstraint("mutation_epoch >= 0", name="ck_audit_watermark_mutation_epoch"),
+        CheckConstraint(
+            "failure_sequence IS NULL OR "
+            "(failure_sequence > 0 AND failure_sequence <= head_sequence)",
+            name="ck_audit_watermark_failure_sequence",
+        ),
+    )
+
+    organization_id: Mapped[UUID] = mapped_column(
+        Uuid(as_uuid=True),
+        ForeignKey("organizations.id", ondelete="RESTRICT"),
+        primary_key=True,
+    )
+    head_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    head_hash: Mapped[str | None] = mapped_column(String(64))
+    verified_sequence: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    verified_hash: Mapped[str | None] = mapped_column(String(64))
+    full_replay_sequence: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+    )
+    full_replay_hash: Mapped[str | None] = mapped_column(String(64))
+    full_replay_finished_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True)
+    )
+    integrity_status: Mapped[str] = mapped_column(String(16), nullable=False, default="PENDING")
+    failure_code: Mapped[str | None] = mapped_column(String(64))
+    failure_sequence: Mapped[int | None] = mapped_column(BigInteger)
+    mutation_epoch: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

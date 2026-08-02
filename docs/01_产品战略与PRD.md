@@ -320,7 +320,7 @@ V1 为**单组织、多项目**。组织不提供切换入口；项目是资源�
 | PRD-BR-016 | 同一运行请求的幂等键在 24 小时有效期内重复提交只能创建一个 Execution；新幂等键只能表达新意图，不能绕过目标空表、目标互斥、源静默或 RecoveryGate。 |
 | PRD-BR-017 | 每次 Execution 固化 JobVersion、源/目标 DatasourceRevision 与 EndpointPolicyRevision、PhysicalEndpointIdentity/TargetNamespace、方向授权与 TransferPolicy `scope_hash`、实际 CredentialSecretEnvelope、连接证据、规范化配置哈希、固定复制策略、Runtime/插件版本、触发人、静默确认、空表证据和触发时间。目标外部独占确认固定 `statement_version="1.0"`、`confirmed_at`、`valid_until`、`responsible_party`；Execution 另存 `ACTIVE / REVOKED / EXPIRED`、`revoked_at/reason`，RuntimeSnapshot 固定声明版本、有效期、接受 actor/时间和确认摘要。 |
 | PRD-BR-018 | DataX JSON 预览只读且脱敏。实际凭据仅在 Worker 运行时按需解密，含密文件只可进入最小权限 tmpfs Attempt，并在结束后删除。只有已切换为新 current secret 的历史 `ACTIVE` 版本可退役为 `RETIRED`；直接退役 current secret 必须拒绝，避免排队工作永久等待失效凭据。`RETIRED` 可单向升级到紧急终态，不能重新激活或降级。`REVOKED/COMPROMISED` 必须同一事务禁用 current 指向它的数据源，并为已绑定非终态工作及尚未领取、将绑定该 current secret 的工作建立持久终止事实；Execution/RecoveryProbe 只能失败关闭，RecoveryGate 必须可重新提交而不能永久卡住。Worker 每一端凭据以全新短事务和 `FOR UPDATE` 状态锁决定是否解密，端间与每个有界外部 I/O 前后复检终止事实；状态先提交拒绝新解密，解密先完成也不得继续下一条外部连接。可控的 mutable 明文缓冲区在退出时尽力清零，但 Python/驱动/子进程可能产生不可逐一清零的内存副本，不能把该措施表述为完整内存擦除证明。 |
-| PRD-BR-019 | 发布、端点/数据源变更与测试、方向授权、TransferPolicy 审批、执行、取消、源静默确认、目标外部独占确认及撤回/破坏报告、处置确认、RecoveryProbe/RecoveryGate、恢复后再次执行和归档必须产生不可变审计事件。Operator/DBA 知悉目标窗口被撤回或破坏时负有立即报告义务；平台不声称能检测全部未报告或已经回滚的外部 DML/DDL。 |
+| PRD-BR-019 | 发布、端点/数据源变更与测试、方向授权、TransferPolicy 审批、执行、取消、源静默确认、目标外部独占确认及撤回/破坏报告、处置确认、RecoveryProbe/RecoveryGate、恢复后再次执行和归档必须产生不可变审计事件。Operator/DBA 知悉目标窗口被撤回或破坏时负有立即报告义务；平台不声称能检测全部未报告或已经回滚的外部 DML/DDL。管理平面就绪检查无法取得当前审计完整性证明时必须失败关闭；水位线、重放与缓存的具体边界以 ADR-0012 和 API 契约为准。 |
 | PRD-BR-020 | 项目、数据源和任务优先软删除/归档；存在引用或历史执行时禁止物理删除。 |
 | PRD-BR-021 | 所有列表稳定排序并分页；所有写操作使用幂等控制或乐观锁，版本冲突不能静默覆盖。 |
 | PRD-BR-022 | 日志、表名、字段名和数据库错误均视为不可信输入；展示时转义，日志需脱敏并限制单次读取大小。 |
@@ -345,7 +345,7 @@ V1 为**单组织、多项目**。组织不提供切换入口；项目是资源�
 
 | 需求 ID | 用户故事 | 验收摘要 |
 |---|---|---|
-| PRD-FR-AUTH-001 | 作为用户，我要使用本地账号登录和退出，以访问被授权项目。 | 正确凭据建立会话；错误凭据返回统一错误；停用用户不能登录；退出后令牌失效。 |
+| PRD-FR-AUTH-001 | 作为用户，我要使用本地账号登录和退出，以访问被授权项目。 | 正确凭据建立会话；错误凭据返回统一错误；停用用户不能登录；退出后令牌失效。登录必须先经单一 API 进程内、账号无关的全局准入，再进入数据库、Argon2 验证和审计；准入拒绝固定返回 `429 AUTH_LOGIN_ADMISSION_LIMITED` 与 `Retry-After: 60`，不创建 session、不作凭据/失败计数决定、不写审计且不设置 Cookie 或 `WWW-Authenticate`。页面不得自动重放该登录，必须清空密码并要求用户等待后重新输入。 |
 | PRD-FR-AUTH-002 | 作为用户，我要修改本人密码，以控制账号安全。 | 校验旧密码和密码策略；成功后撤销其他会话；全程不记录明文。 |
 | PRD-FR-AUTH-003 | 作为本机使用者，我要在全新安装上安全创建唯一的初始 Admin，以便系统在没有公开注册入口的情况下完成首次接入。 | 仅空用户库允许 Launcher 调用一次性离线引导；临时密码只经子进程标准输入进入容器 CLI，不进入参数、环境、浏览器、Launcher 持久化、日志或审计；成功后首次登录强制改密，重复引导被拒绝。 |
 | PRD-FR-PRJ-001 | 作为 Admin，我要创建、编辑和归档项目，以隔离资源与权限。 | 项目标识（slug）唯一且创建后不可变；存在 `QUEUED / STARTING / RUNNING / VERIFYING / CANCEL_REQUESTED` Execution 时归档被阻断；归档后禁止新增和执行。 |

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { reactive, ref } from "vue";
+import { computed, reactive, ref } from "vue";
 
 import { isApiError } from "../api/client";
 import HealthPanel from "../components/HealthPanel.vue";
@@ -29,6 +29,19 @@ const form = reactive({
 const submitting = ref(false);
 const error = ref<unknown>(null);
 
+const loginAdmissionLimited = computed(
+  () =>
+    isApiError(error.value) &&
+    error.value.problem.status === 429 &&
+    error.value.problem.code === "AUTH_LOGIN_ADMISSION_LIMITED",
+);
+const loginAdmissionGuidance = computed(() => {
+  if (!loginAdmissionLimited.value || !isApiError(error.value)) return null;
+  const retryAfter = error.value.retryAfterSeconds;
+  const wait = retryAfter === null ? "请稍后" : `请至少等待约 ${retryAfter} 秒后`;
+  return `${wait}重新输入密码，再手动点击“登录”。为保护账号安全，页面不会自动重试或保留密码。`;
+});
+
 async function submit(): Promise<void> {
   if (!form.email.trim() || !form.password) return;
   submitting.value = true;
@@ -49,10 +62,6 @@ function emitAsyncLogin(): Promise<void> {
   });
 }
 
-function retry(): void {
-  if (isApiError(error.value) && error.value.problem.retryable) void submit();
-  else error.value = null;
-}
 </script>
 
 <template>
@@ -83,7 +92,15 @@ function retry(): void {
         <p class="muted">使用 Launcher 首次引导创建的账号，或 Admin 分配的本地账号。</p>
       </div>
 
-      <ProblemPanel v-if="error" :error="error" @retry="retry" />
+      <ProblemPanel v-if="error" :error="error" :show-retry="false" />
+      <el-alert
+        v-if="loginAdmissionGuidance"
+        type="warning"
+        :closable="false"
+        show-icon
+        title="登录需要手动重试"
+        :description="loginAdmissionGuidance"
+      />
 
       <el-form label-position="top" @submit.prevent="submit">
         <el-form-item label="登录邮箱" required>

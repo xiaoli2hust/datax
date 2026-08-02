@@ -4,17 +4,20 @@ import copy
 import hashlib
 import json
 import re
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Lock
 from typing import Protocol
 from uuid import UUID
 
 import rfc8785
-from sqlalchemy import Engine, create_engine, text
+from sqlalchemy import Engine, create_engine, select, text, update
 from sqlalchemy.exc import SQLAlchemyError
 
 from datax_studio.api.models import ComponentHealth, HealthResponse, HealthStatus
+from datax_studio.auth.db import AuditChainWatermark, AuditEvent, Organization
 from datax_studio.egress_attestation import (
     EgressAttestationError,
     EgressVerifier,
@@ -40,6 +43,45 @@ class _PersistedWorkerReadiness:
     egress: ComponentHealth
     egress_policy_set_hash: str | None = None
     egress_ruleset_hash: str | None = None
+
+
+@dataclass(frozen=True)
+class _AuditWatermark:
+    organization_id: UUID
+    head_sequence: int
+    head_hash: str | None
+    verified_sequence: int
+    verified_hash: str | None
+    full_replay_sequence: int
+    full_replay_hash: str | None
+    full_replay_finished_at: datetime | None
+    integrity_status: str
+    failure_code: str | None
+    failure_sequence: int | None
+    mutation_epoch: int
+
+
+@dataclass(frozen=True)
+class _AuditSnapshot:
+    watermarks: tuple[_AuditWatermark, ...]
+
+
+@dataclass(frozen=True)
+class _AuditReplayResult:
+    success: bool
+    code: str
+    failure_organization_id: UUID | None = None
+    failure_sequence: int | None = None
+
+
+class _AuditIntegrityError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+class _AuditSnapshotChanged(RuntimeError):
+    pass
 
 
 def _as_utc_datetime(value: object) -> datetime | None:
@@ -110,6 +152,19 @@ class SystemReadinessProvider:
             resolver_policy_version=settings.resolver_policy_version,
             lease_creation_capability_file=settings.egress_lease_creation_capability_file,
         )
+        # V1 deploys one API process.  These locks are therefore an admission
+        # boundary for the supported Compose topology, while the watermarks and
+        # compare-and-set publication remain durable across restarts.
+        self._audit_replay_lock = Lock()
+        self._readiness_check_lock = Lock()
+        self._readiness_cache_lock = Lock()
+        # A failed full replay must not turn a high-frequency public health
+        # poll into one expensive retry after another.  The watermark remains
+        # PENDING/DOWN; this process-local cadence gate only bounds repeated
+        # work in V1's one-API-process deployment.
+        self._next_full_audit_replay_at = 0.0
+        self._cached_readiness: HealthResponse | None = None
+        self._cached_readiness_until = 0.0
 
     @property
     def engine(self) -> Engine:
@@ -562,111 +617,599 @@ class SystemReadinessProvider:
             ),
         )
 
-    def _audit_chain(self) -> ComponentHealth:
+    @staticmethod
+    def _watermark_pair_is_valid(sequence: int, value: str | None) -> bool:
+        return (sequence == 0 and value is None) or (
+            sequence > 0 and _valid_hash(value)
+        )
+
+    def _read_audit_snapshot(self) -> _AuditSnapshot:
+        with self.engine.connect() as connection:
+            organization_ids = tuple(
+                connection.execute(
+                    select(Organization.id).order_by(Organization.id)
+                ).scalars()
+            )
+            rows = connection.execute(
+                select(
+                    AuditChainWatermark.organization_id,
+                    AuditChainWatermark.head_sequence,
+                    AuditChainWatermark.head_hash,
+                    AuditChainWatermark.verified_sequence,
+                    AuditChainWatermark.verified_hash,
+                    AuditChainWatermark.full_replay_sequence,
+                    AuditChainWatermark.full_replay_hash,
+                    AuditChainWatermark.full_replay_finished_at,
+                    AuditChainWatermark.integrity_status,
+                    AuditChainWatermark.failure_code,
+                    AuditChainWatermark.failure_sequence,
+                    AuditChainWatermark.mutation_epoch,
+                ).order_by(AuditChainWatermark.organization_id)
+            ).mappings()
+            state_by_organization: dict[UUID, _AuditWatermark] = {}
+            for row in rows:
+                try:
+                    organization_id = UUID(str(row["organization_id"]))
+                    head_sequence = int(row["head_sequence"])
+                    verified_sequence = int(row["verified_sequence"])
+                    full_replay_sequence = int(row["full_replay_sequence"])
+                    mutation_epoch = int(row["mutation_epoch"])
+                    failure_sequence = (
+                        int(row["failure_sequence"])
+                        if row["failure_sequence"] is not None
+                        else None
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise _AuditIntegrityError("AUDIT_CHAIN_STATE_INVALID") from exc
+                if organization_id in state_by_organization:
+                    raise _AuditIntegrityError("AUDIT_CHAIN_STATE_INVALID")
+                full_replay_finished_at = _as_utc_datetime(
+                    row["full_replay_finished_at"]
+                )
+                if (
+                    row["full_replay_finished_at"] is not None
+                    and full_replay_finished_at is None
+                ):
+                    raise _AuditIntegrityError("AUDIT_CHAIN_STATE_INVALID")
+                head_hash = (
+                    str(row["head_hash"]) if row["head_hash"] is not None else None
+                )
+                verified_hash = (
+                    str(row["verified_hash"])
+                    if row["verified_hash"] is not None
+                    else None
+                )
+                full_replay_hash = (
+                    str(row["full_replay_hash"])
+                    if row["full_replay_hash"] is not None
+                    else None
+                )
+                integrity_status = str(row["integrity_status"])
+                failure_code = (
+                    str(row["failure_code"])
+                    if row["failure_code"] is not None
+                    else None
+                )
+                watermark = _AuditWatermark(
+                    organization_id=organization_id,
+                    head_sequence=head_sequence,
+                    head_hash=head_hash,
+                    verified_sequence=verified_sequence,
+                    verified_hash=verified_hash,
+                    full_replay_sequence=full_replay_sequence,
+                    full_replay_hash=full_replay_hash,
+                    full_replay_finished_at=full_replay_finished_at,
+                    integrity_status=integrity_status,
+                    failure_code=failure_code,
+                    failure_sequence=failure_sequence,
+                    mutation_epoch=mutation_epoch,
+                )
+                if not self._watermark_is_well_formed(watermark):
+                    raise _AuditIntegrityError("AUDIT_CHAIN_STATE_INVALID")
+                state_by_organization[organization_id] = watermark
+
+            organization_set = set(organization_ids)
+            if set(state_by_organization) - organization_set:
+                raise _AuditIntegrityError("AUDIT_CHAIN_STATE_ORPHAN")
+            if organization_set - set(state_by_organization):
+                raise _AuditIntegrityError("AUDIT_CHAIN_STATE_MISSING")
+
+            for watermark in state_by_organization.values():
+                tail = connection.execute(
+                    select(
+                        AuditEvent.organization_sequence,
+                        AuditEvent.event_hash,
+                    )
+                    .where(AuditEvent.organization_id == watermark.organization_id)
+                    .order_by(AuditEvent.organization_sequence.desc())
+                    .limit(1)
+                ).one_or_none()
+                tail_sequence = int(tail[0]) if tail is not None else 0
+                tail_hash = str(tail[1]) if tail is not None else None
+                if (
+                    tail_sequence != watermark.head_sequence
+                    or tail_hash != watermark.head_hash
+                ):
+                    raise _AuditIntegrityError("AUDIT_CHAIN_HEAD_DIVERGED")
+        return _AuditSnapshot(
+            watermarks=tuple(
+                state_by_organization[organization_id]
+                for organization_id in sorted(state_by_organization)
+            )
+        )
+
+    def _watermark_is_well_formed(self, watermark: _AuditWatermark) -> bool:
+        if (
+            watermark.head_sequence < 0
+            or watermark.verified_sequence < 0
+            or watermark.full_replay_sequence < 0
+            or watermark.mutation_epoch < 0
+            or watermark.verified_sequence > watermark.head_sequence
+            or watermark.full_replay_sequence > watermark.verified_sequence
+        ):
+            return False
+        if not all(
+            (
+                self._watermark_pair_is_valid(
+                    watermark.head_sequence,
+                    watermark.head_hash,
+                ),
+                self._watermark_pair_is_valid(
+                    watermark.verified_sequence,
+                    watermark.verified_hash,
+                ),
+                self._watermark_pair_is_valid(
+                    watermark.full_replay_sequence,
+                    watermark.full_replay_hash,
+                ),
+                watermark.integrity_status in {"PENDING", "PASSED", "FAILED"},
+            )
+        ):
+            return False
+        if watermark.failure_sequence is not None and not (
+            0 < watermark.failure_sequence <= watermark.head_sequence
+        ):
+            return False
+        if watermark.integrity_status == "FAILED":
+            return (
+                watermark.failure_code is not None
+                and re.fullmatch(r"[A-Z0-9_]{1,64}", watermark.failure_code)
+                is not None
+            )
+        return watermark.failure_code is None and watermark.failure_sequence is None
+
+    def _full_replay_is_fresh(
+        self,
+        watermark: _AuditWatermark,
+        *,
+        now: datetime,
+    ) -> bool:
+        return _is_fresh(
+            watermark.full_replay_finished_at,
+            now=now,
+            maximum_age_seconds=self.settings.audit_integrity_full_replay_max_age_seconds,
+        )
+
+    def _snapshot_is_ready(self, snapshot: _AuditSnapshot, *, now: datetime) -> bool:
+        return bool(snapshot.watermarks) and all(
+            watermark.integrity_status == "PASSED"
+            and watermark.verified_sequence == watermark.head_sequence
+            and watermark.verified_hash == watermark.head_hash
+            and self._full_replay_is_fresh(watermark, now=now)
+            for watermark in snapshot.watermarks
+        )
+
+    @staticmethod
+    def _replay_failure(
+        code: str,
+        *,
+        organization_id: UUID | None = None,
+        sequence: int | None = None,
+    ) -> _AuditReplayResult:
+        return _AuditReplayResult(
+            success=False,
+            code=code,
+            failure_organization_id=organization_id,
+            failure_sequence=sequence,
+        )
+
+    def _verify_audit_row(
+        self,
+        row: object,
+        *,
+        organization_id: UUID,
+        expected_sequence: int,
+        expected_previous: str | None,
+    ) -> tuple[str | None, str | None]:
+        try:
+            mapping = row  # SQLAlchemy RowMapping, kept local for type narrowing.
+            sequence = int(mapping["organization_sequence"])  # type: ignore[index]
+            event_id = str(UUID(str(mapping["id"]))).lower()  # type: ignore[index]
+            canonical_organization_id = str(organization_id).lower()
+            if (
+                sequence != expected_sequence
+                or mapping["canonicalization_version"] != "RFC8785-v1"  # type: ignore[index]
+                or mapping["previous_hash"] != expected_previous  # type: ignore[index]
+            ):
+                return None, "AUDIT_CHAIN_SEQUENCE_INVALID"
+            raw_event = mapping["event_json"]  # type: ignore[index]
+            if isinstance(raw_event, str):
+                raw_event = json.loads(raw_event)
+            if not isinstance(raw_event, dict):
+                return None, "AUDIT_CHAIN_EVENT_INVALID"
+            event = copy.deepcopy(raw_event)
+            integrity = event.get("integrity")
+            if (
+                not isinstance(integrity, dict)
+                or event.get("event_id") != event_id
+                or event.get("organization_id") != canonical_organization_id
+                or event.get("sequence") != sequence
+                or integrity.get("algorithm") != "SHA-256"
+                or integrity.get("canonicalization") != "RFC8785"
+                or integrity.get("chain_scope") != "ORGANIZATION_SEQUENCE"
+                or integrity.get("previous_hash") != expected_previous
+                or integrity.get("event_hash") != mapping["event_hash"]  # type: ignore[index]
+            ):
+                return None, "AUDIT_CHAIN_EVENT_INVALID"
+            event_hash = integrity.pop("event_hash")
+            prefix = (
+                "DXAUDITv1\n"
+                f"{canonical_organization_id}\n"
+                f"{sequence}\n"
+                f"{expected_previous or ('0' * 64)}\n"
+            ).encode()
+            calculated = hashlib.sha256(prefix + rfc8785.dumps(event)).hexdigest()
+            if calculated != event_hash:
+                return None, "AUDIT_CHAIN_HASH_INVALID"
+            return calculated, None
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return None, "AUDIT_CHAIN_EVENT_INVALID"
+
+    def _validate_full_replay(
+        self,
+        connection: object,
+        snapshot: _AuditSnapshot,
+        *,
+        started_at: float,
+    ) -> _AuditReplayResult:
+        watermarks = {
+            watermark.organization_id: watermark for watermark in snapshot.watermarks
+        }
+        expected = {
+            organization_id: (1, None) for organization_id in watermarks
+        }
+        rows = connection.execute(  # type: ignore[union-attr]
+            select(
+                AuditEvent.id,
+                AuditEvent.organization_id,
+                AuditEvent.organization_sequence,
+                AuditEvent.event_json,
+                AuditEvent.canonicalization_version,
+                AuditEvent.previous_hash,
+                AuditEvent.event_hash,
+            ).order_by(AuditEvent.organization_id, AuditEvent.organization_sequence)
+        ).mappings()
+        for row in rows:
+            if (
+                time.monotonic() - started_at
+                > self.settings.audit_integrity_replay_timeout_seconds
+            ):
+                return self._replay_failure("AUDIT_CHAIN_REPLAY_TIMEOUT")
+            try:
+                organization_id = UUID(str(row["organization_id"]))
+                sequence = int(row["organization_sequence"])
+            except (TypeError, ValueError):
+                return self._replay_failure("AUDIT_CHAIN_EVENT_INVALID")
+            watermark = watermarks.get(organization_id)
+            # A row beyond the snapshot head is a concurrent append.  Its
+            # mutation epoch will make publication fail closed below.
+            if watermark is None or sequence > watermark.head_sequence:
+                continue
+            expected_sequence, expected_previous = expected[organization_id]
+            calculated, error_code = self._verify_audit_row(
+                row,
+                organization_id=organization_id,
+                expected_sequence=expected_sequence,
+                expected_previous=expected_previous,
+            )
+            if error_code is not None:
+                return self._replay_failure(
+                    error_code,
+                    organization_id=organization_id,
+                    sequence=sequence,
+                )
+            expected[organization_id] = (expected_sequence + 1, calculated)
+        for organization_id, watermark in watermarks.items():
+            expected_sequence, expected_hash = expected[organization_id]
+            if (
+                expected_sequence - 1 != watermark.head_sequence
+                or expected_hash != watermark.head_hash
+            ):
+                return self._replay_failure(
+                    "AUDIT_CHAIN_SEQUENCE_INVALID",
+                    organization_id=organization_id,
+                    sequence=min(expected_sequence, max(1, watermark.head_sequence)),
+                )
+        return _AuditReplayResult(success=True, code="AUDIT_CHAIN_FULL_REPLAY_VERIFIED")
+
+    def _validate_suffix_replay(
+        self,
+        connection: object,
+        snapshot: _AuditSnapshot,
+        *,
+        started_at: float,
+    ) -> _AuditReplayResult:
+        for watermark in snapshot.watermarks:
+            expected_sequence = watermark.verified_sequence + 1
+            expected_previous = watermark.verified_hash
+            rows = connection.execute(  # type: ignore[union-attr]
+                select(
+                    AuditEvent.id,
+                    AuditEvent.organization_id,
+                    AuditEvent.organization_sequence,
+                    AuditEvent.event_json,
+                    AuditEvent.canonicalization_version,
+                    AuditEvent.previous_hash,
+                    AuditEvent.event_hash,
+                )
+                .where(
+                    AuditEvent.organization_id == watermark.organization_id,
+                    AuditEvent.organization_sequence > watermark.verified_sequence,
+                    AuditEvent.organization_sequence <= watermark.head_sequence,
+                )
+                .order_by(AuditEvent.organization_sequence)
+            ).mappings()
+            for row in rows:
+                if (
+                    time.monotonic() - started_at
+                    > self.settings.audit_integrity_replay_timeout_seconds
+                ):
+                    return self._replay_failure("AUDIT_CHAIN_REPLAY_TIMEOUT")
+                try:
+                    sequence = int(row["organization_sequence"])
+                except (TypeError, ValueError):
+                    return self._replay_failure(
+                        "AUDIT_CHAIN_EVENT_INVALID",
+                        organization_id=watermark.organization_id,
+                    )
+                calculated, error_code = self._verify_audit_row(
+                    row,
+                    organization_id=watermark.organization_id,
+                    expected_sequence=expected_sequence,
+                    expected_previous=expected_previous,
+                )
+                if error_code is not None:
+                    return self._replay_failure(
+                        error_code,
+                        organization_id=watermark.organization_id,
+                        sequence=sequence,
+                    )
+                expected_sequence += 1
+                expected_previous = calculated
+            if (
+                expected_sequence - 1 != watermark.head_sequence
+                or expected_previous != watermark.head_hash
+            ):
+                return self._replay_failure(
+                    "AUDIT_CHAIN_SEQUENCE_INVALID",
+                    organization_id=watermark.organization_id,
+                    sequence=min(expected_sequence, max(1, watermark.head_sequence)),
+                )
+        return _AuditReplayResult(success=True, code="AUDIT_CHAIN_SUFFIX_VERIFIED")
+
+    def _validate_audit_snapshot(
+        self,
+        snapshot: _AuditSnapshot,
+        *,
+        full_replay: bool,
+    ) -> _AuditReplayResult:
+        started_at = time.monotonic()
+        statement_timeout = (
+            f"{max(1, int(self.settings.audit_integrity_replay_timeout_seconds * 1000))}ms"
+        )
         try:
             with self.engine.connect() as connection:
-                rows = connection.execute(
-                    text(
-                        """
-                        SELECT
-                            id,
-                            organization_id,
-                            organization_sequence,
-                            event_json,
-                            canonicalization_version,
-                            previous_hash,
-                            event_hash
-                        FROM audit_events
-                        ORDER BY organization_id, organization_sequence
-                        """
+                if connection.dialect.name == "postgresql":
+                    connection = connection.execution_options(
+                        isolation_level="REPEATABLE READ"
                     )
-                ).mappings()
-                current_organization: str | None = None
-                expected_sequence = 0
-                expected_previous: str | None = None
-                count = 0
-                for row in rows:
-                    organization_id = str(
-                        UUID(str(row["organization_id"]))
-                    ).lower()
-                    event_id = str(UUID(str(row["id"]))).lower()
-                    sequence = int(row["organization_sequence"])
-                    if organization_id != current_organization:
-                        current_organization = organization_id
-                        expected_sequence = 1
-                        expected_previous = None
-                    if (
-                        sequence != expected_sequence
-                        or row["canonicalization_version"] != "RFC8785-v1"
-                        or row["previous_hash"] != expected_previous
-                    ):
-                        return ComponentHealth(
-                            status=HealthStatus.DOWN,
-                            code="AUDIT_CHAIN_SEQUENCE_INVALID",
+                with connection.begin():
+                    if connection.dialect.name == "postgresql":
+                        connection.execute(
+                            text(
+                                "SELECT set_config("
+                                "'statement_timeout', :timeout, true)"
+                            ),
+                            {"timeout": statement_timeout},
                         )
-                    raw_event = row["event_json"]
-                    if isinstance(raw_event, str):
-                        raw_event = json.loads(raw_event)
-                    if not isinstance(raw_event, dict):
-                        return ComponentHealth(
-                            status=HealthStatus.DOWN,
-                            code="AUDIT_CHAIN_EVENT_INVALID",
+                    if full_replay:
+                        return self._validate_full_replay(
+                            connection,
+                            snapshot,
+                            started_at=started_at,
                         )
-                    event = copy.deepcopy(raw_event)
-                    integrity = event.get("integrity")
-                    if (
-                        not isinstance(integrity, dict)
-                        or event.get("event_id") != event_id
-                        or event.get("organization_id") != organization_id
-                        or event.get("sequence") != sequence
-                        or integrity.get("algorithm") != "SHA-256"
-                        or integrity.get("canonicalization") != "RFC8785"
-                        or integrity.get("chain_scope")
-                        != "ORGANIZATION_SEQUENCE"
-                        or integrity.get("previous_hash") != expected_previous
-                        or integrity.get("event_hash") != row["event_hash"]
-                    ):
-                        return ComponentHealth(
-                            status=HealthStatus.DOWN,
-                            code="AUDIT_CHAIN_EVENT_INVALID",
+                    return self._validate_suffix_replay(
+                        connection,
+                        snapshot,
+                        started_at=started_at,
+                    )
+        except (OSError, SQLAlchemyError, TypeError, ValueError):
+            return self._replay_failure("AUDIT_CHAIN_UNAVAILABLE")
+
+    @staticmethod
+    def _watermark_matches_snapshot(watermark: _AuditWatermark) -> tuple[object, ...]:
+        return (
+            AuditChainWatermark.organization_id == watermark.organization_id,
+            AuditChainWatermark.head_sequence == watermark.head_sequence,
+            AuditChainWatermark.head_hash.is_not_distinct_from(watermark.head_hash),
+            AuditChainWatermark.mutation_epoch == watermark.mutation_epoch,
+        )
+
+    def _publish_verified_audit_snapshot(
+        self,
+        snapshot: _AuditSnapshot,
+        *,
+        full_replay: bool,
+    ) -> bool:
+        now = datetime.now(UTC)
+        try:
+            with self.engine.begin() as connection:
+                for watermark in snapshot.watermarks:
+                    values: dict[str, object] = {
+                        "verified_sequence": watermark.head_sequence,
+                        "verified_hash": watermark.head_hash,
+                        "integrity_status": "PASSED",
+                        "failure_code": None,
+                        "failure_sequence": None,
+                        "updated_at": now,
+                    }
+                    if full_replay:
+                        values.update(
+                            {
+                                "full_replay_sequence": watermark.head_sequence,
+                                "full_replay_hash": watermark.head_hash,
+                                "full_replay_finished_at": now,
+                            }
                         )
-                    event_hash = integrity.pop("event_hash")
-                    prefix = (
-                        "DXAUDITv1\n"
-                        f"{organization_id}\n"
-                        f"{sequence}\n"
-                        f"{expected_previous or ('0' * 64)}\n"
-                    ).encode()
-                    calculated = hashlib.sha256(
-                        prefix + rfc8785.dumps(event)
-                    ).hexdigest()
-                    if calculated != event_hash:
-                        return ComponentHealth(
-                            status=HealthStatus.DOWN,
-                            code="AUDIT_CHAIN_HASH_INVALID",
-                        )
-                    expected_previous = calculated
-                    expected_sequence += 1
-                    count += 1
-        except (
-            SQLAlchemyError,
-            OSError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-        ):
+                    result = connection.execute(
+                        update(AuditChainWatermark)
+                        .where(*self._watermark_matches_snapshot(watermark))
+                        .values(**values)
+                    )
+                    if result.rowcount != 1:
+                        raise _AuditSnapshotChanged
+        except (_AuditSnapshotChanged, SQLAlchemyError):
+            return False
+        return True
+
+    def _record_audit_failure_if_stable(
+        self,
+        snapshot: _AuditSnapshot,
+        result: _AuditReplayResult,
+    ) -> None:
+        if result.failure_organization_id is None:
+            return
+        watermark = next(
+            (
+                item
+                for item in snapshot.watermarks
+                if item.organization_id == result.failure_organization_id
+            ),
+            None,
+        )
+        if watermark is None:
+            return
+        failure_sequence = result.failure_sequence
+        if failure_sequence is not None and watermark.head_sequence > 0:
+            failure_sequence = min(max(1, failure_sequence), watermark.head_sequence)
+        elif watermark.head_sequence == 0:
+            failure_sequence = None
+        try:
+            with self.engine.begin() as connection:
+                connection.execute(
+                    update(AuditChainWatermark)
+                    .where(*self._watermark_matches_snapshot(watermark))
+                    .values(
+                        integrity_status="FAILED",
+                        failure_code=result.code,
+                        failure_sequence=failure_sequence,
+                        updated_at=datetime.now(UTC),
+                    )
+                )
+        except SQLAlchemyError:
+            return
+
+    def _audit_chain(self) -> ComponentHealth:
+        try:
+            snapshot = self._read_audit_snapshot()
+        except _AuditIntegrityError as exc:
+            return ComponentHealth(status=HealthStatus.DOWN, code=exc.code)
+        except (OSError, SQLAlchemyError, TypeError, ValueError):
             return ComponentHealth(
                 status=HealthStatus.DOWN,
                 code="AUDIT_CHAIN_UNAVAILABLE",
             )
-        return ComponentHealth(
-            status=HealthStatus.UP,
-            code=(
-                "AUDIT_CHAIN_VERIFIED"
-                if count
-                else "AUDIT_CHAIN_EMPTY_BOOTSTRAP_ALLOWED"
-            ),
-        )
+        if not snapshot.watermarks:
+            return ComponentHealth(
+                status=HealthStatus.UP,
+                code="AUDIT_CHAIN_EMPTY_BOOTSTRAP_ALLOWED",
+            )
+        now = datetime.now(UTC)
+        if self._snapshot_is_ready(snapshot, now=now):
+            return ComponentHealth(
+                status=HealthStatus.UP,
+                code="AUDIT_CHAIN_VERIFIED_WATERMARK",
+            )
+        if any(
+            watermark.integrity_status == "FAILED"
+            for watermark in snapshot.watermarks
+        ):
+            return ComponentHealth(
+                status=HealthStatus.DOWN,
+                code="AUDIT_CHAIN_VERIFICATION_FAILED",
+            )
+        if not self._audit_replay_lock.acquire(blocking=False):
+            return ComponentHealth(
+                status=HealthStatus.DOWN,
+                code="AUDIT_CHAIN_VERIFICATION_IN_PROGRESS",
+            )
+        try:
+            try:
+                snapshot = self._read_audit_snapshot()
+            except _AuditIntegrityError as exc:
+                return ComponentHealth(status=HealthStatus.DOWN, code=exc.code)
+            except (OSError, SQLAlchemyError, TypeError, ValueError):
+                return ComponentHealth(
+                    status=HealthStatus.DOWN,
+                    code="AUDIT_CHAIN_UNAVAILABLE",
+                )
+            now = datetime.now(UTC)
+            if self._snapshot_is_ready(snapshot, now=now):
+                return ComponentHealth(
+                    status=HealthStatus.UP,
+                    code="AUDIT_CHAIN_VERIFIED_WATERMARK",
+                )
+            if any(
+                watermark.integrity_status == "FAILED"
+                for watermark in snapshot.watermarks
+            ):
+                return ComponentHealth(
+                    status=HealthStatus.DOWN,
+                    code="AUDIT_CHAIN_VERIFICATION_FAILED",
+                )
+            full_replay = any(
+                not self._full_replay_is_fresh(watermark, now=now)
+                for watermark in snapshot.watermarks
+            )
+            if full_replay:
+                monotonic_now = time.monotonic()
+                if monotonic_now < self._next_full_audit_replay_at:
+                    return ComponentHealth(
+                        status=HealthStatus.DOWN,
+                        code="AUDIT_CHAIN_FULL_REPLAY_THROTTLED",
+                    )
+                self._next_full_audit_replay_at = (
+                    monotonic_now
+                    + self.settings.audit_integrity_full_replay_max_age_seconds
+                )
+            result = self._validate_audit_snapshot(
+                snapshot,
+                full_replay=full_replay,
+            )
+            if not result.success:
+                self._record_audit_failure_if_stable(snapshot, result)
+                return ComponentHealth(status=HealthStatus.DOWN, code=result.code)
+            if not self._publish_verified_audit_snapshot(
+                snapshot,
+                full_replay=full_replay,
+            ):
+                return ComponentHealth(
+                    status=HealthStatus.DOWN,
+                    code="AUDIT_CHAIN_SNAPSHOT_CHANGED",
+                )
+            return ComponentHealth(status=HealthStatus.UP, code=result.code)
+        finally:
+            self._audit_replay_lock.release()
 
     def _egress_policy(
         self,
@@ -698,7 +1241,7 @@ class SystemReadinessProvider:
             code="EGRESS_POLICY_VERIFIED",
         )
 
-    def check(self) -> HealthResponse:
+    def _check_once(self) -> HealthResponse:
         persisted = self._postgres_migrations_and_worker()
         components = {
             "postgres": persisted.postgres,
@@ -772,3 +1315,46 @@ class SystemReadinessProvider:
             checked_at=datetime.now(UTC),
             components=components,
         )
+
+    def _cached_response(self, *, now: float) -> HealthResponse | None:
+        with self._readiness_cache_lock:
+            if (
+                self._cached_readiness is not None
+                and now < self._cached_readiness_until
+            ):
+                return self._cached_readiness
+        return None
+
+    def check(self) -> HealthResponse:
+        now = time.monotonic()
+        cached = self._cached_response(now=now)
+        if cached is not None:
+            return cached
+        if not self._readiness_check_lock.acquire(blocking=False):
+            # Do not queue unbounded public /ready callers behind an expensive
+            # replay.  Returning DOWN is truthful: this request did not obtain
+            # a fresh readiness proof, and the one in progress may still fail.
+            return HealthResponse(
+                status=HealthStatus.DOWN,
+                version=self.settings.app_version,
+                checked_at=datetime.now(UTC),
+                components={
+                    "readiness": ComponentHealth(
+                        status=HealthStatus.DOWN,
+                        code="READINESS_CHECK_IN_PROGRESS",
+                    )
+                },
+            )
+        try:
+            cached = self._cached_response(now=time.monotonic())
+            if cached is not None:
+                return cached
+            response = self._check_once()
+            with self._readiness_cache_lock:
+                self._cached_readiness = response
+                self._cached_readiness_until = (
+                    time.monotonic() + self.settings.readiness_cache_seconds
+                )
+            return response
+        finally:
+            self._readiness_check_lock.release()

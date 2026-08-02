@@ -8,6 +8,7 @@ on:
       - "desktop/windows/**"
       - "installer/windows/**"
       - "scripts/acceptance/test_windows_hosted_preflight.py"
+      - "scripts/acceptance/test_windows_installer_source.py"
       - "scripts/acceptance/windows-hosted-preflight.requirements.lock"
   push:
     branches:
@@ -19,6 +20,7 @@ on:
       - "desktop/windows/**"
       - "installer/windows/**"
       - "scripts/acceptance/test_windows_hosted_preflight.py"
+      - "scripts/acceptance/test_windows_installer_source.py"
       - "scripts/acceptance/windows-hosted-preflight.requirements.lock"
   workflow_dispatch:
 

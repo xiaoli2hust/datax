@@ -17,6 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from datax_studio.api.problems import ProblemException
+from datax_studio.audit_integrity import advance_audit_chain_watermark
 from datax_studio.auth.db import AuditEvent, Organization, User
 from datax_studio.auth.security import ensure_aware, utc_now
 from datax_studio.auth.service import AuditContext, Principal
@@ -899,6 +900,15 @@ class ExecutionLogService:
             if not isinstance(integrity, dict):
                 raise RuntimeError("audit integrity shape is invalid")
             integrity["event_hash"] = event_hash
+            advance_audit_chain_watermark(
+                session,
+                organization_id=organization.id,
+                previous_sequence=sequence - 1,
+                previous_hash=previous_hash,
+                sequence=sequence,
+                event_hash=event_hash,
+                updated_at=occurred_at,
+            )
             session.add(
                 AuditEvent(
                     id=event_id,

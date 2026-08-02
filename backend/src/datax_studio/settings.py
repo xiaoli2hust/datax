@@ -22,7 +22,7 @@ class Settings(BaseSettings):
 
     app_version: str = "0.1.0-dev"
     app_environment: str = "development"
-    database_schema_revision: str = "20260802_0017"
+    database_schema_revision: str = "20260802_0018"
     ui_origin: str = "http://127.0.0.1:17860"
     trusted_host: str = "127.0.0.1"
     database_host: str = "postgres"
@@ -52,6 +52,23 @@ class Settings(BaseSettings):
     refresh_token_days: int = Field(default=30, ge=1, le=90)
     login_failure_limit: int = Field(default=5, ge=3, le=20)
     login_lock_seconds: int = Field(default=900, ge=60, le=86400)
+    login_admission_burst: int = Field(default=5, ge=1, le=20)
+    login_admission_rate_per_minute: int = Field(default=5, ge=1, le=60)
+    # ADR-0012 fixes V1 to one API process and one bounded password-verification
+    # slot.  Widening this needs an ADR plus a capacity/security review, not an
+    # environment-only tuning change.
+    login_admission_max_in_flight: int = Field(default=1, ge=1, le=1)
+    readiness_cache_seconds: float = Field(default=1.0, ge=0.1, le=5.0)
+    audit_integrity_full_replay_max_age_seconds: float = Field(
+        default=60.0,
+        ge=10.0,
+        le=300.0,
+    )
+    audit_integrity_replay_timeout_seconds: float = Field(
+        default=30.0,
+        ge=1.0,
+        le=60.0,
+    )
     runtime_manifest_path: Path = Path("/opt/datax/runtime-manifest.json")
     java_binary_path: Path = Path("/opt/java/openjdk/bin/java")
     log_volume_path: Path = Path("/var/lib/datax-studio/logs")

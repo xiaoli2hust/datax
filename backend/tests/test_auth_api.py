@@ -18,7 +18,9 @@ from sqlalchemy.pool import StaticPool
 
 from datax_studio.api.app import create_app
 from datax_studio.api.problems import ProblemException
+from datax_studio.auth import routes as auth_routes
 from datax_studio.auth.db import (
+    AuditChainWatermark,
     AuditEvent,
     AuthSession,
     Base,
@@ -29,6 +31,7 @@ from datax_studio.auth.db import (
     User,
     UserStatus,
 )
+from datax_studio.auth.ingress import LoginAdmissionGuard, LoginAdmissionRejection
 from datax_studio.auth.schemas import UserCreate
 from datax_studio.auth.security import (
     Argon2idPasswordHasher,
@@ -60,6 +63,7 @@ def auth_stack() -> tuple[TestClient, AuthService, sessionmaker, TokenManager]:
             AuthSession.__table__,
             IdempotencyRecord.__table__,
             AuditEvent.__table__,
+            AuditChainWatermark.__table__,
         ],
     )
     sessions = sessionmaker(bind=engine, expire_on_commit=False)
@@ -93,7 +97,13 @@ def auth_stack() -> tuple[TestClient, AuthService, sessionmaker, TokenManager]:
         audit=_audit(),
     )
     app = create_app(
-        settings=Settings(app_version="test", trusted_host="testserver"),
+        settings=Settings(
+            app_version="test",
+            trusted_host="testserver",
+            login_admission_burst=20,
+            login_admission_rate_per_minute=20,
+            login_admission_max_in_flight=1,
+        ),
         auth_service=service,
     )
     with TestClient(app) as client:
@@ -188,6 +198,207 @@ def test_login_uses_argon2id_ed25519_and_strict_loopback_cookie(
         assert auth_session is not None
         assert auth_session.token_hash == tokens.hash_refresh_token(refresh_token)
     assert refresh_token.encode() != auth_session.token_hash
+
+
+def test_login_admission_rejects_before_password_hashing_or_audit(
+    auth_stack: tuple[TestClient, AuthService, sessionmaker, TokenManager],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, service, sessions, _ = auth_stack
+    client.app.state.login_admission = LoginAdmissionGuard(
+        burst=1,
+        rate_per_minute=1,
+        max_in_flight=1,
+    )
+    dummy_calls = 0
+    original_dummy = service.password_hasher.verify_dummy
+
+    def counting_dummy(password: str) -> None:
+        nonlocal dummy_calls
+        dummy_calls += 1
+        original_dummy(password)
+
+    monkeypatch.setattr(service.password_hasher, "verify_dummy", counting_dummy)
+    first = client.post(
+        "/api/v1/auth/login",
+        json={"email": "unknown@example.com", "password": "Wrong-password-123!"},
+    )
+    assert first.status_code == 401
+    assert dummy_calls == 1
+
+    known = client.post(
+        "/api/v1/auth/login",
+        json={"email": "admin@example.com", "password": "Wrong-password-123!"},
+    )
+    unknown = client.post(
+        "/api/v1/auth/login",
+        json={"email": "another-unknown@example.com", "password": "Wrong-password-123!"},
+    )
+    assert known.status_code == unknown.status_code == 429
+    assert known.headers["Retry-After"] == unknown.headers["Retry-After"]
+    for response in (known, unknown):
+        body = response.json()
+        assert body["code"] == "AUTH_LOGIN_ADMISSION_LIMITED"
+        assert body["title"] == "登录尝试暂时受限"
+        assert body["detail"] == "请稍后重试。"
+        assert body["retryable"] is True
+        assert body["request_id"] == response.headers["X-Request-Id"]
+        assert response.headers["Retry-After"] == "60"
+        assert response.headers["Cache-Control"] == "no-store"
+        assert response.headers["Content-Type"].startswith("application/problem+json")
+        assert "set-cookie" not in response.headers
+        assert "www-authenticate" not in response.headers
+    assert dummy_calls == 1
+
+    with sessions() as session:
+        events = list(
+            session.scalars(
+                select(AuditEvent).order_by(AuditEvent.organization_sequence)
+            )
+        )
+        actions = [event.event_json["action"] for event in events]
+        assert actions.count("AUTH_LOGIN_FAILED") == 1
+        assert len(events) == 2
+
+
+def test_login_admission_rejection_never_opens_a_session_or_changes_credentials(
+    auth_stack: tuple[TestClient, AuthService, sessionmaker, TokenManager],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429 is an ingress decision, before every login-side effect."""
+
+    client, service, sessions, _ = auth_stack
+    guard = LoginAdmissionGuard(
+        burst=2,
+        rate_per_minute=1,
+        max_in_flight=1,
+    )
+    client.app.state.login_admission = guard
+
+    with sessions() as session:
+        admin = session.scalar(select(User).where(User.email == "admin@example.com"))
+        assert admin is not None
+        credential_state_before = (
+            admin.password_hash,
+            admin.status,
+            admin.failed_login_count,
+            admin.locked_until,
+            admin.last_login_at,
+            admin.row_version,
+        )
+        audit_count_before = session.scalar(select(func.count(AuditEvent.id)))
+        auth_session_count_before = session.scalar(select(func.count(AuthSession.id)))
+
+    def must_not_be_called(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a login-admission rejection must not enter AuthService")
+
+    held = guard.try_acquire()
+    assert not isinstance(held, LoginAdmissionRejection)
+    monkeypatch.setattr(service, "sessions", must_not_be_called)
+    monkeypatch.setattr(service.password_hasher, "verify", must_not_be_called)
+    monkeypatch.setattr(service.password_hasher, "verify_dummy", must_not_be_called)
+    monkeypatch.setattr(service, "_append_audit", must_not_be_called)
+    try:
+        rejected = client.post(
+            "/api/v1/auth/login",
+            json={"email": "admin@example.com", "password": "Wrong-password-123!"},
+        )
+    finally:
+        held.release()
+
+    assert rejected.status_code == 429
+    assert rejected.json()["code"] == "AUTH_LOGIN_ADMISSION_LIMITED"
+    with sessions() as session:
+        admin = session.scalar(select(User).where(User.email == "admin@example.com"))
+        assert admin is not None
+        credential_state_after = (
+            admin.password_hash,
+            admin.status,
+            admin.failed_login_count,
+            admin.locked_until,
+            admin.last_login_at,
+            admin.row_version,
+        )
+        assert credential_state_after == credential_state_before
+        assert session.scalar(select(func.count(AuditEvent.id))) == audit_count_before
+        assert session.scalar(select(func.count(AuthSession.id))) == auth_session_count_before
+
+
+def test_login_admission_rejects_before_lazy_auth_service_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_app(
+        settings=Settings(
+            app_version="test",
+            trusted_host="testserver",
+            login_admission_burst=1,
+            login_admission_rate_per_minute=1,
+            login_admission_max_in_flight=1,
+        )
+    )
+    held = app.state.login_admission.try_acquire()
+    assert not isinstance(held, LoginAdmissionRejection)
+
+    def must_not_build_auth_service(*_args: object, **_kwargs: object) -> AuthService:
+        raise AssertionError("rate-limited request must not build AuthService")
+
+    monkeypatch.setattr(auth_routes, "build_auth_service", must_not_build_auth_service)
+    try:
+        with TestClient(app) as client:
+            rejected = client.post(
+                "/api/v1/auth/login",
+                json={"email": "unknown@example.com", "password": "Wrong-password-123!"},
+            )
+    finally:
+        held.release()
+
+    assert rejected.status_code == 429
+    assert rejected.json()["code"] == "AUTH_LOGIN_ADMISSION_LIMITED"
+    assert rejected.headers["Retry-After"] == "60"
+    assert rejected.headers["X-Request-Id"]
+    assert app.state.auth_service is None
+
+
+def test_invalid_host_or_origin_does_not_consume_login_admission_budget(
+    auth_stack: tuple[TestClient, AuthService, sessionmaker, TokenManager],
+) -> None:
+    client, _, _, _ = auth_stack
+    guard = LoginAdmissionGuard(
+        burst=1,
+        rate_per_minute=1,
+        max_in_flight=1,
+    )
+    client.app.state.login_admission = guard
+
+    rejected = client.post(
+        "/api/v1/auth/login",
+        headers={"Host": "attacker.example"},
+        json={"email": "unknown@example.com", "password": "Wrong-password-123!"},
+    )
+
+    assert rejected.status_code == 400
+    assert rejected.headers["X-Request-Id"]
+    lease = guard.try_acquire()
+    assert not isinstance(lease, LoginAdmissionRejection)
+    lease.release()
+
+    guard = LoginAdmissionGuard(
+        burst=1,
+        rate_per_minute=1,
+        max_in_flight=1,
+    )
+    client.app.state.login_admission = guard
+    origin_rejected = client.post(
+        "/api/v1/auth/login",
+        headers={"Origin": "https://attacker.example"},
+        json={"email": "unknown@example.com", "password": "Wrong-password-123!"},
+    )
+
+    assert origin_rejected.status_code == 403
+    assert origin_rejected.headers["X-Request-Id"]
+    lease = guard.try_acquire()
+    assert not isinstance(lease, LoginAdmissionRejection)
+    lease.release()
 
 
 def test_temporary_password_is_visible_and_business_routes_are_blocked(

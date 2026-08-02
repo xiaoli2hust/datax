@@ -15,6 +15,7 @@ from datax_studio.api.readiness import (
     SystemReadinessProvider,
 )
 from datax_studio.api.routes.health import router as health_router
+from datax_studio.auth.ingress import LoginAdmissionGuard, LoginAdmissionRejection
 from datax_studio.auth.routes import router as auth_router
 from datax_studio.auth.service import AuthService
 from datax_studio.core.routes import router as core_router
@@ -45,14 +46,14 @@ def create_app(
     )
     app.state.settings = resolved_settings
     app.state.readiness = readiness or SystemReadinessProvider(resolved_settings)
+    app.state.login_admission = LoginAdmissionGuard(
+        burst=resolved_settings.login_admission_burst,
+        rate_per_minute=resolved_settings.login_admission_rate_per_minute,
+        max_in_flight=resolved_settings.login_admission_max_in_flight,
+    )
     app.state.auth_service = auth_service
     app.state.control_service = control_service
     app.state.credential_service = credential_service
-    app.add_middleware(
-        TrustedHostMiddleware,
-        allowed_hosts=[resolved_settings.trusted_host],
-    )
-
     @app.middleware("http")
     async def loopback_origin_middleware(
         request: Request,
@@ -69,7 +70,37 @@ def create_app(
                     detail="请求来源不在本机允许列表中。",
                 ),
             )
-        return await call_next(request)
+        admission = None
+        if (
+            request.method == "POST"
+            and request.url.path == "/api/v1/auth/login"
+        ):
+            admission = request.app.state.login_admission.try_acquire()
+            if isinstance(admission, LoginAdmissionRejection):
+                return problem_response(
+                    request,
+                    ProblemException(
+                        status=429,
+                        code="AUTH_LOGIN_ADMISSION_LIMITED",
+                        title="登录尝试暂时受限",
+                        detail="请稍后重试。",
+                        retryable=True,
+                        headers={"Retry-After": str(admission.retry_after_seconds)},
+                    ),
+                )
+        try:
+            return await call_next(request)
+        finally:
+            if admission is not None:
+                admission.release()
+
+    # Middleware is wrapped in reverse registration order.  Register this
+    # after admission so hostile Host headers are rejected before they can
+    # consume the deliberately small, global login-admission budget.
+    app.add_middleware(
+        TrustedHostMiddleware,
+        allowed_hosts=[resolved_settings.trusted_host],
+    )
 
     @app.middleware("http")
     async def request_id_middleware(

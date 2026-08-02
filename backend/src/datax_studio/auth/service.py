@@ -18,6 +18,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
 from datax_studio.api.problems import ProblemException
+from datax_studio.audit_integrity import advance_audit_chain_watermark
 from datax_studio.auth.db import (
     AuditEvent,
     AuthSession,
@@ -1978,6 +1979,15 @@ class AuthService:
         ).encode()
         event_hash = hashlib.sha256(prefix + rfc8785.dumps(event)).hexdigest()
         event["integrity"]["event_hash"] = event_hash
+        advance_audit_chain_watermark(
+            session,
+            organization_id=organization.id,
+            previous_sequence=sequence - 1,
+            previous_hash=previous_hash,
+            sequence=sequence,
+            event_hash=event_hash,
+            updated_at=occurred_at,
+        )
         session.add(
             AuditEvent(
                 id=event_id,

@@ -6,7 +6,7 @@ use ed25519_dalek::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePrivateKey, 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use getrandom::fill as fill_random;
 use runtime_generation::RuntimeGeneration;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
@@ -120,6 +120,11 @@ const EXPECTED_SERVICES: [&str; 6] = [
     "web",
     "worker",
 ];
+const COMPOSE_PROJECT_LABEL: &str = "com.docker.compose.project";
+const COMPOSE_SERVICE_LABEL: &str = "com.docker.compose.service";
+// The tab-delimited outer framing is safe because each dynamic value is JSON encoded; tabs in
+// labels or mount paths are escaped by JSON rather than emitted as framing bytes.
+const COMPOSE_CONTAINER_INVENTORY_FORMAT: &str = "{{json .Id}}\t{{json .Config.Image}}\t{{json .Config.Labels}}\t{{json .Mounts}}\t{{json .State.Running}}";
 const VOLUME_IDENTITY_LABEL: &str = "com.xiaoli.datax.installation-id";
 const VOLUME_ROLE_LABEL: &str = "com.xiaoli.datax.volume-role";
 const HELPER_CONTAINER_ROLE_LABEL: &str = "com.xiaoli.datax.helper-role";
@@ -127,12 +132,19 @@ const HELPER_CONTAINER_ID_LABEL: &str = "com.xiaoli.datax.helper-id";
 const BACKUP_DATA_HELPER_ROLE: &str = "backup-data";
 const BACKUP_SECRETS_HELPER_ROLE: &str = "backup-secrets";
 const RESTORE_STAGE_HELPER_ROLE: &str = "restore-stage";
+const DOCKER_STORAGE_PROBE_HELPER_ROLE: &str = "storage-probe";
 const HELPER_CONTAINER_INSPECT_FORMAT: &str = r#"{{ index .Config.Labels "com.xiaoli.datax.helper-role" }}|{{ index .Config.Labels "com.xiaoli.datax.helper-id" }}"#;
+const RUNTIME_VOLUME_INSPECT_FORMAT: &str =
+    "{{json .Name}}\t{{json .Driver}}\t{{json .Options}}\t{{json .Labels}}";
 const RUNTIME_VOLUMES: [(&str, &str); 3] = [
     ("des-postgres-data", "postgres-data"),
     ("des-log-data", "log-data"),
     ("des-workspace-data", "workspace-data"),
 ];
+// Image acquisition is explicitly complete before the Docker-volume capacity admission. Every
+// subsequent Compose start must refuse an implicit pull, otherwise a concurrent prune could
+// consume the measured volume after the gate and before PostgreSQL starts.
+const COMPOSE_UP_WITHOUT_PULL: [&str; 4] = ["up", "--pull", "never", "-d"];
 const RUNTIME_SECRET_COUNT: usize = 10;
 const MAX_RUNTIME_SECRET_BYTES: u64 = 4096;
 const VERIFY_CONTAINER_SECRETS_SCRIPT: &str = concat!(
@@ -374,6 +386,81 @@ impl ImageLock {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+struct ComposeContainerMount {
+    #[serde(rename = "Type")]
+    kind: String,
+    #[serde(rename = "Name", default)]
+    name: Option<String>,
+    #[serde(rename = "Destination")]
+    destination: String,
+    #[serde(rename = "RW")]
+    read_write: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InspectedComposeContainer {
+    id: String,
+    image: String,
+    labels: BTreeMap<String, String>,
+    mounts: Vec<ComposeContainerMount>,
+    running: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AuthenticatedComposeContainer {
+    id: String,
+    running: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ComposeProjectInventory {
+    Empty,
+    Verified(BTreeMap<String, AuthenticatedComposeContainer>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeVolumeNames {
+    postgres: String,
+    logs: String,
+    workspace: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ActiveRuntimeVolumeContract {
+    installation_id: String,
+    names: RuntimeVolumeNames,
+}
+
+impl ComposeProjectInventory {
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    fn has_service(&self, service: &str) -> bool {
+        matches!(self, Self::Verified(services) if services.contains_key(service))
+    }
+
+    fn service_is_running(&self, service: &str) -> bool {
+        matches!(self, Self::Verified(services) if services.get(service).is_some_and(|container| container.running))
+    }
+
+    fn is_complete(&self) -> bool {
+        matches!(self, Self::Verified(services) if services.len() == EXPECTED_SERVICES.len()
+            && EXPECTED_SERVICES.iter().all(|service| services.contains_key(*service)))
+    }
+
+    fn container_ids(&self) -> Vec<&str> {
+        match self {
+            Self::Empty => Vec::new(),
+            Self::Verified(services) => services
+                .values()
+                .map(|container| container.id.as_str())
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize, PartialEq, Eq)]
 struct StopPreflight {
     safe_to_stop: bool,
@@ -531,9 +618,16 @@ where
             let start_tools = StartTools::discover()?;
             let mut tools = Tools::discover(&installation, &start_tools)?;
             verify_prerequisites(&mut tools, &start_tools, &installation)?;
+            ensure_release_images_available(&tools, &installation, &verified_release.image_lock)?;
             ensure_runtime_secrets(&tools, &start_tools, &installation)?;
+            ensure_docker_storage_capacity(&tools, &installation, &verified_release.image_lock)?;
             verify_compose_config(&tools, &installation, &verified_release.image_lock)?;
-            if start(&tools, &start_tools, &installation)? {
+            if start(
+                &tools,
+                &start_tools,
+                &installation,
+                &verified_release.image_lock,
+            )? {
                 Ok(RunOutcome::Started)
             } else {
                 Ok(RunOutcome::BootstrapCanceled)
@@ -543,7 +637,7 @@ where
             let start_tools = StartTools::discover()?;
             let mut tools = Tools::discover(&installation, &start_tools)?;
             configure_local_docker_endpoint(&mut tools, &installation)?;
-            stop(&tools, &installation, force)?;
+            stop(&tools, &installation, &verified_release.image_lock, force)?;
             Ok(RunOutcome::Stopped)
         }
         Action::Backup {
@@ -557,6 +651,8 @@ where
             let start_tools = StartTools::discover()?;
             let mut tools = Tools::discover(&installation, &start_tools)?;
             verify_prerequisites(&mut tools, &start_tools, &installation)?;
+            ensure_release_images_available(&tools, &installation, &verified_release.image_lock)?;
+            ensure_docker_storage_capacity(&tools, &installation, &verified_release.image_lock)?;
             let (data_package, secrets_package) = create_system_backup(
                 &tools,
                 &start_tools,
@@ -584,6 +680,7 @@ where
             let start_tools = StartTools::discover()?;
             let mut tools = Tools::discover(&installation, &start_tools)?;
             verify_prerequisites(&mut tools, &start_tools, &installation)?;
+            ensure_release_images_available(&tools, &installation, &verified_release.image_lock)?;
             stage_system_restore(
                 &tools,
                 &start_tools,
@@ -1162,34 +1259,7 @@ fn verify_prerequisites(
         &installation.install_dir,
         PROCESS_TIMEOUT,
     )?;
-    if !wsl.status.success() {
-        return Err(LauncherError::new(
-            "WSL2_REQUIRED",
-            "WSL2 不可用。请按 Microsoft 官方说明启用 WSL2；Launcher 不会自动安装。",
-        ));
-    }
-    let wsl_default = run_process(
-        &tools.reg,
-        &[
-            OsString::from("query"),
-            OsString::from(r"HKCU\Software\Microsoft\Windows\CurrentVersion\Lxss"),
-            OsString::from("/v"),
-            OsString::from("DefaultVersion"),
-        ],
-        &[],
-        &installation.install_dir,
-        PROCESS_TIMEOUT,
-    )?;
-    if !wsl_default.status.success()
-        || !normalize_text(&wsl_default.stdout)
-            .split_whitespace()
-            .any(|value| value.eq_ignore_ascii_case("0x2"))
-    {
-        return Err(LauncherError::new(
-            "WSL2_DEFAULT_REQUIRED",
-            "WSL 默认版本不是 2。请按 Microsoft 官方说明配置 WSL2；Launcher 不会修改系统设置。",
-        ));
-    }
+    require_wsl_status(wsl.status.success())?;
 
     configure_local_docker_endpoint(tools, installation)?;
 
@@ -1199,11 +1269,7 @@ fn verify_prerequisites(
         &["version", "--format", "{{.Server.Os}}|{{.Server.Arch}}"],
         PROCESS_TIMEOUT,
     )?;
-    if !version.status.success()
-        || !normalize_text(&version.stdout)
-            .trim()
-            .eq_ignore_ascii_case("linux|amd64")
-    {
+    if !docker_reports_linux_amd64(version.status.success(), &version.stdout) {
         return Err(LauncherError::new(
             "DOCKER_LINUX_ENGINE_REQUIRED",
             "Docker Desktop Linux Engine 未运行或不是 amd64。Launcher 不会切换容器模式。",
@@ -1220,11 +1286,7 @@ fn verify_prerequisites(
         ],
         PROCESS_TIMEOUT,
     )?;
-    let info_text = normalize_text(&info.stdout).to_ascii_lowercase();
-    if !info.status.success()
-        || !info_text.contains("docker desktop")
-        || !info_text.contains("|linux|")
-    {
+    if !docker_reports_desktop_linux(info.status.success(), &info.stdout) {
         return Err(LauncherError::new(
             "DOCKER_DESKTOP_REQUIRED",
             "需要正在运行的本机 Docker Desktop Linux Engine。",
@@ -1248,6 +1310,108 @@ fn verify_prerequisites(
     }
 
     Ok(())
+}
+
+// `HKCU\\...\\Lxss\\DefaultVersion` only affects the version assigned to a newly
+// installed distribution. It is deliberately not an admission input: this preflight needs
+// WSL availability plus the independently verified, local Docker Desktop Linux engine below.
+fn require_wsl_status(status_succeeded: bool) -> Result<(), LauncherError> {
+    if status_succeeded {
+        return Ok(());
+    }
+    Err(LauncherError::new(
+        "WSL2_REQUIRED",
+        "WSL2 不可用。请按 Microsoft 官方说明启用 WSL2；Launcher 不会自动安装。",
+    ))
+}
+
+fn docker_reports_linux_amd64(status_succeeded: bool, stdout: &[u8]) -> bool {
+    status_succeeded
+        && normalize_text(stdout)
+            .trim()
+            .eq_ignore_ascii_case("linux|amd64")
+}
+
+fn docker_reports_desktop_linux(status_succeeded: bool, stdout: &[u8]) -> bool {
+    let info_text = normalize_text(stdout).to_ascii_lowercase();
+    status_succeeded && info_text.contains("docker desktop") && info_text.contains("|linux|")
+}
+
+// A later product `docker run` or `compose up` must never pull after the volume capacity probe.
+// Make all disk-affecting, immutable-digest acquisition explicit and complete first. Cached images
+// are accepted without contacting a registry, so an already-installed workstation can still start
+// offline; a missing image is fetched only through the Launcher-owned anonymous Docker config.
+fn ensure_release_images_available(
+    tools: &Tools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+) -> Result<(), LauncherError> {
+    for image in release_image_references(image_lock) {
+        let inspected = docker(
+            tools,
+            installation,
+            &[
+                "image",
+                "inspect",
+                "--format",
+                "{{.Os}}|{{.Architecture}}",
+                image,
+            ],
+            PROCESS_TIMEOUT,
+        )?;
+        if docker_reports_linux_amd64(inspected.status.success(), &inspected.stdout) {
+            continue;
+        }
+
+        let pulled = docker(
+            tools,
+            installation,
+            &[
+                "image",
+                "pull",
+                "--platform",
+                "linux/amd64",
+                "--quiet",
+                image,
+            ],
+            COMPOSE_TIMEOUT,
+        )?;
+        if !pulled.status.success() {
+            return Err(LauncherError::new(
+                "RELEASE_IMAGE_PULL_FAILED",
+                "无法以固定 digest 获取所需发布镜像；未继续初始化或启动产品服务。",
+            ));
+        }
+        let rechecked = docker(
+            tools,
+            installation,
+            &[
+                "image",
+                "inspect",
+                "--format",
+                "{{.Os}}|{{.Architecture}}",
+                image,
+            ],
+            PROCESS_TIMEOUT,
+        )?;
+        if !docker_reports_linux_amd64(rechecked.status.success(), &rechecked.stdout) {
+            return Err(LauncherError::new(
+                "RELEASE_IMAGE_PLATFORM_INVALID",
+                "固定发布镜像不存在或不是 Linux/amd64；未继续初始化或启动产品服务。",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn release_image_references(image_lock: &ImageLock) -> [&str; 5] {
+    [
+        image_lock.postgres.as_str(),
+        image_lock.api.as_str(),
+        image_lock.egress_guard.as_str(),
+        image_lock.worker.as_str(),
+        image_lock.web.as_str(),
+    ]
 }
 
 fn verify_compose_config(
@@ -1289,11 +1453,7 @@ fn configure_local_docker_endpoint(
             &["version", "--format", "{{.Server.Os}}|{{.Server.Arch}}"],
             PROCESS_TIMEOUT,
         )?;
-        if version.status.success()
-            && normalize_text(&version.stdout)
-                .trim()
-                .eq_ignore_ascii_case("linux|amd64")
-        {
+        if docker_reports_linux_amd64(version.status.success(), &version.stdout) {
             return Ok(());
         }
     }
@@ -2607,6 +2767,272 @@ fn validate_runtime_volume_identity(
     validate_present_runtime_volume_identity(tools, installation, installation_id, [true; 3])
 }
 
+fn active_runtime_volume_contract(
+    installation: &Installation,
+) -> Result<ActiveRuntimeVolumeContract, LauncherError> {
+    let generation = read_runtime_generation(&installation.runtime_generation)?;
+    let installation_id = read_installation_id(&installation.installation_id)?;
+    if !constant_time_ascii_equal(&generation.installation_id, &installation_id) {
+        return Err(LauncherError::new(
+            "RUNTIME_GENERATION_IDENTITY_MISMATCH",
+            "活动运行代际与本机 installation-id 不一致；无法认证现有 Compose 容器。",
+        ));
+    }
+    let names = RuntimeVolumeNames {
+        postgres: generation.volumes.postgres,
+        logs: generation.volumes.logs,
+        workspace: generation.volumes.workspace,
+    };
+    let unique_names = [
+        names.postgres.as_str(),
+        names.logs.as_str(),
+        names.workspace.as_str(),
+    ]
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if unique_names.len() != 3 {
+        return Err(LauncherError::new(
+            "RUNTIME_GENERATION_INVALID",
+            "活动运行代际引用了重复的运行数据卷名称。",
+        ));
+    }
+    Ok(ActiveRuntimeVolumeContract {
+        installation_id,
+        names,
+    })
+}
+
+fn validate_active_runtime_volume_contract(
+    tools: &Tools,
+    installation: &Installation,
+    contract: &ActiveRuntimeVolumeContract,
+) -> Result<(), LauncherError> {
+    if !is_secret_bytes(contract.installation_id.as_bytes()) {
+        return Err(LauncherError::new(
+            "INSTALLATION_ID_INVALID",
+            "installation-id 格式无效。",
+        ));
+    }
+    for (name, role) in [
+        (contract.names.postgres.as_str(), "postgres-data"),
+        (contract.names.logs.as_str(), "log-data"),
+        (contract.names.workspace.as_str(), "workspace-data"),
+    ] {
+        let output = docker(
+            tools,
+            installation,
+            &[
+                "volume",
+                "inspect",
+                "--format",
+                RUNTIME_VOLUME_INSPECT_FORMAT,
+                name,
+            ],
+            PROCESS_TIMEOUT,
+        )?;
+        if !output.status.success()
+            || validate_runtime_volume_inspection(
+                &output.stdout,
+                name,
+                &contract.installation_id,
+                role,
+            )
+            .is_err()
+        {
+            return Err(LauncherError::new(
+                "RUNTIME_VOLUME_IDENTITY_MISMATCH",
+                "活动运行代际的数据卷名称、local driver/options 或 installation-id/角色标签与本机身份不一致，已拒绝挂载。",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_volume_inspection(
+    output: &[u8],
+    expected_name: &str,
+    expected_installation_id: &str,
+    expected_role: &str,
+) -> Result<(), LauncherError> {
+    if output.len() > 16 * 1024 {
+        return Err(LauncherError::new(
+            "RUNTIME_VOLUME_IDENTITY_MISMATCH",
+            "运行数据卷 inspect 输出长度无效。",
+        ));
+    }
+    let output = std::str::from_utf8(output).map_err(|_| {
+        LauncherError::new(
+            "RUNTIME_VOLUME_IDENTITY_MISMATCH",
+            "运行数据卷 inspect 输出不是有效 UTF-8。",
+        )
+    })?;
+    if output.contains(['\r', '\0']) {
+        return Err(LauncherError::new(
+            "RUNTIME_VOLUME_IDENTITY_MISMATCH",
+            "运行数据卷 inspect 输出包含不允许的控制字符。",
+        ));
+    }
+    let output = output.strip_suffix('\n').unwrap_or(output);
+    if output.is_empty() || output.contains('\n') {
+        return Err(LauncherError::new(
+            "RUNTIME_VOLUME_IDENTITY_MISMATCH",
+            "运行数据卷 inspect 输出行数无效。",
+        ));
+    }
+    let fields = output.split('\t').collect::<Vec<_>>();
+    if fields.len() != 4 {
+        return Err(LauncherError::new(
+            "RUNTIME_VOLUME_IDENTITY_MISMATCH",
+            "运行数据卷 inspect 输出字段无效。",
+        ));
+    }
+    let name = serde_json::from_str::<String>(fields[0]).map_err(|_| {
+        LauncherError::new(
+            "RUNTIME_VOLUME_IDENTITY_MISMATCH",
+            "运行数据卷 inspect 名称无效。",
+        )
+    })?;
+    let driver = serde_json::from_str::<String>(fields[1]).map_err(|_| {
+        LauncherError::new(
+            "RUNTIME_VOLUME_IDENTITY_MISMATCH",
+            "运行数据卷 inspect driver 无效。",
+        )
+    })?;
+    let options =
+        serde_json::from_str::<Option<BTreeMap<String, String>>>(fields[2]).map_err(|_| {
+            LauncherError::new(
+                "RUNTIME_VOLUME_IDENTITY_MISMATCH",
+                "运行数据卷 inspect options 无效。",
+            )
+        })?;
+    let labels = serde_json::from_str::<BTreeMap<String, String>>(fields[3]).map_err(|_| {
+        LauncherError::new(
+            "RUNTIME_VOLUME_IDENTITY_MISMATCH",
+            "运行数据卷 inspect 标签无效。",
+        )
+    })?;
+    if name != expected_name
+        || driver != "local"
+        || options.is_some_and(|options| !options.is_empty())
+        || labels.get(VOLUME_IDENTITY_LABEL).map(String::as_str) != Some(expected_installation_id)
+        || labels.get(VOLUME_ROLE_LABEL).map(String::as_str) != Some(expected_role)
+    {
+        return Err(LauncherError::new(
+            "RUNTIME_VOLUME_IDENTITY_MISMATCH",
+            "运行数据卷不是当前本机 local-volume identity。",
+        ));
+    }
+    Ok(())
+}
+
+// Docker Desktop can place its VHD and named-volume filesystem on a disk unrelated to
+// `%LOCALAPPDATA%`. This runs only after the five release images are locally present and only
+// against the authenticated current generation. It mounts the product volumes read-only at fixed
+// paths and executes a release-locked worker image without network or secrets. Its named helper
+// identity gives the timeout/error path an immutable-ID cleanup target rather than trusting --rm.
+fn ensure_docker_storage_capacity(
+    tools: &Tools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+) -> Result<(), LauncherError> {
+    let volume_contract = active_runtime_volume_contract(installation)?;
+    validate_active_runtime_volume_contract(tools, installation, &volume_contract)?;
+    let helper = storage_probe_helper_container(&volume_contract);
+    let arguments =
+        docker_storage_probe_arguments(&volume_contract.names, &image_lock.worker, &helper)?;
+    run_named_container_with_cleanup(
+        tools,
+        installation,
+        &helper,
+        &arguments,
+        PROCESS_TIMEOUT,
+        |output| {
+            platform::ensure_docker_storage_capacity_probe(output.status.success(), &output.stdout)
+        },
+    )
+}
+
+fn storage_probe_helper_container(contract: &ActiveRuntimeVolumeContract) -> HelperContainer {
+    helper_container_identity(
+        DOCKER_STORAGE_PROBE_HELPER_ROLE,
+        &[
+            &contract.installation_id,
+            &contract.names.postgres,
+            &contract.names.logs,
+            &contract.names.workspace,
+        ],
+    )
+}
+
+fn docker_storage_probe_arguments(
+    volume_names: &RuntimeVolumeNames,
+    worker_image: &str,
+    helper: &HelperContainer,
+) -> Result<Vec<OsString>, LauncherError> {
+    let mut arguments = vec![
+        OsString::from("run"),
+        OsString::from("--rm"),
+        OsString::from("--pull=never"),
+        OsString::from("--name"),
+        OsString::from(&helper.name),
+        OsString::from("--label"),
+        OsString::from(format!("{HELPER_CONTAINER_ROLE_LABEL}={}", helper.role)),
+        OsString::from("--label"),
+        OsString::from(format!("{HELPER_CONTAINER_ID_LABEL}={}", helper.opaque_id)),
+        OsString::from("--network"),
+        OsString::from("none"),
+        OsString::from("--read-only"),
+        // PostgreSQL may make its volume root 0700 for its own UID. This probe gets only
+        // DAC_READ_SEARCH, not write or network capability, so its fixed statvfs script can
+        // traverse all three read-only mount roots without assuming shared ownership. On Linux
+        // that capability can also bypass ordinary file-read and directory-search checks, so it
+        // is not a confidentiality boundary: the exact digest, fixed script and no-network/no-
+        // secret contract are all part of the probe's trusted computing base.
+        OsString::from("--user"),
+        OsString::from("0:0"),
+        OsString::from("--cap-drop"),
+        OsString::from("ALL"),
+        OsString::from("--cap-add"),
+        OsString::from("DAC_READ_SEARCH"),
+        OsString::from("--security-opt"),
+        OsString::from("no-new-privileges:true"),
+        OsString::from("--pids-limit"),
+        OsString::from("16"),
+        OsString::from("--memory"),
+        OsString::from("64m"),
+        OsString::from("--cpus"),
+        OsString::from("0.25"),
+        OsString::from("--tmpfs"),
+        OsString::from("/tmp:rw,noexec,nosuid,size=4m"),
+    ];
+    for mount in platform::DOCKER_STORAGE_PROBE_MOUNTS {
+        let source = match mount.role {
+            "postgres-data" => &volume_names.postgres,
+            "log-data" => &volume_names.logs,
+            "workspace-data" => &volume_names.workspace,
+            _ => {
+                return Err(LauncherError::new(
+                    "DOCKER_STORAGE_PROBE_CONTRACT_INVALID",
+                    "Docker 数据卷容量探测的固定角色契约无效；Launcher 已安全阻断。",
+                ));
+            }
+        };
+        arguments.push(OsString::from("--mount"));
+        arguments.push(OsString::from(format!(
+            "type=volume,source={source},target={},readonly,volume-nocopy",
+            mount.target_path
+        )));
+    }
+    arguments.extend([
+        OsString::from("--entrypoint"),
+        OsString::from("python"),
+        OsString::from(worker_image),
+        OsString::from("-c"),
+        OsString::from(platform::DOCKER_STORAGE_PROBE_SCRIPT),
+    ]);
+    Ok(arguments)
+}
+
 fn validate_present_runtime_volume_identity(
     tools: &Tools,
     installation: &Installation,
@@ -2623,21 +3049,25 @@ fn validate_present_runtime_volume_identity(
         if !exists {
             continue;
         }
-        let format = format!(
-            "{{{{ index .Labels \"{VOLUME_IDENTITY_LABEL}\" }}}}|\
-             {{{{ index .Labels \"{VOLUME_ROLE_LABEL}\" }}}}"
-        );
         let output = docker(
             tools,
             installation,
-            &["volume", "inspect", "--format", &format, *name],
+            &[
+                "volume",
+                "inspect",
+                "--format",
+                RUNTIME_VOLUME_INSPECT_FORMAT,
+                *name,
+            ],
             PROCESS_TIMEOUT,
         )?;
-        let expected = format!("{installation_id}|{role}");
-        if !output.status.success() || normalize_text(&output.stdout).trim() != expected {
+        if !output.status.success()
+            || validate_runtime_volume_inspection(&output.stdout, name, installation_id, role)
+                .is_err()
+        {
             return Err(LauncherError::new(
                 "RUNTIME_VOLUME_IDENTITY_MISMATCH",
-                "运行数据卷的 installation-id/角色标签与本机安装身份不一致，已拒绝挂载。",
+                "运行数据卷的名称、local driver/options 或 installation-id/角色标签与本机安装身份不一致，已拒绝挂载。",
             ));
         }
     }
@@ -2735,38 +3165,47 @@ fn start(
     tools: &Tools,
     start_tools: &StartTools,
     installation: &Installation,
+    image_lock: &ImageLock,
 ) -> Result<bool, LauncherError> {
+    let inventory = inspect_compose_project_inventory(tools, installation, image_lock)?;
     let listeners = host_port_listeners(start_tools, installation)?;
     if listeners.iter().any(|address| address != "127.0.0.1") {
-        return Err(clean_up_unhealthy_start(
-            tools,
-            installation,
-            LauncherError::new(
-                "PUBLIC_LISTENER_REJECTED",
-                "检测到 0.0.0.0、::、::1 或其他非 127.0.0.1 的 17860 监听；已安全阻断。",
-            ),
+        return Err(LauncherError::new(
+            "PUBLIC_LISTENER_REJECTED",
+            "检测到 0.0.0.0、::、::1 或其他非 127.0.0.1 的 17860 监听；在未尝试启动前不会停止任何容器。",
         ));
     }
-    if !listeners.is_empty() && !compose_web_is_running(tools, installation)? {
+    if !listeners.is_empty() && !inventory.service_is_running("web") {
         return Err(LauncherError::new(
             "LOOPBACK_PORT_IN_USE",
             "127.0.0.1:17860 已被非本产品进程占用；Launcher 不会换端口或终止未知进程。",
         ));
     }
 
-    let up = match compose(
+    let up = match compose_owned(
         tools,
         installation,
-        &["up", "-d", "--remove-orphans"],
+        image_lock,
+        &[],
+        false,
+        &COMPOSE_UP_WITHOUT_PULL,
         COMPOSE_TIMEOUT,
     ) {
         Ok(output) => output,
-        Err(error) => return Err(clean_up_unhealthy_start(tools, installation, error)),
+        Err(error) => {
+            return Err(clean_up_unhealthy_start(
+                tools,
+                installation,
+                image_lock,
+                error,
+            ));
+        }
     };
     if !up.status.success() {
         return Err(clean_up_unhealthy_start(
             tools,
             installation,
+            image_lock,
             LauncherError::new(
                 "COMPOSE_START_FAILED",
                 "Docker Compose 启动失败。请检查 Docker Desktop 和签名发布镜像。",
@@ -2774,20 +3213,32 @@ fn start(
         ));
     }
     let start_safety_checks = (|| -> Result<(), LauncherError> {
-        let installation_id = read_installation_id(&installation.installation_id)?;
-        validate_runtime_volume_identity(tools, installation, &installation_id)?;
-        validate_actual_compose_ports(tools, start_tools, installation)?;
-        verify_shared_network_namespace(tools, installation)?;
+        let volume_contract = active_runtime_volume_contract(installation)?;
+        validate_active_runtime_volume_contract(tools, installation, &volume_contract)?;
+        validate_actual_compose_ports(tools, start_tools, installation, image_lock)?;
+        verify_shared_network_namespace(tools, installation, image_lock)?;
         wait_for_http(LIVE_PATH, LIVE_TIMEOUT, "API_LIVE_TIMEOUT")?;
-        verify_container_secret_targets(tools, installation)
+        verify_container_secret_targets(tools, installation, image_lock)
     })();
     if let Err(error) = start_safety_checks {
-        return Err(clean_up_unhealthy_start(tools, installation, error));
+        return Err(clean_up_unhealthy_start(
+            tools,
+            installation,
+            image_lock,
+            error,
+        ));
     }
 
-    let resume = match lifecycle(tools, installation, "resume") {
+    let resume = match lifecycle(tools, installation, image_lock, "resume") {
         Ok(value) => value,
-        Err(error) => return Err(clean_up_unhealthy_start(tools, installation, error)),
+        Err(error) => {
+            return Err(clean_up_unhealthy_start(
+                tools,
+                installation,
+                image_lock,
+                error,
+            ));
+        }
     };
     if !resume.safe_to_stop {
         return Err(LauncherError::new(
@@ -2799,9 +3250,14 @@ fn start(
         ));
     }
     if let Err(error) = wait_for_http(READY_PATH, READY_TIMEOUT, "SERVICE_NOT_READY") {
-        return Err(clean_up_unhealthy_start(tools, installation, error));
+        return Err(clean_up_unhealthy_start(
+            tools,
+            installation,
+            image_lock,
+            error,
+        ));
     }
-    if !ensure_bootstrap_admin(tools, installation)? {
+    if !ensure_bootstrap_admin(tools, installation, image_lock)? {
         return Ok(false);
     }
     platform::open_browser(UI_URL)?;
@@ -2811,24 +3267,34 @@ fn start(
 fn clean_up_unhealthy_start(
     tools: &Tools,
     installation: &Installation,
+    image_lock: &ImageLock,
     primary: LauncherError,
 ) -> LauncherError {
-    let cleanup = compose(
-        tools,
-        installation,
-        &["down", "--remove-orphans", "--timeout", "30"],
-        COMPOSE_TIMEOUT,
-    )
-    .and_then(|output| {
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(LauncherError::new(
-                "COMPOSE_START_CLEANUP_FAILED",
-                "启动后自动停止不健康的 Compose 服务失败；named volumes 未被删除。",
-            ))
-        }
-    });
+    let cleanup =
+        inspect_compose_project_inventory(tools, installation, image_lock).and_then(|inventory| {
+            if inventory.is_empty() {
+                return Ok(());
+            }
+            compose_owned(
+                tools,
+                installation,
+                image_lock,
+                &[],
+                false,
+                &["down", "--timeout", "30"],
+                COMPOSE_TIMEOUT,
+            )
+            .and_then(|output| {
+                if output.status.success() {
+                    Ok(())
+                } else {
+                    Err(LauncherError::new(
+                        "COMPOSE_START_CLEANUP_FAILED",
+                        "启动后自动停止不健康的 Compose 服务失败；named volumes 未被删除。",
+                    ))
+                }
+            })
+        });
     merge_unhealthy_start_cleanup_result(primary, cleanup)
 }
 
@@ -2838,6 +3304,15 @@ fn merge_unhealthy_start_cleanup_result(
 ) -> LauncherError {
     match cleanup {
         Ok(()) => primary,
+        Err(cleanup_error) if cleanup_error.code() == "COMPOSE_PROJECT_OWNERSHIP_UNVERIFIED" => {
+            LauncherError::new(
+                "COMPOSE_PROJECT_OWNERSHIP_UNVERIFIED",
+                format!(
+                    "启动后的安全核验失败（{}），且重新核验 Compose 容器归属失败；Launcher 未执行自动清理。",
+                    primary.code(),
+                ),
+            )
+        }
         Err(cleanup_error) => LauncherError::new(
             "STARTUP_CLEANUP_FAILED",
             format!(
@@ -2852,10 +3327,14 @@ fn merge_unhealthy_start_cleanup_result(
 fn verify_container_secret_targets(
     tools: &Tools,
     installation: &Installation,
+    image_lock: &ImageLock,
 ) -> Result<(), LauncherError> {
-    let api_output = compose(
+    let api_output = compose_owned(
         tools,
         installation,
+        image_lock,
+        &["api"],
+        true,
         &[
             "exec",
             "-T",
@@ -2866,9 +3345,12 @@ fn verify_container_secret_targets(
         ],
         PROCESS_TIMEOUT,
     )?;
-    let worker_output = compose(
+    let worker_output = compose_owned(
         tools,
         installation,
+        image_lock,
+        &["worker"],
+        true,
         &[
             "exec",
             "-T",
@@ -2879,9 +3361,12 @@ fn verify_container_secret_targets(
         ],
         PROCESS_TIMEOUT,
     )?;
-    let guard_output = compose(
+    let guard_output = compose_owned(
         tools,
         installation,
+        image_lock,
+        &["egress-guard"],
+        true,
         &[
             "exec",
             "-T",
@@ -2910,6 +3395,7 @@ fn verify_container_secret_targets(
 fn verify_shared_network_namespace(
     tools: &Tools,
     installation: &Installation,
+    image_lock: &ImageLock,
 ) -> Result<(), LauncherError> {
     let mut namespaces = BTreeSet::new();
     for (service, interpreter) in [
@@ -2917,9 +3403,12 @@ fn verify_shared_network_namespace(
         ("api", "python"),
         ("worker", "python"),
     ] {
-        let output = compose(
+        let output = compose_owned(
             tools,
             installation,
+            image_lock,
+            &[service],
+            true,
             &[
                 "exec",
                 "-T",
@@ -2963,8 +3452,9 @@ fn is_network_namespace_id(value: &str) -> bool {
 fn ensure_bootstrap_admin(
     tools: &Tools,
     installation: &Installation,
+    image_lock: &ImageLock,
 ) -> Result<bool, LauncherError> {
-    if bootstrap_status(tools, installation)? == BootstrapState::Complete {
+    if bootstrap_status(tools, installation, image_lock)? == BootstrapState::Complete {
         return Ok(true);
     }
 
@@ -2986,6 +3476,8 @@ fn ensure_bootstrap_admin(
         OsString::from(PRODUCT_NAME),
         OsString::from("--json"),
     ];
+    let inventory = inspect_compose_project_inventory(tools, installation, image_lock)?;
+    require_authenticated_compose_services(&inventory, &["api"], true)?;
     let mut output = compose_with_secret_stdin(
         tools,
         installation,
@@ -3002,7 +3494,7 @@ fn ensure_bootstrap_admin(
     })?;
     match interpret_bootstrap_create_response(output.status.code(), &parsed)? {
         BootstrapCreateState::Created => {
-            if bootstrap_status(tools, installation)? != BootstrapState::Complete {
+            if bootstrap_status(tools, installation, image_lock)? != BootstrapState::Complete {
                 return Err(LauncherError::new(
                     "BOOTSTRAP_POSTCHECK_FAILED",
                     "管理员 helper 报告创建成功，但只读复核未确认完成；浏览器未打开。",
@@ -3032,10 +3524,14 @@ fn ensure_bootstrap_admin(
 fn bootstrap_status(
     tools: &Tools,
     installation: &Installation,
+    image_lock: &ImageLock,
 ) -> Result<BootstrapState, LauncherError> {
-    let mut output = compose(
+    let mut output = compose_owned(
         tools,
         installation,
+        image_lock,
+        &["api"],
+        true,
         &[
             "exec",
             "-T",
@@ -3563,9 +4059,8 @@ fn create_system_backup(
         request.secrets_key,
     )?;
     verify_compose_config(tools, installation, image_lock)?;
-    if !compose_project_exists(tools, installation)?
-        || !compose_web_is_running(tools, installation)?
-    {
+    let inventory = inspect_compose_project_inventory(tools, installation, image_lock)?;
+    if !inventory.is_complete() || !inventory.service_is_running("web") {
         return Err(LauncherError::new(
             "BACKUP_RUNNING_SERVICE_REQUIRED",
             "系统备份必须从已正常运行的本机服务发起，以便先进入 draining 并证明没有活动任务。",
@@ -3573,17 +4068,17 @@ fn create_system_backup(
     }
     let staging = prepare_backup_staging(start_tools, installation, &prepared.current_user_sid)?;
 
-    let preflight = match lifecycle(tools, installation, "preflight-stop") {
+    let preflight = match lifecycle(tools, installation, image_lock, "preflight-stop") {
         Ok(value) => value,
         Err(error) => {
             let _ = cleanup_backup_staging(&staging);
-            let _ = lifecycle(tools, installation, "resume");
+            let _ = lifecycle(tools, installation, image_lock, "resume");
             return Err(error);
         }
     };
     if !preflight.safe_to_stop {
         let _ = cleanup_backup_staging(&staging);
-        let _ = lifecycle(tools, installation, "resume");
+        let _ = lifecycle(tools, installation, image_lock, "resume");
         return Err(LauncherError::new(
             "ACTIVE_ATTEMPTS_PRESENT",
             format!(
@@ -3606,6 +4101,7 @@ fn create_system_backup(
         tools,
         start_tools,
         installation,
+        image_lock,
         &prepared.installation_id,
     );
 
@@ -3950,9 +4446,12 @@ fn perform_system_backup(
     prepared: &PreparedBackup,
     staging: &BackupStaging,
 ) -> Result<(PathBuf, PathBuf), LauncherError> {
-    let stop_app = compose(
+    let stop_app = compose_owned(
         tools,
         installation,
+        image_lock,
+        &["web", "api", "worker", "egress-guard"],
+        true,
         &[
             "stop",
             "--timeout",
@@ -3970,8 +4469,8 @@ fn perform_system_backup(
             "无法停止全部应用写入组件；尚未生成数据库备份。",
         ));
     }
-    ensure_backup_migration_revision(tools, installation)?;
-    run_postgres_dump(tools, installation, &staging.postgres_dump)?;
+    ensure_backup_migration_revision(tools, installation, image_lock)?;
+    run_postgres_dump(tools, installation, image_lock, &staging.postgres_dump)?;
     platform::ensure_regular_file(&staging.postgres_dump)?;
     restrict_file_acl(
         start_tools,
@@ -3981,9 +4480,12 @@ fn perform_system_backup(
     )?;
     validate_postgres_dump_file(&staging.postgres_dump)?;
 
-    let stop_postgres = compose(
+    let stop_postgres = compose_owned(
         tools,
         installation,
+        image_lock,
+        &["postgres"],
+        true,
         &["stop", "--timeout", "30", "postgres"],
         COMPOSE_TIMEOUT,
     )?;
@@ -4030,10 +4532,14 @@ fn perform_system_backup(
 fn ensure_backup_migration_revision(
     tools: &Tools,
     installation: &Installation,
+    image_lock: &ImageLock,
 ) -> Result<(), LauncherError> {
-    let output = compose(
+    let output = compose_owned(
         tools,
         installation,
+        image_lock,
+        &["postgres"],
+        true,
         &[
             "exec",
             "-T",
@@ -4067,8 +4573,11 @@ fn ensure_backup_migration_revision(
 fn run_postgres_dump(
     tools: &Tools,
     installation: &Installation,
+    image_lock: &ImageLock,
     output: &Path,
 ) -> Result<(), LauncherError> {
+    let inventory = inspect_compose_project_inventory(tools, installation, image_lock)?;
+    require_authenticated_compose_services(&inventory, &["postgres"], true)?;
     let arguments = [
         "exec",
         "-T",
@@ -4303,6 +4812,7 @@ fn backup_container_arguments(
     let mut arguments = vec![
         OsString::from("run"),
         OsString::from("--rm"),
+        OsString::from("--pull=never"),
         OsString::from("--name"),
         OsString::from(&helper.name),
         OsString::from("--label"),
@@ -4371,6 +4881,34 @@ fn run_helper_with_cleanup<T>(
         secret_stdin,
     )
     .and_then(validate);
+    complete_helper_operation(tools, installation, helper, operation)
+}
+
+fn run_named_container_with_cleanup<T>(
+    tools: &Tools,
+    installation: &Installation,
+    helper: &HelperContainer,
+    arguments: &[OsString],
+    timeout: Duration,
+    validate: impl FnOnce(ProcessOutput) -> Result<T, LauncherError>,
+) -> Result<T, LauncherError> {
+    let operation = run_process(
+        &tools.docker,
+        arguments,
+        &tools.docker_environment(),
+        &installation.install_dir,
+        timeout,
+    )
+    .and_then(validate);
+    complete_helper_operation(tools, installation, helper, operation)
+}
+
+fn complete_helper_operation<T>(
+    tools: &Tools,
+    installation: &Installation,
+    helper: &HelperContainer,
+    operation: Result<T, LauncherError>,
+) -> Result<T, LauncherError> {
     match operation {
         Ok(value) => Ok(value),
         Err(primary) => Err(merge_helper_cleanup_result(
@@ -4686,12 +5224,16 @@ fn resume_services_after_system_backup(
     tools: &Tools,
     start_tools: &StartTools,
     installation: &Installation,
+    image_lock: &ImageLock,
     installation_id: &str,
 ) -> Result<(), LauncherError> {
-    let up = compose(
+    let up = compose_owned(
         tools,
         installation,
-        &["up", "-d", "--remove-orphans"],
+        image_lock,
+        &[],
+        false,
+        &COMPOSE_UP_WITHOUT_PULL,
         COMPOSE_TIMEOUT,
     )?;
     if !up.status.success() {
@@ -4700,12 +5242,19 @@ fn resume_services_after_system_backup(
             "备份后 Docker Compose 无法重新启动。",
         ));
     }
-    validate_runtime_volume_identity(tools, installation, installation_id)?;
-    validate_actual_compose_ports(tools, start_tools, installation)?;
-    verify_shared_network_namespace(tools, installation)?;
+    let volume_contract = active_runtime_volume_contract(installation)?;
+    if !constant_time_ascii_equal(&volume_contract.installation_id, installation_id) {
+        return Err(LauncherError::new(
+            "RUNTIME_GENERATION_IDENTITY_MISMATCH",
+            "备份开始与恢复之间活动运行代际的 installation-id 发生变化；未继续启动服务。",
+        ));
+    }
+    validate_active_runtime_volume_contract(tools, installation, &volume_contract)?;
+    validate_actual_compose_ports(tools, start_tools, installation, image_lock)?;
+    verify_shared_network_namespace(tools, installation, image_lock)?;
     wait_for_http(LIVE_PATH, LIVE_TIMEOUT, "BACKUP_RESUME_LIVE_TIMEOUT")?;
-    verify_container_secret_targets(tools, installation)?;
-    let resume = lifecycle(tools, installation, "resume")?;
+    verify_container_secret_targets(tools, installation, image_lock)?;
+    let resume = lifecycle(tools, installation, image_lock, "resume")?;
     if !resume.safe_to_stop {
         return Err(LauncherError::new(
             "BACKUP_RECONCILIATION_REQUIRED",
@@ -4715,8 +5264,13 @@ fn resume_services_after_system_backup(
     wait_for_http(READY_PATH, READY_TIMEOUT, "BACKUP_RESUME_READY_TIMEOUT")
 }
 
-fn stop(tools: &Tools, installation: &Installation, force: bool) -> Result<(), LauncherError> {
-    if !compose_project_exists(tools, installation)? {
+fn stop(
+    tools: &Tools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+    force: bool,
+) -> Result<(), LauncherError> {
+    if inspect_compose_project_inventory(tools, installation, image_lock)?.is_empty() {
         return Ok(());
     }
     if force {
@@ -4727,7 +5281,7 @@ fn stop(tools: &Tools, installation: &Installation, force: bool) -> Result<(), L
             ));
         }
     } else {
-        let preflight = lifecycle(tools, installation, "preflight-stop")?;
+        let preflight = lifecycle(tools, installation, image_lock, "preflight-stop")?;
         if !preflight.safe_to_stop {
             return Err(LauncherError::new(
                 "ACTIVE_ATTEMPTS_PRESENT",
@@ -4739,10 +5293,13 @@ fn stop(tools: &Tools, installation: &Installation, force: bool) -> Result<(), L
         }
     }
 
-    let down = compose(
+    let down = compose_owned(
         tools,
         installation,
-        &["down", "--remove-orphans", "--timeout", "30"],
+        image_lock,
+        &[],
+        false,
+        &["down", "--timeout", "30"],
         COMPOSE_TIMEOUT,
     )?;
     if !down.status.success() {
@@ -4754,10 +5311,36 @@ fn stop(tools: &Tools, installation: &Installation, force: bool) -> Result<(), L
     Ok(())
 }
 
-fn compose_project_exists(
+fn compose_project_ownership_unverified() -> LauncherError {
+    LauncherError::new(
+        "COMPOSE_PROJECT_OWNERSHIP_UNVERIFIED",
+        "无法证明现有 Compose 容器属于当前签名发布、固定镜像和当前 installation-id；Launcher 不会执行 up、exec、stop、down 或自动清理。",
+    )
+}
+
+fn inspect_compose_project_inventory(
     tools: &Tools,
     installation: &Installation,
-) -> Result<bool, LauncherError> {
+    image_lock: &ImageLock,
+) -> Result<ComposeProjectInventory, LauncherError> {
+    let ids = list_compose_project_container_ids(tools, installation)?;
+    if ids.is_empty() {
+        return Ok(ComposeProjectInventory::Empty);
+    }
+
+    let volume_contract = active_runtime_volume_contract(installation)
+        .map_err(|_| compose_project_ownership_unverified())?;
+    validate_active_runtime_volume_contract(tools, installation, &volume_contract)
+        .map_err(|_| compose_project_ownership_unverified())?;
+    let containers = inspect_compose_project_containers(tools, installation, &ids)?;
+    validate_compose_project_inventory(containers, image_lock, &volume_contract.names)
+}
+
+fn list_compose_project_container_ids(
+    tools: &Tools,
+    installation: &Installation,
+) -> Result<Vec<String>, LauncherError> {
+    let project_filter = format!("label={COMPOSE_PROJECT_LABEL}={COMPOSE_PROJECT}");
     let output = docker(
         tools,
         installation,
@@ -4765,43 +5348,246 @@ fn compose_project_exists(
             "ps",
             "--all",
             "--filter",
-            "label=com.docker.compose.project=datax-enterprise-studio",
+            &project_filter,
             "--format",
             "{{.ID}}",
         ],
         PROCESS_TIMEOUT,
-    )?;
+    )
+    .map_err(|_| compose_project_ownership_unverified())?;
     if !output.status.success() {
-        return Err(LauncherError::new(
-            "COMPOSE_PROJECT_CHECK_FAILED",
-            "无法核验本机 Compose project；未执行停止。",
-        ));
+        return Err(compose_project_ownership_unverified());
     }
-    let text = normalize_text(&output.stdout);
-    let ids: Vec<&str> = text
+    parse_compose_project_container_ids(&output.stdout)
+}
+
+fn parse_compose_project_container_ids(output: &[u8]) -> Result<Vec<String>, LauncherError> {
+    let mut ids = Vec::new();
+    let mut seen = BTreeSet::new();
+    let normalized = normalize_text(output);
+    for identifier in normalized
         .lines()
         .map(str::trim)
         .filter(|value| !value.is_empty())
-        .collect();
-    if ids.iter().any(|value| {
-        !(12..=64).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
-    }) {
-        return Err(LauncherError::new(
-            "COMPOSE_PROJECT_CHECK_FAILED",
-            "Compose project 返回了无效容器身份；未执行停止。",
-        ));
+    {
+        if !is_docker_container_identifier(identifier) || !seen.insert(identifier.to_owned()) {
+            return Err(compose_project_ownership_unverified());
+        }
+        ids.push(identifier.to_owned());
     }
-    Ok(!ids.is_empty())
+    Ok(ids)
+}
+
+fn inspect_compose_project_containers(
+    tools: &Tools,
+    installation: &Installation,
+    ids: &[String],
+) -> Result<Vec<InspectedComposeContainer>, LauncherError> {
+    let mut arguments = vec![
+        "inspect".to_owned(),
+        "--format".to_owned(),
+        COMPOSE_CONTAINER_INVENTORY_FORMAT.to_owned(),
+    ];
+    arguments.extend(ids.iter().cloned());
+    let argument_references = arguments.iter().map(String::as_str).collect::<Vec<_>>();
+    let output = docker(tools, installation, &argument_references, PROCESS_TIMEOUT)
+        .map_err(|_| compose_project_ownership_unverified())?;
+    if !output.status.success() {
+        return Err(compose_project_ownership_unverified());
+    }
+    parse_compose_project_container_inspections(&output.stdout, ids)
+}
+
+fn parse_compose_project_container_inspections(
+    output: &[u8],
+    expected_ids: &[String],
+) -> Result<Vec<InspectedComposeContainer>, LauncherError> {
+    let normalized = normalize_text(output);
+    let lines = normalized
+        .lines()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .collect::<Vec<_>>();
+    if lines.len() != expected_ids.len() {
+        return Err(compose_project_ownership_unverified());
+    }
+    let expected = expected_ids.iter().cloned().collect::<BTreeSet<_>>();
+    if expected.len() != expected_ids.len() {
+        return Err(compose_project_ownership_unverified());
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut containers = Vec::with_capacity(lines.len());
+    for line in lines {
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != 5 {
+            return Err(compose_project_ownership_unverified());
+        }
+        let id = serde_json::from_str::<String>(fields[0])
+            .map_err(|_| compose_project_ownership_unverified())?;
+        let image = serde_json::from_str::<String>(fields[1])
+            .map_err(|_| compose_project_ownership_unverified())?;
+        let labels = serde_json::from_str::<BTreeMap<String, String>>(fields[2])
+            .map_err(|_| compose_project_ownership_unverified())?;
+        let mounts = serde_json::from_str::<Vec<ComposeContainerMount>>(fields[3])
+            .map_err(|_| compose_project_ownership_unverified())?;
+        let running = serde_json::from_str::<bool>(fields[4])
+            .map_err(|_| compose_project_ownership_unverified())?;
+        if !is_docker_container_identifier(&id)
+            || !expected.contains(&id)
+            || !seen.insert(id.clone())
+        {
+            return Err(compose_project_ownership_unverified());
+        }
+        containers.push(InspectedComposeContainer {
+            id,
+            image,
+            labels,
+            mounts,
+            running,
+        });
+    }
+    Ok(containers)
+}
+
+fn validate_compose_project_inventory(
+    containers: Vec<InspectedComposeContainer>,
+    image_lock: &ImageLock,
+    volume_names: &RuntimeVolumeNames,
+) -> Result<ComposeProjectInventory, LauncherError> {
+    if containers.is_empty() {
+        return Ok(ComposeProjectInventory::Empty);
+    }
+
+    let mut services = BTreeMap::new();
+    let mut ids = BTreeSet::new();
+    for container in containers {
+        let service = container
+            .labels
+            .get(COMPOSE_SERVICE_LABEL)
+            .filter(|service| EXPECTED_SERVICES.contains(&service.as_str()))
+            .ok_or_else(compose_project_ownership_unverified)?;
+        if container
+            .labels
+            .get(COMPOSE_PROJECT_LABEL)
+            .map(String::as_str)
+            != Some(COMPOSE_PROJECT)
+            || image_lock.for_service(service) != Some(container.image.as_str())
+            || !runtime_volume_mounts_match(service, &container.mounts, volume_names)
+            || !ids.insert(container.id.clone())
+            || services.contains_key(service)
+        {
+            return Err(compose_project_ownership_unverified());
+        }
+        services.insert(
+            service.to_owned(),
+            AuthenticatedComposeContainer {
+                id: container.id,
+                running: container.running,
+            },
+        );
+    }
+    Ok(ComposeProjectInventory::Verified(services))
+}
+
+fn runtime_volume_mounts_match(
+    service: &str,
+    mounts: &[ComposeContainerMount],
+    volume_names: &RuntimeVolumeNames,
+) -> bool {
+    let mut actual = BTreeSet::new();
+    for mount in mounts.iter().filter(|mount| mount.kind == "volume") {
+        let Some(name) = mount.name.as_deref() else {
+            return false;
+        };
+        if !mount.read_write || !actual.insert((name.to_owned(), mount.destination.clone())) {
+            return false;
+        }
+    }
+    let expected = expected_runtime_volume_mounts(service, volume_names);
+    actual == expected
+}
+
+fn expected_runtime_volume_mounts(
+    service: &str,
+    volume_names: &RuntimeVolumeNames,
+) -> BTreeSet<(String, String)> {
+    match service {
+        "postgres" => BTreeSet::from([(
+            volume_names.postgres.clone(),
+            String::from("/var/lib/postgresql/data"),
+        )]),
+        "api" => BTreeSet::from([(
+            volume_names.logs.clone(),
+            String::from("/var/lib/datax-studio/logs"),
+        )]),
+        "worker" => BTreeSet::from([
+            (
+                volume_names.logs.clone(),
+                String::from("/var/lib/datax-studio/logs"),
+            ),
+            (
+                volume_names.workspace.clone(),
+                String::from("/var/lib/datax-studio/runs"),
+            ),
+        ]),
+        "migrate" | "egress-guard" | "web" => BTreeSet::new(),
+        _ => BTreeSet::from([(String::from("invalid"), String::from("invalid"))]),
+    }
+}
+
+fn is_docker_container_identifier(value: &str) -> bool {
+    (12..=64).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn require_authenticated_compose_services(
+    inventory: &ComposeProjectInventory,
+    required_services: &[&str],
+    require_complete: bool,
+) -> Result<(), LauncherError> {
+    if inventory.is_empty()
+        || required_services
+            .iter()
+            .any(|service| !inventory.has_service(service))
+        || (require_complete && !inventory.is_complete())
+    {
+        return Err(compose_project_ownership_unverified());
+    }
+    Ok(())
+}
+
+fn compose_owned(
+    tools: &Tools,
+    installation: &Installation,
+    image_lock: &ImageLock,
+    required_services: &[&str],
+    require_complete: bool,
+    arguments: &[&str],
+    timeout: Duration,
+) -> Result<ProcessOutput, LauncherError> {
+    let inventory = inspect_compose_project_inventory(tools, installation, image_lock)?;
+    if inventory.is_empty() && required_services.is_empty() && !require_complete {
+        return compose(tools, installation, arguments, timeout);
+    }
+    require_authenticated_compose_services(&inventory, required_services, require_complete)?;
+    compose(tools, installation, arguments, timeout)
 }
 
 fn lifecycle(
     tools: &Tools,
     installation: &Installation,
+    image_lock: &ImageLock,
     command: &str,
 ) -> Result<StopPreflight, LauncherError> {
-    let output = compose(
+    let output = compose_owned(
         tools,
         installation,
+        image_lock,
+        &["api"],
+        true,
         &[
             "exec",
             "-T",
@@ -4832,24 +5618,6 @@ fn lifecycle(
             "容器 lifecycle helper 执行失败或返回矛盾状态；已安全阻断。",
         )),
     }
-}
-
-fn compose_web_is_running(
-    tools: &Tools,
-    installation: &Installation,
-) -> Result<bool, LauncherError> {
-    let output = compose(
-        tools,
-        installation,
-        &["ps", "--status", "running", "--services"],
-        PROCESS_TIMEOUT,
-    )?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    Ok(normalize_text(&output.stdout)
-        .lines()
-        .any(|line| line.trim() == "web"))
 }
 
 fn docker(
@@ -5692,35 +6460,11 @@ fn validate_actual_compose_ports(
     tools: &Tools,
     start_tools: &StartTools,
     installation: &Installation,
+    image_lock: &ImageLock,
 ) -> Result<(), LauncherError> {
-    let ids = compose(
-        tools,
-        installation,
-        &["ps", "--all", "--quiet"],
-        PROCESS_TIMEOUT,
-    )?;
-    if !ids.status.success() {
-        return Err(LauncherError::new(
-            "ACTUAL_PORT_CHECK_FAILED",
-            "无法枚举固定 Compose 容器。",
-        ));
-    }
-    let ids_text = normalize_text(&ids.stdout);
-    let ids: Vec<&str> = ids_text
-        .lines()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .collect();
-    if ids.len() != EXPECTED_SERVICES.len()
-        || ids.iter().any(|value| {
-            !(12..=64).contains(&value.len()) || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
-        })
-    {
-        return Err(LauncherError::new(
-            "ACTUAL_CONTAINER_SET_REJECTED",
-            "实际 Compose 容器集合或容器 ID 无效。",
-        ));
-    }
+    let inventory = inspect_compose_project_inventory(tools, installation, image_lock)?;
+    require_authenticated_compose_services(&inventory, &[], true)?;
+    let ids = inventory.container_ids();
 
     let mut arguments = vec![
         OsString::from("inspect"),
@@ -5729,7 +6473,7 @@ fn validate_actual_compose_ports(
             r#"{{ index .Config.Labels "com.docker.compose.service" }}|{{json .NetworkSettings.Ports}}"#,
         ),
     ];
-    arguments.extend(ids.iter().map(OsString::from));
+    arguments.extend(ids.iter().map(|identifier| OsString::from(*identifier)));
     let docker_environment = tools.docker_environment();
     let inspected = run_process(
         &tools.docker,
@@ -6358,6 +7102,425 @@ fn independent_credential_kek_valid(
 mod tests {
     use super::*;
 
+    fn compose_inventory_test_image_lock() -> ImageLock {
+        let digest = "b".repeat(64);
+        ImageLock {
+            postgres: format!("postgres@sha256:{digest}"),
+            api: format!("ghcr.io/xiaoli2hust/datax-studio-api@sha256:{digest}"),
+            egress_guard: format!("ghcr.io/xiaoli2hust/datax-studio-egress-guard@sha256:{digest}"),
+            worker: format!("ghcr.io/xiaoli2hust/datax-studio-worker@sha256:{digest}"),
+            web: format!("ghcr.io/xiaoli2hust/datax-studio-web@sha256:{digest}"),
+        }
+    }
+
+    fn legacy_test_runtime_volume_names() -> RuntimeVolumeNames {
+        RuntimeVolumeNames {
+            postgres: String::from("des-postgres-data"),
+            logs: String::from("des-log-data"),
+            workspace: String::from("des-workspace-data"),
+        }
+    }
+
+    #[test]
+    fn release_image_availability_covers_each_locked_runtime_image_once() {
+        let lock = compose_inventory_test_image_lock();
+        let references = release_image_references(&lock);
+        assert_eq!(references.len(), 5);
+        assert_eq!(references.into_iter().collect::<BTreeSet<_>>().len(), 5);
+        assert!(references.iter().all(|image| image.contains("@sha256:")));
+        assert!(references.contains(&lock.worker.as_str()));
+    }
+
+    #[test]
+    fn compose_start_refuses_implicit_pull_after_image_and_capacity_admission() {
+        assert_eq!(COMPOSE_UP_WITHOUT_PULL, ["up", "--pull", "never", "-d"]);
+    }
+
+    fn compose_inventory_test_container(
+        service: &str,
+        identifier: char,
+        image_lock: &ImageLock,
+        volume_names: &RuntimeVolumeNames,
+    ) -> InspectedComposeContainer {
+        let expected = expected_runtime_volume_mounts(service, volume_names);
+        InspectedComposeContainer {
+            id: identifier.to_string().repeat(64),
+            image: image_lock.for_service(service).unwrap().to_owned(),
+            labels: BTreeMap::from([
+                (
+                    String::from(COMPOSE_PROJECT_LABEL),
+                    String::from(COMPOSE_PROJECT),
+                ),
+                (String::from(COMPOSE_SERVICE_LABEL), String::from(service)),
+            ]),
+            mounts: expected
+                .iter()
+                .map(|(name, destination)| ComposeContainerMount {
+                    kind: String::from("volume"),
+                    name: Some((*name).to_owned()),
+                    destination: (*destination).to_owned(),
+                    read_write: true,
+                })
+                .collect(),
+            running: true,
+        }
+    }
+
+    #[test]
+    fn compose_inventory_requires_exact_owned_service_set_images_and_runtime_mounts() {
+        let lock = compose_inventory_test_image_lock();
+        let volume_names = legacy_test_runtime_volume_names();
+        let identifiers = ['a', 'b', 'c', 'd', 'e', 'f'];
+        let containers = EXPECTED_SERVICES
+            .iter()
+            .zip(identifiers)
+            .map(|(service, identifier)| {
+                compose_inventory_test_container(service, identifier, &lock, &volume_names)
+            })
+            .collect();
+        let inventory =
+            validate_compose_project_inventory(containers, &lock, &volume_names).unwrap();
+        assert!(inventory.is_complete());
+        assert!(inventory.service_is_running("web"));
+        assert_eq!(inventory.container_ids().len(), EXPECTED_SERVICES.len());
+        assert!(
+            require_authenticated_compose_services(&inventory, &["api", "worker"], true).is_ok()
+        );
+
+        let mut unknown_service =
+            compose_inventory_test_container("api", 'a', &lock, &volume_names);
+        unknown_service.labels.insert(
+            String::from(COMPOSE_SERVICE_LABEL),
+            String::from("attacker"),
+        );
+        let mut duplicate_service =
+            compose_inventory_test_container("api", 'a', &lock, &volume_names);
+        let duplicate_service_second =
+            compose_inventory_test_container("api", 'b', &lock, &volume_names);
+        let mut wrong_image = compose_inventory_test_container("api", 'a', &lock, &volume_names);
+        wrong_image.image = lock.web.clone();
+        let mut wrong_mount = compose_inventory_test_container("worker", 'a', &lock, &volume_names);
+        wrong_mount.mounts.pop();
+        let mut wrong_project = compose_inventory_test_container("api", 'a', &lock, &volume_names);
+        wrong_project.labels.insert(
+            String::from(COMPOSE_PROJECT_LABEL),
+            String::from("other-project"),
+        );
+
+        for containers in [
+            vec![unknown_service],
+            vec![duplicate_service, duplicate_service_second],
+            vec![wrong_image],
+            vec![wrong_mount],
+            vec![wrong_project],
+        ] {
+            assert_eq!(
+                validate_compose_project_inventory(containers, &lock, &volume_names)
+                    .unwrap_err()
+                    .code(),
+                "COMPOSE_PROJECT_OWNERSHIP_UNVERIFIED"
+            );
+        }
+
+        duplicate_service = compose_inventory_test_container("api", 'a', &lock, &volume_names);
+        duplicate_service.mounts.push(ComposeContainerMount {
+            kind: String::from("volume"),
+            name: Some(String::from("unexpected")),
+            destination: String::from("/unexpected"),
+            read_write: true,
+        });
+        assert_eq!(
+            validate_compose_project_inventory(vec![duplicate_service], &lock, &volume_names)
+                .unwrap_err()
+                .code(),
+            "COMPOSE_PROJECT_OWNERSHIP_UNVERIFIED"
+        );
+    }
+
+    #[test]
+    fn compose_inventory_uses_the_active_generations_opaque_volume_names() {
+        let lock = compose_inventory_test_image_lock();
+        let generation_id = "c".repeat(32);
+        let active_names = RuntimeVolumeNames {
+            postgres: format!("des-postgres-{generation_id}"),
+            logs: format!("des-log-{generation_id}"),
+            workspace: format!("des-workspace-{generation_id}"),
+        };
+        let identifiers = ['a', 'b', 'c', 'd', 'e', 'f'];
+        let containers = EXPECTED_SERVICES
+            .iter()
+            .zip(identifiers)
+            .map(|(service, identifier)| {
+                compose_inventory_test_container(service, identifier, &lock, &active_names)
+            })
+            .collect();
+        assert!(
+            validate_compose_project_inventory(containers, &lock, &active_names)
+                .unwrap()
+                .is_complete()
+        );
+
+        let worker = compose_inventory_test_container("worker", 'a', &lock, &active_names);
+        assert!(runtime_volume_mounts_match(
+            "worker",
+            &worker.mounts,
+            &active_names,
+        ));
+        assert!(!runtime_volume_mounts_match(
+            "worker",
+            &worker.mounts,
+            &legacy_test_runtime_volume_names(),
+        ));
+    }
+
+    #[test]
+    fn docker_storage_probe_uses_fixed_hardening_and_active_generation_volumes() {
+        let generation_id = "d".repeat(32);
+        let active_names = RuntimeVolumeNames {
+            postgres: format!("des-postgres-{generation_id}"),
+            logs: format!("des-log-{generation_id}"),
+            workspace: format!("des-workspace-{generation_id}"),
+        };
+        let worker_image = format!(
+            "ghcr.io/xiaoli2hust/datax-studio-worker@sha256:{}",
+            "e".repeat(64)
+        );
+        let helper = helper_container_identity(
+            DOCKER_STORAGE_PROBE_HELPER_ROLE,
+            &[
+                "installation-id",
+                &active_names.postgres,
+                &active_names.logs,
+                &active_names.workspace,
+            ],
+        );
+        let arguments = docker_storage_probe_arguments(&active_names, &worker_image, &helper)
+            .unwrap()
+            .iter()
+            .map(|argument| argument.to_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+
+        assert_eq!(arguments.first().map(String::as_str), Some("run"));
+        for expected in [
+            ["--pull=never", "--name"],
+            ["--name", helper.name.as_str()],
+            ["--network", "none"],
+            ["--user", "0:0"],
+            ["--cap-drop", "ALL"],
+            ["--cap-add", "DAC_READ_SEARCH"],
+            ["--security-opt", "no-new-privileges:true"],
+            ["--pids-limit", "16"],
+            ["--memory", "64m"],
+            ["--cpus", "0.25"],
+            ["--tmpfs", "/tmp:rw,noexec,nosuid,size=4m"],
+            ["--entrypoint", "python"],
+        ] {
+            assert!(
+                arguments
+                    .windows(2)
+                    .any(|pair| pair[0] == expected[0] && pair[1] == expected[1])
+            );
+        }
+        assert!(arguments.iter().any(|argument| argument == "--rm"));
+        assert!(arguments.iter().any(|argument| argument == "--read-only"));
+        let capability_additions = arguments
+            .windows(2)
+            .filter_map(|pair| (pair[0] == "--cap-add").then_some(pair[1].as_str()))
+            .collect::<Vec<_>>();
+        let capability_drops = arguments
+            .windows(2)
+            .filter_map(|pair| (pair[0] == "--cap-drop").then_some(pair[1].as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(capability_additions, vec!["DAC_READ_SEARCH"]);
+        assert_eq!(capability_drops, vec!["ALL"]);
+        assert!(arguments.windows(2).any(|pair| {
+            pair[0] == "--label"
+                && pair[1] == format!("{HELPER_CONTAINER_ROLE_LABEL}={}", helper.role)
+        }));
+        assert!(arguments.windows(2).any(|pair| {
+            pair[0] == "--label"
+                && pair[1] == format!("{HELPER_CONTAINER_ID_LABEL}={}", helper.opaque_id)
+        }));
+        assert!(!arguments.iter().any(|argument| argument == "--privileged"));
+        for forbidden in [
+            "--env",
+            "--env-file",
+            "--secret",
+            "--volume",
+            "--device",
+            "--pid",
+            "--ipc",
+            "--uts",
+        ] {
+            assert!(
+                !arguments.iter().any(|argument| argument == forbidden),
+                "capacity probe must not receive {forbidden}",
+            );
+        }
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument == "--pull=missing")
+        );
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.contains("/run/secrets"))
+        );
+
+        let mounts = arguments
+            .windows(2)
+            .filter_map(|pair| (pair[0] == "--mount").then_some(pair[1].as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            mounts,
+            vec![
+                format!(
+                    "type=volume,source=des-postgres-{generation_id},target=/probe/postgres-data,readonly,volume-nocopy"
+                ),
+                format!(
+                    "type=volume,source=des-log-{generation_id},target=/probe/log-data,readonly,volume-nocopy"
+                ),
+                format!(
+                    "type=volume,source=des-workspace-{generation_id},target=/probe/workspace-data,readonly,volume-nocopy"
+                ),
+            ]
+        );
+        assert!(
+            !arguments
+                .iter()
+                .any(|argument| argument.contains("des-postgres-data"))
+        );
+        assert_eq!(arguments[arguments.len() - 3], worker_image);
+        assert_eq!(arguments[arguments.len() - 2], "-c");
+        assert_eq!(
+            arguments.last().map(String::as_str),
+            Some(platform::DOCKER_STORAGE_PROBE_SCRIPT)
+        );
+    }
+
+    #[test]
+    fn runtime_volume_inspection_requires_exact_local_identity_without_options() {
+        fn output(
+            name: &str,
+            driver: &str,
+            options: &str,
+            labels: BTreeMap<String, String>,
+        ) -> Vec<u8> {
+            format!(
+                "{}\t{}\t{options}\t{}\n",
+                serde_json::to_string(name).unwrap(),
+                serde_json::to_string(driver).unwrap(),
+                serde_json::to_string(&labels).unwrap(),
+            )
+            .into_bytes()
+        }
+
+        let labels = BTreeMap::from([
+            (
+                String::from(VOLUME_IDENTITY_LABEL),
+                String::from("a").repeat(64),
+            ),
+            (
+                String::from(VOLUME_ROLE_LABEL),
+                String::from("postgres-data"),
+            ),
+        ]);
+        let name = "des-postgres-data";
+        let installation_id = "a".repeat(64);
+        assert!(
+            validate_runtime_volume_inspection(
+                &output(name, "local", "null", labels.clone()),
+                name,
+                &installation_id,
+                "postgres-data",
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_runtime_volume_inspection(
+                &output(name, "local", "{}", labels.clone()),
+                name,
+                &installation_id,
+                "postgres-data",
+            )
+            .is_ok()
+        );
+
+        let mut wrong_labels = labels.clone();
+        wrong_labels.insert(String::from(VOLUME_ROLE_LABEL), String::from("log-data"));
+        for inspected in [
+            output("other", "local", "null", labels.clone()),
+            output(name, "nfs", "null", labels.clone()),
+            output(name, "local", r#"{"type":"nfs"}"#, labels.clone()),
+            output(name, "local", "null", wrong_labels),
+            b"not-json\n".to_vec(),
+        ] {
+            assert_eq!(
+                validate_runtime_volume_inspection(
+                    &inspected,
+                    name,
+                    &installation_id,
+                    "postgres-data",
+                )
+                .unwrap_err()
+                .code(),
+                "RUNTIME_VOLUME_IDENTITY_MISMATCH"
+            );
+        }
+    }
+
+    #[test]
+    fn compose_inventory_parsers_reject_ambiguous_or_malformed_docker_output() {
+        let first = "a".repeat(64);
+        let second = "b".repeat(64);
+        assert_eq!(
+            parse_compose_project_container_ids(format!("{first}\n{second}\n").as_bytes()).unwrap(),
+            vec![first.clone(), second.clone()]
+        );
+        for output in [
+            format!("{first}\n{first}\n"),
+            format!("{}\n", "A".repeat(64)),
+            String::from("not-a-container\n"),
+        ] {
+            assert_eq!(
+                parse_compose_project_container_ids(output.as_bytes())
+                    .unwrap_err()
+                    .code(),
+                "COMPOSE_PROJECT_OWNERSHIP_UNVERIFIED"
+            );
+        }
+
+        let lock = compose_inventory_test_image_lock();
+        let volume_names = legacy_test_runtime_volume_names();
+        let container = compose_inventory_test_container("api", 'a', &lock, &volume_names);
+        let encoded = format!(
+            "{}\t{}\t{}\t{}\t{}\n",
+            serde_json::to_string(&container.id).unwrap(),
+            serde_json::to_string(&container.image).unwrap(),
+            serde_json::to_string(&container.labels).unwrap(),
+            serde_json::to_string(&container.mounts).unwrap(),
+            serde_json::to_string(&container.running).unwrap(),
+        );
+        assert_eq!(
+            parse_compose_project_container_inspections(
+                encoded.as_bytes(),
+                std::slice::from_ref(&container.id),
+            )
+            .unwrap(),
+            vec![container.clone()]
+        );
+        assert_eq!(
+            parse_compose_project_container_inspections(
+                format!("{encoded}extra\n").as_bytes(),
+                &[container.id],
+            )
+            .unwrap_err()
+            .code(),
+            "COMPOSE_PROJECT_OWNERSHIP_UNVERIFIED"
+        );
+    }
+
     #[test]
     fn cli_defaults_to_start() {
         assert_eq!(parse_action(Vec::<OsString>::new()).unwrap(), Action::Start);
@@ -6463,6 +7626,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("--network\nnone"));
+        assert!(text.contains("--pull=never"));
         assert!(text.contains(&format!("--name\n{}", helper.name)));
         assert!(text.contains(&format!(
             "{HELPER_CONTAINER_ROLE_LABEL}={BACKUP_DATA_HELPER_ROLE}"
@@ -6619,6 +7783,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(text.contains("--network\nnone"));
+        assert!(text.contains("--pull=never"));
         assert!(text.contains(&format!("--name\n{}", helper.name)));
         assert_eq!(
             arguments.iter().filter(|value| *value == "--name").count(),
@@ -7180,6 +8345,34 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn wsl_status_and_local_docker_engine_gates_are_fail_closed_without_default_version() {
+        // A missing or `1` DefaultVersion must not be an input here: it only controls newly
+        // installed WSL distributions. The launcher separately verifies the live local engine.
+        assert!(require_wsl_status(true).is_ok());
+        assert_eq!(
+            require_wsl_status(false).unwrap_err().code(),
+            "WSL2_REQUIRED"
+        );
+
+        assert!(docker_reports_linux_amd64(true, b"linux|amd64\r\n"));
+        assert!(!docker_reports_linux_amd64(true, b"linux|arm64\n"));
+        assert!(!docker_reports_linux_amd64(false, b"linux|amd64\n"));
+
+        assert!(docker_reports_desktop_linux(
+            true,
+            b"Docker Desktop|linux|x86_64\r\n"
+        ));
+        assert!(!docker_reports_desktop_linux(
+            true,
+            b"Docker Desktop|windows|amd64\n"
+        ));
+        assert!(!docker_reports_desktop_linux(
+            false,
+            b"Docker Desktop|linux|x86_64\n"
+        ));
     }
 
     #[test]

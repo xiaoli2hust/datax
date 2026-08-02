@@ -82,7 +82,7 @@ def _readiness_engine(
             text(
                 """
                 INSERT INTO alembic_version (version_num)
-                VALUES ('20260802_0017')
+                VALUES ('20260802_0018')
                 """
             )
         )

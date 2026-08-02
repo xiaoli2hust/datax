@@ -1,6 +1,133 @@
 use crate::{BootstrapInput, LauncherError};
 use std::path::{Path, PathBuf};
 
+// `%LOCALAPPDATA%` stores Launcher-owned configuration, secrets and local backup metadata, but
+// Docker Desktop may keep its VHD and named volumes on a different disk.  Keep the two storage
+// admission facts separate: the host check below protects Launcher-owned files; this probe
+// contract is for the actual Docker-managed volume filesystem.
+pub const MIN_DOCKER_STORAGE_FREE_BYTES: u64 = 200 * 1024 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DockerStorageProbeMount {
+    pub role: &'static str,
+    pub target_path: &'static str,
+}
+
+// These are fixed product volume *roles* and fixed, non-secret container paths.  The current
+// RuntimeGeneration maps each role to an authenticated concrete Docker volume name; neither the
+// probe protocol nor its parser accepts a name supplied by Docker output.
+pub const DOCKER_STORAGE_PROBE_MOUNTS: [DockerStorageProbeMount; 3] = [
+    DockerStorageProbeMount {
+        role: "postgres-data",
+        target_path: "/probe/postgres-data",
+    },
+    DockerStorageProbeMount {
+        role: "log-data",
+        target_path: "/probe/log-data",
+    },
+    DockerStorageProbeMount {
+        role: "workspace-data",
+        target_path: "/probe/workspace-data",
+    },
+];
+
+// This is passed as a fixed `python -c` argument to a release-locked worker image.  It performs
+// only statvfs on read-only mounts and emits no host path, filesystem name, or Docker metadata.
+// The line protocol is deliberately simpler than JSON so a hostile/garbled daemon response cannot
+// hide duplicate keys or unknown fields behind permissive object parsing.
+pub const DOCKER_STORAGE_PROBE_SCRIPT: &str = concat!(
+    "import os\n",
+    "print('schema_version=1.0')\n",
+    "for name, path in (",
+    "('postgres-data', '/probe/postgres-data'),",
+    "('log-data', '/probe/log-data'),",
+    "('workspace-data', '/probe/workspace-data')):\n",
+    "    stat = os.statvfs(path)\n",
+    "    print(name + '=' + str(stat.f_bavail * stat.f_frsize))\n",
+);
+
+/// Validates the fixed Docker volume-capacity probe.  A caller must invoke the probe using the
+/// Launcher-controlled local Docker pipe and must not continue to a destructive product action
+/// when this returns an error.
+pub fn ensure_docker_storage_capacity_probe(
+    process_succeeded: bool,
+    stdout: &[u8],
+) -> Result<(), LauncherError> {
+    if !process_succeeded {
+        return Err(LauncherError::new(
+            "DOCKER_STORAGE_PROBE_FAILED",
+            "无法完成 Docker 受控数据卷容量探测；Launcher 不会把本机安装目录空间当作 Docker 数据盘容量。",
+        ));
+    }
+    if stdout.len() > 4096 {
+        return Err(LauncherError::new(
+            "DOCKER_STORAGE_PROBE_INVALID",
+            "Docker 受控数据卷容量探测输出无效；Launcher 已安全阻断。",
+        ));
+    }
+    let output = std::str::from_utf8(stdout).map_err(|_| {
+        LauncherError::new(
+            "DOCKER_STORAGE_PROBE_INVALID",
+            "Docker 受控数据卷容量探测输出不是有效 UTF-8；Launcher 已安全阻断。",
+        )
+    })?;
+    if output
+        .as_bytes()
+        .iter()
+        .any(|byte| *byte == b'\r' || *byte == 0)
+    {
+        return Err(LauncherError::new(
+            "DOCKER_STORAGE_PROBE_INVALID",
+            "Docker 受控数据卷容量探测输出包含不允许的控制字符；Launcher 已安全阻断。",
+        ));
+    }
+
+    let mut lines: Vec<&str> = output.split('\n').collect();
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    if lines.len() != DOCKER_STORAGE_PROBE_MOUNTS.len() + 1
+        || lines.first() != Some(&"schema_version=1.0")
+    {
+        return Err(LauncherError::new(
+            "DOCKER_STORAGE_PROBE_INVALID",
+            "Docker 受控数据卷容量探测格式不符合固定契约；Launcher 已安全阻断。",
+        ));
+    }
+
+    for (line, mount) in lines[1..].iter().zip(DOCKER_STORAGE_PROBE_MOUNTS) {
+        let expected_prefix = format!("{}=", mount.role);
+        let value = line.strip_prefix(&expected_prefix).ok_or_else(|| {
+            LauncherError::new(
+                "DOCKER_STORAGE_PROBE_INVALID",
+                "Docker 受控数据卷容量探测包含未知、重复或乱序条目；Launcher 已安全阻断。",
+            )
+        })?;
+        if value.is_empty()
+            || !value.bytes().all(|byte| byte.is_ascii_digit())
+            || (value.len() > 1 && value.starts_with('0'))
+        {
+            return Err(LauncherError::new(
+                "DOCKER_STORAGE_PROBE_INVALID",
+                "Docker 受控数据卷容量探测数值无效；Launcher 已安全阻断。",
+            ));
+        }
+        let free_bytes = value.parse::<u64>().map_err(|_| {
+            LauncherError::new(
+                "DOCKER_STORAGE_PROBE_INVALID",
+                "Docker 受控数据卷容量探测数值超出支持范围；Launcher 已安全阻断。",
+            )
+        })?;
+        if free_bytes < MIN_DOCKER_STORAGE_FREE_BYTES {
+            return Err(LauncherError::new(
+                "DOCKER_STORAGE_CAPACITY_INSUFFICIENT",
+                "Docker 实际数据卷可用空间低于 200 GiB 容量基线；未启动 Compose 或业务数据库写入，受控初始化或镜像缓存可能已保留。",
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "windows")]
 mod imp {
     use super::{BootstrapInput, LauncherError, Path, PathBuf};
@@ -88,7 +215,7 @@ mod imp {
     const PKCS_7_ASN_ENCODING: u32 = 0x0001_0000;
     const MIN_TOTAL_MEMORY_BYTES: u64 = 16 * 1024 * 1024 * 1024;
     const MIN_AVAILABLE_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
-    const MIN_FREE_DISK_BYTES: u64 = 40 * 1024 * 1024 * 1024;
+    const MIN_LOCAL_APP_DATA_FREE_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 
     type Handle = *mut c_void;
 
@@ -564,11 +691,11 @@ mod imp {
         let mut free = 0_u64;
         // SAFETY: path is NUL terminated and output pointers are valid.
         if unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut available, &mut total, &mut free) } == 0
-            || available < MIN_FREE_DISK_BYTES
+            || available < MIN_LOCAL_APP_DATA_FREE_BYTES
         {
             return Err(LauncherError::new(
                 "HOST_DISK_INSUFFICIENT",
-                "产品数据所在本地卷需要至少 40 GiB 当前可用空间。",
+                "Launcher 配置/本地备份所在卷需要至少 40 GiB 当前可用空间；Docker 数据卷容量另行受控核验。",
             ));
         }
         Ok(())
@@ -2077,3 +2204,86 @@ mod imp {
 }
 
 pub use imp::*;
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        DOCKER_STORAGE_PROBE_MOUNTS, DOCKER_STORAGE_PROBE_SCRIPT, MIN_DOCKER_STORAGE_FREE_BYTES,
+        ensure_docker_storage_capacity_probe,
+    };
+
+    fn probe_output(free_bytes: u64) -> Vec<u8> {
+        let mut output = String::from("schema_version=1.0\n");
+        for mount in DOCKER_STORAGE_PROBE_MOUNTS {
+            output.push_str(mount.role);
+            output.push('=');
+            output.push_str(&free_bytes.to_string());
+            output.push('\n');
+        }
+        output.into_bytes()
+    }
+
+    #[test]
+    fn docker_storage_capacity_probe_accepts_exact_fixed_schema_and_boundary() {
+        assert!(
+            ensure_docker_storage_capacity_probe(
+                true,
+                &probe_output(MIN_DOCKER_STORAGE_FREE_BYTES),
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn docker_storage_capacity_probe_fails_closed_for_process_or_capacity_failure() {
+        let valid = probe_output(MIN_DOCKER_STORAGE_FREE_BYTES);
+        assert_eq!(
+            ensure_docker_storage_capacity_probe(false, &valid)
+                .unwrap_err()
+                .code(),
+            "DOCKER_STORAGE_PROBE_FAILED"
+        );
+        assert_eq!(
+            ensure_docker_storage_capacity_probe(
+                true,
+                &probe_output(MIN_DOCKER_STORAGE_FREE_BYTES - 1),
+            )
+            .unwrap_err()
+            .code(),
+            "DOCKER_STORAGE_CAPACITY_INSUFFICIENT"
+        );
+    }
+
+    #[test]
+    fn docker_storage_capacity_probe_rejects_untrusted_or_ambiguous_output() {
+        let cases: Vec<Vec<u8>> = vec![
+            b"schema_version=1.0\r\npostgres-data=214748364800\r\nlog-data=214748364800\r\nworkspace-data=214748364800\r\n".to_vec(),
+            b"schema_version=1.0\nlog-data=214748364800\npostgres-data=214748364800\nworkspace-data=214748364800\n".to_vec(),
+            b"schema_version=1.0\npostgres-data=0214748364800\nlog-data=214748364800\nworkspace-data=214748364800\n".to_vec(),
+            b"schema_version=1.0\npostgres-data=18446744073709551616\nlog-data=214748364800\nworkspace-data=214748364800\n".to_vec(),
+            b"schema_version=1.0\npostgres-data=214748364800\nlog-data=214748364800\nworkspace-data=214748364800\nunknown=214748364800\n".to_vec(),
+            vec![0xff],
+            vec![b'x'; 4097],
+        ];
+        for output in cases {
+            assert_eq!(
+                ensure_docker_storage_capacity_probe(true, &output)
+                    .unwrap_err()
+                    .code(),
+                "DOCKER_STORAGE_PROBE_INVALID"
+            );
+        }
+    }
+
+    #[test]
+    fn docker_storage_probe_script_uses_only_fixed_non_host_paths() {
+        for mount in DOCKER_STORAGE_PROBE_MOUNTS {
+            assert!(DOCKER_STORAGE_PROBE_SCRIPT.contains(mount.target_path));
+            assert!(DOCKER_STORAGE_PROBE_SCRIPT.contains(mount.role));
+        }
+        assert!(DOCKER_STORAGE_PROBE_SCRIPT.contains("os.statvfs"));
+        assert!(!DOCKER_STORAGE_PROBE_SCRIPT.contains("subprocess"));
+        assert!(!DOCKER_STORAGE_PROBE_SCRIPT.contains("/var/lib/docker"));
+        assert!(!DOCKER_STORAGE_PROBE_SCRIPT.contains("C:\\\\"));
+    }
+}

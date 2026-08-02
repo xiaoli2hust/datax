@@ -143,6 +143,19 @@ class WindowsHostedPreflightTests(unittest.TestCase):
         )
         self.assertNotIn("uvloop", "\n".join(non_comment_lines).lower())
 
+    def test_trigger_paths_cover_both_static_boundary_test_suites(self) -> None:
+        for event in ("pull_request", "push"):
+            with self.subTest(event=event):
+                paths = self.workflow["on"][event]["paths"]
+                self.assertIn(
+                    "scripts/acceptance/test_windows_hosted_preflight.py",
+                    paths,
+                )
+                self.assertIn(
+                    "scripts/acceptance/test_windows_installer_source.py",
+                    paths,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

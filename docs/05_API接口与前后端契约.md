@@ -115,6 +115,24 @@ Content-Type: application/json
 审计。loopback 不是加密通道，V1 的安全边界是假定 Windows 登录会话与本机进程可信；
 同机恶意进程仍是明确剩余风险，不能把 `127.0.0.1` 描述成 TLS。
 
+### 3.4 登录入口准入
+
+在路由、依赖、懒加载的 `AuthService`、数据库会话、组织锁、Argon2id 和 `AuditEvent`
+之前，`POST /auth/login` 必须先通过单一 API 进程内的全局、账号无关准入。V1 固定一个
+API 容器和一个 Uvicorn 进程；默认控制为 burst `5`、每分钟 `5` 个令牌和一个非阻塞验证
+并发槽。它不以邮箱、密码、IP、User-Agent 或浏览器身份分桶，也不保存这些值。Host/Origin
+先被拒绝的请求不消耗该配额。
+
+未获准的请求固定返回 `429 AUTH_LOGIN_ADMISSION_LIMITED`、`Retry-After: 60`、
+`application/problem+json`、`X-Request-Id` 与 `Cache-Control: no-store`。这是尚未进入
+认证决策的入站拒绝，而不是 `AUTH_INVALID_CREDENTIALS`：不得创建 session、验密码、修改
+失败计数或锁定状态、写 `AuditEvent`、设置 Cookie 或 `WWW-Authenticate`。`retryable=true`
+只表示用户可在等待后重新输入密码并手动提交；前端不得自动重放登录或保留密码。获准后实际
+执行的登录成功/失败仍按既有会话与审计规则处理。
+
+该进程内控制仅适用于 V1 的单 API 部署，不能用 Uvicorn workers、Compose scale、额外 API
+容器或旁路入口扩大部署；多进程/HA 需要新的 Accepted ADR、共享准入与重放租约设计。
+
 ## 4. RBAC
 
 一个用户可拥有多个角色，权限取并集。组织级 Admin 可访问组织内全部项目；其他角色必须在项目作用域内授予。
@@ -231,6 +249,7 @@ GET 单个 Project、Datasource、SyncJob 时返回 `ETag: W/"<row_version>"`。
 | 400 | `CURSOR_INVALID` | cursor 无效或条件不一致 |
 | 400 | `IDEMPOTENCY_KEY_INVALID` | key 格式错误 |
 | 401 | `AUTH_INVALID_CREDENTIALS` | 登录失败，不区分账号是否存在 |
+| 429 | `AUTH_LOGIN_ADMISSION_LIMITED` | 尚未进入认证决策的全局登录入口准入拒绝；固定 `Retry-After: 60`，不创建 session、不验密码、不改失败计数、不写审计，且不设置 Cookie 或 `WWW-Authenticate`；只允许人工等待后重新输入密码提交，不能自动重放 |
 | 401 | `AUTH_TOKEN_EXPIRED` | access token 到期 |
 | 403 | `PASSWORD_CHANGE_REQUIRED` | 当前账号必须先修改临时密码 |
 | 403 | `FORBIDDEN` | 已认证但无操作权限 |
@@ -268,7 +287,7 @@ GET 单个 Project、Datasource、SyncJob 时返回 `ETag: W/"<row_version>"`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/auth/login` | 登录并创建 refresh session |
+| POST | `/auth/login` | 先经账号无关入口准入；获准后登录并创建 refresh session |
 | POST | `/auth/refresh` | 旋转 refresh token |
 | POST | `/auth/logout` | 幂等撤销 bearer/refresh 能精确证明的 session；凭证缺失、无效、过期或已撤销仍返回 204 并清 Cookie |
 | GET | `/auth/me` | 当前用户、可见项目与角色 |
@@ -289,7 +308,8 @@ GET 单个 Project、Datasource、SyncJob 时返回 `ETag: W/"<row_version>"`。
 Admin 创建或重置密码时，临时密码只在本机同源 loopback HTTP 请求体中出现，响应不生成
 或回显密码。V1 不宣称远程 TLS 服务；若未来开放远程入口，必须先以 ADR 和威胁模型引入
 HTTPS。本人改密成功后保留当前 session、撤销其他 session；Admin 重置或停用用户时撤销
-全部 session。所有成功、失败和拒绝结果均写审计。
+全部 session。除尚未进入认证决策的 `AUTH_LOGIN_ADMISSION_LIMITED` 外，成功、失败和
+已进入业务/权限判断的拒绝结果均写审计。
 
 ### 8.3 Project
 
@@ -905,6 +925,20 @@ DSN、密码、容器环境变量、Docker secret 路径或堆栈。管理平面
 `503/DOWN`；管理平面可用但执行能力被阻断返回 `200/DEGRADED`，此时 launcher 可打开
 浏览器用于配置和诊断，但页面与执行 API 必须明确阻断新任务，不能显示“任务可运行”。
 容器仅为 running 或 live=200 不能替代 readiness。
+
+`audit_chain` 组件以与审计事件同事务推进的持久水位线表达已知 head、已验证 head、最近
+完整重放和失败状态。正常 `/health/ready` 只读取组织、水位线和每组织索引尾部，不读取
+整条审计事件内容或逐请求全量重算。只有水位线 `PASSED`、已验证 head 与真实尾部一致且
+完整重放仍新鲜时才报告该组件 `UP`；空审计库是显式 bootstrap 例外。缺失或孤立水位线、
+尾部漂移、过期/PENDING/FAILED 证明、篡改、超时或 CAS 竞争一律失败关闭。
+
+当完整证明过期或尚未建立时，单一 API 进程至多每 60 秒发起一次、最长 30 秒的有界完整
+重放；在新事件附加且完整证明仍新鲜时可只重放未验证后缀。失败或 timeout 的完整重放仍
+占用该 60 秒 cadence，窗口内返回 `AUDIT_CHAIN_FULL_REPLAY_THROTTLED/DOWN`。重放中的并发调用不会排队等待，
+而返回 `DOWN`（例如 `AUDIT_CHAIN_VERIFICATION_IN_PROGRESS` 或
+`READINESS_CHECK_IN_PROGRESS`）；完整 Health 响应最多缓存 1 秒。这些是 V1 单 API 进程
+的本机控制，不证明持续检测、数据库管理员无法篡改，亦不构成真实 DataX E3 或 Windows E4
+验收。数据库外 WORM/签名锚点仍是独立发布门禁。
 
 launcher 的“停止服务”不通过新增远程 HTTP 端点实现。它只能调用安装包内固定、签名且
 参数不可由用户扩展的 Compose/容器 lifecycle helper：先让 Worker 停止新领取，等待活动
