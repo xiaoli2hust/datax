@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$')]
+    [ValidatePattern('^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-[a-f0-9]{12}$')]
     [string]$ReleaseCandidate,
     [Parameter(Mandatory = $true)]
     [ValidatePattern('^[a-f0-9]{40}$')]
@@ -31,6 +31,14 @@ param(
 
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
+
+$expectedCandidateSuffix = "-$($CommitSha.Substring(0, 12))"
+if (-not $ReleaseCandidate.EndsWith(
+    $expectedCandidateSuffix,
+    [StringComparison]::Ordinal
+)) {
+    throw "ReleaseCandidate must bind the exact CommitSha prefix."
+}
 
 # This script is deliberately a local, read-mostly preflight.  It never runs
 # Setup, Docker Compose, DataX, a browser, or a database test; it never enables

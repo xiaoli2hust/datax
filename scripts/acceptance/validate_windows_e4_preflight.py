@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -34,6 +35,10 @@ EXPECTED_CHECK_IDS = frozenset(
         "CANDIDATE_SIGNATURES",
         "PRODUCT_STATE_ABSENT",
     }
+)
+_COMMIT_SHA = re.compile(r"^[a-f0-9]{40}$")
+_RELEASE_CANDIDATE = re.compile(
+    r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-([a-f0-9]{12})$"
 )
 
 
@@ -129,6 +134,20 @@ def _observed_check_results(document: dict[str, Any]) -> dict[str, bool]:
     }
 
 
+def _validate_candidate_identity(document: dict[str, Any]) -> None:
+    """Require the local E4 observation to name the exact candidate commit."""
+
+    candidate = document["release_candidate"]
+    commit_sha = document["commit_sha"]
+    candidate_match = _RELEASE_CANDIDATE.fullmatch(candidate)
+    if _COMMIT_SHA.fullmatch(commit_sha) is None or candidate_match is None:
+        raise ValueError("Windows E4 preflight candidate identity is malformed")
+    if candidate_match.group(4) != commit_sha[:12]:
+        raise ValueError(
+            "Windows E4 preflight release_candidate does not bind the commit prefix"
+        )
+
+
 def validate_windows_e4_preflight(
     *, document: dict[str, Any], schema: dict[str, Any]
 ) -> dict[str, Any]:
@@ -143,6 +162,7 @@ def validate_windows_e4_preflight(
     if set(check_ids) != EXPECTED_CHECK_IDS:
         raise ValueError("Windows E4 preflight check IDs do not match the v1 roster")
 
+    _validate_candidate_identity(document)
     observed = _observed_check_results(document)
     actual = {check["check_id"]: check["result"] for check in checks}
     for check_id, passed in observed.items():

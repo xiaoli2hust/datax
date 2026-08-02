@@ -42,7 +42,7 @@ def ready_document() -> dict[str, object]:
         "e4_result": "NOT_RUN",
         "release_approved": False,
         "captured_at": "2026-08-02T00:00:00Z",
-        "release_candidate": "0.1.0-a1b2c3d4e5f6",
+        "release_candidate": "0.1.0-dddddddddddd",
         "commit_sha": "d" * 40,
         "harness_version": "windows-e4-preflight/v1",
         "baseline": {
@@ -182,6 +182,24 @@ class ValidateWindowsE4PreflightTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "VIRTUALIZATION"):
             validate_windows_e4_preflight(document=document, schema=self.schema)
 
+    def test_rejects_release_candidate_for_a_different_commit(self) -> None:
+        document = ready_document()
+        document["release_candidate"] = "0.1.0-a1b2c3d4e5f6"
+
+        with self.assertRaisesRegex(ValueError, "does not bind the commit prefix"):
+            validate_windows_e4_preflight(document=document, schema=self.schema)
+
+    def test_validator_keeps_candidate_binding_if_schema_is_accidentally_relaxed(
+        self,
+    ) -> None:
+        document = ready_document()
+        document["release_candidate"] = "unbound-candidate"
+        relaxed_schema = copy.deepcopy(self.schema)
+        relaxed_schema["properties"]["release_candidate"] = {"type": "string"}
+
+        with self.assertRaisesRegex(ValueError, "candidate identity is malformed"):
+            validate_windows_e4_preflight(document=document, schema=relaxed_schema)
+
     def test_rejects_e4_result_other_than_not_run(self) -> None:
         document = ready_document()
         document["e4_result"] = "PASSED"
@@ -231,6 +249,7 @@ class ValidateWindowsE4PreflightTests(unittest.TestCase):
         self.assertEqual(
             properties["harness_version"], {"const": "windows-e4-preflight/v1"}
         )
+        self.assertIn("commit_sha", properties["release_candidate"]["description"])
         self.assertFalse(self.schema["additionalProperties"])
         ready_docker = self.schema["allOf"][0]["then"]["properties"]["docker"][
             "properties"
@@ -268,6 +287,7 @@ class ValidateWindowsE4PreflightTests(unittest.TestCase):
         self.assertIn('"version", "--format", "{{.server.os}}|{{.server.arch}}"', executable_lines)
         self.assertIn('"volume", "ls", "--quiet", "--filter",', executable_lines)
         self.assertIn('-id "wsl2_status"', executable_lines)
+        self.assertIn("releasecandidate must bind the exact commitsha prefix", executable_lines)
         self.assertNotIn("wsl_default_version -eq 2", executable_lines)
 
         for forbidden in (

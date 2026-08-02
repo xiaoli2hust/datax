@@ -74,7 +74,8 @@
 - `windows-e4-preflight.v1.schema.json`：未来受保护 Windows E4 harness 的本机前置观察
   记录；对应 `scripts/acceptance/windows_e4_preflight.ps1` 和
   `validate_windows_e4_preflight.py` 只能检查 Windows/WSL2/Docker、候选哈希/签名与
-  固定产品残留，并固定 `e4_result=NOT_RUN`、`release_approved=false`。当前仓库只对该
+  固定产品残留，并要求 `release_candidate=<semver>-<commit12>` 与完整 `commit_sha` 精确对应；
+  它固定 `e4_result=NOT_RUN`、`release_approved=false`。当前仓库只对该
   脚本与契约做 E1 静态/结构测试；即使未来本机记录为 `READY`，也不是 E4、不是 golden-image
   或 runner 信任证明，不能写入 `candidate-root.v1` 或用于发布晋级。
 - `release-payload.v1.schema.json`、`harness-qualification.v1.schema.json`、
