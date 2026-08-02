@@ -323,10 +323,15 @@ class ValidateWindowsE4PreflightTests(unittest.TestCase):
         ci_workflow = CI_WORKFLOW_PATH.read_text(encoding="utf-8")
         self.assertIn("Windows launcher", ci_workflow)
         self.assertIn("Parse Windows release scripts", ci_workflow)
-        self.assertIn(
-            '"scripts/acceptance/windows_e4_preflight.ps1"',
-            ci_workflow,
-        )
+        for path in (
+            "scripts/windows/build-installer.ps1",
+            "scripts/windows/validate-release.ps1",
+            "scripts/release/finalize_windows_publisher_binding.ps1",
+            "scripts/release/verify_windows_publisher_binding.ps1",
+            "scripts/acceptance/windows_e4_preflight.ps1",
+        ):
+            with self.subTest(path=path):
+                self.assertIn(f'"{path}"', ci_workflow)
 
 
 if __name__ == "__main__":

@@ -235,6 +235,8 @@ jobs:
           $paths = @(
             "scripts/windows/build-installer.ps1",
             "scripts/windows/validate-release.ps1",
+            "scripts/release/finalize_windows_publisher_binding.ps1",
+            "scripts/release/verify_windows_publisher_binding.ps1",
             "desktop/windows/resources/secure-acl.ps1",
             "scripts/acceptance/windows_e4_preflight.ps1"
           )
