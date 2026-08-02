@@ -27,7 +27,7 @@ def test_0014_is_linear_and_settings_require_it() -> None:
 
     assert module.revision == "20260731_0014"
     assert module.down_revision == "20260731_0013"
-    assert Settings().database_schema_revision == "20260802_0020"
+    assert Settings().database_schema_revision == "20260802_0021"
 
 
 def test_0014_persists_hold_scope_release_and_expiry_constraints() -> None:

@@ -27,6 +27,7 @@ from datax_studio.release_qualification import (
     VerifiedHarnessQualification,
     payload_binding,
     verify_harness_qualification,
+    verify_harness_qualification_with_recorder,
 )
 
 _IMAGE_DIGEST = re.compile(r"^sha256:[a-f0-9]{64}$")
@@ -38,6 +39,7 @@ _WRITER_PLUGIN_NAMES = frozenset({"mysqlwriter", "postgresqlwriter"})
 _PLUGIN_NAMES = _READER_PLUGIN_NAMES | _WRITER_PLUGIN_NAMES
 _AUTHORIZATION_PROVENANCE = object()
 _EXECUTION_BINDING_PROVENANCE = object()
+_GRANT_ISSUANCE_PROVENANCE = object()
 # Deliberately process-local: persistence must be revalidated by the future
 # protected ledger reader, rather than deserializing an in-process authority.
 _IN_PROCESS_INTEGRITY_KEY = secrets.token_bytes(32)
@@ -136,6 +138,68 @@ class PhaseAExecutionBinding:
     _integrity_tag: str = field(repr=False, compare=False)
 
 
+@dataclass(frozen=True)
+class PhaseAGrantIssuance:
+    """One exact P/QH/runtime/pair input for an atomic durable PAG issue call.
+
+    It is constructed only after P, QH, current runtime, and immutable
+    JobVersion facts have all been checked.  The future issuer must consume it
+    in one database transaction that writes both the nonce replay fact and the
+    grant.  It has no execution ID and cannot authorize the ordinary Worker.
+    """
+
+    payload_root_sha256: str
+    payload_binding_sha256: str
+    payload_commit_sha: str
+    worker_image_digest: str
+    datax_release: str
+    runtime_sha256: str
+    reader_plugin_name: str
+    reader_plugin_sha256: str
+    writer_plugin_name: str
+    writer_plugin_sha256: str
+    harness: ExpectedHarness
+    qualification_id: str
+    issuer_key_id: str
+    nonce_sha256: str
+    qh_document_sha256: str
+    issued_at: datetime
+    not_before: datetime
+    valid_until: datetime
+    _provenance: object = field(repr=False, compare=False)
+    _integrity_tag: str = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
+class PhaseADurableGrantFields:
+    """Non-secret fields returned by the protected ledger reader only.
+
+    This value intentionally has no local provenance marker: a consumer must
+    only construct it from the row returned by the dedicated PostgreSQL
+    Security Definer function.  ``reconstruct_execution_binding_from_ledger``
+    validates every field before minting a new in-process binding.
+    """
+
+    payload_root_sha256: str
+    payload_binding_sha256: str
+    payload_commit_sha: str
+    worker_image_digest: str
+    datax_release: str
+    runtime_sha256: str
+    reader_plugin_name: str
+    reader_plugin_sha256: str
+    writer_plugin_name: str
+    writer_plugin_sha256: str
+    harness: ExpectedHarness
+    qualification_id: str
+    issuer_key_id: str
+    nonce_sha256: str
+    qh_document_sha256: str
+    issued_at: datetime
+    not_before: datetime
+    valid_until: datetime
+
+
 def activate_harness_authorization(
     *,
     raw_qualification: bytes,
@@ -202,6 +266,305 @@ def activate_harness_authorization(
         authorization,
         _integrity_tag=_authorization_integrity_tag(authorization),
     )
+
+
+def issue_phase_a_grant[IssuedGrant](
+    *,
+    raw_qualification: bytes,
+    release_payload: ReleasePayload,
+    expected_harness: ExpectedHarness,
+    current_runtime: PhaseARuntimeIdentity,
+    version: JobVersionBinding,
+    now: datetime,
+    issue_durable_grant: Callable[[PhaseAGrantIssuance], IssuedGrant],
+) -> IssuedGrant:
+    """Verify P/QH/runtime/pair before one atomic nonce-and-grant write.
+
+    This is deliberately distinct from :func:`activate_harness_authorization`.
+    The older E1 primitive accepts a nonce callback before a later
+    ``bind_execution`` call, which would be unsafe for a durable grant: a
+    process crash between those operations can consume a one-time QH without
+    creating its PAG.  Here the callback receives every immutable field only
+    after P, QH, runtime, and selected JobVersion pair have passed; it must
+    atomically persist nonce consumption and the grant itself.
+
+    The callback is private-harness infrastructure, not a Settings value or
+    ordinary API/Worker extension.  This function neither creates an
+    ``Execution`` nor changes the production deny-all certification path.
+    """
+
+    if type(raw_qualification) is not bytes:
+        raise PhaseAAuthorizationError("PHASE_A_QUALIFICATION_DOCUMENT_INVALID")
+    if not callable(issue_durable_grant):
+        raise PhaseAAuthorizationError("PHASE_A_ISSUER_CALLBACK_INVALID")
+    normalized_now = _normalise_now(now)
+    binding = payload_binding(release_payload)
+    _assert_runtime_matches_payload(current_runtime=current_runtime, binding=binding)
+    _assert_version_matches_payload_binding(version=version, binding=binding)
+    qh_document_sha256 = hashlib.sha256(raw_qualification).hexdigest()
+
+    def record(
+        verified: VerifiedHarnessQualification,
+        nonce_use: QualificationNonceUse,
+    ) -> IssuedGrant:
+        _assert_verified_qualification(
+            verified=verified,
+            nonce_use=nonce_use,
+            expected_payload_root=binding.payload_root_sha256,
+        )
+        issuance = _build_grant_issuance(
+            binding=binding,
+            version=version,
+            expected_harness=expected_harness,
+            verified=verified,
+            nonce_use=nonce_use,
+            qh_document_sha256=qh_document_sha256,
+        )
+        return issue_durable_grant(issuance)
+
+    return verify_harness_qualification_with_recorder(
+        raw_qualification,
+        release_payload=release_payload,
+        expected_harness=expected_harness,
+        now=normalized_now,
+        record_verified=record,
+    )
+
+
+def durable_grant_fields(issuance: PhaseAGrantIssuance) -> PhaseADurableGrantFields:
+    """Return validated non-secret parameters for the protected SQL issuer."""
+
+    _assert_issuance_shape(issuance)
+    return PhaseADurableGrantFields(
+        payload_root_sha256=issuance.payload_root_sha256,
+        payload_binding_sha256=issuance.payload_binding_sha256,
+        payload_commit_sha=issuance.payload_commit_sha,
+        worker_image_digest=issuance.worker_image_digest,
+        datax_release=issuance.datax_release,
+        runtime_sha256=issuance.runtime_sha256,
+        reader_plugin_name=issuance.reader_plugin_name,
+        reader_plugin_sha256=issuance.reader_plugin_sha256,
+        writer_plugin_name=issuance.writer_plugin_name,
+        writer_plugin_sha256=issuance.writer_plugin_sha256,
+        harness=issuance.harness,
+        qualification_id=issuance.qualification_id,
+        issuer_key_id=issuance.issuer_key_id,
+        nonce_sha256=issuance.nonce_sha256,
+        qh_document_sha256=issuance.qh_document_sha256,
+        issued_at=issuance.issued_at,
+        not_before=issuance.not_before,
+        valid_until=issuance.valid_until,
+    )
+
+
+def reconstruct_execution_binding_from_ledger(
+    fields: PhaseADurableGrantFields,
+) -> PhaseAExecutionBinding:
+    """Mint an in-process binding from a protected ledger-function row.
+
+    Callers must never deserialize arbitrary request or file data into
+    ``fields``.  The PostgreSQL issuer/consumer role/function boundary is the
+    cross-process authority; the freshly minted local integrity tag only
+    protects the subsequent same-process handoff to a future private worker.
+    """
+
+    if type(fields) is not PhaseADurableGrantFields:
+        raise PhaseAAuthorizationError("PHASE_A_DURABLE_GRANT_INVALID")
+    return _execution_binding_from_fields(
+        payload_root_sha256=fields.payload_root_sha256,
+        payload_binding_sha256=fields.payload_binding_sha256,
+        payload_commit_sha=fields.payload_commit_sha,
+        worker_image_digest=fields.worker_image_digest,
+        datax_release=fields.datax_release,
+        runtime_sha256=fields.runtime_sha256,
+        reader_plugin_name=fields.reader_plugin_name,
+        reader_plugin_sha256=fields.reader_plugin_sha256,
+        writer_plugin_name=fields.writer_plugin_name,
+        writer_plugin_sha256=fields.writer_plugin_sha256,
+        harness=fields.harness,
+        qualification_id=fields.qualification_id,
+        issuer_key_id=fields.issuer_key_id,
+        nonce_sha256=fields.nonce_sha256,
+        qh_document_sha256=fields.qh_document_sha256,
+        issued_at=fields.issued_at,
+        not_before=fields.not_before,
+        valid_until=fields.valid_until,
+        invalid_code="PHASE_A_DURABLE_GRANT_INVALID",
+    )
+
+
+def _assert_version_matches_payload_binding(
+    *,
+    version: JobVersionBinding,
+    binding: PayloadBinding,
+) -> None:
+    if type(binding) is not PayloadBinding:
+        raise PhaseAAuthorizationError("PHASE_A_PAYLOAD_BINDING_INVALID")
+    (
+        datax_release,
+        runtime_sha256,
+        reader_plugin_name,
+        reader_plugin_sha256,
+        writer_plugin_name,
+        writer_plugin_sha256,
+    ) = _validated_version_fields(version, invalid_code="PHASE_A_JOB_VERSION_INVALID")
+    plugin_sha256s = dict(binding.plugin_sha256s)
+    if (
+        datax_release != binding.datax_release
+        or runtime_sha256 != binding.runtime_sha256
+        or reader_plugin_name not in _READER_PLUGIN_NAMES
+        or writer_plugin_name not in _WRITER_PLUGIN_NAMES
+        or reader_plugin_sha256 != plugin_sha256s.get(reader_plugin_name)
+        or writer_plugin_sha256 != plugin_sha256s.get(writer_plugin_name)
+    ):
+        raise PhaseAAuthorizationError("PHASE_A_JOB_VERSION_MISMATCH")
+
+
+def _build_grant_issuance(
+    *,
+    binding: PayloadBinding,
+    version: JobVersionBinding,
+    expected_harness: ExpectedHarness,
+    verified: VerifiedHarnessQualification,
+    nonce_use: QualificationNonceUse,
+    qh_document_sha256: str,
+) -> PhaseAGrantIssuance:
+    _assert_version_matches_payload_binding(version=version, binding=binding)
+    if not _is_valid_harness(expected_harness):
+        raise PhaseAAuthorizationError("PHASE_A_EXPECTED_HARNESS_INVALID")
+    if type(verified) is not VerifiedHarnessQualification:
+        raise PhaseAAuthorizationError("PHASE_A_QUALIFICATION_BINDING_INVALID")
+    _assert_verified_qualification(
+        verified=verified,
+        nonce_use=nonce_use,
+        expected_payload_root=binding.payload_root_sha256,
+    )
+    (
+        datax_release,
+        runtime_sha256,
+        reader_plugin_name,
+        reader_plugin_sha256,
+        writer_plugin_name,
+        writer_plugin_sha256,
+    ) = _validated_version_fields(version, invalid_code="PHASE_A_JOB_VERSION_INVALID")
+    issuance = PhaseAGrantIssuance(
+        payload_root_sha256=binding.payload_root_sha256,
+        payload_binding_sha256=binding.payload_binding_sha256,
+        payload_commit_sha=binding.commit_sha,
+        worker_image_digest=binding.worker_image_digest,
+        datax_release=datax_release,
+        runtime_sha256=runtime_sha256,
+        reader_plugin_name=reader_plugin_name,
+        reader_plugin_sha256=reader_plugin_sha256,
+        writer_plugin_name=writer_plugin_name,
+        writer_plugin_sha256=writer_plugin_sha256,
+        harness=ExpectedHarness(
+            identity=expected_harness.identity,
+            environment_id=expected_harness.environment_id,
+            environment_manifest_sha256=expected_harness.environment_manifest_sha256,
+            harness_version=expected_harness.harness_version,
+        ),
+        qualification_id=verified.qualification_id,
+        issuer_key_id=verified.issuer_key_id,
+        nonce_sha256=_nonce_sha256(nonce_use.nonce),
+        qh_document_sha256=qh_document_sha256,
+        issued_at=verified.issued_at,
+        not_before=verified.not_before,
+        valid_until=verified.valid_until,
+        _provenance=_GRANT_ISSUANCE_PROVENANCE,
+        _integrity_tag="",
+    )
+    issuance = replace(issuance, _integrity_tag=_issuance_integrity_tag(issuance))
+    _assert_issuance_shape(issuance)
+    return issuance
+
+
+def _assert_issuance_shape(value: PhaseAGrantIssuance) -> None:
+    if (
+        type(value) is not PhaseAGrantIssuance
+        or value._provenance is not _GRANT_ISSUANCE_PROVENANCE
+    ):
+        raise PhaseAAuthorizationError("PHASE_A_GRANT_INVALID")
+    if type(value._integrity_tag) is not str or not hmac.compare_digest(
+        value._integrity_tag,
+        _issuance_integrity_tag(value),
+    ):
+        raise PhaseAAuthorizationError("PHASE_A_GRANT_INVALID")
+    _execution_binding_from_fields(
+        payload_root_sha256=value.payload_root_sha256,
+        payload_binding_sha256=value.payload_binding_sha256,
+        payload_commit_sha=value.payload_commit_sha,
+        worker_image_digest=value.worker_image_digest,
+        datax_release=value.datax_release,
+        runtime_sha256=value.runtime_sha256,
+        reader_plugin_name=value.reader_plugin_name,
+        reader_plugin_sha256=value.reader_plugin_sha256,
+        writer_plugin_name=value.writer_plugin_name,
+        writer_plugin_sha256=value.writer_plugin_sha256,
+        harness=value.harness,
+        qualification_id=value.qualification_id,
+        issuer_key_id=value.issuer_key_id,
+        nonce_sha256=value.nonce_sha256,
+        qh_document_sha256=value.qh_document_sha256,
+        issued_at=value.issued_at,
+        not_before=value.not_before,
+        valid_until=value.valid_until,
+        invalid_code="PHASE_A_GRANT_INVALID",
+    )
+
+
+def _execution_binding_from_fields(
+    *,
+    payload_root_sha256: object,
+    payload_binding_sha256: object,
+    payload_commit_sha: object,
+    worker_image_digest: object,
+    datax_release: object,
+    runtime_sha256: object,
+    reader_plugin_name: object,
+    reader_plugin_sha256: object,
+    writer_plugin_name: object,
+    writer_plugin_sha256: object,
+    harness: object,
+    qualification_id: object,
+    issuer_key_id: object,
+    nonce_sha256: object,
+    qh_document_sha256: object,
+    issued_at: object,
+    not_before: object,
+    valid_until: object,
+    invalid_code: str,
+) -> PhaseAExecutionBinding:
+    if type(invalid_code) is not str:
+        raise PhaseAAuthorizationError("PHASE_A_GRANT_INVALID")
+    binding = PhaseAExecutionBinding(
+        payload_root_sha256=payload_root_sha256,  # type: ignore[arg-type]
+        payload_binding_sha256=payload_binding_sha256,  # type: ignore[arg-type]
+        payload_commit_sha=payload_commit_sha,  # type: ignore[arg-type]
+        worker_image_digest=worker_image_digest,  # type: ignore[arg-type]
+        datax_release=datax_release,  # type: ignore[arg-type]
+        runtime_sha256=runtime_sha256,  # type: ignore[arg-type]
+        reader_plugin_name=reader_plugin_name,  # type: ignore[arg-type]
+        reader_plugin_sha256=reader_plugin_sha256,  # type: ignore[arg-type]
+        writer_plugin_name=writer_plugin_name,  # type: ignore[arg-type]
+        writer_plugin_sha256=writer_plugin_sha256,  # type: ignore[arg-type]
+        harness=harness,  # type: ignore[arg-type]
+        qualification_id=qualification_id,  # type: ignore[arg-type]
+        issuer_key_id=issuer_key_id,  # type: ignore[arg-type]
+        nonce_sha256=nonce_sha256,  # type: ignore[arg-type]
+        qh_document_sha256=qh_document_sha256,  # type: ignore[arg-type]
+        issued_at=issued_at,  # type: ignore[arg-type]
+        not_before=not_before,  # type: ignore[arg-type]
+        valid_until=valid_until,  # type: ignore[arg-type]
+        _provenance=_EXECUTION_BINDING_PROVENANCE,
+        _integrity_tag="",
+    )
+    binding = replace(binding, _integrity_tag=_execution_binding_integrity_tag(binding))
+    try:
+        _assert_binding_shape(binding)
+    except PhaseAAuthorizationError as error:
+        raise PhaseAAuthorizationError(invalid_code) from error
+    return binding
 
 
 def bind_execution(
@@ -580,6 +943,32 @@ def _execution_binding_integrity_tag(value: PhaseAExecutionBinding) -> str:
     return _integrity_tag(
         {
             "kind": "execution-binding",
+            "payload_root_sha256": value.payload_root_sha256,
+            "payload_binding_sha256": value.payload_binding_sha256,
+            "payload_commit_sha": value.payload_commit_sha,
+            "worker_image_digest": value.worker_image_digest,
+            "datax_release": value.datax_release,
+            "runtime_sha256": value.runtime_sha256,
+            "reader_plugin_name": value.reader_plugin_name,
+            "reader_plugin_sha256": value.reader_plugin_sha256,
+            "writer_plugin_name": value.writer_plugin_name,
+            "writer_plugin_sha256": value.writer_plugin_sha256,
+            "harness": _harness_integrity_fields(value.harness),
+            "qualification_id": value.qualification_id,
+            "issuer_key_id": value.issuer_key_id,
+            "nonce_sha256": value.nonce_sha256,
+            "qh_document_sha256": value.qh_document_sha256,
+            "issued_at": _utc_integrity_timestamp(value.issued_at),
+            "not_before": _utc_integrity_timestamp(value.not_before),
+            "valid_until": _utc_integrity_timestamp(value.valid_until),
+        }
+    )
+
+
+def _issuance_integrity_tag(value: PhaseAGrantIssuance) -> str:
+    return _integrity_tag(
+        {
+            "kind": "grant-issuance",
             "payload_root_sha256": value.payload_root_sha256,
             "payload_binding_sha256": value.payload_binding_sha256,
             "payload_commit_sha": value.payload_commit_sha,

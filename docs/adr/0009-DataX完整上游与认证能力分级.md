@@ -129,10 +129,11 @@ UI 从目录渲染 Reader/Writer 并对非 E4 能力显示阻断原因。明确�
 受信的生产发布证明读取器尚未实现，当前 `WINDOWS_E4_CERTIFIED=0`。ADR-0011 的
 `release-payload.v1`、`harness-qualification.v1`、`phase-a-qualification-grant.v1` Schema，
 失败关闭 P/QH parser、私有 payload/runtime/job binding 与 durable nonce/grant 账本已作为
-E1 基础件进入源码；两张 ledger 表已拒绝 `datax_api`、`datax_worker` 的直接权限。它们
-没有专用 protected ledger role/function、protected issuer/consumer、private API/Worker/Compose
-override、受保护 harness、QR schema/reader、真实 E3/E4 或最终 promotion validator，也不会
-改变公开 `plugin-manifest.v2`、普通用户状态或 production deny-all。
+E1 基础件进入源码；`20260802_0021` 还把 private ledger 交给无登录 owner，并以无登录
+issuer/consumer 的最小 `SECURITY DEFINER` 函数分离 atomic issue/revoke 与 current-grant read。
+该 adapter 没有标准 API/Worker/Compose/Settings 接线，也没有 `execution_id` 或 DataX start
+能力。仍没有受保护 harness 凭据配置、private override、QR schema/reader、真实 E3/E4 或最终
+promotion validator，也不会改变公开 `plugin-manifest.v2`、普通用户状态或 production deny-all。
 因此该切片仍只证明“不会把未取证能力当成已认证能力运行”，不证明四方向 DataX E3、
 Windows E4 或全部 DataX 功能已完成。
 

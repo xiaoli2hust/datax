@@ -49,10 +49,11 @@
 > 状态），独立签发 detached QR 后才构建私有最终候选；再在无 QH 的 Phase B 中验证精确
 > 安装包，才可派生 Windows E4 插件状态并交给 ADR-0010 hosted attestor/PR 公开晋级。
 > 当前已有 P/QH/PAG Schema、失败关闭 P/QH parser、私有 payload/runtime/job binding 与
-> PostgreSQL nonce/grant E1 基础账本；它们不等于已签发 P/QH、可运行的 qualification workflow
-> 或 release approval。仍没有专用 protected ledger role/function、protected issuer/consumer、
-> private API/Worker/Compose override、受保护 harness、QR reader、candidate-root.v2 或真实
-> Windows/签名/OIDC 证据，发布仍只能生成显式 BLOCKED 候选。
+> PostgreSQL nonce/grant E1 基础账本；`20260802_0021` 还增加了无登录 ledger owner / issuer /
+> consumer、最小 `SECURITY DEFINER` 签发/撤回/读取函数和未接入标准路径的 private adapter。它们
+> 不等于已签发 P/QH、可运行的 qualification workflow 或 release approval：没有标准角色凭据、
+> QH/PAG source/override、私有 API/Worker Execution authorization、受保护 harness、QR reader、
+> candidate-root.v2 或真实 Windows/签名/OIDC 证据，发布仍只能生成显式 BLOCKED 候选。
 
 ## 1. 仓库目标
 
@@ -218,7 +219,10 @@ Windows release runner 或签名结果已经在线验证。Java 源码也没有�
 - 后端格式化、lint、类型检查、单元和 API 集成测试。
 - Alembic 从空库升级、前后版本兼容与恢复测试。
 - 改动 ADR-0011 Phase-A 基础件时，必须验证 P/QH/PAG Schema、失败关闭 parser/binding，及
-  PostgreSQL nonce/grant 的重放、不可变、生命周期和 API/Worker direct-table-denial。
+  PostgreSQL nonce/grant 的重放、不可变、生命周期、标准运行角色 direct-table-denial、issuer/consumer
+  的函数最小权限、原子 nonce+grant 签发与 current-grant 读取。它们不得被 Settings、标准 Compose、
+  API 或普通 Worker 接入；还必须验证预存私有角色名/成员关系失败关闭，以及 ledger owner 后续
+  新建函数默认无 `PUBLIC EXECUTE`。
   该临时 PostgreSQL 容器检查最多是数据库 E2；未启动产品 Compose、API、Worker、DataX、
   MySQL 或独立 oracle 时，绝不能称为 Phase-A E3、Windows E4 或发布证据。
 - Docker 镜像构建、健康检查、非 root 和制品摘要检查。
@@ -310,10 +314,11 @@ ADR-0011 要求把未来 release workflow 拆成以下不可互相替代的阶�
 把 QR 写进 Worker 镜像、让 QR 绑定包含它的 Setup/manifest、使用环境变量放行，或把
 self-hosted runner 的自述 JSON 当作公开 release 证明。
 
-当前的 E1 状态止于 P/QH parser、私有 payload/runtime/job binding 与 durable nonce/grant
-账本；`datax_api`、`datax_worker` 对两张 ledger 表的直接权限已撤销，但没有专用 protected
-ledger role/function、issuer/consumer 或 private override。它不能产生 QH、PAG 消费路径、QR、
-E3/E4、普通用户能力或可发布候选。
+当前的 E1 状态包括 P/QH parser、私有 payload/runtime/job binding 与 durable nonce/grant
+账本；`20260802_0021` 已用无登录 dedicated role 与精确 `SECURITY DEFINER` 函数把 atomic
+nonce+PAG issue/revoke 与 current-grant read 分离，并提供只接受未来受保护 Engine 注入的 private
+adapter。它没有 private override、Execution authorization、普通 API/Worker 接线或受保护 harness；
+因此不能产生 QH、普通运行路径的 PAG 消费、QR、E3/E4、普通用户能力或可发布候选。
 
 ## 7. Issue 规范
 

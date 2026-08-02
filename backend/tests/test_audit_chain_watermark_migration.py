@@ -114,4 +114,4 @@ def test_0018_backfills_only_audit_heads_as_pending_and_is_reversible() -> None:
 
     assert module.revision == "20260802_0018"
     assert module.down_revision == "20260802_0017"
-    assert Settings().database_schema_revision == "20260802_0020"
+    assert Settings().database_schema_revision == "20260802_0021"

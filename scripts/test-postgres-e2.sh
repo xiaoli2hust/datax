@@ -50,15 +50,21 @@ owner_secret="$temporary_directory/migration-owner-password"
 guard_secret="$temporary_directory/egress-guard-password"
 api_secret="$temporary_directory/api-password"
 worker_secret="$temporary_directory/worker-password"
+issuer_secret="$temporary_directory/phase-a-issuer-password"
+consumer_secret="$temporary_directory/phase-a-consumer-password"
 write_hex_secret "$owner_secret"
 write_hex_secret "$guard_secret"
 write_hex_secret "$api_secret"
 write_hex_secret "$worker_secret"
+write_hex_secret "$issuer_secret"
+write_hex_secret "$consumer_secret"
 
 owner_password=$(cat "$owner_secret")
 guard_password=$(cat "$guard_secret")
 api_password=$(cat "$api_secret")
 worker_password=$(cat "$worker_secret")
+issuer_password=$(cat "$issuer_secret")
+consumer_password=$(cat "$consumer_secret")
 
 docker run --detach --rm \
   --name "$container_name" \
@@ -88,6 +94,8 @@ owner_url="postgresql+psycopg://datax_migration_test:${owner_password}@127.0.0.1
 api_url="postgresql+psycopg://datax_api:${api_password}@127.0.0.1:${host_port}/datax_e2_test"
 worker_url="postgresql+psycopg://datax_worker:${worker_password}@127.0.0.1:${host_port}/datax_e2_test"
 guard_url="postgresql+psycopg://datax_egress_guard:${guard_password}@127.0.0.1:${host_port}/datax_e2_test"
+issuer_url="postgresql+psycopg://datax_phase_a_issuer:${issuer_password}@127.0.0.1:${host_port}/datax_e2_test"
+consumer_url="postgresql+psycopg://datax_phase_a_consumer:${consumer_password}@127.0.0.1:${host_port}/datax_e2_test"
 
 run_alembic() {
 (
@@ -112,16 +120,29 @@ run_alembic upgrade head
 run_alembic downgrade 20260802_0016
 run_alembic upgrade head
 
+# 0021 deliberately leaves these privileged roles NOLOGIN in the standard
+# product. Give them disposable E2-only logins only after migration cycling;
+# they are never exposed to Compose, Settings, or the Windows launcher.
+docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
+  psql --no-psqlrc --set ON_ERROR_STOP=1 \
+  --username=datax_migration_test --dbname=datax_e2_test \
+  --command "ALTER ROLE datax_phase_a_issuer LOGIN PASSWORD '$issuer_password';
+             ALTER ROLE datax_phase_a_consumer LOGIN PASSWORD '$consumer_password';" \
+  >/dev/null
+
 cd "$repository_root"
 DATAX_MIGRATION_POSTGRES_TEST_URL="$owner_url" \
 DATAX_API_POSTGRES_TEST_URL="$api_url" \
 DATAX_WORKER_POSTGRES_TEST_URL="$worker_url" \
 DATAX_EGRESS_GUARD_POSTGRES_TEST_URL="$guard_url" \
+DATAX_PHASE_A_ISSUER_POSTGRES_TEST_URL="$issuer_url" \
+DATAX_PHASE_A_CONSUMER_POSTGRES_TEST_URL="$consumer_url" \
 DATAX_CREDENTIAL_POSTGRES_TEST_URL="$owner_url" \
 DATAX_AUTH_POSTGRES_TEST_URL="$owner_url" \
 PYTHONDONTWRITEBYTECODE=1 \
   "$python" -m pytest -q -p no:cacheprovider \
     backend/tests/test_runtime_database_roles_postgres.py \
+    backend/tests/test_phase_a_authorization.py \
     backend/tests/test_phase_a_qualification_postgres.py \
     backend/tests/test_egress_guard_postgres.py \
     backend/tests/test_audit_append_only_postgres.py \
@@ -212,5 +233,31 @@ restored_phase_a_schema=$(docker exec --env "PGPASSWORD=$owner_password" "$conta
 docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
   dropdb --username=datax_migration_test "$restore_probe_database"
 
+# 0021 must never normalize a pre-existing role name or membership edge. That
+# could let a standard runtime role SET ROLE into the private ledger owner.
+# Prove the migration fails closed, then remove only this disposable poison and
+# prove a clean rerun still reaches head.
+run_alembic downgrade 20260802_0020
+docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
+  psql --no-psqlrc --set ON_ERROR_STOP=1 \
+  --username=datax_migration_test --dbname=datax_e2_test \
+  --command "CREATE ROLE datax_phase_a_ledger_owner NOLOGIN;
+             GRANT datax_phase_a_ledger_owner TO datax_api;" \
+  >/dev/null
+role_collision_output="$temporary_directory/phase-a-role-collision.out"
+if run_alembic upgrade head >"$role_collision_output" 2>&1
+then
+  fail "Phase-A migration accepted a pre-existing private ledger role"
+fi
+grep -Fq 'Phase-A private ledger roles must not pre-exist' "$role_collision_output" \
+  || fail "Phase-A role-collision migration rejection was not explicit"
+docker exec --env "PGPASSWORD=$owner_password" "$container_name" \
+  psql --no-psqlrc --set ON_ERROR_STOP=1 \
+  --username=datax_migration_test --dbname=datax_e2_test \
+  --command "REVOKE datax_phase_a_ledger_owner FROM datax_api;
+             DROP ROLE datax_phase_a_ledger_owner;" \
+  >/dev/null
+run_alembic upgrade head
+
 printf '%s\n' \
-  'POSTGRES_E2_SUBSET_PASSED: real disposable PostgreSQL migrations, runtime-role boundaries, Phase-A qualification ledger guards and standard-backup complete-private-schema exclusion, audit append-only/readiness replay, credential concurrency, and auth concurrency passed. This is E2 subset evidence only; it is not full restore, DataX E3, Windows E4, or product-Compose acceptance.'
+  'POSTGRES_E2_SUBSET_PASSED: real disposable PostgreSQL migrations, pre-existing-private-role fail-closed rejection, runtime-role boundaries, Phase-A issuer/consumer SECURITY DEFINER function boundaries and ledger guards, standard-backup complete-private-schema exclusion, audit append-only/readiness replay, credential concurrency, and auth concurrency passed. This is E2 subset evidence only; it is not full restore, DataX E3, Windows E4, or product-Compose acceptance.'

@@ -171,7 +171,7 @@ def test_0020_creates_durable_private_ledger_and_revokes_runtime_roles() -> None
 
     assert module.revision == "20260802_0020"
     assert module.down_revision == "20260802_0019"
-    assert Settings().database_schema_revision == "20260802_0020"
+    assert Settings().database_schema_revision == "20260802_0021"
     assert set(operations.created_tables) == {
         "phase_a_qualification_nonces",
         "phase_a_qualification_grants",

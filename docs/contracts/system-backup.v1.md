@@ -34,7 +34,7 @@ journal 或 staging 文件存在都不能表述为“Windows 可恢复门禁已�
   `pg_dump --format=custom --compress=0 --serializable-deferrable`
   `--exclude-schema=des_phase_a_qualification` 并取得单一一致性快照；该排除项是
   Launcher 固定字面量，不能由用户、环境变量或备份请求改写。该 schema 包含 Phase-A 的两张
-  ledger 表、触发器及 guard functions；使用 schema 排除而不是 `--exclude-table-data`，以避免
+  ledger 表、触发器、guard functions 及 0021 `SECURITY DEFINER` entrypoints；使用 schema 排除而不是 `--exclude-table-data`，以避免
   custom dump 留下私有 schema/function metadata。禁用 dump 压缩是为了让导出前的部署 secret 精确 byte 扫描可执行。helper 只接受
   以 `PGDMP` 开头的普通文件，不接受物理
   `des-postgres-data` volume 归档。
@@ -71,7 +71,7 @@ DATA 包只允许以下归档项：
 - Launcher keyring、数据库密码、`egress_lease_creation_capability`、JWT 私钥、HMAC、
   KEK、数据源明文凭据；
 - `des_phase_a_qualification` 整个 schema（`phase_a_qualification_nonces`、
-  `phase_a_qualification_grants`、触发器、guard functions 及其记录），以及任何
+  `phase_a_qualification_grants`、触发器、guard functions、0021 `SECURITY DEFINER` entrypoints 及其记录），以及任何
   QH/PAG/QR/private qualification source；标准 backup 与 diagnostics 均不得携带这些受保护
   资格材料；
 - 未知元数据文件、链接、设备、FIFO、socket 或未声明归档路径。
@@ -135,8 +135,9 @@ DATA 包只允许以下归档项：
 6. 中断后只允许使用同一包对和秘密继续，或只清理由 journal 记录的 staging 对象。
 
 由于标准 DATA dump 特意不含整个 `des_phase_a_qualification` schema，任何未来完整恢复也**不得**
-复活备份时存在的 QH/PAG 或重放防护状态。恢复后的数据库仍会携带 `alembic_version=0020`，
-却不会有该 schema；所以当前真实 `pg_restore`、应用启动和迁移后的 ledger bootstrap 均保持
+复活备份时存在的 QH/PAG 或重放防护状态。恢复后的数据库仍会携带 `alembic_version=20260802_0021`，
+却不会有该 schema、其 0021 `SECURITY DEFINER` entrypoints 或无登录 ledger roles；所以当前真实
+`pg_restore`、应用启动和迁移后的 ledger bootstrap 均保持
 `BLOCKED`，不得把空 probe restore 写成可恢复系统。未来完整恢复必须先在受保护的 restore
 bootstrap 中创建空 ledger、生成不随备份恢复的 issuance epoch，并只接受该 epoch 后重新验证
 P/QH、原子消费的新 nonce 与新 PAG。当前没有这种 issuer/source 或完整 restore，因此本规则

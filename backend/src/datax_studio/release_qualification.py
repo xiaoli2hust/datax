@@ -432,6 +432,66 @@ def verify_harness_qualification(
     have succeeded.  A false return or ledger failure always rejects the QH.
     """
 
+    verified, nonce_use = _verified_harness_qualification_facts(
+        raw,
+        release_payload=release_payload,
+        expected_harness=expected_harness,
+        now=now,
+    )
+    try:
+        consumed = consume_nonce(nonce_use)
+    except Exception:
+        raise QualificationVerificationError("QH_NONCE_LEDGER_UNAVAILABLE") from None
+    if consumed is not True:
+        raise QualificationVerificationError("QH_NONCE_REPLAYED")
+    return verified
+
+
+def verify_harness_qualification_with_recorder[RecordedQualification](
+    raw: bytes,
+    *,
+    release_payload: ReleasePayload,
+    expected_harness: ExpectedHarness,
+    now: datetime,
+    record_verified: Callable[
+        [VerifiedHarnessQualification, QualificationNonceUse],
+        RecordedQualification,
+    ],
+) -> RecordedQualification:
+    """Verify QH, then make one caller-owned atomic durable recording attempt.
+
+    This private primitive exists for the future protected Phase-A issuer.  It
+    deliberately does *not* call a generic nonce callback before the caller
+    has prepared its exact reader/writer binding: a nonce-only write followed
+    by a separate grant insert creates a crash window in which the QH is spent
+    without a corresponding PAG.  The supplied recorder must therefore make
+    nonce consumption and grant persistence one database transaction.
+
+    The recorder is intentionally not wrapped or retried here.  In particular,
+    an ambiguous database commit must remain visible to the protected caller;
+    silently retrying could turn an uncertain issuance into a replay decision.
+    No standard API, Worker, Settings, or plugin-certification path imports
+    this function.
+    """
+
+    verified, nonce_use = _verified_harness_qualification_facts(
+        raw,
+        release_payload=release_payload,
+        expected_harness=expected_harness,
+        now=now,
+    )
+    return record_verified(verified, nonce_use)
+
+
+def _verified_harness_qualification_facts(
+    raw: bytes,
+    *,
+    release_payload: ReleasePayload,
+    expected_harness: ExpectedHarness,
+    now: datetime,
+) -> tuple[VerifiedHarnessQualification, QualificationNonceUse]:
+    """Return verified QH facts without touching a nonce ledger."""
+
     payload_document = _verify_release_payload_provenance(release_payload)
     expected_harness_fields = _verified_harness_fields(expected_harness)
     current_time = _normalise_now(now)
@@ -475,19 +535,16 @@ def verify_harness_qualification(
         nonce=qualification.nonce,
         valid_until=qualification.valid_until,
     )
-    try:
-        consumed = consume_nonce(nonce_use)
-    except Exception:
-        raise QualificationVerificationError("QH_NONCE_LEDGER_UNAVAILABLE") from None
-    if consumed is not True:
-        raise QualificationVerificationError("QH_NONCE_REPLAYED")
-    return VerifiedHarnessQualification(
+    return (
+        VerifiedHarnessQualification(
         qualification_id=qualification.qualification_id,
         payload_root_sha256=release_payload.payload_root_sha256,
         issuer_key_id=qualification.issuer_key_id,
         issued_at=qualification.issued_at,
         not_before=qualification.not_before,
         valid_until=qualification.valid_until,
+        ),
+        nonce_use,
     )
 
 

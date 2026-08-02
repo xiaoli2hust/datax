@@ -260,12 +260,13 @@ attestation 服务上运行，因而没有真实 bundle/反向验证证据；虽
 `TRUSTED_RELEASE_ATTESTATION_NOT_IMPLEMENTED`。
 
 ADR-0011 在 2026-08-02 已落地 P/QH/PAG Schema、失败关闭 P/QH parser、私有
-payload/runtime/job binding 与 durable nonce/grant E1 基础件；PostgreSQL ledger 已撤销
-`datax_api`、`datax_worker` 的直接表权限。它不代表已有已签发 P/QH、专用 protected
-ledger role/function、protected issuer/consumer、private API/Worker/Compose override、受保护
-harness、QR schema/reader、candidate-root.v2 或 Phase A/Phase B workflow；也不能产生 E3/E4、
-改变 candidate-root.v1 的 BLOCKED 语义，或代替真实 Windows/签名/OIDC 证据。上述项目继续
-为 BLOCKED。
+payload/runtime/job binding 与 durable nonce/grant E1 基础件；`20260802_0021` 还以无登录的
+ledger owner / issuer / consumer 与最小 `SECURITY DEFINER` issue/revoke/read 函数建立了私有
+PostgreSQL role/function 边界，adapter 只接受未来 harness 注入的 Engine。它不代表已有已签发
+P/QH、protected harness credential provisioning、private API/Worker/Compose override、Execution
+authorization、受保护 harness、QR schema/reader、candidate-root.v2 或 Phase A/Phase B workflow；也
+不能产生 E3/E4、改变 candidate-root.v1 的 BLOCKED 语义，或代替真实 Windows/签名/OIDC 证据。上述
+项目继续为 BLOCKED。
 
 ## 后果
 

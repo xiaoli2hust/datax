@@ -41,13 +41,28 @@ Reader/Writer；当前生产证据源为 deny-all，普通用户实际开放能�
 受保护 harness 中以短期签名资格取得真实取证，再以 detached 签名资格构建私有最终候选，
 最后对精确安装包完成 Windows E4、候选根与 hosted provenance。当前已有 `P → QH → PAG → QR`
 设计中的 P/QH Schema 与失败关闭 parser、PAG Schema，以及 private Phase-A
-payload/runtime/job binding + durable nonce/grant persistence 的 **E1、进行中**基础件；尚无专用
-ledger database role/function、QH/PAG private source/override、受保护 harness、QR、受信 reader、
-已签发资格或真实外部 E3/E4 证据。它不改变当前行为。普通路径仍默认拒绝，发布仍为 BLOCKED。
-标准备份/诊断必须固定排除完整私有 schema `des_phase_a_qualification`（两张 ledger 表、触发器和
-guard functions）；普通恢复不得复活 Phase-A authority。当前真实 restore/start/ledger bootstrap
-仍阻断：dump 会保留 `alembic_version=0020` 而不会保留私有 schema。未来只能由在 restore epoch 后
-重新验证 P/QH 的受保护 issuer 重新签发，而当前不存在该 runtime issuer。
+payload/runtime/job binding + durable nonce/grant persistence 的 **E1、进行中**基础件。`20260802_0021`
+新增了只供未来私有 harness 使用的 PostgreSQL ledger 边界：无登录的 ledger owner / issuer /
+consumer 角色、仅精确授权的 `SECURITY DEFINER` 签发/撤回/读取函数，以及不接入标准路径的
+private Engine adapter。签发函数在一个数据库事务中同时写 nonce 消费事实和不可变 PAG；读取函数
+只返回当前 `ACTIVE` grant，并不把它变成 Execution 授权。若私有角色名或成员关系预先存在，
+迁移失败关闭；ledger owner 后续新建函数默认没有 `PUBLIC EXECUTE`。
+
+这不是可运行的 qualification workflow：标准 Settings、Compose、Launcher、API、Worker 和公开
+Plugin Manifest 都没有这些角色的凭据、QH/PAG override 或读取入口；J0a 没有 `execution_id`、不会
+启动 DataX，也不会改变生产 deny-all。专用登录只能由未来受保护 harness 在标准产品之外临时配置；
+受保护 harness、QH/PAG private source/override、QR、受信 reader、已签发资格和真实外部 E3/E4
+证据仍不存在。发布继续 `BLOCKED`。
+
+该基础件的数据库边界已在临时、一次性真实 PostgreSQL 15 中取得 `22 passed` 的受限 E2：含
+0021 升级/回滚/再升级、实际 issuer/consumer 函数边界、Python issuer → consumer preflight → revoke
+往返、预存私有角色失败关闭和 future-function `PUBLIC EXECUTE` 默认权负例。它不启动产品 Compose/API/Worker/DataX/MySQL/独立 oracle，
+不验证完整 restore 或 Windows，因此绝不是 E3、E4 或最终安装包验收。
+标准备份/诊断必须固定排除完整私有 schema `des_phase_a_qualification`（两张 ledger 表、触发器、
+guard functions 和 0021 `SECURITY DEFINER` entrypoints）；普通恢复不得复活 Phase-A authority。当前真实 restore/start/ledger bootstrap
+仍阻断：dump 会保留 `alembic_version=20260802_0021` 而不会保留私有 schema。未来只能由在
+restore epoch 后重新验证 P/QH 的受保护 issuer 重新签发，而当前不存在该 runtime issuer 或其
+受保护凭据配置。
 
 ## V1 一句话范围
 

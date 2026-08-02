@@ -114,34 +114,36 @@ HQA keyring/P/QH 实例。
 PAG 当前是**E1、进行中**的 private Phase-A payload/runtime/job binding 与 durable nonce/grant
 persistence 基础件；它仍不是可运行的 qualification 通道。受保护消费者必须先独立验证 P 和 QH，
 再精确比较 PAG 的所有 binding；原始 QH nonce 只可由独立 durable nonce ledger 原子消费，grant
-只允许 `ACTIVE -> REVOKED|EXPIRED` 的单调终态，且其有效窗口必须落在 QH 有效窗口内。当前 E1
-PAG ledger 刻意不含 `execution_id` linkage；未来精确 execution binding 必须由单独的 protected
-atomic issuer/function 纵向切片提供，不能事后把 grant 改为可变。当前没有
-专用 ledger database role/function、private API/Worker/Compose override、受保护 harness、QR reader
-或真实 E3/E4 证据。不得把 PAG 放入标准 Compose/Setup/Launcher、公开候选、备份/诊断包、环境
-变量、普通 API/UI、Plugin Manifest 或普通 Worker 检查点；它不得改变
+只允许 `ACTIVE -> REVOKED|EXPIRED` 的单调终态，且其有效窗口必须落在 QH 有效窗口内。
+`20260802_0021` 新增无登录 ledger owner / issuer / consumer、最小 `SECURITY DEFINER`
+issue/revoke/read 函数和只接受未来 protected Engine 注入的 private adapter。issue 必须在一个事务写
+nonce 与 PAG；read 只返回 current `ACTIVE` grant。J0a 仍刻意不含 `execution_id` linkage；未来精确
+Execution authorization 必须由单独 protected atomic 纵向切片提供，不能事后把 grant 改为可变。没有
+private API/Worker/Compose override、受保护 harness、QR reader 或真实 E3/E4 证据。不得把 PAG 放入
+标准 Compose/Setup/Launcher、公开候选、备份/诊断包、环境变量、普通 API/UI、Plugin Manifest 或普通
+Worker 检查点；它不得改变
 `ordinary_user_executable`、创建 E3/E4 PASS、`WINDOWS_E4_CERTIFIED`、QR 或公开发布批准。
 标准系统备份与诊断必须固定排除完整 `des_phase_a_qualification` schema；普通 restore 不得复制、
-恢复或重新激活任何 Phase-A nonce/grant authority。当前 dump 会保留 `alembic_version=0020` 却排除
+恢复或重新激活任何 Phase-A nonce/grant authority。当前 dump 会保留 `alembic_version=20260802_0021` 却排除
 该 schema，因此真实 restore/bootstrap/start 不是现有能力且继续 `BLOCKED`。若未来需要继续资格化，
 只能由独立受保护 issuer 在新 restore epoch 后重新验证 P/QH 并重新签发。
 
-本轮已记录 `scripts/test-postgres-e2.sh` 在临时、一次性真实 PostgreSQL 15 容器上的结果为
-`12 passed`，其中包含 0020 migration 的 upgrade/downgrade/re-upgrade，并覆盖运行角色实际登录对
-private schema 的 SELECT/INSERT/UPDATE/DELETE/TRUNCATE 拒绝、nonce/grant 不可变性、nonce replay
-和 grant 生命周期；同一脚本还验证 nonce/grant sentinel 的 schema exclusion、TOC 与临时库 restore
-probe。这只是受限 PostgreSQL E2：它不启动产品 Compose、API/Worker/DataX/MySQL 或独立数据 oracle，
-也不验证 restore bootstrap/start，因而不是 DataX E3、Windows E4、私有 harness 验收或任何发布结论；
-测试/脚本文件存在本身仍不能代替该次 `12 passed` 加 dump probe 的运行记录。
+`scripts/test-postgres-e2.sh` 已在临时、一次性真实 PostgreSQL 15 容器取得 `22 passed`：0021
+upgrade/downgrade/re-upgrade、标准运行角色及实际 issuer/consumer 的 direct-DML/function boundary、
+真实 Python issuer → consumer preflight → revoke 往返和 schema-exclusion TOC/临时库 restore probe。
+该次还覆盖预存私有角色名/成员关系失败关闭和 ledger owner future-function `PUBLIC EXECUTE` 默认权
+负例。这只是受限 PostgreSQL **E2**：不启动产品 Compose、API/Worker/DataX/MySQL 或独立数据 oracle，也不
+验证 restore bootstrap/start，因而不是 DataX E3、Windows E4、私有 harness 验收或任何发布结论；
+测试/脚本文件存在本身不能代替这次 `22 passed` 运行记录。
 
 `ReleasePayload`、`PhaseAHarnessAuthorization` 与 `PhaseAExecutionBinding` 的进程内 provenance
 marker 只能捕获同一 Python 进程中的意外构造或篡改；Python 内存不是 protected issuer/consumer
-信任边界。跨进程消费者必须从受保护 durable grant lookup 重建绑定，并由未来专用 role/function
-和 private source 保护；不得反序列化调用方 dataclass、请求体或 marker 来授予资格。
+信任边界。跨进程消费者可从 dedicated durable grant lookup 重建 binding，但 Engine 凭据和 QH
+source 仍须由未来 protected harness 保护；不得反序列化调用方 dataclass、请求体或 marker 来授予资格。
 
 `release-qualification`、candidate-root.v2、受保护 qualification override、受信 reader、真实
-Phase-A/Phase-B harness、签名/OIDC 证据仍未实现；PAG 的专用 ledger role/function 与 private
-API/Worker/Compose 接线也仍未实现。Windows E4 profile/result 的 E1 语义契约
+Phase-A/Phase-B harness、签名/OIDC 证据仍未实现；PAG 的 private API/Worker/Compose 接线与
+Execution authorization 也仍未实现。Windows E4 profile/result 的 E1 语义契约
 不等于这些最终发布契约，也不提供其受信结果。现有 candidate-root.v1 继续只允许
 BLOCKED/release_approved=false；不得用新增可选字段、宽松 schema、测试注入、环境变量或自签
 公钥伪造资格。普通生产路径继续 deny-all。
