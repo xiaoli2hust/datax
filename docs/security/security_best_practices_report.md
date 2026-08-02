@@ -3,9 +3,9 @@
 | 项 | 值 |
 |---|---|
 | 审查日期 | 2026-08-02 |
-| 审查范围 | Windows Launcher/Setup、Compose/egress-guard、API 登录准入与审计 readiness、Worker 租约客户端、GitHub Windows 签名链，以及其权威契约与验收追踪 |
+| 审查范围 | Windows Launcher/Setup、Compose/egress-guard、API 登录准入与审计 readiness、数据源外部操作、Worker 租约客户端、GitHub Windows 签名链，以及其权威契约与验收追踪 |
 | 方法 | 从攻击者可控制的环境变量、同 netns 调用、同名容器、安装器参数、Runner 工具路径和工作区污染出发；每项都要求失败关闭或明确外部阻塞 |
-| 当前结论 | 已有源码修复仍只到 E1/E2；本轮补齐登录入口与审计 readiness 的资源边界，并确认安装路径重解析、Compose 项目归属和 GitHub 发布治理缺口。Windows 实机、真实签名和发布仍 `BLOCKED` |
+| 当前结论 | 已有源码修复仍只到 E1/E2；本轮补齐登录入口与审计 readiness 的资源边界，并确认数据源外部操作持锁/无准入（ASR-013，仍 `OPEN`）、安装路径重解析、Compose 项目归属和 GitHub 发布治理缺口。Windows 实机、真实签名和发布仍 `BLOCKED` |
 
 ## 证据等级
 
@@ -54,9 +54,9 @@
 
 发现：新 secret 已加入运行面，但既有 Worker secret-closure 测试和两个 Worker settings fixture 最初没有同步。完整后端回归立即暴露该漂移。
 
-修复：将能力 secret 纳入 exact Compose closure、Worker settings fixture、备份固定 secret 集合、威胁模型、部署/架构契约和机器验收 catalog；新增 `SEC-EGRESS-LEASE-001`，后续对抗式审查又把安装器、Compose、WSL、磁盘、本机登录准入和审计 readiness 测试纳入 catalog，当前为 81 个需求、102 个 requirement/test 对。
+修复：将能力 secret 纳入 exact Compose closure、Worker settings fixture、备份固定 secret 集合、威胁模型、部署/架构契约和机器验收 catalog；新增 `SEC-EGRESS-LEASE-001`，后续对抗式审查又把安装器、Compose、WSL、磁盘、本机登录准入、审计 readiness 和数据源外部操作边界测试纳入 catalog，当前为 81 个需求、106 个 requirement/test 对。
 
-验证：本轮 67 个 acceptance 回归已通过；requirements catalog canonical check 已重算，catalog SHA-256 为 `938d5b0ae1f1fb3b6325c04a55bed13db2b9a0f4ba6e9cd6458c369faa32af4e`。完整回归结果记录于本报告末尾；仍只代表 E1/E2。
+验证：本轮 67 个 acceptance 回归已通过；requirements catalog canonical check 已重算，catalog SHA-256 为 `07d6b3fe09cae64c065de5d733569f347e00abc7c701512fbd03815aa2074985`。完整回归结果记录于本报告末尾；仍只代表 E1/E2。
 
 ### ASR-006 — High — Environment 保护检查发生在 signing job 已引用名称之后
 
@@ -186,6 +186,35 @@ transaction-local statement-timeout 设置。它不启动产品 API/Worker healt
 
 残余风险：同库 watermark 可以检测普通应用路径的漂移，却不能阻止有数据库管理员权限的攻击者
 同时改写 AuditEvent、水位线和触发器。外部 WORM/签名锚点仍是独立发布阻塞，不能被本修复替代。
+
+## 开放发现
+
+### ASR-013 — High — 数据源外部探测持有组织锁，且没有独立准入
+
+**状态：OPEN，未修复。**
+
+攻击路径：获授权的 Admin 可反复触发数据源创建/更新的连接 probe 或显式连接测试；拥有精确
+`SOURCE_USE`/`TARGET_USE` grant 的 Developer 也可读取 metadata。当前这五个入口——
+`create_datasource()`、`update_datasource()` 的 `requires_probe`、`test_datasource()`、
+`list_columns()`（Schema tables）和 `collect_job_validation_material()` 经
+`_capture_validation_snapshot()`——在产品数据库事务和 Organization/Project/Datasource/Job
+等锁仍持有时做 DNS、egress、密码解密、JDBC/数据库连接和 Schema 读取。慢的允许端点或最多
+200 张表的探测可使同一 Organization 的取消、凭据 revoke、目标外部独占撤回和其他控制写入
+排队；当前没有针对这一面向的连接测试/metadata admission。
+
+已接受的修复：ADR-0014 要求所有五个入口采用 A（短事务授权和不可变绑定 snapshot）→ B
+（无产品 DB 锁的 DNS/egress/strict current-credential barrier/connector，受总 deadline）→ C
+（短事务重新授权与完整 binding 复核）三阶段。revision、policy、current secret/envelope、
+成员/UsageGrant、Job spec、TransferPolicy scope 或 TargetNamespace 在 B 期间变化时，C 必须
+返回 409 stale，不能泄露旧 metadata、写 evidence/audit 或覆盖新状态。单 API 进程内的非阻塞
+admission 必须在认证后、A 前限制全局/组织/datasource 在途操作，并让拒绝在任何 resolver、
+connector、解密或 audit 前以 429 返回。
+
+尚未验证：没有相应源码、OpenAPI 409/429 契约、admission、总 deadline 或回归。关闭前必须
+在真实 PostgreSQL 用可控阻塞 connector 证明外部调用期间没有 Organization lock，且并发
+取消、目标独占撤回、secret revoke、datasource/job/policy 更新可完成；解锁后旧请求必须 stale
+且没有陈旧副作用。随后仍需真 MySQL/PostgreSQL E3 与 Windows 运行证据。不能用 API 空闲
+事务 timeout、SQLite、mock 或“登录已限速”代替该修复。
 
 ## 未关闭的发布阻塞
 

@@ -538,6 +538,33 @@ def test_project_idempotency_etag_archive_and_endpoint_normalization(
     ]
 
 
+def test_project_creation_never_bootstraps_migration_owned_scheduler_state(
+    core_stack: CoreStack,
+) -> None:
+    with core_stack.sessions.begin() as session:
+        scheduler = session.get(QueueSchedulerState, 1)
+        assert scheduler is not None
+        session.delete(scheduler)
+
+    response = core_stack.client.post(
+        "/api/v1/projects",
+        headers={"Idempotency-Key": "scheduler-state-missing-001"},
+        json={
+            "name": "Scheduler State Guard",
+            "slug": "scheduler-state-guard",
+            "description": None,
+        },
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["code"] == "SERVICE_UNAVAILABLE"
+    with core_stack.sessions() as session:
+        assert session.get(QueueSchedulerState, 1) is None
+        assert session.scalar(
+            select(Project.id).where(Project.slug == "scheduler-state-guard")
+        ) is None
+
+
 def test_project_dashboard_has_fixed_window_complete_zero_counts_and_drilldowns(
     core_stack: CoreStack,
 ) -> None:

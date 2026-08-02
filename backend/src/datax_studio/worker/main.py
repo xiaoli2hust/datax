@@ -445,7 +445,11 @@ def initialize_worker_dispatchers(
     if runtime_manifest is None:
         return None, None
     try:
-        credentials = build_credential_service(settings, engine=engine)
+        credentials = build_credential_service(
+            settings,
+            engine=engine,
+            register_active_kek=False,
+        )
         recovery = RecoveryService(control)
         return (
             ExecutionWorker(

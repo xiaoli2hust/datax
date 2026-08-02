@@ -32,8 +32,8 @@ class AcceptanceManifestTests(unittest.TestCase):
         self.assertEqual(document["requirement_count"], 81)
         self.assertEqual(document["v1_must_count"], 80)
         self.assertEqual(document["post_v1_count"], 1)
-        self.assertEqual(document["entry_count"], 102)
-        self.assertEqual(len(entries), 102)
+        self.assertEqual(document["entry_count"], 106)
+        self.assertEqual(len(entries), 106)
         self.assertTrue(
             {"PERF-001", "PERF-002", "SEC-001", "SEC-002", "SEC-003"}.isdisjoint(
                 entry.test_id for entry in entries
@@ -58,6 +58,23 @@ class AcceptanceManifestTests(unittest.TestCase):
                 if (entry.requirement_id, entry.test_id) in new_e3_pairs
             },
             {"E3"},
+        )
+        external_operation_pairs = {
+            ("PRD-FR-DS-002", "SEC-DS-EXTERNAL-BOUNDARY-001"),
+            ("PRD-FR-DS-003", "SEC-DS-EXTERNAL-BOUNDARY-001"),
+            ("PRD-FR-JOB-005", "SEC-DS-EXTERNAL-BOUNDARY-001"),
+            ("NFR-SEC-003", "SEC-DS-EXTERNAL-BOUNDARY-001"),
+        }
+        pairs = {(entry.requirement_id, entry.test_id) for entry in entries}
+        self.assertTrue(external_operation_pairs.issubset(pairs))
+        self.assertEqual(
+            {
+                entry.minimum_evidence_level
+                for entry in entries
+                if (entry.requirement_id, entry.test_id)
+                in external_operation_pairs
+            },
+            {"E2", "E3"},
         )
         self.assertEqual(
             {

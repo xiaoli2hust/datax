@@ -4,12 +4,15 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event, select
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import sessionmaker
 
 import datax_studio.core.service as core_service
 import datax_studio.credentials.service as credential_service
 import datax_studio.worker.main as worker_main
+from datax_studio.api.problems import ProblemException
+from datax_studio.credentials.db import KekKeyVersion
 from datax_studio.worker.main import DynamicWorkerAttestation
 
 
@@ -94,6 +97,118 @@ def test_runtime_service_builders_reuse_a_worker_owned_engine(
 
     assert control.sessions.kw["bind"] is shared_engine
     assert credentials.sessions.kw["bind"] is shared_engine
+
+
+def test_worker_read_only_credential_service_requires_pre_registered_active_kek(
+    tmp_path: Path,
+) -> None:
+    """The Worker cannot bootstrap its own KEK registry row."""
+
+    settings = _runtime_settings(tmp_path)
+    key_path = tmp_path / "credential-kek-v1.key"
+    key_path.write_bytes(b"k" * 32)
+    key_path.chmod(0o600)
+    engine = create_engine("sqlite+pysqlite://")
+    KekKeyVersion.__table__.create(engine)
+    statements: list[str] = []
+
+    def record_statement(
+        _connection: object,
+        _cursor: object,
+        statement: str,
+        _parameters: object,
+        _context: object,
+        _executemany: object,
+    ) -> None:
+        statements.append(statement.upper())
+
+    event.listen(engine, "before_cursor_execute", record_statement)
+    try:
+        with pytest.raises(ProblemException) as exc_info:
+            credential_service.build_credential_service(
+                settings,
+                engine=engine,
+                register_active_kek=False,
+            )
+
+        assert exc_info.value.code == "KEK_KEYRING_UNAVAILABLE"
+        assert not any("INSERT INTO KEK_KEY_VERSIONS" in item for item in statements)
+        assert not any("FOR UPDATE" in item for item in statements)
+        with sessionmaker(bind=engine)() as session:
+            assert list(session.scalars(select(KekKeyVersion))) == []
+
+        api_service = credential_service.build_credential_service(
+            settings,
+            engine=engine,
+        )
+        assert api_service.sessions.kw["bind"] is engine
+        with sessionmaker(bind=engine)() as session:
+            registered = session.get(KekKeyVersion, "v1")
+            assert registered is not None
+            assert registered.status == "ACTIVE"
+
+        worker_service = credential_service.build_credential_service(
+            settings,
+            engine=engine,
+            register_active_kek=False,
+        )
+        assert worker_service.sessions.kw["bind"] is engine
+    finally:
+        engine.dispose()
+
+
+def test_worker_dispatcher_fails_closed_when_active_kek_is_unregistered(
+    tmp_path: Path,
+) -> None:
+    settings = _runtime_settings(tmp_path)
+    key_path = tmp_path / "credential-kek-v1.key"
+    key_path.write_bytes(b"k" * 32)
+    key_path.chmod(0o600)
+    engine = create_engine("sqlite+pysqlite://")
+    KekKeyVersion.__table__.create(engine)
+    try:
+        dispatchers = worker_main.initialize_worker_dispatchers(
+            settings=settings,
+            engine=engine,
+            control=object(),
+            reconciler=object(),
+            runtime_manifest=object(),
+        )
+
+        assert dispatchers == (None, None)
+        with sessionmaker(bind=engine)() as session:
+            assert list(session.scalars(select(KekKeyVersion))) == []
+    finally:
+        engine.dispose()
+
+
+def test_worker_dispatcher_requests_read_only_kek_validation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[tuple[object, bool]] = []
+
+    def unavailable_builder(
+        _settings: object,
+        *,
+        engine: object,
+        register_active_kek: bool,
+    ) -> object:
+        calls.append((engine, register_active_kek))
+        raise SQLAlchemyError("missing active KEK")
+
+    worker_engine = object()
+    monkeypatch.setattr(worker_main, "build_credential_service", unavailable_builder)
+
+    dispatchers = worker_main.initialize_worker_dispatchers(
+        settings=SimpleNamespace(),
+        engine=worker_engine,
+        control=object(),
+        reconciler=object(),
+        runtime_manifest=object(),
+    )
+
+    assert dispatchers == (None, None)
+    assert calls == [(worker_engine, False)]
 
 
 def test_dispatcher_initialization_fails_closed_on_database_pressure(

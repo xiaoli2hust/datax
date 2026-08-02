@@ -13,6 +13,13 @@
   },
   "grant_ready": false,
   "grant_ready_condition": "Every grouped product-management table must be expanded to exact SQL operation, writable column and transition rows before a DML-revocation migration is authored.",
+  "implementation_status": {
+    "overall": "ACCEPTED_BASELINE_NOT_GRANT_READY",
+    "worker_kek_read_only": "E1_SOURCE_COMPLETE_POSTGRES_PERMISSION_PENDING",
+    "scheduler_singleton": "E1_SOURCE_COMPLETE_POSTGRES_PERMISSION_PENDING",
+    "lifecycle_claim_lock": "E1_SOURCE_COMPLETE_FUNCTION_MIGRATION_AND_POSTGRES_CONCURRENCY_PENDING",
+    "lifecycle_function": "NOT_IMPLEMENTED"
+  },
   "global_invariants": [
     "No datax_api or datax_worker ON ALL TABLES INSERT UPDATE DELETE grant may remain.",
     "No migration-owner ALTER DEFAULT PRIVILEGES grant may give runtime DML on future tables.",
@@ -112,7 +119,8 @@
             "UPDATE",
             "DELETE"
           ],
-          "implementation_prerequisite": "Worker CredentialService must use a read-only constructor and fail closed if no active KEK is registered."
+          "implementation_prerequisite": "Worker CredentialService must use a read-only constructor and fail closed if no active KEK is registered.",
+          "implementation_status": "E1_SOURCE_COMPLETE_POSTGRES_PERMISSION_PENDING"
         },
         {
           "table": "endpoint_connection_evidences",
@@ -148,7 +156,8 @@
             "UPDATE",
             "DELETE"
           ],
-          "implementation_prerequisite": "migration owner initializes the singleton; create_project must not lazily create it."
+          "implementation_prerequisite": "migration owner initializes the singleton; create_project must not lazily create it.",
+          "implementation_status": "E1_SOURCE_COMPLETE_POSTGRES_PERMISSION_PENDING"
         },
         {
           "table": "executions",
@@ -456,15 +465,21 @@
   "preimplementation_blockers": [
     {
       "id": "P1-003A-KEK-WORKER-WRITE",
-      "resolution": "Make Worker KEK lookup read-only and fail closed; register active KEK through migration/API/bootstrap owner."
+      "resolution": "Make Worker KEK lookup read-only and fail closed; register active KEK through migration/API/bootstrap owner.",
+      "source_prerequisite_status": "E1_COMPLETE",
+      "remaining": "PostgreSQL grant migration and direct-SQL negative evidence"
     },
     {
       "id": "P1-003A-SCHEDULER-API-WRITE",
-      "resolution": "Initialize queue_scheduler_state through migration owner; remove API lazy singleton creation."
+      "resolution": "Initialize queue_scheduler_state through migration owner; remove API lazy singleton creation.",
+      "source_prerequisite_status": "E1_COMPLETE",
+      "remaining": "PostgreSQL grant migration and direct-SQL negative evidence"
     },
     {
       "id": "P1-003A-LIFECYCLE-SYSTEM-CONTROL",
-      "resolution": "Use des_api_request_local_stop rather than generic system_control UPDATE."
+      "resolution": "Use des_api_request_local_stop rather than generic system_control UPDATE.",
+      "source_prerequisite_status": "CLAIM_ROW_LOCK_E1_COMPLETE",
+      "remaining": "Create the constrained PostgreSQL function, revoke generic UPDATE/EXECUTE, and prove stop-versus-claim serialization on PostgreSQL"
     },
     {
       "id": "P1-003A-MAINTENANCE-DELETE",

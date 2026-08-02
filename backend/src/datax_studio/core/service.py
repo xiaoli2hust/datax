@@ -372,6 +372,7 @@ class ControlService:
                         title="项目名称或标识已存在",
                         detail="请使用新的项目名称和 slug。",
                     )
+                self._require_scheduler_state(session)
                 project = Project(
                     id=uuid4(),
                     organization_id=principal.organization_id,
@@ -395,7 +396,6 @@ class ControlService:
                         updated_at=now,
                     )
                 )
-                self._ensure_scheduler_state(session, now)
                 self._append_audit(
                     session,
                     organization=organization,
@@ -3298,7 +3298,15 @@ class ControlService:
         if not cgroup_identity or len(cgroup_identity) > 256:
             raise ValueError("cgroup_identity is invalid")
         with self.sessions.begin() as session:
-            control = session.get(SystemControl, 1)
+            # Serialize admission with the Launcher stop request.  PostgreSQL
+            # grants the fixed local-stop function the same row lock, so a
+            # claim cannot pass a stale `draining=false` observation and then
+            # commit after stop preflight has checked for active work.
+            control = session.scalar(
+                select(SystemControl)
+                .where(SystemControl.singleton_id == 1)
+                .with_for_update()
+            )
             if control is None or control.draining:
                 raise ProblemException(
                     status=503,
@@ -6604,14 +6612,15 @@ class ControlService:
             )
         return None
 
-    def _ensure_scheduler_state(self, session: Session, now: datetime) -> None:
+    @staticmethod
+    def _require_scheduler_state(session: Session) -> None:
         if session.get(QueueSchedulerState, 1) is None:
-            session.add(
-                QueueSchedulerState(
-                    singleton_id=1,
-                    next_service_sequence=1,
-                    updated_at=now,
-                )
+            raise ProblemException(
+                status=503,
+                code="SERVICE_UNAVAILABLE",
+                title="服务控制状态不可用",
+                detail="调度控制事实缺失；请完成数据库迁移和恢复后重试。",
+                retryable=True,
             )
 
     def _claim_idempotency(

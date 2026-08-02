@@ -561,7 +561,15 @@ class RecoveryService:
         if not 5 <= lease_seconds <= 300:
             raise ValueError("lease_seconds must be between 5 and 300")
         with self.control.sessions.begin() as session:
-            control = session.get(SystemControl, 1)
+            # Use the same row lock as normal Execution claims.  The future
+            # PostgreSQL local-stop function takes this lock before its
+            # preflight, preventing a RecoveryProbe from being claimed from a
+            # stale `draining=false` observation.
+            control = session.scalar(
+                select(SystemControl)
+                .where(SystemControl.singleton_id == 1)
+                .with_for_update()
+            )
             if control is None or control.draining:
                 raise ProblemException(
                     status=503,

@@ -231,8 +231,15 @@ def build_credential_service(
     settings: Settings,
     *,
     engine: Engine | None = None,
+    register_active_kek: bool = True,
 ) -> CredentialService:
-    """Build credential services on an optional caller-owned database pool."""
+    """Build credential services on an optional caller-owned database pool.
+
+    API/bootstrap callers retain the default registration path.  The Worker
+    must pass ``register_active_kek=False`` so its database role only needs to
+    read an already registered active KEK and fails closed when that invariant
+    is absent.
+    """
 
     if engine is None:
         engine = create_engine(settings.database_url, pool_pre_ping=True, future=True)
@@ -267,7 +274,10 @@ def build_credential_service(
             query_timeout_seconds=settings.datasource_query_timeout_seconds,
         ),
     )
-    service.ensure_active_kek_registered()
+    if register_active_kek:
+        service.ensure_active_kek_registered()
+    else:
+        service.require_active_kek_registered()
     return service
 
 
@@ -338,6 +348,35 @@ class CredentialService:
                     raise self._keyring_unavailable()
         except IntegrityError as exc:
             raise self._keyring_unavailable() from exc
+
+    def require_active_kek_registered(self) -> None:
+        """Read-only startup check for a configured, registered active KEK.
+
+        This deliberately does not use ``FOR UPDATE`` or create a registration:
+        the Worker must be unable to turn a missing key registry row into a
+        writable credential-table requirement.  Credential binding still
+        revalidates the relevant KEK at each work claim.
+        """
+
+        try:
+            fingerprint = self.keyring.fingerprint(self.active_kek_version)
+        except (OSError, ValueError) as exc:
+            raise self._keyring_unavailable() from exc
+        with self.sessions() as session:
+            active = session.scalar(
+                select(KekKeyVersion).where(KekKeyVersion.status == "ACTIVE")
+            )
+            registered = session.get(KekKeyVersion, self.active_kek_version)
+            if (
+                active is None
+                or registered is None
+                or active.key_version != registered.key_version
+                or registered.status != "ACTIVE"
+                or registered.purpose != "CREDENTIAL_DEK_WRAP"
+                or registered.wrapping_algorithm != WRAPPING_ALGORITHM
+                or not hmac.compare_digest(registered.fingerprint_sha256, fingerprint)
+            ):
+                raise self._keyring_unavailable()
 
     def validate_registered_keyring(self, session: Session) -> None:
         registrations = list(
