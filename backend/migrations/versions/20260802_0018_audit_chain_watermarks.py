@@ -30,7 +30,12 @@ def upgrade() -> None:
         sa.Column("full_replay_sequence", sa.BigInteger(), nullable=False, server_default="0"),
         sa.Column("full_replay_hash", sa.String(length=64), nullable=True),
         sa.Column("full_replay_finished_at", sa.DateTime(timezone=True), nullable=True),
-        sa.Column("integrity_status", sa.String(length=16), nullable=False, server_default="PENDING"),
+        sa.Column(
+            "integrity_status",
+            sa.String(length=16),
+            nullable=False,
+            server_default="PENDING",
+        ),
         sa.Column("failure_code", sa.String(length=64), nullable=True),
         sa.Column("failure_sequence", sa.BigInteger(), nullable=True),
         sa.Column("mutation_epoch", sa.BigInteger(), nullable=False, server_default="0"),
