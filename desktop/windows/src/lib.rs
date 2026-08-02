@@ -155,6 +155,18 @@ const RUNTIME_VOLUMES: [(&str, &str); 3] = [
 // consume the measured volume after the gate and before PostgreSQL starts.
 const COMPOSE_UP_WITHOUT_PULL: [&str; 4] = ["up", "--pull", "never", "-d"];
 const RUNTIME_SECRET_COUNT: usize = 10;
+const RUNTIME_SECRET_FILE_NAMES: [&str; RUNTIME_SECRET_COUNT] = [
+    "postgres_password.txt",
+    "egress_guard_database_password.txt",
+    "egress_lease_creation_capability",
+    "api_database_password.txt",
+    "worker_database_password.txt",
+    "jwt_private_key.pem",
+    "jwt_public_key.pem",
+    "refresh_token_hmac_key",
+    "idempotency_hmac_key",
+    "credential-kek-v1.key",
+];
 const MAX_RUNTIME_SECRET_BYTES: u64 = 4096;
 const VERIFY_CONTAINER_SECRETS_SCRIPT: &str = concat!(
     "import os,stat,sys\n",
@@ -307,16 +319,6 @@ struct Installation {
     installation_id: PathBuf,
     runtime_generation: PathBuf,
     secret_dir: PathBuf,
-    postgres_secret: PathBuf,
-    egress_guard_database_secret: PathBuf,
-    egress_lease_creation_capability: PathBuf,
-    api_database_secret: PathBuf,
-    worker_database_secret: PathBuf,
-    jwt_private_key: PathBuf,
-    jwt_public_key: PathBuf,
-    refresh_token_hmac_key: PathBuf,
-    idempotency_hmac_key: PathBuf,
-    credential_kek: PathBuf,
 }
 
 #[derive(Debug)]
@@ -453,16 +455,16 @@ struct RuntimeSecretPaths {
 impl RuntimeSecretPaths {
     fn from_directory(directory: PathBuf) -> Self {
         Self {
-            postgres: directory.join("postgres_password.txt"),
-            egress_guard_database: directory.join("egress_guard_database_password.txt"),
-            egress_lease_creation_capability: directory.join("egress_lease_creation_capability"),
-            api_database: directory.join("api_database_password.txt"),
-            worker_database: directory.join("worker_database_password.txt"),
-            jwt_private_key: directory.join("jwt_private_key.pem"),
-            jwt_public_key: directory.join("jwt_public_key.pem"),
-            refresh_token_hmac_key: directory.join("refresh_token_hmac_key"),
-            idempotency_hmac_key: directory.join("idempotency_hmac_key"),
-            credential_kek: directory.join("credential-kek-v1.key"),
+            postgres: directory.join(RUNTIME_SECRET_FILE_NAMES[0]),
+            egress_guard_database: directory.join(RUNTIME_SECRET_FILE_NAMES[1]),
+            egress_lease_creation_capability: directory.join(RUNTIME_SECRET_FILE_NAMES[2]),
+            api_database: directory.join(RUNTIME_SECRET_FILE_NAMES[3]),
+            worker_database: directory.join(RUNTIME_SECRET_FILE_NAMES[4]),
+            jwt_private_key: directory.join(RUNTIME_SECRET_FILE_NAMES[5]),
+            jwt_public_key: directory.join(RUNTIME_SECRET_FILE_NAMES[6]),
+            refresh_token_hmac_key: directory.join(RUNTIME_SECRET_FILE_NAMES[7]),
+            idempotency_hmac_key: directory.join(RUNTIME_SECRET_FILE_NAMES[8]),
+            credential_kek: directory.join(RUNTIME_SECRET_FILE_NAMES[9]),
             directory,
         }
     }
@@ -798,6 +800,18 @@ struct LegacyRootObjectPresence {
     generations_directory: bool,
 }
 
+// The generation pointer is the only current-runtime source, but that does
+// not make unreferenced root objects harmless.  Keep the root-state verdict
+// separate from ACL changes and object creation so a FRESH/RESTORE pointer can
+// never silently coexist with a second LEGACY-looking object set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeGenerationRootObjectPresence {
+    legacy_installation_id: bool,
+    legacy_secret_directory: bool,
+    generations_directory: bool,
+    generation_entries: BTreeSet<String>,
+}
+
 pub fn run<I>(arguments: I) -> Result<RunOutcome, LauncherError>
 where
     I: IntoIterator<Item = OsString>,
@@ -1048,16 +1062,6 @@ impl Installation {
         let installation_id = app_data_root.join("installation-id");
         let runtime_generation = app_data_root.join("runtime-generation.json");
         let secret_dir = app_data_root.join("secrets");
-        let postgres_secret = secret_dir.join("postgres_password.txt");
-        let egress_guard_database_secret = secret_dir.join("egress_guard_database_password.txt");
-        let egress_lease_creation_capability = secret_dir.join("egress_lease_creation_capability");
-        let api_database_secret = secret_dir.join("api_database_password.txt");
-        let worker_database_secret = secret_dir.join("worker_database_password.txt");
-        let jwt_private_key = secret_dir.join("jwt_private_key.pem");
-        let jwt_public_key = secret_dir.join("jwt_public_key.pem");
-        let refresh_token_hmac_key = secret_dir.join("refresh_token_hmac_key");
-        let idempotency_hmac_key = secret_dir.join("idempotency_hmac_key");
-        let credential_kek = secret_dir.join("credential-kek-v1.key");
 
         Ok(Self {
             executable,
@@ -1074,16 +1078,6 @@ impl Installation {
             installation_id,
             runtime_generation,
             secret_dir,
-            postgres_secret,
-            egress_guard_database_secret,
-            egress_lease_creation_capability,
-            api_database_secret,
-            worker_database_secret,
-            jwt_private_key,
-            jwt_public_key,
-            refresh_token_hmac_key,
-            idempotency_hmac_key,
-            credential_kek,
         })
     }
 
@@ -1705,11 +1699,8 @@ fn ensure_runtime_secrets(
         )
     })?;
     platform::ensure_directory(local_app_data)?;
-    create_controlled_directory(&installation.app_data_root)?;
-    platform::ensure_directory(&installation.app_data_root)?;
-
+    inspect_runtime_app_data_root(installation)?;
     let sid = current_user_sid(start_tools, installation)?;
-    restrict_directory_acl(start_tools, installation, &installation.app_data_root, &sid)?;
 
     match controlled_regular_file_presence(
         &installation.initialization_state,
@@ -1717,6 +1708,7 @@ fn ensure_runtime_secrets(
         "FRESH 首次初始化 journal",
     )? {
         ControlledRegularFilePresence::Present => {
+            ensure_runtime_app_data_root_acl(start_tools, installation, &sid)?;
             return resume_fresh_runtime_initialization(tools, start_tools, installation, &sid);
         }
         ControlledRegularFilePresence::Absent => {}
@@ -1730,7 +1722,18 @@ fn ensure_runtime_secrets(
         "活动运行代际指针",
     )? {
         ControlledRegularFilePresence::Present => {
+            // The root/generation closure is read before the Launcher changes
+            // the root ACL.  A malformed active set is not a reason to repair
+            // or normalise its on-disk permissions.
+            let expected = load_active_runtime_snapshot(installation)?;
+            ensure_runtime_app_data_root_acl(start_tools, installation, &sid)?;
             let active = load_verified_active_runtime_snapshot(start_tools, installation, &sid)?;
+            if active != expected {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_CHANGED_DURING_CHECK",
+                    "活动运行代际在根目录 ACL 核验期间发生变化；Launcher 已安全阻断。",
+                ));
+            }
             let allowed_volume_names = runtime_volume_name_set(&active.volumes);
             ensure_no_unbound_product_volumes(tools, installation, &allowed_volume_names)?;
             validate_active_runtime_volume_contract(
@@ -1743,24 +1746,137 @@ fn ensure_runtime_secrets(
         ControlledRegularFilePresence::Absent => {}
     }
 
-    match select_uninitialized_runtime_path(tools, installation)? {
+    let selected_path = select_uninitialized_runtime_path(tools, installation)?;
+    match selected_path {
         UninitializedRuntimePath::LegacyMigration => {
             // This is the one retained migration path: a complete historical
             // fixed-object installation becomes one immutable LEGACY pointer.
-            create_controlled_directory(&installation.secret_dir)?;
-            platform::ensure_directory(&installation.secret_dir)?;
+            // Do not create or ACL even the app-data root until the old marker,
+            // all secrets, and all three fixed volumes prove that they are one
+            // coherent existing installation.  This initial identity proof is
+            // read-only; the same proof is repeated after the root ACL change.
+            let installation_id = ensure_storage_identity(tools, installation)?;
+            ensure_uninitialized_runtime_path_still_selected(
+                tools,
+                installation,
+                UninitializedRuntimePath::LegacyMigration,
+            )?;
+            ensure_runtime_app_data_root_acl(start_tools, installation, &sid)?;
+            ensure_uninitialized_runtime_path_still_selected(
+                tools,
+                installation,
+                UninitializedRuntimePath::LegacyMigration,
+            )?;
+            let acl_preflight_installation_id = ensure_storage_identity(tools, installation)?;
+            if !constant_time_ascii_equal(&installation_id, &acl_preflight_installation_id) {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_IDENTITY_MISMATCH",
+                    "旧式运行对象在根目录 ACL 核验期间发生变化；Launcher 不会提交 LEGACY 指针。",
+                ));
+            }
             restrict_directory_acl(start_tools, installation, &installation.secret_dir, &sid)?;
-            let storage_was_existing =
-                ensure_storage_identity(tools, start_tools, installation, &sid)?;
-            ensure_existing_runtime_secrets(start_tools, installation, &sid, storage_was_existing)?;
-            let installation_id = read_installation_id(&installation.installation_id)?;
+            ensure_existing_runtime_secrets(start_tools, installation, &sid, true)?;
+            restrict_file_acl(
+                start_tools,
+                installation,
+                &installation.installation_id,
+                &sid,
+            )?;
+            let confirmed_installation_id = ensure_storage_identity(tools, installation)?;
+            if !constant_time_ascii_equal(&installation_id, &confirmed_installation_id) {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_IDENTITY_MISMATCH",
+                    "旧式运行对象在 ACL 核验期间发生变化；Launcher 不会提交 LEGACY 指针。",
+                ));
+            }
+            ensure_uninitialized_runtime_path_still_selected(
+                tools,
+                installation,
+                UninitializedRuntimePath::LegacyMigration,
+            )?;
             ensure_legacy_runtime_generation(start_tools, installation, &sid, &installation_id)
         }
         UninitializedRuntimePath::Fresh => {
+            ensure_runtime_app_data_root_acl(start_tools, installation, &sid)?;
+            ensure_uninitialized_runtime_path_still_selected(
+                tools,
+                installation,
+                UninitializedRuntimePath::Fresh,
+            )?;
             create_fresh_initialization_journal(start_tools, installation, &sid)?;
             resume_fresh_runtime_initialization(tools, start_tools, installation, &sid)
         }
     }
+}
+
+// Inspection of an existing runtime root must not repair it.  In particular,
+// a LEGACY preflight needs to reject a reparse point or inaccessible root
+// before any root ACL change can make the state look launcher-controlled.
+fn inspect_runtime_app_data_root(installation: &Installation) -> Result<(), LauncherError> {
+    match fs::symlink_metadata(&installation.app_data_root) {
+        Ok(_) => platform::ensure_tree_no_reparse(&installation.app_data_root).map_err(|_| {
+            LauncherError::new(
+                "RUNTIME_GENERATION_INVALID",
+                "无法安全检查运行代际根目录；检测到非目录、reparse point 或不可访问路径。",
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(LauncherError::new(
+            "RUNTIME_GENERATION_INVALID",
+            "无法检查运行代际根目录；Launcher 不会把元数据异常当作空目标。",
+        )),
+    }
+}
+
+fn ensure_runtime_app_data_root_acl(
+    start_tools: &StartTools,
+    installation: &Installation,
+    sid: &str,
+) -> Result<(), LauncherError> {
+    create_controlled_directory(&installation.app_data_root)?;
+    platform::ensure_tree_no_reparse(&installation.app_data_root)?;
+    restrict_directory_acl(start_tools, installation, &installation.app_data_root, sid)?;
+    platform::ensure_tree_no_reparse(&installation.app_data_root).map_err(|_| {
+        LauncherError::new(
+            "RUNTIME_GENERATION_INVALID",
+            "运行代际根目录在 ACL 核验期间发生变化。",
+        )
+    })
+}
+
+fn ensure_uninitialized_runtime_path_still_selected(
+    tools: &Tools,
+    installation: &Installation,
+    expected: UninitializedRuntimePath,
+) -> Result<(), LauncherError> {
+    for (path, error_code, object_name) in [
+        (
+            &installation.initialization_state,
+            "FRESH_INITIALIZATION_JOURNAL_INVALID",
+            "FRESH 首次初始化 journal",
+        ),
+        (
+            &installation.runtime_generation,
+            "RUNTIME_GENERATION_INVALID",
+            "活动运行代际指针",
+        ),
+    ] {
+        if controlled_regular_file_presence(path, error_code, object_name)?
+            == ControlledRegularFilePresence::Present
+        {
+            return Err(LauncherError::new(
+                "RUNTIME_INITIALIZATION_STATE_CHANGED",
+                "初始化路径选择后出现 journal 或活动代际指针；Launcher 不会继续改变运行对象。",
+            ));
+        }
+    }
+    if select_uninitialized_runtime_path(tools, installation)? != expected {
+        return Err(LauncherError::new(
+            "RUNTIME_INITIALIZATION_STATE_CHANGED",
+            "初始化路径选择期间 root 对象或 Docker volume 状态发生变化；Launcher 已安全阻断。",
+        ));
+    }
+    Ok(())
 }
 
 // This discriminator runs before a FRESH journal exists.  It never opens a root
@@ -1829,6 +1945,231 @@ fn controlled_regular_file_presence(
             format!("无法证明{object_name}不存在或是受控普通文件；Launcher 已安全阻断。"),
         )),
     }
+}
+
+// This check intentionally has no ACL or create-new side effect.  A pointer
+// alone cannot prove there is only one local runtime object set: a lost Docker
+// volume can leave an old root marker/secret tree or a sibling generated tree
+// behind.  Do not follow any of those entries while deciding whether the
+// pointer may be consumed.
+fn inspect_runtime_generation_root_objects(
+    app_data_root: &Path,
+    legacy_installation_id: &Path,
+    legacy_secret_directory: &Path,
+) -> Result<RuntimeGenerationRootObjectPresence, LauncherError> {
+    let legacy_installation_id = runtime_generation_root_object_present(
+        legacy_installation_id,
+        "root LEGACY installation-id",
+    )?;
+    let legacy_secret_directory =
+        runtime_generation_root_object_present(legacy_secret_directory, "root LEGACY secrets")?;
+    let generations = app_data_root.join("generations");
+    let generations_directory =
+        runtime_generation_root_object_present(&generations, "generations 目录")?;
+    let mut generation_entries = BTreeSet::new();
+    if generations_directory {
+        platform::ensure_directory(&generations).map_err(|_| {
+            LauncherError::new(
+                "RUNTIME_GENERATION_STATE_INSPECTION_FAILED",
+                "无法证明 generations 是受控普通目录；检测到文件、链接或 reparse point。",
+            )
+        })?;
+        let entries = fs::read_dir(&generations).map_err(|_| {
+            LauncherError::new(
+                "RUNTIME_GENERATION_STATE_INSPECTION_FAILED",
+                "无法枚举 generations 目录；Launcher 不会混合运行代际。",
+            )
+        })?;
+        for entry in entries {
+            let entry = entry.map_err(|_| {
+                LauncherError::new(
+                    "RUNTIME_GENERATION_STATE_INSPECTION_FAILED",
+                    "无法读取 generations 目录项；Launcher 不会混合运行代际。",
+                )
+            })?;
+            let name = entry.file_name().into_string().map_err(|_| {
+                LauncherError::new(
+                    "RUNTIME_GENERATION_STATE_INSPECTION_FAILED",
+                    "generations 目录包含无法认证的名称；Launcher 已安全阻断。",
+                )
+            })?;
+            platform::ensure_directory(&entry.path()).map_err(|_| {
+                LauncherError::new(
+                    "RUNTIME_GENERATION_STATE_INSPECTION_FAILED",
+                    "generations 目录包含文件、链接或 reparse point；Launcher 已安全阻断。",
+                )
+            })?;
+            if !generation_entries.insert(name) {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_STATE_INSPECTION_FAILED",
+                    "generations 目录包含重复或不可认证的名称；Launcher 已安全阻断。",
+                ));
+            }
+        }
+    }
+    Ok(RuntimeGenerationRootObjectPresence {
+        legacy_installation_id,
+        legacy_secret_directory,
+        generations_directory,
+        generation_entries,
+    })
+}
+
+fn runtime_generation_root_object_present(
+    path: &Path,
+    object_name: &str,
+) -> Result<bool, LauncherError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(_) => Err(LauncherError::new(
+            "RUNTIME_GENERATION_STATE_INSPECTION_FAILED",
+            format!("无法检查{object_name}；Launcher 不会把未知对象当作不存在。"),
+        )),
+    }
+}
+
+fn validate_active_runtime_generation_object_closure(
+    installation: &Installation,
+    generation: &RuntimeGeneration,
+) -> Result<(), LauncherError> {
+    let presence = inspect_runtime_generation_root_objects(
+        &installation.app_data_root,
+        &installation.installation_id,
+        &installation.secret_dir,
+    )?;
+    active_runtime_generation_object_closure_decision(generation, &presence)?;
+    match generation.source.as_str() {
+        "FRESH" | "RESTORE" => {
+            let secrets = RuntimeSecretPaths::from_directory(
+                generation.secret_path(&installation.app_data_root),
+            );
+            validate_generated_runtime_generation_directory(
+                &secrets,
+                true,
+                false,
+                "RUNTIME_GENERATION_STATE_CONFLICT",
+                "活动 FRESH/RESTORE 代际",
+            )?;
+        }
+        "LEGACY" => {
+            platform::ensure_regular_file(&installation.installation_id).map_err(|_| {
+                LauncherError::new(
+                    "RUNTIME_GENERATION_STATE_CONFLICT",
+                    "活动 LEGACY 代际的 root installation-id 不是受控普通文件。",
+                )
+            })?;
+            platform::ensure_tree_no_reparse(&installation.secret_dir).map_err(|_| {
+                LauncherError::new(
+                    "RUNTIME_GENERATION_STATE_CONFLICT",
+                    "活动 LEGACY 代际的 root secrets 目录不可安全使用。",
+                )
+            })?;
+            validate_runtime_secret_directory_entries(
+                &RuntimeSecretPaths::from_directory(installation.secret_dir.clone()),
+                true,
+                "RUNTIME_GENERATION_STATE_CONFLICT",
+                "活动 LEGACY root secret",
+            )?;
+        }
+        _ => {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_INVALID",
+                "活动运行代际来源无效。",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn active_runtime_generation_object_closure_decision(
+    generation: &RuntimeGeneration,
+    presence: &RuntimeGenerationRootObjectPresence,
+) -> Result<(), LauncherError> {
+    match generation.source.as_str() {
+        "FRESH" | "RESTORE" => {
+            let expected = BTreeSet::from([generation.generation_id.clone()]);
+            if presence.legacy_installation_id
+                || presence.legacy_secret_directory
+                || !presence.generations_directory
+                || presence.generation_entries != expected
+            {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_STATE_CONFLICT",
+                    "活动 FRESH/RESTORE 代际与 root LEGACY 对象或未知 generation sibling 交叉；Launcher 不会选择非唯一运行集合。",
+                ));
+            }
+        }
+        "LEGACY" => {
+            if !presence.legacy_installation_id
+                || !presence.legacy_secret_directory
+                || presence.generations_directory
+                || !presence.generation_entries.is_empty()
+            {
+                return Err(LauncherError::new(
+                    "RUNTIME_GENERATION_STATE_CONFLICT",
+                    "活动 LEGACY 代际没有唯一的 root 对象集合，或同时存在 generation 对象；Launcher 已安全阻断。",
+                ));
+            }
+        }
+        _ => {
+            return Err(LauncherError::new(
+                "RUNTIME_GENERATION_INVALID",
+                "活动运行代际来源无效。",
+            ));
+        }
+    }
+    Ok(())
+}
+
+// A pending FRESH journal may legitimately have no generated directory yet, or
+// an empty/partial directory for its own generation after an interruption.  It
+// must still reject a root LEGACY set and every sibling generation before it
+// creates another directory, secret, or volume.
+fn validate_pending_fresh_generation_object_closure(
+    installation: &Installation,
+    generation: &RuntimeGeneration,
+) -> Result<(), LauncherError> {
+    let presence = inspect_runtime_generation_root_objects(
+        &installation.app_data_root,
+        &installation.installation_id,
+        &installation.secret_dir,
+    )?;
+    pending_fresh_generation_object_closure_decision(generation, &presence)?;
+    if presence
+        .generation_entries
+        .contains(&generation.generation_id)
+    {
+        validate_generated_runtime_generation_directory(
+            &RuntimeSecretPaths::from_directory(
+                generation.secret_path(&installation.app_data_root),
+            ),
+            false,
+            true,
+            "FRESH_INITIALIZATION_TARGET_NOT_CLEAN",
+            "FRESH journal 代际",
+        )?;
+    }
+    Ok(())
+}
+
+fn pending_fresh_generation_object_closure_decision(
+    generation: &RuntimeGeneration,
+    presence: &RuntimeGenerationRootObjectPresence,
+) -> Result<(), LauncherError> {
+    let expected = BTreeSet::from([generation.generation_id.clone()]);
+    if generation.source != "FRESH"
+        || generation.restore_journal_id.is_some()
+        || presence.legacy_installation_id
+        || presence.legacy_secret_directory
+        || !presence.generation_entries.is_subset(&expected)
+    {
+        return Err(LauncherError::new(
+            "FRESH_INITIALIZATION_TARGET_NOT_CLEAN",
+            "FRESH journal 与 root LEGACY 对象或未知 generation sibling 交叉；Launcher 不会继续或创建替代运行对象。",
+        ));
+    }
+    Ok(())
 }
 
 fn uninitialized_runtime_path_for_legacy_presence(
@@ -1980,13 +2321,21 @@ fn fresh_initialization_secret_decision(
 // errors to `false`, either of which could otherwise look like a safely absent
 // secret and allow a new secret to be generated beside existing data volumes.
 fn fresh_runtime_secret_file_count(secrets: &RuntimeSecretPaths) -> Result<usize, LauncherError> {
+    controlled_runtime_secret_file_count(
+        secrets,
+        "FRESH_INITIALIZATION_SECRET_SET_INCOMPLETE",
+        "FRESH 运行 secret 文件",
+    )
+}
+
+fn controlled_runtime_secret_file_count(
+    secrets: &RuntimeSecretPaths,
+    error_code: &str,
+    object_name: &str,
+) -> Result<usize, LauncherError> {
     secrets.all().iter().try_fold(
         0_usize,
-        |count, path| match controlled_regular_file_presence(
-            path,
-            "FRESH_INITIALIZATION_SECRET_SET_INCOMPLETE",
-            "FRESH 运行 secret 文件",
-        )? {
+        |count, path| match controlled_regular_file_presence(path, error_code, object_name)? {
             ControlledRegularFilePresence::Absent => Ok(count),
             ControlledRegularFilePresence::Present => Ok(count + 1),
         },
@@ -2088,6 +2437,7 @@ fn resume_fresh_runtime_initialization(
         &installation.app_data_root,
         journal.generation.clone(),
     )?;
+    validate_pending_fresh_generation_object_closure(installation, &journal.generation)?;
     let allowed_volume_names = runtime_volume_name_set(&active.volumes);
     ensure_no_unbound_product_volumes(tools, installation, &allowed_volume_names)?;
 
@@ -2116,6 +2466,7 @@ fn resume_fresh_runtime_initialization(
     }
 
     ensure_initialization_containers_absent_for(tools, installation, &active.volumes)?;
+    validate_pending_fresh_generation_object_closure(installation, &journal.generation)?;
     ensure_fresh_secret_directory(start_tools, installation, sid, &active.secrets.directory)?;
     let secret_count = fresh_runtime_secret_file_count(&active.secrets)?;
     let presence = runtime_volume_presence_for(tools, installation, &active.volumes)?;
@@ -2146,6 +2497,13 @@ fn resume_fresh_runtime_initialization(
             "FRESH journal 对应的完整 secret 集合尚未落盘；未创建或补写任何数据卷。",
         ));
     }
+    validate_generated_runtime_generation_directory(
+        &active.secrets,
+        true,
+        false,
+        "FRESH_INITIALIZATION_SECRET_SET_INCOMPLETE",
+        "FRESH journal 代际",
+    )?;
     create_missing_runtime_volumes_for(
         tools,
         installation,
@@ -2162,7 +2520,15 @@ fn resume_fresh_runtime_initialization(
     }
     validate_active_runtime_volume_contract(tools, installation, &active.volume_contract())?;
     verify_active_runtime_secret_set(start_tools, installation, sid, &active)?;
+    validate_pending_fresh_generation_object_closure(installation, &journal.generation)?;
     commit_runtime_generation(start_tools, installation, sid, &journal.generation)?;
+    let committed = load_active_runtime_snapshot(installation)?;
+    if committed != active {
+        return Err(LauncherError::new(
+            "FRESH_INITIALIZATION_POINTER_MISMATCH",
+            "FRESH 指针提交后不再精确绑定同一 journal 对象集合；服务未启动。",
+        ));
+    }
     remove_fresh_initialization_journal(installation)
 }
 
@@ -2194,7 +2560,13 @@ fn ensure_fresh_secret_directory(
         platform::ensure_directory(path)?;
         restrict_directory_acl(start_tools, installation, path, sid)?;
     }
-    Ok(())
+    validate_generated_runtime_generation_directory(
+        &RuntimeSecretPaths::from_directory(secret_directory.to_path_buf()),
+        false,
+        true,
+        "FRESH_INITIALIZATION_TARGET_NOT_CLEAN",
+        "FRESH journal 代际",
+    )
 }
 
 fn remove_fresh_initialization_journal(installation: &Installation) -> Result<(), LauncherError> {
@@ -2283,21 +2655,6 @@ fn ensure_runtime_secret_paths(
         secrets,
         storage_was_existing,
     )
-}
-
-fn runtime_secret_paths(installation: &Installation) -> [&Path; RUNTIME_SECRET_COUNT] {
-    [
-        installation.postgres_secret.as_path(),
-        installation.egress_guard_database_secret.as_path(),
-        installation.egress_lease_creation_capability.as_path(),
-        installation.api_database_secret.as_path(),
-        installation.worker_database_secret.as_path(),
-        installation.jwt_private_key.as_path(),
-        installation.jwt_public_key.as_path(),
-        installation.refresh_token_hmac_key.as_path(),
-        installation.idempotency_hmac_key.as_path(),
-        installation.credential_kek.as_path(),
-    ]
 }
 
 fn ensure_initialization_containers_absent_for(
@@ -2832,6 +3189,7 @@ fn load_active_runtime_snapshot(
         )
     })?;
     let generation = read_runtime_generation(&installation.runtime_generation)?;
+    validate_active_runtime_generation_object_closure(installation, &generation)?;
     if generation.source == "LEGACY" {
         let legacy_installation_id = read_installation_id(&installation.installation_id)?;
         if !constant_time_ascii_equal(&generation.installation_id, &legacy_installation_id) {
@@ -2863,6 +3221,9 @@ fn load_verified_active_runtime_snapshot(
     installation: &Installation,
     sid: &str,
 ) -> Result<ActiveRuntimeSnapshot, LauncherError> {
+    // Consume and close the pointer object set before changing any ACL.  The
+    // later read detects a replacement during the ACL verification window.
+    let expected = load_active_runtime_snapshot(installation)?;
     platform::ensure_tree_no_reparse(&installation.app_data_root).map_err(|_| {
         LauncherError::new(
             "RUNTIME_GENERATION_INVALID",
@@ -2888,7 +3249,14 @@ fn load_verified_active_runtime_snapshot(
         &installation.runtime_generation,
         sid,
     )?;
-    load_active_runtime_snapshot(installation)
+    let actual = load_active_runtime_snapshot(installation)?;
+    if actual != expected {
+        return Err(LauncherError::new(
+            "RUNTIME_GENERATION_CHANGED_DURING_CHECK",
+            "活动运行代际在 ACL 核验期间发生变化；Launcher 已安全阻断。",
+        ));
+    }
+    Ok(actual)
 }
 
 fn ensure_legacy_runtime_generation(
@@ -3205,43 +3573,173 @@ fn validate_existing_credential_kek_paths(
     Ok(())
 }
 
-fn validate_active_runtime_secret_set(
-    active_runtime: &ActiveRuntimeSnapshot,
+fn validate_runtime_secret_directory_entries(
+    secrets: &RuntimeSecretPaths,
+    require_complete: bool,
+    error_code: &str,
+    object_name: &str,
 ) -> Result<(), LauncherError> {
-    platform::ensure_tree_no_reparse(&active_runtime.secrets.directory)?;
-    platform::ensure_directory(&active_runtime.secrets.directory)?;
-    for path in active_runtime.secrets.all() {
+    platform::ensure_tree_no_reparse(&secrets.directory).map_err(|_| {
+        LauncherError::new(
+            error_code,
+            format!("无法证明{object_name}目录不是链接或 reparse point。"),
+        )
+    })?;
+    let expected = RUNTIME_SECRET_FILE_NAMES
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let entries = fs::read_dir(&secrets.directory)
+        .map_err(|_| LauncherError::new(error_code, format!("无法枚举{object_name}目录。")))?;
+    let mut observed = BTreeSet::new();
+    for entry in entries {
+        let entry = entry.map_err(|_| {
+            LauncherError::new(error_code, format!("无法读取{object_name}目录项。"))
+        })?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            LauncherError::new(error_code, format!("{object_name}目录包含无法认证的名称。"))
+        })?;
+        if !expected.contains(name.as_str()) {
+            return Err(LauncherError::new(
+                error_code,
+                format!("{object_name}目录包含未被当前运行代际允许的对象。"),
+            ));
+        }
+        platform::ensure_regular_file(&entry.path()).map_err(|_| {
+            LauncherError::new(
+                error_code,
+                format!("{object_name}目录包含非普通文件、链接或 reparse point。"),
+            )
+        })?;
+        if !observed.insert(name) {
+            return Err(LauncherError::new(
+                error_code,
+                format!("{object_name}目录包含重复或不可认证的对象。"),
+            ));
+        }
+    }
+    if require_complete && observed.len() != RUNTIME_SECRET_COUNT {
+        return Err(LauncherError::new(
+            error_code,
+            format!("{object_name}目录未包含完整的受控 secret 集合。"),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_generated_runtime_generation_directory(
+    secrets: &RuntimeSecretPaths,
+    require_complete_secret_set: bool,
+    allow_empty_generation_directory: bool,
+    error_code: &str,
+    object_name: &str,
+) -> Result<(), LauncherError> {
+    let generation_directory = secrets.directory.parent().ok_or_else(|| {
+        LauncherError::new(error_code, format!("{object_name}缺少 generation 父目录。"))
+    })?;
+    platform::ensure_tree_no_reparse(generation_directory).map_err(|_| {
+        LauncherError::new(
+            error_code,
+            format!("无法证明{object_name} generation 目录不是链接或 reparse point。"),
+        )
+    })?;
+    let entries = fs::read_dir(generation_directory).map_err(|_| {
+        LauncherError::new(
+            error_code,
+            format!("无法枚举{object_name} generation 目录。"),
+        )
+    })?;
+    let mut secret_directory_present = false;
+    for entry in entries {
+        let entry = entry.map_err(|_| {
+            LauncherError::new(
+                error_code,
+                format!("无法读取{object_name} generation 目录项。"),
+            )
+        })?;
+        let name = entry.file_name().into_string().map_err(|_| {
+            LauncherError::new(
+                error_code,
+                format!("{object_name} generation 目录包含无法认证的名称。"),
+            )
+        })?;
+        if name != "secrets" || secret_directory_present {
+            return Err(LauncherError::new(
+                error_code,
+                format!("{object_name} generation 目录包含未被当前代际允许的对象。"),
+            ));
+        }
+        platform::ensure_directory(&entry.path()).map_err(|_| {
+            LauncherError::new(
+                error_code,
+                format!("{object_name} generation 目录包含文件、链接或 reparse point。"),
+            )
+        })?;
+        secret_directory_present = true;
+    }
+    if !secret_directory_present {
+        if allow_empty_generation_directory {
+            return Ok(());
+        }
+        return Err(LauncherError::new(
+            error_code,
+            format!("{object_name}缺少 generation secret 目录。"),
+        ));
+    }
+    validate_runtime_secret_directory_entries(
+        secrets,
+        require_complete_secret_set,
+        error_code,
+        object_name,
+    )
+}
+
+fn validate_runtime_secret_set(secrets: &RuntimeSecretPaths) -> Result<(), LauncherError> {
+    validate_runtime_secret_directory_entries(
+        secrets,
+        true,
+        "RUNTIME_SECRET_SET_INVALID",
+        "运行 secret",
+    )?;
+    platform::ensure_tree_no_reparse(&secrets.directory)?;
+    platform::ensure_directory(&secrets.directory)?;
+    for path in secrets.all() {
         platform::ensure_regular_file(path)?;
     }
     validate_existing_hex_secret(
-        &active_runtime.secrets.postgres,
+        &secrets.postgres,
         "POSTGRES_SECRET_INVALID",
         "PostgreSQL 密码",
     )?;
     validate_existing_hex_secret(
-        &active_runtime.secrets.egress_guard_database,
+        &secrets.egress_guard_database,
         "EGRESS_GUARD_DATABASE_SECRET_INVALID",
         "出口守卫数据库密码",
     )?;
     validate_existing_hex_secret(
-        &active_runtime.secrets.api_database,
+        &secrets.api_database,
         "API_DATABASE_SECRET_INVALID",
         "API 运行数据库密码",
     )?;
     validate_existing_hex_secret(
-        &active_runtime.secrets.worker_database,
+        &secrets.worker_database,
         "WORKER_DATABASE_SECRET_INVALID",
         "Worker 运行数据库密码",
     )?;
     validate_existing_hex_secret(
-        &active_runtime.secrets.egress_lease_creation_capability,
+        &secrets.egress_lease_creation_capability,
         "EGRESS_LEASE_CREATION_CAPABILITY_INVALID",
         "出口租约创建能力密钥",
     )?;
-    validate_database_secret_domain_separation_paths(&active_runtime.secrets)?;
-    validate_egress_lease_creation_capability_domain_separation_paths(&active_runtime.secrets)?;
-    validate_existing_auth_secret_bundle_paths(&active_runtime.secrets)?;
-    validate_existing_credential_kek_paths(&active_runtime.secrets)
+    validate_database_secret_domain_separation_paths(secrets)?;
+    validate_egress_lease_creation_capability_domain_separation_paths(secrets)?;
+    validate_existing_auth_secret_bundle_paths(secrets)?;
+    validate_existing_credential_kek_paths(secrets)
+}
+
+fn validate_active_runtime_secret_set(
+    active_runtime: &ActiveRuntimeSnapshot,
+) -> Result<(), LauncherError> {
+    validate_runtime_secret_set(&active_runtime.secrets)
 }
 
 fn verify_active_runtime_secret_set(
@@ -3318,15 +3816,35 @@ fn validate_existing_hex_secret(
 
 fn ensure_storage_identity(
     tools: &Tools,
-    start_tools: &StartTools,
     installation: &Installation,
-    sid: &str,
-) -> Result<bool, LauncherError> {
+) -> Result<String, LauncherError> {
+    let root_objects = inspect_runtime_generation_root_objects(
+        &installation.app_data_root,
+        &installation.installation_id,
+        &installation.secret_dir,
+    )?;
+    if root_objects.generations_directory || !root_objects.generation_entries.is_empty() {
+        return Err(LauncherError::new(
+            "RUNTIME_GENERATION_STATE_CONFLICT",
+            "旧式迁移旁边存在 generation 对象；Launcher 不会在混合对象集合上修改 ACL 或提交 LEGACY 指针。",
+        ));
+    }
     let presence = runtime_volume_presence(tools, installation)?;
-    let has_marker = installation.installation_id.exists();
-    let has_any_secret = runtime_secret_paths(installation)
-        .iter()
-        .any(|path| path.exists());
+    let has_marker = matches!(
+        controlled_regular_file_presence(
+            &installation.installation_id,
+            "INSTALLATION_ID_INVALID",
+            "旧式 installation-id",
+        )?,
+        ControlledRegularFilePresence::Present
+    );
+    let legacy_secrets = RuntimeSecretPaths::from_directory(installation.secret_dir.clone());
+    let secret_count = controlled_runtime_secret_file_count(
+        &legacy_secrets,
+        "LEGACY_RUNTIME_SECRET_SET_INCOMPLETE",
+        "旧式运行 secret 文件",
+    )?;
+    let has_any_secret = secret_count != 0;
     match storage_identity_decision(presence, has_marker, has_any_secret) {
         StorageIdentityDecision::IncompleteVolumes => {
             return Err(LauncherError::new(
@@ -3354,16 +3872,27 @@ fn ensure_storage_identity(
         }
         StorageIdentityDecision::Existing => {}
     }
-    platform::ensure_regular_file(&installation.installation_id)?;
-    restrict_file_acl(
-        start_tools,
-        installation,
-        &installation.installation_id,
-        sid,
-    )?;
+    if secret_count != RUNTIME_SECRET_COUNT {
+        return Err(LauncherError::new(
+            "LEGACY_RUNTIME_SECRET_SET_INCOMPLETE",
+            "旧式运行对象的十个 root secret 不完整；Launcher 不会创建目录、修改 ACL 或生成替代密钥。",
+        ));
+    }
+    platform::ensure_tree_no_reparse(&installation.secret_dir).map_err(|_| {
+        LauncherError::new(
+            "LEGACY_RUNTIME_SECRET_SET_INCOMPLETE",
+            "旧式 root secrets 目录不是受控普通目录；Launcher 不会修改其 ACL。",
+        )
+    })?;
+    validate_runtime_secret_set(&legacy_secrets).map_err(|_| {
+        LauncherError::new(
+            "LEGACY_RUNTIME_SECRET_SET_INCOMPLETE",
+            "无法完整认证旧式 root secret 集合；Launcher 不会修改 ACL 或生成替代密钥。",
+        )
+    })?;
     let installation_id = read_installation_id(&installation.installation_id)?;
     validate_runtime_volume_identity(tools, installation, &installation_id)?;
-    Ok(true)
+    Ok(installation_id)
 }
 
 fn storage_identity_decision(
@@ -9905,6 +10434,71 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn legacy_preflight_never_creates_or_acls_root_secrets_before_the_full_set_exists() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "datax-legacy-preflight-no-write-test-{}-{unique}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        let fake_docker = root.join("fake-docker");
+        fs::write(
+            &fake_docker,
+            "#!/bin/sh\nprintf '%s\\n' des-postgres-data des-log-data des-workspace-data\n",
+        )
+        .unwrap();
+        fs::set_permissions(&fake_docker, fs::Permissions::from_mode(0o700)).unwrap();
+
+        let installation_id = root.join("installation-id");
+        let installation_id_value = "b".repeat(64);
+        fs::write(&installation_id, &installation_id_value).unwrap();
+        let secret_dir = root.join("secrets");
+        let installation = Installation {
+            executable: root.join("launcher.exe"),
+            install_dir: root.clone(),
+            compose_file: root.join("compose.yaml"),
+            image_env_file: root.join("images.release.env"),
+            acl_script: root.join("secure-acl.ps1"),
+            release_manifest: root.join("release-manifest.json"),
+            local_app_data: root.clone(),
+            app_data_root: root.clone(),
+            docker_cli_config_dir: root.join("docker-cli-config"),
+            docker_cli_config_file: root.join("docker-cli-config/config.json"),
+            initialization_state: root.join("initialization-incomplete"),
+            installation_id,
+            runtime_generation: root.join("runtime-generation.json"),
+            secret_dir: secret_dir.clone(),
+        };
+        let tools = Tools {
+            docker: fake_docker.clone(),
+            compose: fake_docker.clone(),
+            docker_host: None,
+            docker_cli_config_dir: root.join("docker-cli-config"),
+            reg: fake_docker,
+        };
+
+        assert_eq!(
+            ensure_storage_identity(&tools, &installation)
+                .unwrap_err()
+                .code(),
+            "LEGACY_RUNTIME_SECRET_SET_INCOMPLETE"
+        );
+        assert!(!secret_dir.exists());
+        assert_eq!(
+            fs::read_to_string(&installation.installation_id).unwrap(),
+            installation_id_value
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn fresh_initialization_journal_round_trips_one_immutable_generated_object_set() {
         let generation = RuntimeGeneration::fresh(
@@ -10028,6 +10622,253 @@ mod tests {
             .code(),
             "FRESH_INITIALIZATION_TARGET_NOT_CLEAN"
         );
+    }
+
+    #[test]
+    fn active_generation_state_requires_exactly_one_source_object_set() {
+        let generation_id = "a".repeat(32);
+        let fresh = RuntimeGeneration::fresh(
+            generation_id.clone(),
+            "b".repeat(64),
+            "2026-08-02T03:30:00Z".to_owned(),
+        )
+        .unwrap();
+        let restore = RuntimeGeneration::restore(
+            generation_id.clone(),
+            "b".repeat(64),
+            "c".repeat(32),
+            "2026-08-02T03:30:00Z".to_owned(),
+        )
+        .unwrap();
+        let exact_generated = RuntimeGenerationRootObjectPresence {
+            legacy_installation_id: false,
+            legacy_secret_directory: false,
+            generations_directory: true,
+            generation_entries: BTreeSet::from([generation_id.clone()]),
+        };
+        assert!(
+            active_runtime_generation_object_closure_decision(&fresh, &exact_generated).is_ok()
+        );
+        assert!(
+            active_runtime_generation_object_closure_decision(&restore, &exact_generated).is_ok()
+        );
+
+        for crossed in [
+            RuntimeGenerationRootObjectPresence {
+                legacy_installation_id: true,
+                ..exact_generated.clone()
+            },
+            RuntimeGenerationRootObjectPresence {
+                legacy_secret_directory: true,
+                ..exact_generated.clone()
+            },
+            RuntimeGenerationRootObjectPresence {
+                generation_entries: BTreeSet::from([generation_id.clone(), "d".repeat(32)]),
+                ..exact_generated.clone()
+            },
+            RuntimeGenerationRootObjectPresence {
+                generations_directory: false,
+                generation_entries: BTreeSet::new(),
+                ..exact_generated.clone()
+            },
+        ] {
+            assert_eq!(
+                active_runtime_generation_object_closure_decision(&fresh, &crossed)
+                    .unwrap_err()
+                    .code(),
+                "RUNTIME_GENERATION_STATE_CONFLICT"
+            );
+            assert_eq!(
+                active_runtime_generation_object_closure_decision(&restore, &crossed)
+                    .unwrap_err()
+                    .code(),
+                "RUNTIME_GENERATION_STATE_CONFLICT"
+            );
+        }
+
+        let legacy = RuntimeGeneration::legacy(
+            "e".repeat(32),
+            "b".repeat(64),
+            "2026-08-02T03:30:00Z".to_owned(),
+        )
+        .unwrap();
+        let exact_legacy = RuntimeGenerationRootObjectPresence {
+            legacy_installation_id: true,
+            legacy_secret_directory: true,
+            generations_directory: false,
+            generation_entries: BTreeSet::new(),
+        };
+        assert!(active_runtime_generation_object_closure_decision(&legacy, &exact_legacy).is_ok());
+        assert_eq!(
+            active_runtime_generation_object_closure_decision(
+                &legacy,
+                &RuntimeGenerationRootObjectPresence {
+                    generations_directory: true,
+                    generation_entries: BTreeSet::from(["f".repeat(32)]),
+                    ..exact_legacy
+                },
+            )
+            .unwrap_err()
+            .code(),
+            "RUNTIME_GENERATION_STATE_CONFLICT"
+        );
+    }
+
+    #[test]
+    fn generation_root_inventory_and_pending_fresh_reject_crossed_or_sibling_state() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "datax-generation-root-closure-test-{}-{unique}",
+            std::process::id()
+        ));
+        let generation_id = "a".repeat(32);
+        let marker = root.join("installation-id");
+        let legacy_secrets = root.join("secrets");
+        let generation_root = root.join("generations").join(&generation_id);
+        fs::create_dir_all(generation_root.join("secrets")).unwrap();
+        let generation = RuntimeGeneration::fresh(
+            generation_id.clone(),
+            "b".repeat(64),
+            "2026-08-02T03:30:00Z".to_owned(),
+        )
+        .unwrap();
+
+        let exact =
+            inspect_runtime_generation_root_objects(&root, &marker, &legacy_secrets).unwrap();
+        assert_eq!(
+            exact.generation_entries,
+            BTreeSet::from([generation_id.clone()])
+        );
+        assert!(active_runtime_generation_object_closure_decision(&generation, &exact).is_ok());
+        assert!(pending_fresh_generation_object_closure_decision(&generation, &exact).is_ok());
+
+        fs::create_dir(root.join("generations").join("d".repeat(32))).unwrap();
+        let sibling =
+            inspect_runtime_generation_root_objects(&root, &marker, &legacy_secrets).unwrap();
+        assert_eq!(
+            active_runtime_generation_object_closure_decision(&generation, &sibling)
+                .unwrap_err()
+                .code(),
+            "RUNTIME_GENERATION_STATE_CONFLICT"
+        );
+        assert_eq!(
+            pending_fresh_generation_object_closure_decision(&generation, &sibling)
+                .unwrap_err()
+                .code(),
+            "FRESH_INITIALIZATION_TARGET_NOT_CLEAN"
+        );
+
+        fs::remove_dir_all(root.join("generations").join("d".repeat(32))).unwrap();
+        fs::write(&marker, "b".repeat(64)).unwrap();
+        let crossed =
+            inspect_runtime_generation_root_objects(&root, &marker, &legacy_secrets).unwrap();
+        assert_eq!(
+            active_runtime_generation_object_closure_decision(&generation, &crossed)
+                .unwrap_err()
+                .code(),
+            "RUNTIME_GENERATION_STATE_CONFLICT"
+        );
+        assert_eq!(
+            pending_fresh_generation_object_closure_decision(&generation, &crossed)
+                .unwrap_err()
+                .code(),
+            "FRESH_INITIALIZATION_TARGET_NOT_CLEAN"
+        );
+
+        fs::remove_file(&marker).unwrap();
+        fs::create_dir(&legacy_secrets).unwrap();
+        let crossed =
+            inspect_runtime_generation_root_objects(&root, &marker, &legacy_secrets).unwrap();
+        assert_eq!(
+            active_runtime_generation_object_closure_decision(&generation, &crossed)
+                .unwrap_err()
+                .code(),
+            "RUNTIME_GENERATION_STATE_CONFLICT"
+        );
+        assert_eq!(
+            pending_fresh_generation_object_closure_decision(&generation, &crossed)
+                .unwrap_err()
+                .code(),
+            "FRESH_INITIALIZATION_TARGET_NOT_CLEAN"
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generated_and_legacy_secret_directories_reject_unknown_entries() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = env::temp_dir().join(format!(
+            "datax-secret-directory-closure-test-{}-{unique}",
+            std::process::id()
+        ));
+        let generation_id = "a".repeat(32);
+        let generated_secrets = RuntimeSecretPaths::from_directory(
+            root.join("generations")
+                .join(&generation_id)
+                .join("secrets"),
+        );
+        fs::create_dir_all(&generated_secrets.directory).unwrap();
+        fs::write(&generated_secrets.postgres, b"partial").unwrap();
+        assert!(
+            validate_generated_runtime_generation_directory(
+                &generated_secrets,
+                false,
+                true,
+                "FRESH_INITIALIZATION_TARGET_NOT_CLEAN",
+                "FRESH journal 代际",
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            validate_generated_runtime_generation_directory(
+                &generated_secrets,
+                true,
+                false,
+                "RUNTIME_GENERATION_STATE_CONFLICT",
+                "活动 FRESH 代际",
+            )
+            .unwrap_err()
+            .code(),
+            "RUNTIME_GENERATION_STATE_CONFLICT"
+        );
+
+        fs::write(generated_secrets.directory.join("unexpected-secret"), b"x").unwrap();
+        assert_eq!(
+            validate_generated_runtime_generation_directory(
+                &generated_secrets,
+                false,
+                true,
+                "FRESH_INITIALIZATION_TARGET_NOT_CLEAN",
+                "FRESH journal 代际",
+            )
+            .unwrap_err()
+            .code(),
+            "FRESH_INITIALIZATION_TARGET_NOT_CLEAN"
+        );
+
+        let legacy_secrets = RuntimeSecretPaths::from_directory(root.join("secrets"));
+        fs::create_dir(&legacy_secrets.directory).unwrap();
+        fs::write(legacy_secrets.directory.join("unexpected-secret"), b"x").unwrap();
+        assert_eq!(
+            validate_runtime_secret_directory_entries(
+                &legacy_secrets,
+                true,
+                "LEGACY_RUNTIME_SECRET_SET_INCOMPLETE",
+                "旧式 root secret",
+            )
+            .unwrap_err()
+            .code(),
+            "LEGACY_RUNTIME_SECRET_SET_INCOMPLETE"
+        );
+
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

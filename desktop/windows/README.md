@@ -48,6 +48,15 @@
    `FRESH_INITIALIZATION_TARGET_NOT_CLEAN` 阻断，发生在 secret 或 volume 写入之前。journal、活动
    pointer 与 pending pointer 的存在性只以 `symlink_metadata` 判定：只有明确 `NotFound` 才是不存在；
    目录、链接/reparse point、悬空链接或元数据 I/O 异常均在 ACL 修改或 `create_new` 前失败关闭。
+   活动 FRESH/RESTORE pointer 还必须通过无副作用的 root/generation exact-set 检查：root
+   `installation-id`/`secrets/` 均不存在，`generations/` 只含当前 generation，generation 只含
+   `secrets/`，后者只含十个固定 secret；任一 root LEGACY 对象、未知 sibling、未知 secret 或
+   reparse/枚举异常均失败关闭。pending FRESH 仅可保留自身 generation 的空/部分已知 secret，且在
+   写齐十项 secret、创建任一卷前再次复核。`ensure_runtime_secrets` 的 LEGACY 分支在 root marker、
+   十个 secret 和三固定卷都已只读认证前，不会创建或修改运行 app-root 的 DACL，更不会创建 root
+   `secrets/` 或修改其 ACL；认证通过后才可调整 root DACL，且调整后会再次认证同一集合。独立的
+   `docker-cli-config`/`system-restore` 门禁不被误判为 generation sibling；前者是 Docker 子进程
+   的独立受控配置，不能被表述为 LEGACY 运行对象预检已经涵盖了整个 Launcher 的所有文件副作用。
    已有候选安装只有在 root `installation-id`、root `secrets/` 和固定三卷全部通过身份检查时，
    才能一次性迁移成 `LEGACY` pointer；不会复制、移动或重命名旧对象。
    Launcher 在 FRESH 的 generation secret 目录（LEGACY 迁移时才为 root `secrets/`）中以
