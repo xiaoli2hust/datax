@@ -1,0 +1,169 @@
+{
+  "schema_version": "1.0",
+  "artifact_kind": "WINDOWS_E4_SCENARIO_PROFILE_CATALOG",
+  "profile_catalog_id": "windows-e4-v1",
+  "requirements_catalog_sha256": "e797409612c4c352a88d76167adfe4f3303ab09ec4924ecec1c24b1090220af4",
+  "profiles": [
+    {
+      "profile_id": "E2E-ACC-PRD-012",
+      "category": "PRODUCT",
+      "title": "受控本机工作站产品验收",
+      "requirement_bindings": [{"requirement_id": "ACC-PRD-012", "test_id": "E2E-ACC-PRD-012"}],
+      "required_assertion_ids": ["E2E-ACC-PRD-012"]
+    },
+    {
+      "profile_id": "E2E-ACC-PRD-013",
+      "category": "PRODUCT",
+      "title": "本地部署可用性验收",
+      "requirement_bindings": [{"requirement_id": "ACC-PRD-013", "test_id": "E2E-ACC-PRD-013"}],
+      "required_assertion_ids": ["E2E-ACC-PRD-013"]
+    },
+    {
+      "profile_id": "E2E-WIN-001",
+      "category": "RELEASE",
+      "title": "干净 Windows 11 本机安装和运行",
+      "requirement_bindings": [{"requirement_id": "PRD-FR-WS-001", "test_id": "E2E-WIN-001"}],
+      "required_assertion_ids": ["E2E-WIN-001", "E2E-WIN-DX-001", "OPS-WIN-DOCKER-MISSING-001", "OPS-WIN-DOCKER-STOPPED-001", "OPS-WIN-INSTALL-001", "OPS-WIN-PORT-001", "OPS-WIN-PORTS-001", "OPS-WIN-UNINSTALL-001", "REC-WIN-BACKUP-001", "REC-WIN-RESTART-001", "REC-WIN-SLEEP-001"]
+    },
+    {
+      "profile_id": "E2E-WIN-002",
+      "category": "RELEASE",
+      "title": "签名发布候选端到端验收",
+      "requirement_bindings": [{"requirement_id": "ACC-PRD-014", "test_id": "E2E-WIN-002"}],
+      "required_assertion_ids": ["E2E-WIN-002", "SEC-WIN-SIGN-001"]
+    },
+    {
+      "profile_id": "OPS-FRESH-001",
+      "category": "OPERATIONS",
+      "title": "全新安装初始化",
+      "requirement_bindings": [{"requirement_id": "PRD-FR-AUTH-003", "test_id": "OPS-FRESH-001"}],
+      "required_assertion_ids": ["OPS-FRESH-001"]
+    },
+    {
+      "profile_id": "OPS-NFR-001",
+      "category": "OPERATIONS",
+      "title": "单工作站非高可用边界",
+      "requirement_bindings": [{"requirement_id": "NFR-COMP-001", "test_id": "OPS-NFR-001"}],
+      "required_assertion_ids": ["OPS-NFR-001"]
+    },
+    {
+      "profile_id": "OPS-NFR-002",
+      "category": "OPERATIONS",
+      "title": "本机启动与依赖恢复边界",
+      "requirement_bindings": [{"requirement_id": "NFR-DEP-001", "test_id": "OPS-NFR-002"}],
+      "required_assertion_ids": ["OPS-NFR-002"]
+    },
+    {
+      "profile_id": "OPS-WIN-DISK-001",
+      "category": "OPERATIONS",
+      "title": "Docker 数据盘容量与受限探针",
+      "requirement_bindings": [{"requirement_id": "PRD-FR-WS-001", "test_id": "OPS-WIN-DISK-001"}],
+      "required_assertion_ids": ["OPS-WIN-DISK-001"]
+    },
+    {
+      "profile_id": "OPS-WIN-WSL-001",
+      "category": "OPERATIONS",
+      "title": "WSL2 与 Linux backend 前置检查",
+      "requirement_bindings": [{"requirement_id": "PRD-FR-WS-001", "test_id": "OPS-WIN-WSL-001"}],
+      "required_assertion_ids": ["OPS-WIN-WSL-001"]
+    },
+    {
+      "profile_id": "REC-NFR-001",
+      "category": "RECOVERY",
+      "title": "可靠性恢复验收",
+      "requirement_bindings": [{"requirement_id": "NFR-REL-001", "test_id": "REC-NFR-001"}],
+      "required_assertion_ids": ["REC-NFR-001"]
+    },
+    {
+      "profile_id": "REC-NFR-002",
+      "category": "RECOVERY",
+      "title": "容灾恢复验收",
+      "requirement_bindings": [{"requirement_id": "NFR-REL-002", "test_id": "REC-NFR-002"}],
+      "required_assertion_ids": ["REC-NFR-002"]
+    },
+    {
+      "profile_id": "REC-NFR-003",
+      "category": "RECOVERY",
+      "title": "数据恢复与可核验证据",
+      "requirement_bindings": [{"requirement_id": "NFR-DATA-001", "test_id": "REC-NFR-003"}],
+      "required_assertion_ids": ["REC-NFR-003"]
+    },
+    {
+      "profile_id": "REC-WIN-INIT-001",
+      "category": "RECOVERY",
+      "title": "首次初始化中断恢复",
+      "requirement_bindings": [{"requirement_id": "PRD-FR-WS-001", "test_id": "REC-WIN-INIT-001"}],
+      "required_assertion_ids": ["REC-WIN-INIT-001"]
+    },
+    {
+      "profile_id": "REC-WIN-WORKER-DB-001",
+      "category": "RECOVERY",
+      "title": "Worker 数据库会话回收",
+      "requirement_bindings": [{"requirement_id": "PRD-FR-WS-001", "test_id": "REC-WIN-WORKER-DB-001"}],
+      "required_assertion_ids": ["REC-WIN-WORKER-DB-001"]
+    },
+    {
+      "profile_id": "SEC-EGRESS-LEASE-001",
+      "category": "SECURITY",
+      "title": "出口租约与秘密边界",
+      "requirement_bindings": [{"requirement_id": "PRD-FR-WS-001", "test_id": "SEC-EGRESS-LEASE-001"}],
+      "required_assertion_ids": ["SEC-EGRESS-LEASE-001"]
+    },
+    {
+      "profile_id": "SEC-NFR-002",
+      "category": "SECURITY",
+      "title": "运行时安全基线",
+      "requirement_bindings": [{"requirement_id": "NFR-SEC-002", "test_id": "SEC-NFR-002"}],
+      "required_assertion_ids": ["SEC-NFR-002"]
+    },
+    {
+      "profile_id": "SEC-WIN-COMPOSE-OWNERSHIP-001",
+      "category": "SECURITY",
+      "title": "Compose 容器与卷归属",
+      "requirement_bindings": [{"requirement_id": "PRD-FR-WS-001", "test_id": "SEC-WIN-COMPOSE-OWNERSHIP-001"}],
+      "required_assertion_ids": ["SEC-WIN-COMPOSE-OWNERSHIP-001"]
+    },
+    {
+      "profile_id": "SEC-WIN-DOCKER-CLI-001",
+      "category": "SECURITY",
+      "title": "Docker CLI 环境隔离",
+      "requirement_bindings": [{"requirement_id": "PRD-FR-WS-001", "test_id": "SEC-WIN-DOCKER-CLI-001"}],
+      "required_assertion_ids": ["SEC-WIN-DOCKER-CLI-001"]
+    },
+    {
+      "profile_id": "SEC-WIN-IMAGE-PULL-001",
+      "category": "SECURITY",
+      "title": "匿名固定镜像拉取",
+      "requirement_bindings": [{"requirement_id": "ACC-PRD-014", "test_id": "SEC-WIN-IMAGE-PULL-001"}, {"requirement_id": "PRD-FR-WS-001", "test_id": "SEC-WIN-IMAGE-PULL-001"}],
+      "required_assertion_ids": ["SEC-WIN-IMAGE-PULL-001"]
+    },
+    {
+      "profile_id": "SEC-WIN-SETUP-BYPASS-001",
+      "category": "SECURITY",
+      "title": "安装器参数绕过拒绝",
+      "requirement_bindings": [{"requirement_id": "PRD-FR-WS-001", "test_id": "SEC-WIN-SETUP-BYPASS-001"}],
+      "required_assertion_ids": ["SEC-WIN-SETUP-BYPASS-001"]
+    },
+    {
+      "profile_id": "SEC-WIN-SETUP-REPARSE-001",
+      "category": "SECURITY",
+      "title": "安装器重解析点拒绝",
+      "requirement_bindings": [{"requirement_id": "PRD-FR-WS-001", "test_id": "SEC-WIN-SETUP-REPARSE-001"}],
+      "required_assertion_ids": ["SEC-WIN-SETUP-REPARSE-001"]
+    },
+    {
+      "profile_id": "SEC-WIN-STORAGE-PROBE-001",
+      "category": "SECURITY",
+      "title": "受控存储容量探针",
+      "requirement_bindings": [{"requirement_id": "NFR-SEC-002", "test_id": "SEC-WIN-STORAGE-PROBE-001"}, {"requirement_id": "PRD-FR-WS-001", "test_id": "SEC-WIN-STORAGE-PROBE-001"}],
+      "required_assertion_ids": ["SEC-WIN-STORAGE-PROBE-001"]
+    },
+    {
+      "profile_id": "SEC-WIN-TMPFS-001",
+      "category": "SECURITY",
+      "title": "Worker 敏感 tmpfs 清理",
+      "requirement_bindings": [{"requirement_id": "PRD-FR-WS-001", "test_id": "SEC-WIN-TMPFS-001"}],
+      "required_assertion_ids": ["SEC-WIN-TMPFS-001"]
+    }
+  ]
+}

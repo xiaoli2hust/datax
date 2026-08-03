@@ -1,0 +1,44 @@
+{
+  "job": {
+    "setting": {
+      "speed": {
+        "channel": 1
+      },
+      "errorLimit": {
+        "record": 0,
+        "percentage": 0
+      }
+    },
+    "content": [
+      {
+        "reader": {
+          "name": "streamreader",
+          "parameter": {
+            "column": [
+              {
+                "value": "DataX Enterprise Studio runtime smoke",
+                "type": "string"
+              },
+              {
+                "value": 20260730,
+                "type": "long"
+              },
+              {
+                "value": true,
+                "type": "bool"
+              }
+            ],
+            "sliceRecordCount": 10
+          }
+        },
+        "writer": {
+          "name": "streamwriter",
+          "parameter": {
+            "print": false,
+            "encoding": "UTF-8"
+          }
+        }
+      }
+    ]
+  }
+}

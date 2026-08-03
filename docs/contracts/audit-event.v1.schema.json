@@ -47,10 +47,12 @@
       "type": "string",
       "enum": [
         "SYSTEM_BOOTSTRAP_ADMIN",
+        "SYSTEM_RECOVER_ADMIN",
         "AUTH_LOGIN_SUCCEEDED",
         "AUTH_LOGIN_FAILED",
         "AUTH_TOKEN_REFRESHED",
         "AUTH_LOGOUT",
+        "AUTHORIZATION_DENIED",
         "USER_CREATED",
         "USER_STATUS_CHANGED",
         "USER_PASSWORD_CHANGED",
@@ -61,22 +63,61 @@
         "PROJECT_CREATED",
         "PROJECT_UPDATED",
         "PROJECT_ARCHIVED",
+        "ENDPOINT_POLICY_CREATED",
+        "ENDPOINT_POLICY_REVISION_CREATED",
+        "ENDPOINT_POLICY_UPDATED",
+        "ENDPOINT_POLICY_DISABLED",
         "DATASOURCE_CREATED",
         "DATASOURCE_UPDATED",
+        "DATASOURCE_REVISION_CREATED",
         "DATASOURCE_TESTED",
+        "DATASOURCE_METADATA_READ",
         "DATASOURCE_CREDENTIAL_ROTATED",
+        "DATASOURCE_SECRET_STATUS_CHANGED",
+        "DATASOURCE_SECRET_ENVELOPE_REWRAPPED",
+        "PHYSICAL_ENDPOINT_IDENTITY_BOUND",
+        "DATASOURCE_USAGE_GRANTED",
+        "DATASOURCE_USAGE_REVOKED",
         "DATASOURCE_DISABLED",
         "DATASOURCE_DELETED",
+        "TRANSFER_POLICY_CREATED",
+        "TRANSFER_POLICY_UPDATED",
+        "TRANSFER_POLICY_SUBMITTED",
+        "TRANSFER_POLICY_APPROVED",
+        "TRANSFER_POLICY_REJECTED",
+        "TRANSFER_POLICY_ACTIVATED",
+        "TRANSFER_POLICY_REVOKED",
         "JOB_CREATED",
         "JOB_DRAFT_UPDATED",
         "JOB_VALIDATED",
+        "JOB_VALIDATION_SCHEMA_COLLECTED",
         "JOB_PREVIEWED",
         "JOB_VERSION_PUBLISHED",
         "JOB_ARCHIVED",
         "EXECUTION_CREATED",
+        "TARGET_EXCLUSIVITY_CONFIRMED",
+        "TARGET_EXCLUSIVITY_REVOKED",
+        "EXECUTION_PREFLIGHT_ACCEPTED",
+        "EXECUTION_PREFLIGHT_REJECTED",
         "EXECUTION_CANCEL_REQUESTED",
+        "EXECUTION_REMEDIATION_SUBMITTED",
+        "RECOVERY_PROBE_CREATED",
+        "RECOVERY_PROBE_STARTED",
+        "RECOVERY_PROBE_COMPLETED",
+        "EXECUTION_RECOVERY_VERIFIED",
+        "EXECUTION_RECOVERY_REJECTED",
         "EXECUTION_RERUN_CREATED",
+        "EXECUTION_VERIFICATION_STARTED",
+        "EXECUTION_VERIFICATION_COMPLETED",
         "EXECUTION_LOG_EXPORTED",
+        "RETENTION_MAINTENANCE_STARTED",
+        "RETENTION_MAINTENANCE_COMPLETED",
+        "RETENTION_MAINTENANCE_FAILED",
+        "AUDIT_ANCHOR_KEY_REGISTERED",
+        "AUDIT_ANCHOR_KEY_ROTATED",
+        "AUDIT_ANCHOR_KEY_STATUS_CHANGED",
+        "AUDIT_CHECKPOINT_ANCHORED",
+        "AUDIT_CHECKPOINT_VERIFIED",
         "AUDIT_EXPORTED"
       ]
     },
@@ -115,10 +156,174 @@
       "$ref": "#/$defs/integrity"
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "TARGET_EXCLUSIVITY_CONFIRMED"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "actor": {
+            "properties": {
+              "kind": {
+                "const": "USER"
+              }
+            }
+          },
+          "target": {
+            "properties": {
+              "type": {
+                "const": "EXECUTION"
+              },
+              "id": {
+                "$ref": "#/$defs/uuid"
+              }
+            }
+          },
+          "outcome": {
+            "const": "SUCCEEDED"
+          },
+          "metadata": {
+            "type": "object",
+            "required": [
+              "statement_version",
+              "responsible_party",
+              "confirmed_at",
+              "accepted_at",
+              "valid_until",
+              "target_namespace_id",
+              "confirmation_sha256"
+            ],
+            "properties": {
+              "statement_version": {
+                "const": "1.0"
+              },
+              "responsible_party": {
+                "type": "string",
+                "enum": [
+                  "OPERATOR",
+                  "DBA"
+                ]
+              },
+              "confirmed_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "accepted_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "valid_until": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "target_namespace_id": {
+                "$ref": "#/$defs/uuid"
+              },
+              "confirmation_sha256": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "TARGET_EXCLUSIVITY_REVOKED"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "actor": {
+            "properties": {
+              "kind": {
+                "const": "USER"
+              }
+            }
+          },
+          "target": {
+            "properties": {
+              "type": {
+                "const": "EXECUTION"
+              },
+              "id": {
+                "$ref": "#/$defs/uuid"
+              }
+            }
+          },
+          "outcome": {
+            "const": "SUCCEEDED"
+          },
+          "metadata": {
+            "type": "object",
+            "required": [
+              "statement_version",
+              "responsible_party",
+              "reported_at",
+              "revoked_at",
+              "reason",
+              "target_namespace_id",
+              "confirmation_sha256"
+            ],
+            "properties": {
+              "statement_version": {
+                "const": "1.0"
+              },
+              "responsible_party": {
+                "type": "string",
+                "enum": [
+                  "OPERATOR",
+                  "DBA"
+                ]
+              },
+              "reported_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "revoked_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "reason": {
+                "type": "string",
+                "enum": [
+                  "OPERATOR_REVOKED",
+                  "DBA_REVOKED",
+                  "EXTERNAL_DML_DDL_REPORTED",
+                  "CHANGE_FREEZE_BROKEN"
+                ]
+              },
+              "target_namespace_id": {
+                "$ref": "#/$defs/uuid"
+              },
+              "confirmation_sha256": {
+                "$ref": "#/$defs/sha256"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "uuid": {
       "type": "string",
-      "format": "uuid"
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
     },
     "nullableUuid": {
       "oneOf": [
@@ -140,6 +345,10 @@
           "type": "null"
         }
       ]
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
     },
     "actor": {
       "type": "object",
@@ -218,11 +427,24 @@
             "USER",
             "ROLE_ASSIGNMENT",
             "PROJECT",
+            "ENDPOINT_POLICY",
+            "ENDPOINT_POLICY_REVISION",
             "DATASOURCE",
+            "PHYSICAL_ENDPOINT_IDENTITY",
+            "CREDENTIAL_SECRET",
+            "CREDENTIAL_SECRET_ENVELOPE",
+            "DATASOURCE_USAGE_GRANT",
+            "TRANSFER_POLICY",
             "SYNC_JOB",
             "JOB_VERSION",
             "EXECUTION",
-            "AUDIT_EXPORT"
+            "TARGET_NAMESPACE",
+            "RECOVERY_GATE",
+            "RECOVERY_PROBE",
+            "AUDIT_ANCHOR_KEY_VERSION",
+            "AUDIT_CHECKPOINT",
+            "AUDIT_EXPORT",
+            "RETENTION_MAINTENANCE"
           ]
         },
         "id": {
@@ -330,8 +552,11 @@
     "integrity": {
       "type": "object",
       "additionalProperties": false,
+      "description": "event_hash = SHA-256(UTF8(\"DXAUDITv1\\n\" + lowercase organization UUID + \"\\n\" + sequence base10 + \"\\n\" + lowercase previous hash or 64 zeroes + \"\\n\") || RFC8785(event object after removing integrity.event_hash)); integrity.previous_hash 必须与前像一致，末尾无 LF。",
       "required": [
         "algorithm",
+        "canonicalization",
+        "chain_scope",
         "previous_hash",
         "event_hash"
       ],
@@ -339,12 +564,19 @@
         "algorithm": {
           "const": "SHA-256"
         },
+        "canonicalization": {
+          "const": "RFC8785"
+        },
+        "chain_scope": {
+          "const": "ORGANIZATION_SEQUENCE"
+        },
         "previous_hash": {
           "$ref": "#/$defs/nullableHash"
         },
         "event_hash": {
           "type": "string",
-          "pattern": "^[a-f0-9]{64}$"
+          "pattern": "^[a-f0-9]{64}$",
+          "description": "对移除本字段后的完整 AuditEvent 按 integrity.description 计算，避免自引用。"
         }
       }
     }

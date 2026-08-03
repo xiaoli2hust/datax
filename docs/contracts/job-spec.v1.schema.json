@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://datax-enterprise-studio.local/schemas/job-spec.v1.schema.json",
   "title": "DataX Enterprise Studio JobSpec V1",
-  "description": "V1 离线批同步任务草稿与发布版本的规范格式。结构上不提供 SQL、调度、Transformer 或自定义插件入口。",
+  "description": "V1 安全的一次性离线全量复制任务草稿与发布版本的规范格式。每次执行要求操作员确认源端静默、平台验证目标表为空并持有目标活动锁；结构上不提供 SQL、调度、Transformer、自动清理或自定义插件入口。",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,6 +11,11 @@
     "target",
     "selection_mode",
     "mappings",
+    "source_consistency_mode",
+    "target_precondition",
+    "write_semantics",
+    "duplicate_policy",
+    "partial_write_policy",
     "write_policy",
     "execution_policy"
   ],
@@ -39,6 +44,26 @@
         "$ref": "#/$defs/columnMapping"
       }
     },
+    "source_consistency_mode": {
+      "const": "OPERATOR_QUIESCED",
+      "description": "V1 不创建数据库级跨库一致性快照。操作员必须在每次执行前确认源表在复制及独立核验期间保持静默；平台保存确认事实但不把确认冒充技术锁。"
+    },
+    "target_precondition": {
+      "const": "EMPTY_AND_VERIFIABLE",
+      "description": "目标表必须预先存在、允许受控只读计数核验且在启动 DataX 前实测为空。"
+    },
+    "write_semantics": {
+      "const": "INSERT_ONLY_ONCE",
+      "description": "一个已发布版本只用于一次安全全量复制；平台不承诺重复运行的幂等性。"
+    },
+    "duplicate_policy": {
+      "const": "REJECT_NONEMPTY_TARGET",
+      "description": "目标表非空时拒绝执行，不以警告代替服务端阻断。"
+    },
+    "partial_write_policy": {
+      "const": "MANUAL_REMEDIATE",
+      "description": "失败、取消、超时、丢失或核验失败后不得自动重跑；须完成必要外部处置（无需清理时记录理由）并由独立 RecoveryProbe 重新核验目标为空。"
+    },
     "write_policy": {
       "$ref": "#/$defs/writePolicy"
     },
@@ -66,7 +91,12 @@
       ],
       "properties": {
         "schema_name": {
-          "$ref": "#/$defs/identifier"
+          "allOf": [
+            {
+              "$ref": "#/$defs/identifier"
+            }
+          ],
+          "description": "PostgreSQL 填 schema；MySQL 没有独立 schema，固定填写 datasource revision 的 database_name。SchemaSnapshot 对 MySQL 仍使用 catalog_name=database_name、schema_name=\"\" 的空哨兵。"
         },
         "table_name": {
           "$ref": "#/$defs/identifier"
@@ -78,12 +108,17 @@
       "additionalProperties": false,
       "required": [
         "datasource_id",
+        "datasource_revision_id",
         "plugin_name",
         "table"
       ],
       "properties": {
         "datasource_id": {
           "$ref": "#/$defs/uuid"
+        },
+        "datasource_revision_id": {
+          "$ref": "#/$defs/uuid",
+          "description": "发布版本固定的不可变非敏感连接配置修订。"
         },
         "plugin_name": {
           "type": "string",
@@ -102,12 +137,17 @@
       "additionalProperties": false,
       "required": [
         "datasource_id",
+        "datasource_revision_id",
         "plugin_name",
         "table"
       ],
       "properties": {
         "datasource_id": {
           "$ref": "#/$defs/uuid"
+        },
+        "datasource_revision_id": {
+          "$ref": "#/$defs/uuid",
+          "description": "发布版本固定的不可变非敏感连接配置修订。"
         },
         "plugin_name": {
           "type": "string",
@@ -133,6 +173,7 @@
         "target_ordinal",
         "target_type",
         "target_nullable",
+        "oracle_logical_type",
         "compatibility"
       ],
       "properties": {
@@ -168,6 +209,20 @@
         "target_nullable": {
           "type": "boolean"
         },
+        "oracle_logical_type": {
+          "type": "string",
+          "description": "由服务端根据两端 SchemaSnapshot 证明可无损规范化的共同 oracle 类型；不得由浏览器自行猜测。",
+          "enum": [
+            "INTEGER",
+            "DECIMAL",
+            "TEXT",
+            "BOOLEAN",
+            "DATE",
+            "TIME",
+            "TIMESTAMP",
+            "BINARY"
+          ]
+        },
         "compatibility": {
           "type": "string",
           "enum": [
@@ -182,7 +237,9 @@
       "additionalProperties": false,
       "required": [
         "mode",
-        "target_table_must_exist"
+        "target_table_must_exist",
+        "target_table_must_be_empty",
+        "platform_may_mutate_target_before_run"
       ],
       "properties": {
         "mode": {
@@ -190,6 +247,13 @@
         },
         "target_table_must_exist": {
           "const": true
+        },
+        "target_table_must_be_empty": {
+          "const": true
+        },
+        "platform_may_mutate_target_before_run": {
+          "const": false,
+          "description": "平台只读核验目标为空，不代替操作员清空、truncate、delete 或修改目标业务表。"
         }
       }
     },
@@ -224,16 +288,13 @@
           "properties": {
             "record_count": {
               "type": "integer",
-              "minimum": 0,
-              "maximum": 1000000,
-              "default": 0
+              "const": 0,
+              "description": "V1 固定为 0；任一脏行都必须使本次复制不能进入业务成功。正数阈值属于 POST-V1。"
             },
             "percentage": {
               "type": "number",
-              "minimum": 0,
-              "maximum": 1,
-              "multipleOf": 0.000001,
-              "default": 0
+              "const": 0,
+              "description": "V1 固定为 0；不得由 UI 或 API 配置正数容忍比例。正数阈值属于 POST-V1。"
             }
           }
         }
@@ -245,6 +306,7 @@
       "schema_version": "1.0",
       "source": {
         "datasource_id": "11111111-1111-4111-8111-111111111111",
+        "datasource_revision_id": "11111111-1111-4111-8111-111111111112",
         "plugin_name": "mysqlreader",
         "table": {
           "schema_name": "sales",
@@ -253,6 +315,7 @@
       },
       "target": {
         "datasource_id": "22222222-2222-4222-8222-222222222222",
+        "datasource_revision_id": "22222222-2222-4222-8222-222222222223",
         "plugin_name": "postgresqlwriter",
         "table": {
           "schema_name": "public",
@@ -270,6 +333,7 @@
           "target_ordinal": 1,
           "target_type": "bigint",
           "target_nullable": false,
+          "oracle_logical_type": "INTEGER",
           "compatibility": "EXACT"
         },
         {
@@ -281,12 +345,20 @@
           "target_ordinal": 2,
           "target_type": "numeric(18,2)",
           "target_nullable": false,
+          "oracle_logical_type": "DECIMAL",
           "compatibility": "EXACT"
         }
       ],
+      "source_consistency_mode": "OPERATOR_QUIESCED",
+      "target_precondition": "EMPTY_AND_VERIFIABLE",
+      "write_semantics": "INSERT_ONLY_ONCE",
+      "duplicate_policy": "REJECT_NONEMPTY_TARGET",
+      "partial_write_policy": "MANUAL_REMEDIATE",
       "write_policy": {
         "mode": "INSERT",
-        "target_table_must_exist": true
+        "target_table_must_exist": true,
+        "target_table_must_be_empty": true,
+        "platform_may_mutate_target_before_run": false
       },
       "execution_policy": {
         "channel": 1,

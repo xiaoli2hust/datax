@@ -1,0 +1,174 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/phase-a-qualification-grant.v1.schema.json",
+  "title": "DataX Enterprise Studio Private Phase-A Qualification Grant V1",
+  "description": "ADR-0011 的 Phase-A Qualification Grant（PAG）：仅供受保护私有 qualification 控制面记录的精确授权，不是 QH 本身。它必须绑定已独立验证的不可变 P、完整 P binding 的 canonical digest、精确受保护 harness、已验证 QH 的 issuer/id/document_sha256/nonce_sha256 和一个精确 Reader/Writer pair；原始 QH nonce 必须由独立 durable nonce ledger 一次性消费。它不得携带原始 QH nonce、凭据、命令、测试结果或可配置公钥；不是 E3/E4 结论、Plugin Manifest 状态、普通用户能力、Release Qualification 或公开发布批准。普通产品路径固定 deny-all，不能读取、接受、生成或由本对象解锁。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "purpose",
+    "visibility",
+    "ordinary_path_authorized",
+    "evidence_conclusion",
+    "grant_id",
+    "state",
+    "payload_binding",
+    "harness_binding",
+    "qh_binding",
+    "selected_pair",
+    "issued_at",
+    "not_before",
+    "valid_until"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_kind": { "const": "PHASE_A_QUALIFICATION_GRANT" },
+    "purpose": { "const": "PRIVATE_PHASE_A_QUALIFICATION" },
+    "visibility": { "const": "PROTECTED_PRIVATE" },
+    "ordinary_path_authorized": { "const": false },
+    "evidence_conclusion": { "const": "NOT_E3_OR_E4" },
+    "grant_id": { "$ref": "#/$defs/uuid" },
+    "state": {
+      "description": "只有 ACTIVE 可由受保护 Phase-A 控制面接受；原始 QH nonce 的一次性消费由独立 durable nonce ledger 原子完成。grant ledger 只允许 ACTIVE 原子、单调地转为 REVOKED 或 EXPIRED；不得回退或重置，JSON Schema 只校验形状而不证明该生命周期。",
+      "enum": ["ACTIVE", "REVOKED", "EXPIRED"]
+    },
+    "payload_binding": { "$ref": "#/$defs/payloadBinding" },
+    "harness_binding": { "$ref": "#/$defs/harnessBinding" },
+    "qh_binding": { "$ref": "#/$defs/qhBinding" },
+    "selected_pair": { "$ref": "#/$defs/selectedPair" },
+    "issued_at": { "$ref": "#/$defs/rfc3339Utc" },
+    "not_before": { "$ref": "#/$defs/rfc3339Utc" },
+    "valid_until": { "$ref": "#/$defs/rfc3339Utc" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "identifier": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+    },
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "rfc3339Utc": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$",
+      "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "source_ref",
+        "commit_sha",
+        "product_version",
+        "release_candidate"
+      ],
+      "properties": {
+        "repository": { "const": "xiaoli2hust/datax" },
+        "source_ref": {
+          "type": "string",
+          "pattern": "^refs/(heads/main|tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*))$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        },
+        "commit_sha": {
+          "type": "string",
+          "minLength": 40,
+          "maxLength": 40,
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "product_version": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        },
+        "release_candidate": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-[0-9a-f]{12}$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        }
+      }
+    },
+    "payloadBinding": {
+      "description": "payload_root_sha256 是完整不可变 P 的主绑定；payload_binding_sha256 固定为 SHA-256(RFC8785(QH.payload_binding))，不得附加域前缀。保护消费者还必须独立重算 P root 和完整 P binding digest，并要求 identity 与已验证 P 和 QH.payload_binding.identity 精确相等。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["payload_root_sha256", "payload_binding_sha256", "identity"],
+      "properties": {
+        "payload_root_sha256": { "$ref": "#/$defs/sha256" },
+        "payload_binding_sha256": { "$ref": "#/$defs/sha256" },
+        "identity": { "$ref": "#/$defs/identity" }
+      }
+    },
+    "harnessBinding": {
+      "description": "必须与已验证 QH.harness 逐字段相等；不是允许 harness 自报、由普通 API 传入或由用户配置改写的描述。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "environment_id",
+        "environment_manifest_sha256",
+        "harness_version"
+      ],
+      "properties": {
+        "identity": { "$ref": "#/$defs/identifier" },
+        "environment_id": { "$ref": "#/$defs/identifier" },
+        "environment_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "harness_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._+-]+$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        }
+      }
+    },
+    "qhBinding": {
+      "description": "只绑定已经通过 release-payload 固定 HQA keyring 验证的 QH。document_sha256 固定为 SHA-256(RFC8785(已签名 QH 文档，包含 signature))；由于 QH parser 已拒绝非 canonical raw UTF-8，它等价于已验证 raw QH 文件的 SHA-256。nonce_sha256（即 QH nonce hash）固定为 SHA-256(UTF8(QH.nonce))；两者均不得附加域前缀，PAG 不得保存、返回或记录 QH.nonce 原文。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "issuer_key_id",
+        "qualification_id",
+        "document_sha256",
+        "nonce_sha256"
+      ],
+      "properties": {
+        "issuer_key_id": { "$ref": "#/$defs/identifier" },
+        "qualification_id": { "$ref": "#/$defs/identifier" },
+        "document_sha256": { "$ref": "#/$defs/sha256" },
+        "nonce_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "selectedPair": {
+      "description": "一个 grant 只允许一个精确 Reader/Writer pair；两个 SHA-256 必须分别与独立验证 P 的对应 Worker Runtime plugin JAR 相等。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reader_plugin",
+        "reader_plugin_sha256",
+        "writer_plugin",
+        "writer_plugin_sha256"
+      ],
+      "properties": {
+        "reader_plugin": { "enum": ["mysqlreader", "postgresqlreader"] },
+        "reader_plugin_sha256": { "$ref": "#/$defs/sha256" },
+        "writer_plugin": { "enum": ["mysqlwriter", "postgresqlwriter"] },
+        "writer_plugin_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    }
+  }
+}

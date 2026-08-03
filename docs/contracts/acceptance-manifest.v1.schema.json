@@ -1,0 +1,1270 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/acceptance-manifest.v1.schema.json",
+  "title": "DataX Enterprise Studio Acceptance Manifest V1",
+  "description": "候选版本结构与内部绑定的机器可读证据清单。requirement_priority 使用 V1-MUST/POST-V1；defect_severity 使用 P0/P1/P2/P3，二者不得混用。gate_result=PASS 时拒绝任何 P0/P1，状态为 ACCEPTED 也不能绕过。Windows E4 证据存在时必须同时绑定权威场景 profile 与完整场景结果目录。当前缺少可信 Windows harness/candidate attestation validator，因此 gate_result=PASS 不等于发布批准，CLI --require-pass 必须失败关闭。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "release_candidate",
+    "commit_sha",
+    "generated_at",
+    "requirements_catalog_sha256",
+    "environment_manifest_sha256",
+    "coverage",
+    "gate_result",
+    "entries",
+    "defects",
+    "known_limitations"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.1"
+    },
+    "release_candidate": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "commit_sha": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{40}$"
+    },
+    "generated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "requirements_catalog_sha256": {
+      "$ref": "#/$defs/sha256",
+      "description": "CI 输入的规范化需求目录 SHA-256；目录至少包含 requirement_id、requirement_priority、精确 test_id、minimum_evidence_level 与 evidence_requirements。"
+    },
+    "environment_manifest_sha256": {
+      "$ref": "#/$defs/sha256"
+    },
+    "windows_scenario_catalogs": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "$ref": "#/$defs/windowsScenarioCatalogs"
+        }
+      ]
+    },
+    "coverage": {
+      "$ref": "#/$defs/coverage"
+    },
+    "gate_result": {
+      "type": "string",
+      "enum": [
+        "PASS",
+        "FAIL",
+        "BLOCKED"
+      ]
+    },
+    "entries": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/entry"
+      }
+    },
+    "defects": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/defect"
+      }
+    },
+    "known_limitations": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 1000
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "由独立 CI validator 对需求目录与 entries 的 requirement_id/priority/test_id/minimum_evidence_level/evidence_requirements 元组做精确比对后生成；JSON Schema 只校验形状和 PASS 时的空缺口约束。",
+      "required": [
+        "expected_v1_must_count",
+        "covered_v1_must_count",
+        "catalog_exact_match",
+        "missing_requirement_ids",
+        "duplicate_requirement_test_pairs"
+      ],
+      "properties": {
+        "expected_v1_must_count": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "covered_v1_must_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "catalog_exact_match": {
+          "type": "boolean",
+          "description": "独立 CI validator 在 catalog hash 有效、expected=covered，且 entries 的 V1-MUST requirement_id/priority/test_id/minimum_evidence_level/evidence_requirements 元组精确等于 catalog 时写 true。"
+        },
+        "missing_requirement_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/requirementId"
+          }
+        },
+        "duplicate_requirement_test_pairs": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/requirementTestPair"
+          }
+        }
+      }
+    },
+    "requirementId": {
+      "type": "string",
+      "pattern": "^(PRD-(FR|BR)-[A-Z0-9-]+|NFR-[A-Z0-9-]+|ACC-PRD-[0-9]{3})$"
+    },
+    "testId": {
+      "type": "string",
+      "pattern": "^(UT|CT|IT|E2E|UI|SEC|PERF|REC|OPS)-[A-Z0-9-]+$"
+    },
+    "requirementTestPair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requirement_id",
+        "test_id"
+      ],
+      "properties": {
+        "requirement_id": {
+          "$ref": "#/$defs/requirementId"
+        },
+        "test_id": {
+          "$ref": "#/$defs/testId"
+        }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requirement_id",
+        "requirement_priority",
+        "test_id",
+        "evidence_requirements",
+        "result",
+        "minimum_evidence_level",
+        "evidence_level",
+        "oracle",
+        "windows_evidence",
+        "evidence",
+        "executed_at",
+        "environment_id"
+      ],
+      "properties": {
+        "requirement_id": {
+          "$ref": "#/$defs/requirementId"
+        },
+        "requirement_priority": {
+          "type": "string",
+          "enum": [
+            "V1-MUST",
+            "POST-V1"
+          ]
+        },
+        "test_id": {
+          "$ref": "#/$defs/testId"
+        },
+        "evidence_requirements": {
+          "type": "array",
+          "uniqueItems": true,
+          "maxItems": 2,
+          "items": {
+            "type": "string",
+            "enum": [
+              "VERIFICATION_ORACLE_V1",
+              "WINDOWS_E4"
+            ]
+          },
+          "description": "由 catalog 固定的结构化证据类型；validator 必须逐项精确比对，运行器不得自行移除。"
+        },
+        "result": {
+          "type": "string",
+          "enum": [
+            "PASS",
+            "FAIL",
+            "BLOCKED",
+            "NOT_RUN"
+          ]
+        },
+        "minimum_evidence_level": {
+          "type": "string",
+          "description": "由权威需求 catalog 固定，独立 CI validator 必须逐项比对；客户端或测试运行器不得自行降低。",
+          "enum": [
+            "E0",
+            "E1",
+            "E2",
+            "E3",
+            "E4"
+          ]
+        },
+        "evidence_level": {
+          "type": "string",
+          "enum": [
+            "E0",
+            "E1",
+            "E2",
+            "E3",
+            "E4"
+          ]
+        },
+        "oracle": {
+          "description": "仅在独立 oracle 实际启动并产生制品后填写。Oracle 从未启动时必须为 null（Execution.verification_state=NOT_STARTED）；不得用 INCONCLUSIVE 伪装未启动。",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/oracleEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "windows_evidence": {
+          "description": "最低证据为 E4 的 Windows 条目必须引用通过结构和语义校验的 Windows E4 JSON 产物；普通文本、截图或自声明 PASS 不能替代。",
+          "oneOf": [
+            {
+              "$ref": "#/$defs/windowsEvidence"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "evidence": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/artifact"
+          }
+        },
+        "executed_at": {
+          "description": "测试尝试完成时间；validator 要求不早于引用 oracle 的 finished_at，且 environment captured_at 不晚于本时间。",
+          "oneOf": [
+            {
+              "type": "string",
+              "format": "date-time"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "environment_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 128
+        },
+        "blocked_reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1000
+        },
+        "defect_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "PASS"
+              },
+              "minimum_evidence_level": {
+                "const": "E0"
+              }
+            },
+            "required": [
+              "result",
+              "minimum_evidence_level"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence_level": {
+                "const": "E0"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "PASS"
+              },
+              "minimum_evidence_level": {
+                "const": "E1"
+              }
+            },
+            "required": [
+              "result",
+              "minimum_evidence_level"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence_level": {
+                "const": "E1"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "PASS"
+              },
+              "minimum_evidence_level": {
+                "const": "E2"
+              }
+            },
+            "required": [
+              "result",
+              "minimum_evidence_level"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence_level": {
+                "const": "E2"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "PASS"
+              },
+              "minimum_evidence_level": {
+                "const": "E3"
+              }
+            },
+            "required": [
+              "result",
+              "minimum_evidence_level"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence_level": {
+                "const": "E3"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "PASS"
+              },
+              "minimum_evidence_level": {
+                "const": "E4"
+              }
+            },
+            "required": [
+              "result",
+              "minimum_evidence_level"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence_level": {
+                "const": "E4"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "PASS"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "evidence": {
+                "minItems": 1
+              },
+              "executed_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "environment_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "blocked_reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "PASS"
+              },
+              "evidence_requirements": {
+                "contains": {
+                  "const": "VERIFICATION_ORACLE_V1"
+                }
+              }
+            },
+            "required": [
+              "result",
+              "evidence_requirements"
+            ]
+          },
+          "then": {
+            "properties": {
+              "oracle": {
+                "$ref": "#/$defs/passedOracleEvidence"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "PASS"
+              },
+              "evidence_requirements": {
+                "contains": {
+                  "const": "WINDOWS_E4"
+                }
+              }
+            },
+            "required": [
+              "result",
+              "evidence_requirements"
+            ]
+          },
+          "then": {
+            "properties": {
+              "windows_evidence": {
+                "$ref": "#/$defs/passedWindowsEvidence"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "FAIL"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "required": [
+              "defect_ids"
+            ],
+            "properties": {
+              "evidence": {
+                "minItems": 1
+              },
+              "executed_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "environment_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "defect_ids": {
+                "minItems": 1
+              },
+              "blocked_reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "BLOCKED"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "required": [
+              "blocked_reason"
+            ],
+            "properties": {
+              "blocked_reason": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "NOT_RUN"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "oracle": {
+                "type": "null"
+              },
+              "windows_evidence": {
+                "type": "null"
+              },
+              "evidence": {
+                "maxItems": 0
+              },
+              "executed_at": {
+                "type": "null"
+              },
+              "environment_id": {
+                "type": "null"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "oracleEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "result",
+        "binding",
+        "artifact"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "result": {
+          "type": "string",
+          "description": "INCONCLUSIVE 仅表示 oracle 已启动但无法形成结论；Oracle 未启动不创建 oracleEvidence。",
+          "enum": [
+            "PASSED",
+            "FAILED",
+            "INCONCLUSIVE"
+          ]
+        },
+        "binding": {
+          "$ref": "#/$defs/oracleBinding"
+        },
+        "artifact": {
+          "$ref": "#/$defs/artifact"
+        }
+      }
+    },
+    "passedOracleEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "result",
+        "binding",
+        "artifact"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "result": {
+          "const": "PASSED"
+        },
+        "binding": {
+          "$ref": "#/$defs/oracleBinding"
+        },
+        "artifact": {
+          "$ref": "#/$defs/artifact"
+        }
+      }
+    },
+    "oracleBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "release_candidate",
+        "commit_sha",
+        "requirement_id",
+        "test_id",
+        "environment_id",
+        "environment_manifest_sha256",
+        "execution_id",
+        "job_version_id"
+      ],
+      "properties": {
+        "release_candidate": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "commit_sha": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "requirement_id": {
+          "$ref": "#/$defs/requirementId"
+        },
+        "test_id": {
+          "$ref": "#/$defs/testId"
+        },
+        "environment_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "environment_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "execution_id": {
+          "type": "string",
+          "format": "uuid"
+        },
+        "job_version_id": {
+          "type": "string",
+          "format": "uuid"
+        }
+      }
+    },
+    "windowsBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "release_candidate",
+        "commit_sha",
+        "requirement_id",
+        "test_id",
+        "environment_id",
+        "environment_manifest_sha256",
+        "execution_ids"
+      ],
+      "properties": {
+        "release_candidate": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "commit_sha": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "requirement_id": {
+          "$ref": "#/$defs/requirementId"
+        },
+        "test_id": {
+          "$ref": "#/$defs/testId"
+        },
+        "environment_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "environment_manifest_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "execution_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "format": "uuid"
+          }
+        }
+      }
+    },
+    "windowsScenarioCatalogs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile",
+        "result"
+      ],
+      "properties": {
+        "profile": {
+          "$ref": "#/$defs/artifact"
+        },
+        "result": {
+          "$ref": "#/$defs/artifact"
+        }
+      }
+    },
+    "windowsScenarioBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_id",
+        "profile_catalog_sha256",
+        "result_catalog_sha256"
+      ],
+      "properties": {
+        "profile_id": {
+          "$ref": "#/$defs/testId"
+        },
+        "profile_catalog_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "result_catalog_sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "environmentManifest": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": [
+        "schema_version",
+        "artifact_kind",
+        "environment_id",
+        "release_candidate",
+        "commit_sha",
+        "captured_at",
+        "system"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "artifact_kind": {
+          "const": "ACCEPTANCE_ENVIRONMENT"
+        },
+        "environment_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "release_candidate": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "commit_sha": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "captured_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "system": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": [
+            "os_family",
+            "os_name",
+            "os_version",
+            "architecture"
+          ],
+          "properties": {
+            "os_family": {
+              "type": "string",
+              "enum": [
+                "WINDOWS",
+                "LINUX",
+                "MACOS"
+              ]
+            },
+            "os_name": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "os_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "architecture": {
+              "type": "string",
+              "enum": [
+                "X86_64",
+                "ARM64"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "windowsEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "result",
+        "binding",
+        "artifact"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "result": {
+          "type": "string",
+          "enum": [
+            "PASSED",
+            "FAILED"
+          ]
+        },
+        "binding": {
+          "$ref": "#/$defs/windowsBinding"
+        },
+        "artifact": {
+          "$ref": "#/$defs/artifact"
+        }
+      }
+    },
+    "passedWindowsEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "result",
+        "binding",
+        "artifact"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "result": {
+          "const": "PASSED"
+        },
+        "binding": {
+          "$ref": "#/$defs/windowsBinding"
+        },
+        "artifact": {
+          "$ref": "#/$defs/artifact"
+        }
+      }
+    },
+    "windowsEvidenceArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "artifact_kind",
+        "result",
+        "binding",
+        "executed_at",
+        "windows",
+        "release_artifacts",
+        "assertions",
+        "scenario"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "artifact_kind": {
+          "const": "WINDOWS_E4_TEST_RESULT"
+        },
+        "result": {
+          "type": "string",
+          "enum": [
+            "PASSED",
+            "FAILED"
+          ]
+        },
+        "binding": {
+          "$ref": "#/$defs/windowsBinding"
+        },
+        "executed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "windows": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "edition",
+            "build",
+            "architecture",
+            "clean_vm",
+            "wsl_version",
+            "docker_desktop_version",
+            "docker_engine_version",
+            "docker_compose_version",
+            "exposed_host_ports",
+            "lan_reachable"
+          ],
+          "properties": {
+            "edition": {
+              "const": "Windows 11"
+            },
+            "build": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "architecture": {
+              "const": "X86_64"
+            },
+            "clean_vm": {
+              "type": "boolean"
+            },
+            "wsl_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "docker_desktop_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "docker_engine_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "docker_compose_version": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128
+            },
+            "exposed_host_ports": {
+              "type": "array",
+              "minItems": 1,
+              "maxItems": 1,
+              "uniqueItems": true,
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "address",
+                  "port",
+                  "service"
+                ],
+                "properties": {
+                  "address": {
+                    "const": "127.0.0.1"
+                  },
+                  "port": {
+                    "const": 17860
+                  },
+                  "service": {
+                    "const": "web"
+                  }
+                }
+              }
+            },
+            "lan_reachable": {
+              "type": "boolean"
+            }
+          }
+        },
+        "release_artifacts": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "setup",
+            "launcher",
+            "setup_signature_status",
+            "launcher_signature_status",
+            "timestamp_status"
+          ],
+          "properties": {
+            "setup": {
+              "$ref": "#/$defs/artifact",
+              "description": "实际 Setup.exe 制品的 evidence-root 相对路径与文件 SHA-256；不得只填写脱离文件的裸摘要。"
+            },
+            "launcher": {
+              "$ref": "#/$defs/artifact",
+              "description": "实际 launcher.exe 制品的 evidence-root 相对路径与文件 SHA-256；不得只填写脱离文件的裸摘要。"
+            },
+            "setup_signature_status": {
+              "type": "string",
+              "enum": [
+                "VALID",
+                "INVALID"
+              ]
+            },
+            "launcher_signature_status": {
+              "type": "string",
+              "enum": [
+                "VALID",
+                "INVALID"
+              ]
+            },
+            "timestamp_status": {
+              "type": "string",
+              "enum": [
+                "VALID",
+                "INVALID"
+              ]
+            }
+          }
+        },
+        "scenario": {
+          "$ref": "#/$defs/windowsScenarioBinding"
+        },
+        "assertions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "assertion_id",
+              "result",
+              "evidence"
+            ],
+            "properties": {
+              "assertion_id": {
+                "$ref": "#/$defs/testId"
+              },
+              "result": {
+                "type": "string",
+                "enum": [
+                  "PASS",
+                  "FAIL"
+                ]
+              },
+              "evidence": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "$ref": "#/$defs/artifact"
+                }
+              }
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "result": {
+                "const": "PASSED"
+              }
+            },
+            "required": [
+              "result"
+            ]
+          },
+          "then": {
+            "properties": {
+              "windows": {
+                "properties": {
+                  "clean_vm": {
+                    "const": true
+                  },
+                  "lan_reachable": {
+                    "const": false
+                  }
+                }
+              },
+              "release_artifacts": {
+                "properties": {
+                  "setup_signature_status": {
+                    "const": "VALID"
+                  },
+                  "launcher_signature_status": {
+                    "const": "VALID"
+                  },
+                  "timestamp_status": {
+                    "const": "VALID"
+                  }
+                }
+              },
+              "assertions": {
+                "not": {
+                  "contains": {
+                    "properties": {
+                      "result": {
+                        "const": "FAIL"
+                      }
+                    },
+                    "required": [
+                      "result"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 500,
+          "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+$"
+        },
+        "sha256": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "defect": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "defect_id",
+        "defect_severity",
+        "status"
+      ],
+      "properties": {
+        "defect_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "defect_severity": {
+          "type": "string",
+          "enum": [
+            "P0",
+            "P1",
+            "P2",
+            "P3"
+          ]
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "OPEN",
+            "FIXED",
+            "ACCEPTED"
+          ]
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "gate_result": {
+            "const": "PASS"
+          }
+        },
+        "required": [
+          "gate_result"
+        ]
+      },
+      "then": {
+        "properties": {
+          "entries": {
+            "not": {
+              "contains": {
+                "properties": {
+                  "requirement_priority": {
+                    "const": "V1-MUST"
+                  },
+                  "result": {
+                    "enum": [
+                      "FAIL",
+                      "BLOCKED",
+                      "NOT_RUN"
+                    ]
+                  }
+                },
+                "required": [
+                  "requirement_priority",
+                  "result"
+                ]
+              }
+            }
+          },
+          "defects": {
+            "not": {
+              "contains": {
+                "properties": {
+                  "defect_severity": {
+                    "enum": [
+                      "P0",
+                      "P1"
+                    ]
+                  }
+                },
+                "required": [
+                  "defect_severity"
+                ]
+              }
+            }
+          },
+          "coverage": {
+            "properties": {
+              "catalog_exact_match": {
+                "const": true
+              },
+              "missing_requirement_ids": {
+                "maxItems": 0
+              },
+              "duplicate_requirement_test_pairs": {
+                "maxItems": 0
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

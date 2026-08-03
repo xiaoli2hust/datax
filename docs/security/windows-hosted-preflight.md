@@ -1,0 +1,88 @@
+# GitHub-hosted Windows 安装器预检（非发布，E1）
+
+[`windows-hosted-preflight.yml`](../../.github/workflows/windows-hosted-preflight.yml) 是一个刻意
+受限的开发预检。它会在 GitHub-hosted `windows-2025`（Windows Server x64）上，用真实 Windows
+原生工具链执行 Launcher 单元测试/构建，并用固定 NSIS 3.11 压缩包编译一次临时安装器。
+
+它的价值是尽早发现以下回归：
+
+- Windows 原生 Rust/MSVC 编译失败；
+- Launcher 的纯单元测试失败；
+- NSIS 语法、宏、资源打包路径或 Unicode 插件引用失败。
+
+该 hosted-only 静态检查显式使用 `Python 3.12.10`：这是 `windows-2025` 当前可用的精确
+3.12 patch 版本，用来运行 hash-locked 的检查依赖，并不改变产品 API/Worker 镜像固定的
+Python 3.12.13，也不构成产品 Runtime 的供应链证明。
+
+它不安装 `backend/requirements-dev.lock`，而只安装
+[`windows-hosted-preflight.requirements.lock`](../../scripts/acceptance/windows-hosted-preflight.requirements.lock)
+内的单个 PyYAML 6.0.3 Windows CPython 3.12 x64 wheel 哈希。这个最小依赖只用于解析 workflow
+以执行本预检的静态反向测试，且配合 `--only-binary=:all:` 与 `--require-hashes` 失败关闭。原因是
+完整开发锁文件合法地包含 Linux 侧 `uvloop`，但该依赖没有 Windows 支持；让 hosted Windows
+预检安装它会在真正的 Launcher/NSIS 检查之前无意义地失败。此独立锁文件不改变产品依赖、镜像或
+发布供应链，也不能作为其证明。
+
+该工作流若在线成功，最高证据等级也只能是 **E1**。2026-08-02 的真实运行不是“绿色”的替身：
+第一次 [run 30723692714](https://github.com/xiaoli2hust/datax/actions/runs/30723692714) 在安装
+`3.12.13` 时发现该 patch 不存在于 `windows-2025`，因此在任何编译前失败；把检查器固定到可用的
+`3.12.10` 后，第二次 [run 30723744355](https://github.com/xiaoli2hust/datax/actions/runs/30723744355)
+证明 Python 安装成功，却在安装完整 Linux 开发锁文件中的 `uvloop` 时失败，仍在任何 Launcher、
+NSIS、签名或候选产物之前。本文所述最小 Windows wheel lock 修复该第二个失败条件。第三次
+[run 30723926366](https://github.com/xiaoli2hust/datax/actions/runs/30723926366) 因此成功安装最小
+依赖、编译 Launcher 并运行其 57 个单元测试；其中 56 个通过，剩余一个错误地要求
+`Command::get_envs()` 把 `HTTP_PROXY` 与 `http_proxy` 表示为两条独立移除记录。Windows 环境变量
+名是大小写不敏感的，实际受控子进程仍在启动前移除二者的同一有效变量。测试现只在 Windows 对
+该观察结果作大小写无关匹配，在其他平台仍逐项精确断言；修复后的真实 run 尚待记录，不能预先
+表述为 E1 通过。第四次 [run 30724102606](https://github.com/xiaoli2hust/datax/actions/runs/30724102606)
+已经通过 Launcher 原生测试与 release 构建，却发现 PowerShell `Invoke-WebRequest` 返回内容的
+SHA-256 不等于固定 NSIS archive；工作流在解压前停止且 finally 清理临时目录。下载器现改为
+显式 `%SystemRoot%\System32\curl.exe`，禁用用户 curl 配置、仅允许 HTTPS 及 HTTPS 重定向，并在
+相同 SHA-256 校验后才解压。第五次
+[run 30724285608](https://github.com/xiaoli2hust/datax/actions/runs/30724285608) 在同一 Windows Server
+runner 完整通过：57 个 Windows 可执行 Launcher 单元测试、release 构建、固定 NSIS archive hash、
+`makensis` 对临时输入的编译，以及生成物删除均成功。日志记录该临时 installer 的输出大小为
+487,477 bytes，随后其完整临时根目录被删除；此记录是可复查的 **E1**，不是签名候选、安装验收或
+E4。
+
+它不创建、上传或保留任何候选安装包；临时 `nonrelease-installer-preflight.exe`、其非发布资源、
+NSIS 和 Cargo 输出都只存在于 GitHub-hosted runner 的临时目录，并在作业结束前删除。
+
+## 硬边界
+
+该 workflow 只能由 `pull_request`、`main`/`agent/**` 的普通 push 或手动 dispatch 触发；
+没有 tag trigger，手动选择 tag 时 job 也会跳过。顶层和 job 权限都固定为 `contents: read`，没有 GitHub Environment、
+secrets、OIDC `id-token`、attestation、发布、签名、Docker/WSL2 调用或 artifact upload。
+
+NSIS 只从官方 SourceForge 下载固定的 `nsis-3.11.zip`，并要求 SHA-256
+`c7d27f780ddb6cffb4730138cd1591e841f4b7edb155856901cdf5f214394fa1`；下载、哈希、解压或
+`makensis.exe` 定位失败即失败。下载只调用明确的 `%SystemRoot%\System32\curl.exe`，使用
+`--disable --fail --location --proto =https --proto-redir =https --tlsv1.2`，不读取用户 curl 配置，
+不回退到 PATH、Chocolatey 或任意预装 NSIS。
+这只限制开发工具输入，不能证明最终发布工具链、工具目录 ACL、TOCTOU、签名私钥或候选二进制的
+来源可信。NSIS 在本预检中只是构建时工具，不随产品分发；其官方许可证为 zlib/libpng。
+替代路径是正式 self-hosted 签名 runner 上由受控发布环境显式提供的 `MAKENSIS_PATH`，不能把
+该路径或任意 PATH/Chocolatey 回退混入 hosted 预检。
+
+构建 Launcher 前显式移除 `DES_RELEASE_MANIFEST_SHA256` 及 Cargo/Rust 常见编译覆盖。
+用于 NSIS 的镜像锁与 release manifest 是刻意无效的临时占位输入；工作流不执行
+`Setup.exe` 或 `launcher.exe`，也不尝试产生可安装制品。
+
+`scripts/acceptance/test_windows_hosted_preflight.py` 会静态拒绝把该工作流扩展成 tag/
+`pull_request_target`/schedule 触发、Environment/secrets/OIDC、签名、发布、Docker/WSL 或
+artifact 上传通道。
+
+## 它不能证明的事项
+
+GitHub-hosted `windows-2025` 是 Windows Server，不是 V1 认证目标 Windows 11 x64 Client；
+它也不提供真实 Docker Desktop + WSL2、本机用户配置、代码签名证书、可信时间戳、受控签名
+runner、真实 MySQL/PostgreSQL 或 DataX Runtime。因此它不能证明：
+
+- `Setup.exe`/`launcher.exe` 的 Authenticode 签名、时间戳、安装、升级、卸载或可交付性；
+- Docker Desktop/WSL2 前置检查、Compose、loopback/LAN、睡眠/重启、备份恢复；
+- 任意真实 DataX E3，或 `E2E-WIN-001` / `E2E-WIN-002` 的 Windows E4；
+- ADR-0010 的受保护 signing Environment、self-hosted Windows E4 harness、候选根或 hosted
+  provenance。
+
+正式发布仍只能经 `.github/workflows/release.yml` 的专用 self-hosted Windows 签名路径和
+ADR-0010/ADR-0011 要求的真实证据完成。当前签名 Environment、受限 Windows runner 和完整
+Windows E4 仍为 `BLOCKED`；本预检的成功绝不能改变该状态。

@@ -1,0 +1,206 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xiaoli2hust/datax/docs/contracts/egress-guard-lease.v1.schema.json",
+  "title": "DataX Enterprise Studio egress guard selected-IP lease v1",
+  "description": "此 Schema 只描述 JSON body。POST /v1/leases 还必须恰好携带一个 X-DataX-Egress-Lease-Capability 请求头，其值为 64 个 ASCII 小写十六进制字符；该能力头不属于 body，且不得出现在响应或日志中。",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/createRequest"
+    },
+    {
+      "$ref": "#/$defs/createResponse"
+    },
+    {
+      "$ref": "#/$defs/renewResponse"
+    },
+    {
+      "$ref": "#/$defs/errorResponse"
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "canonicalUuid": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "selectedIp": {
+      "type": "string",
+      "anyOf": [
+        {
+          "format": "ipv4"
+        },
+        {
+          "format": "ipv6"
+        }
+      ]
+    },
+    "createRequest": {
+      "description": "仅 POST body。传输层还要求恰好一个 X-DataX-Egress-Lease-Capability: <64 ASCII lowercase hex characters> 请求头。",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "revision_id",
+        "policy_hash",
+        "selected_ip",
+        "port"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "revision_id": {
+          "$ref": "#/$defs/canonicalUuid"
+        },
+        "policy_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "selected_ip": {
+          "$ref": "#/$defs/selectedIp"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        }
+      }
+    },
+    "commonResponseProperties": {
+      "type": "object",
+      "properties": {
+        "schema_version": {
+          "const": "1.0"
+        },
+        "lease_id": {
+          "$ref": "#/$defs/canonicalUuid"
+        },
+        "revision_id": {
+          "$ref": "#/$defs/canonicalUuid"
+        },
+        "policy_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "selected_ip": {
+          "$ref": "#/$defs/selectedIp"
+        },
+        "port": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "renew_after_seconds": {
+          "const": 5
+        },
+        "kernel_timeout_seconds": {
+          "const": 15
+        },
+        "ruleset_hash": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    },
+    "createResponse": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/commonResponseProperties"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "status",
+            "lease_id",
+            "bearer_token",
+            "revision_id",
+            "policy_hash",
+            "selected_ip",
+            "port",
+            "expires_at",
+            "renew_after_seconds",
+            "kernel_timeout_seconds",
+            "ruleset_hash"
+          ],
+          "properties": {
+            "schema_version": true,
+            "status": {
+              "const": "GRANTED"
+            },
+            "lease_id": true,
+            "bearer_token": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            },
+            "revision_id": true,
+            "policy_hash": true,
+            "selected_ip": true,
+            "port": true,
+            "expires_at": true,
+            "renew_after_seconds": true,
+            "kernel_timeout_seconds": true,
+            "ruleset_hash": true
+          }
+        }
+      ]
+    },
+    "renewResponse": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/commonResponseProperties"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "schema_version",
+            "status",
+            "lease_id",
+            "revision_id",
+            "policy_hash",
+            "selected_ip",
+            "port",
+            "expires_at",
+            "renew_after_seconds",
+            "kernel_timeout_seconds",
+            "ruleset_hash"
+          ],
+          "properties": {
+            "schema_version": true,
+            "status": {
+              "const": "RENEWED"
+            },
+            "lease_id": true,
+            "revision_id": true,
+            "policy_hash": true,
+            "selected_ip": true,
+            "port": true,
+            "expires_at": true,
+            "renew_after_seconds": true,
+            "kernel_timeout_seconds": true,
+            "ruleset_hash": true
+          }
+        }
+      ]
+    },
+    "errorResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "code"
+      ],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9_]{2,63}$"
+        }
+      }
+    }
+  }
+}

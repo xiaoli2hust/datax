@@ -2,13 +2,19 @@ openapi: 3.1.0
 jsonSchemaDialect: https://json-schema.org/draft/2020-12/schema
 info:
   title: DataX Enterprise Studio API
-  version: 1.0.0
+  version: 1.2.0
+  license:
+    name: License pending repository-owner decision
+    url: https://github.com/xiaoli2hust/datax/blob/main/README.md
   description: |
-    V1 单组织、多项目离线批同步控制 API。
-    仅支持 MySQL 8/PostgreSQL 15、人工触发、预存在目标表和 insert-only。
+    V1 单组织、多项目、安全的一次性离线全量复制控制 API。
+    仅支持 MySQL 8/PostgreSQL 15、人工触发、源端静默确认、预存在且实测为空的目标表和 insert-only-once。
     不提供调度、DAG、告警、AI、CDC、自由 SQL、Transformer 或插件安装接口。
+    交付形态为 Windows 11 x64 本地工作站；业务 API 仅经 web 反向代理绑定本机
+    127.0.0.1:17860，api、worker 和 postgres 不暴露宿主端口。
 servers:
-  - url: /api/v1
+  - url: http://127.0.0.1:17860/api/v1
+    description: Windows 本地工作站唯一支持入口；不得替换为 0.0.0.0、LAN IP 或公网地址
 tags:
   - name: Auth
     description: 本地账号会话与本人密码
@@ -18,16 +24,18 @@ tags:
     description: 项目、成员、角色与首页统计
   - name: Plugins
     description: 只读认证插件清单
+  - name: SecurityPolicies
+    description: Admin 管理的数据端点、使用授权和传输审批
   - name: Datasources
     description: 数据源、凭证测试和 Schema 探测
   - name: Jobs
     description: 任务草稿、校验、预览与不可变版本
   - name: Executions
-    description: 人工运行、取消、重跑和脱敏日志
+    description: 人工运行、取消、恢复后再次执行和脱敏日志
   - name: Audit
     description: 项目级与组织级追加式审计
   - name: Health
-    description: 无敏感信息的存活与就绪检查
+    description: 仅供本机 launcher/web 使用、无敏感信息的 loopback 存活与就绪检查
 security:
   - bearerAuth: []
 
@@ -36,7 +44,13 @@ paths:
     post:
       tags: [Auth]
       operationId: login
-      summary: 本地账号登录
+      summary: 本地账号登录（先入口准入，后认证）
+      description: |
+        在 Host/Origin 检查后、路由依赖、数据库、Argon2id 与审计之前，单一 API 进程以
+        全局、账号无关的准入控制保护本机登录入口。准入拒绝不是凭据决定：不会创建 session、
+        验证密码、改变失败计数或锁定状态、写入审计，也不会设置 Cookie 或 `WWW-Authenticate`。
+        V1 不支持把 API 扩展为多个 Uvicorn workers、Compose scale 或额外入口；若未来改变，
+        必须先定义共享准入控制。
       security: []
       requestBody:
         required: true
@@ -54,7 +68,7 @@ paths:
             Set-Cookie:
               schema:
                 type: string
-              description: des_refresh cookie
+              description: des_refresh；HttpOnly、SameSite=Strict、Path=/api/v1/auth、无 Domain。V1 loopback HTTP 不虚假声明 Secure。
             X-Request-Id:
               $ref: '#/components/headers/RequestId'
           content:
@@ -63,6 +77,39 @@ paths:
                 $ref: '#/components/schemas/AuthResponse'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '429':
+          description: |
+            `AUTH_LOGIN_ADMISSION_LIMITED`：固定 60 秒的全局、账号无关登录入口准入拒绝。
+            这是尚未进入认证决策的响应；不创建 session、不验密码、不修改失败计数或锁定状态、
+            不写 AuditEvent，且不得设置 Cookie 或 `WWW-Authenticate`。客户端只能在等待后
+            要求用户重新输入密码并手动提交，不得自动重放。
+          headers:
+            Retry-After:
+              description: 固定的 delta-seconds 等待提示；不反映令牌或并发槽的内部状态。
+              schema:
+                type: integer
+                const: 60
+            X-Request-Id:
+              $ref: '#/components/headers/RequestId'
+            Cache-Control:
+              description: 防止浏览器或中间层缓存包含登录拒绝信息的响应。
+              schema:
+                type: string
+                const: no-store
+          content:
+            application/problem+json:
+              schema:
+                $ref: '#/components/schemas/LoginAdmissionLimitedProblem'
+              example:
+                type: https://datax-enterprise-studio.local/problems/auth-login-admission-limited
+                title: 登录尝试暂时受限
+                status: 429
+                code: AUTH_LOGIN_ADMISSION_LIMITED
+                detail: 请稍后重试。
+                instance: /api/v1/auth/login
+                request_id: 8a70a0eb-0f0d-4a26-a3e3-1b84ebbd92c4
+                retryable: true
+                field_errors: []
         '422':
           $ref: '#/components/responses/ValidationError'
 
@@ -80,6 +127,7 @@ paths:
             Set-Cookie:
               schema:
                 type: string
+              description: 旋转后的 des_refresh；属性与登录响应一致
             X-Request-Id:
               $ref: '#/components/headers/RequestId'
           content:
@@ -93,7 +141,15 @@ paths:
     post:
       tags: [Auth]
       operationId: logout
-      summary: 撤销当前 refresh session
+      summary: 幂等撤销调用方持有的本机会话凭证
+      description: |
+        接受 bearer、refresh cookie 或两者。每个能被密码学验证并精确定位的 session 都会
+        被撤销；两者指向不同 session 时分别撤销，避免只删除 cookie 而留下服务器端 refresh
+        session。缺失、无效、过期或已撤销凭证同样返回 204，响应始终删除本机 cookie。
+      security:
+        - bearerAuth: []
+        - refreshCookie: []
+        - {}
       responses:
         '204':
           description: 已撤销；重复退出同样返回 204
@@ -103,9 +159,6 @@ paths:
                 type: string
             X-Request-Id:
               $ref: '#/components/headers/RequestId'
-        '401':
-          $ref: '#/components/responses/Unauthorized'
-
   /auth/me:
     get:
       tags: [Auth]
@@ -262,6 +315,9 @@ paths:
       responses:
         '200':
           description: 已解锁
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
           content:
             application/json:
               schema:
@@ -322,6 +378,9 @@ paths:
       responses:
         '204':
           description: 已重置
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
@@ -366,7 +425,7 @@ paths:
             example:
               name: 订单数据集成
               slug: order-integration
-              description: 订单离线同步任务
+              description: 订单离线复制任务
       responses:
         '201':
           description: 已创建
@@ -500,7 +559,7 @@ paths:
       summary: 获取固定时间窗的项目运行概览
       description: |
         所有项目成员可读。Execution 以 queued_at 落入半开区间 [from,to) 统计；
-        时间窗最长 31 天。成功率为 SUCCEEDED /
+        时间窗最长 31 天。成功率分子为 process_state=SUCCEEDED 且 verification_state=PASSED，口径为该分子 /
         (SUCCEEDED + FAILED + TIMED_OUT + LOST)，分母为 0 时 ratio 为 null。
       parameters:
         - name: from
@@ -532,11 +591,25 @@ paths:
   /plugins:
     get:
       tags: [Plugins]
-      operationId: listCertifiedPlugins
-      summary: 获取四个只读认证插件 manifest
+      operationId: listPluginCapabilities
+      summary: 获取当前 DataX 能力目录与认证状态
+      description: |
+        返回当前 Runtime 中四个 V1 候选 Reader/Writer 的制品、上游、
+        依赖/许可审查、访问边界、oracle 和证据状态。源码存在、
+        构建成功或已打包均不等于普通用户可执行。`WINDOWS_E4_CERTIFIED`
+        只表示精确最终候选已完成 Phase-B Windows E4；只有该状态、同一最终候选
+        的有效 `evidence.release_promotion_ref`、`ordinary_user_executable=true`，且
+        证据仍在有效期并绑定当前候选时才能创建和启动 Execution。E4 已通过但尚无
+        公开发布晋级时，接口必须返回 `WINDOWS_E4_CERTIFIED`、
+        `ordinary_user_executable=false` 及 `RELEASE_PROMOTION_REQUIRED`。该引用是
+        opaque identifier，不是客户端可自行信任的证明；服务端只会在其认证源已确认
+        可用时返回字符串。缺失、格式无效或同一候选内不一致时返回 null，并以
+        `RELEASE_PROMOTION_REQUIRED`、`RELEASE_PROMOTION_REF_INVALID` 或
+        `PAIR_RELEASE_PROMOTION_MISMATCH` 失败关闭。当前 production 仍没有受信 reader，
+        默认 deny-all；测试注入不会被序列化为公开可信的普通用户能力。
       responses:
         '200':
-          description: 插件 manifest 列表
+          description: 插件能力与证据状态列表
           content:
             application/json:
               schema:
@@ -549,9 +622,220 @@ paths:
                     minItems: 4
                     maxItems: 4
                     items:
-                      $ref: './plugin-manifest.v1.schema.json'
+                      $ref: './plugin-manifest.v2.schema.json'
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+
+  /endpoint-policies:
+    get:
+      tags: [SecurityPolicies]
+      operationId: listEndpointPolicies
+      summary: Admin 分页列出组织数据端点白名单
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 端点策略页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EndpointPolicyPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+    post:
+      tags: [SecurityPolicies]
+      operationId: createEndpointPolicy
+      summary: Admin 创建组织数据端点白名单
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EndpointPolicyCreate'
+      responses:
+        '201':
+          description: 已创建
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EndpointPolicy'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /endpoint-policies/{endpoint_policy_id}:
+    parameters:
+      - name: endpoint_policy_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    get:
+      tags: [SecurityPolicies]
+      operationId: getEndpointPolicy
+      summary: Admin 获取端点策略
+      responses:
+        '200':
+          description: 端点策略
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EndpointPolicy'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [SecurityPolicies]
+      operationId: updateEndpointPolicy
+      summary: Admin 更新或停用端点策略
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/EndpointPolicyPatch'
+      responses:
+        '200':
+          description: 已更新
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EndpointPolicy'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /endpoint-policies/{endpoint_policy_id}/revisions/{revision_id}:
+    parameters:
+      - name: endpoint_policy_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+      - name: revision_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    get:
+      tags: [SecurityPolicies]
+      operationId: getEndpointPolicyRevision
+      summary: Admin 获取不可变端点策略修订
+      description: 原始 FQDN/IP、CIDR、端口和出口策略属于 Admin-only 配置，不向项目只读角色暴露。
+      responses:
+        '200':
+          description: 不可变 EndpointPolicyRevision
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EndpointPolicyRevision'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /physical-endpoint-identities/{physical_endpoint_identity_id}:
+    parameters:
+      - name: physical_endpoint_identity_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    get:
+      tags: [SecurityPolicies]
+      operationId: getPhysicalEndpointIdentity
+      summary: Admin 获取不可变物理端点身份
+      description: 只返回加盐哈希和脱敏验证证据，不返回引擎原生 server UUID/system identifier。
+      responses:
+        '200':
+          description: PhysicalEndpointIdentity
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PhysicalEndpointIdentity'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /target-namespaces/{target_namespace_id}:
+    parameters:
+      - name: target_namespace_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    get:
+      tags: [SecurityPolicies]
+      operationId: getTargetNamespace
+      summary: Admin 获取不可变物理目标表命名空间
+      responses:
+        '200':
+          description: TargetNamespace
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TargetNamespace'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /endpoint-connection-evidence/{connection_evidence_id}:
+    parameters:
+      - name: connection_evidence_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    get:
+      tags: [SecurityPolicies]
+      operationId: getEndpointConnectionEvidence
+      summary: Admin 获取不可变端点连接证据
+      description: |
+        返回一次 TEST/METADATA/PREFLIGHT/DATAX/ORACLE/RECOVERY_PROBE 连接的 DNS、
+        selected/peer IP 与 egress 决策证据。该响应包含网络定位信息，仅 Admin 可读；
+        项目成员响应只返回 connection_evidence_id。
+      responses:
+        '200':
+          description: EndpointConnectionEvidence
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EndpointConnectionEvidence'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   /projects/{project_id}/datasources:
     parameters:
@@ -580,7 +864,11 @@ paths:
       tags: [Datasources]
       operationId: createDatasource
       summary: 创建数据源并加密凭证
-      description: 需要 Admin 或 Developer。
+      description: |
+        仅 Admin；host/port 必须命中 ACTIVE EndpointPolicy，运行时仍需 DNS 重解析和出口策略复检。
+        连接探针采用数据源外部操作 A/B/C 契约：短事务授权并冻结非秘密快照，随后在无产品
+        数据库锁的条件下完成外部工作，最终仅在安全绑定仍一致时写入新数据源。准入拒绝不探测、
+        解密、写审计或创建幂等保留；外部阶段后的安全绑定漂移不会创建数据源。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -592,6 +880,7 @@ paths:
             example:
               name: 订单库
               description: 只读订单源
+              endpoint_policy_id: 33333333-3333-4333-8333-333333333333
               engine: MYSQL_8
               host: mysql.internal.example
               port: 3306
@@ -611,11 +900,15 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Datasource'
+                $ref: '#/components/schemas/DatasourceAdminDetail'
         '403':
           $ref: '#/components/responses/Forbidden'
         '409':
-          $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
+        '503':
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
         '422':
           $ref: '#/components/responses/ValidationError'
 
@@ -625,7 +918,8 @@ paths:
     get:
       tags: [Datasources]
       operationId: getDatasource
-      summary: 获取脱敏数据源
+      summary: 获取项目可读的数据源脱敏摘要
+      description: 对所有项目角色使用同一最小披露形状；不返回真实 host、port、database_name、default_schema 或 username。
       responses:
         '200':
           description: 数据源
@@ -635,14 +929,20 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Datasource'
+                $ref: '#/components/schemas/DatasourceRedactedSummary'
         '404':
           $ref: '#/components/responses/NotFound'
     patch:
       tags: [Datasources]
       operationId: updateDatasource
       summary: 更新数据源或轮换密码
-      description: password 缺失表示不轮换；null 或空字符串无效。
+      description: |
+        password 缺失表示安全复用当前 ACTIVE secret；null 或空字符串无效。任一非秘密连接
+        定位字段变化时，服务端必须先按当前 ACTIVE EndpointPolicyRevision 完成 DNS、精确
+        出口、TLS/认证与物理实例身份探针，再新增不可变 DatasourceRevision 并原子切换
+        current_revision_id；探针失败时整次 PATCH 失败且不能保存新修订或新 secret。外部探针
+        遵循数据源外部操作 A/B/C 契约；若原 ETag、安全指针或候选配置在探针期间漂移，服务端
+        不得把旧探针结果写入新修订，而是返回可人工重试的 stale 响应。
       parameters:
         - $ref: '#/components/parameters/IfMatch'
       requestBody:
@@ -660,15 +960,19 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Datasource'
+                $ref: '#/components/schemas/DatasourceAdminDetail'
         '403':
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
-          $ref: '#/components/responses/Conflict'
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
         '422':
           $ref: '#/components/responses/ValidationError'
+        '503':
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
     delete:
       tags: [Datasources]
       operationId: deleteDatasource
@@ -685,6 +989,185 @@ paths:
         '409':
           $ref: '#/components/responses/Conflict'
 
+  /datasources/{datasource_id}/admin-detail:
+    parameters:
+      - $ref: '#/components/parameters/DatasourceId'
+    get:
+      tags: [Datasources]
+      operationId: getDatasourceAdminDetail
+      summary: Admin 获取数据源连接配置详情
+      description: |
+        仅 Admin 可读取真实 host、port、database_name、default_schema 和 username。
+        响应仍不得包含密码、密文、nonce、DEK、完整 JDBC URL 或可直接执行的 DataX 配置。
+      responses:
+        '200':
+          description: Admin-only 数据源详情
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasourceAdminDetail'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /datasources/{datasource_id}/revisions/{revision_id}:
+    parameters:
+      - $ref: '#/components/parameters/DatasourceId'
+      - name: revision_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    get:
+      tags: [Datasources]
+      operationId: getDatasourceRevision
+      summary: Admin 获取不可变数据源修订原始详情
+      description: 真实连接定位字段为 Admin-only；项目只读角色使用 DatasourceRedactedSummary。
+      responses:
+        '200':
+          description: 数据源修订；永不包含密码、secret ID 或连接串
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasourceRevisionAdminDetail'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /datasources/{datasource_id}/credential-secrets:
+    parameters:
+      - $ref: '#/components/parameters/DatasourceId'
+    get:
+      tags: [Datasources]
+      operationId: listDatasourceCredentialSecrets
+      summary: Admin 列出凭据版本的非秘密生命周期元数据
+      description: 不返回 secret ID、密文、nonce、Envelope 密文或 KEK 材料。
+      responses:
+        '200':
+          description: 凭据版本摘要
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CredentialSecretSummary'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /datasources/{datasource_id}/credential-secrets/{secret_version}/status:
+    parameters:
+      - $ref: '#/components/parameters/DatasourceId'
+      - name: secret_version
+        in: path
+        required: true
+        schema:
+          type: integer
+          minimum: 1
+    post:
+      tags: [Datasources]
+      operationId: changeDatasourceCredentialSecretStatus
+      summary: Admin 退役或紧急撤销凭据版本
+      description: |
+        已先切换为另一枚 current secret 的历史 ACTIVE 版本可转为 RETIRED、REVOKED 或
+        COMPROMISED；直接退役 current secret 返回 CREDENTIAL_STATUS_CONFLICT，避免新队列
+        等待不能领取的凭据。已 RETIRED 的历史版本仅可进一步升级为 REVOKED 或 COMPROMISED，
+        以处理轮换后才发现的泄露。REVOKED/COMPROMISED 均为终态，必须 fail closed，并为
+        引用该版本的非终态 Execution/RecoveryProbe 建立紧急终止事实。
+        该接口不能把任何历史版本重新变为 ACTIVE；配置新密码应走数据源更新接口并创建新版本。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CredentialSecretStatusChange'
+      responses:
+        '200':
+          description: 更新后的非秘密生命周期摘要
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CredentialSecretSummary'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /datasources/{datasource_id}/grants:
+    parameters:
+      - $ref: '#/components/parameters/DatasourceId'
+    get:
+      tags: [SecurityPolicies]
+      operationId: listDatasourceUsageGrants
+      summary: Admin 分页列出数据源使用授权
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 授权页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasourceUsageGrantPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /datasources/{datasource_id}/grants/{member_id}:
+    parameters:
+      - $ref: '#/components/parameters/DatasourceId'
+      - name: member_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    put:
+      tags: [SecurityPolicies]
+      operationId: replaceDatasourceUsageGrants
+      summary: Admin 原子替换成员的源端/目标端使用授权
+      description: 空 usages 撤销全部授权；授权不能绕过项目成员关系、EndpointPolicy 或 TransferPolicy。
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasourceUsageGrantReplace'
+      responses:
+        '200':
+          description: 当前有效授权
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasourceUsageGrantPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
   /datasources/{datasource_id}/test:
     parameters:
       - $ref: '#/components/parameters/DatasourceId'
@@ -692,6 +1175,12 @@ paths:
       tags: [Datasources]
       operationId: testDatasource
       summary: 使用已保存凭证执行受限连接测试
+      description: |
+        仅 Admin；连接前必须复检 ACTIVE EndpointPolicy、DNS 解析结果和网络出口限制。服务端在
+        A 阶段冻结授权与安全绑定，在无产品数据库锁的 B 阶段执行外部测试，并只在 C 阶段复核
+        成功后持久化测试状态和证据。普通已获准的数据库连通/鉴权失败通过 `200 + status=FAILED`
+        表达；egress guard/lease/attestation 平台失败必须保留 503 Problem code，不能伪装为测试
+        失败，也不能写入测试状态、evidence 或 audit。准入拒绝与 stale 响应均不会把旧结果覆盖到当前配置。
       responses:
         '200':
           description: 测试已完成；连接失败通过 status=FAILED 表达
@@ -703,8 +1192,12 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
 
   /datasources/{datasource_id}/schema/tables:
     parameters:
@@ -713,7 +1206,17 @@ paths:
       tags: [Datasources]
       operationId: listDatasourceTables
       summary: 读取表和列元数据
+      description: |
+        Admin 可按任一用途检查；Developer 必须声明 SOURCE_USE 或 TARGET_USE，服务端按该精确用途
+        授权，cursor 同时绑定用途。服务端在 A 阶段冻结用途、筛选、cursor scope 与安全绑定，
+        在无产品数据库锁的 B 阶段读取 Schema，并在 C 阶段重新授权；任一漂移不返回旧 metadata。
       parameters:
+        - name: usage
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [SOURCE_USE, TARGET_USE]
         - name: schema_name
           in: query
           required: false
@@ -741,8 +1244,250 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
-        '502':
-          $ref: '#/components/responses/DatasourceConnectionFailed'
+        '409':
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
+        '503':
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
+
+  /projects/{project_id}/transfer-policies:
+    parameters:
+      - $ref: '#/components/parameters/ProjectId'
+    get:
+      tags: [SecurityPolicies]
+      operationId: listTransferPolicies
+      summary: Admin 分页列出项目源到目标传输策略
+      description: 精确物理端点、表、列 scope 和审批信息仅向有效组织级 Admin 返回。
+      parameters:
+        - $ref: '#/components/parameters/Cursor'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: 传输策略页
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferPolicyPage'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [SecurityPolicies]
+      operationId: createTransferPolicy
+      summary: Admin 创建源修订到目标修订的 DRAFT 传输策略
+      description: |
+        请求必须分别给出 source/target 的 catalog/database、schema、table 和显式允许列。
+        selection_mode=ALL_COLUMNS 也必须先由元数据解析为显式 allowed_columns 后提交，不接受
+        *、正则或“运行时全部列”。服务端校验两侧表属于所选 DatasourceRevision，解析并固定
+        PhysicalEndpointIdentity，按引擎标识符规则规范化/排序/去重后生成不可变 scope_json，
+        再计算 scope_hash；客户端不能自报 scope_hash。创建和任何会重算 scope 的 PATCH 都是
+        双数据源复合 metadata 操作：A 阶段完成两端安全绑定检查后，必须在任一 resolver、connector、
+        解密或审计前原子取得 source/target 两个 datasource permit；两个 probe 复用同一个总 deadline，
+        但同步 PostgreSQL transport 网络黑洞和提交窗口仍未证明端到端必在 30 秒返回。429 不发起任一
+        外部 probe，也不写 audit 或新的幂等状态；C 阶段只在绑定仍一致时创建或更新策略。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferPolicyCreate'
+            example:
+              source_datasource_revision_id: 11111111-1111-4111-8111-111111111112
+              target_datasource_revision_id: 22222222-2222-4222-8222-222222222223
+              requested_scope:
+                schema_version: '1.0'
+                source:
+                  catalog: sales
+                  schema: ''
+                  table: orders
+                  selection_mode: ALL_COLUMNS
+                  allowed_columns: [amount, id]
+                target:
+                  catalog: warehouse
+                  schema: public
+                  table: orders_copy
+                  selection_mode: SELECTED_COLUMNS
+                  allowed_columns: [amount, id]
+              classification: STANDARD
+      responses:
+        '201':
+          description: 已创建 DRAFT
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferPolicy'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
+        '503':
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /transfer-policies/{transfer_policy_id}:
+    parameters:
+      - name: transfer_policy_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    get:
+      tags: [SecurityPolicies]
+      operationId: getTransferPolicy
+      summary: Admin 获取传输策略及脱敏审批摘要
+      description: 精确物理端点、表、列 scope 和审批信息仅向有效组织级 Admin 返回。
+      responses:
+        '200':
+          description: 传输策略
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferPolicy'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [SecurityPolicies]
+      operationId: updateTransferPolicy
+      summary: Admin 修订 DRAFT 或撤销策略
+      description: |
+        修改 source、target、requested_scope 或 classification 会把策略退回 DRAFT、清空旧审批并重算
+        规范化 scope_json/scope_hash；ACTIVE 只允许变为 REVOKED。前 3 类变更会进行双数据源复合
+        metadata probe：两端 permit 必须在任一外部 I/O 前原子取得，并在 source/target probe 间复用
+        同一总 deadline；classification-only 和 ACTIVE→REVOKED 不进入外部操作面。当前 deadline
+        是 fail-closed 结果规则，不是同步 PostgreSQL 网络黑洞下端到端 30 秒必返回承诺。
+      parameters:
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferPolicyPatch'
+      responses:
+        '200':
+          description: 已更新
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferPolicy'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
+        '503':
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /transfer-policies/{transfer_policy_id}/submit:
+    parameters:
+      - name: transfer_policy_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    post:
+      tags: [SecurityPolicies]
+      operationId: submitTransferPolicy
+      summary: Admin 提交策略审批
+      description: expected_scope_hash 必须等于当前规范化 scope_hash，防止提交旧页面看到的范围。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferPolicySubmit'
+            example:
+              expected_scope_hash: 5f70bf18a08660b49f80c16fb9c0aa31c5e158d1471c4f4637ae0f0bde8f26f5
+      responses:
+        '200':
+          description: 状态进入 PENDING_APPROVAL
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferPolicy'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /transfer-policies/{transfer_policy_id}/approvals:
+    parameters:
+      - name: transfer_policy_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    post:
+      tags: [SecurityPolicies]
+      operationId: decideTransferPolicy
+      summary: 不同 Admin 审批或拒绝传输策略
+      description: STANDARD 至少一名 Admin 批准；SENSITIVE 至少两名不同 Admin 批准。申请人不得批准自己的策略。审批请求必须固定当前 expected_scope_hash；scope/revision/classification 任一修改即使旧审批失效。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TransferPolicyDecision'
+            example:
+              decision: APPROVED
+              expected_scope_hash: 5f70bf18a08660b49f80c16fb9c0aa31c5e158d1471c4f4637ae0f0bde8f26f5
+              comment: 已核对源目标表与显式列范围
+      responses:
+        '200':
+          description: 当前策略；达到门槛后原子进入 ACTIVE，任一拒绝立即进入 REJECTED
+          headers:
+            ETag:
+              $ref: '#/components/headers/ETag'
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TransferPolicy'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
 
   /projects/{project_id}/jobs:
     parameters:
@@ -754,6 +1499,13 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
+        - name: q
+          in: query
+          description: 按任务名称、源表名或目标表名搜索。
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
         - name: status
           in: query
           schema:
@@ -766,6 +1518,20 @@ paths:
           in: query
           schema:
             type: boolean
+        - name: reader_plugin
+          in: query
+          schema:
+            type: string
+            enum: [mysqlreader, postgresqlreader]
+        - name: writer_plugin
+          in: query
+          schema:
+            type: string
+            enum: [mysqlwriter, postgresqlwriter]
+        - name: latest_execution_state
+          in: query
+          schema:
+            $ref: '#/components/schemas/ProcessState'
       responses:
         '200':
           description: 任务页
@@ -864,7 +1630,13 @@ paths:
       tags: [Jobs]
       operationId: validateJobDraft
       summary: 校验当前已保存草稿
-      description: 包括结构、权限、同表自同步阻断、Schema 漂移和类型兼容。
+      description: |
+        包括结构、权限、同一物理表别名自复制阻断、Schema 漂移、类型兼容，以及每个 source/target
+        mapping 都是当前 ACTIVE TransferPolicy 精确 scope 的子集。两端 Schema 采集采用数据源
+        外部操作 A/B/C 契约：source/target datasource permit 必须原子取得；外部读取无产品数据库
+        锁；C 阶段重新验证 AuthSession、项目/Job 状态、数据源、授权、TargetNamespace、runtime
+        proof 和 TransferPolicy，并与当前 Job validation state/evidence/audit 接受原子化；它不创建
+        或修改 JobVersion。PUBLISHED/ARCHIVED Job 在任何外部 I/O 前返回普通 409。
       responses:
         '200':
           description: 校验已完成；valid=false 是正常业务结果
@@ -876,8 +1648,12 @@ paths:
           $ref: '#/components/responses/Forbidden'
         '404':
           $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/DatasourceOperationStale'
+        '429':
+          $ref: '#/components/responses/DatasourceOperationAdmissionLimited'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/DatasourceOperationUnavailable'
 
   /jobs/{job_id}/preview:
     parameters:
@@ -923,6 +1699,7 @@ paths:
       tags: [Jobs]
       operationId: publishJobVersion
       summary: 发布当前 VALID 草稿为不可变版本
+      description: 发布前重新校验当前 ACTIVE TransferPolicy、expected scope_hash 与全部 mapping 子集关系；scope/revision/classification 修改导致旧审批失效时拒绝发布。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
         - $ref: '#/components/parameters/IfMatch'
@@ -979,17 +1756,65 @@ paths:
       parameters:
         - $ref: '#/components/parameters/Cursor'
         - $ref: '#/components/parameters/Limit'
-        - name: state
+        - name: process_state
           in: query
           style: form
           explode: true
           schema:
             type: array
-            maxItems: 9
+            maxItems: 10
             uniqueItems: true
             items:
-              $ref: '#/components/schemas/ExecutionState'
+              $ref: '#/components/schemas/ProcessState'
+        - name: data_effect
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            maxItems: 4
+            uniqueItems: true
+            items:
+              $ref: '#/components/schemas/DataEffect'
+        - name: verification_state
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            maxItems: 5
+            uniqueItems: true
+            items:
+              $ref: '#/components/schemas/VerificationState'
+        - name: target_exclusivity_status
+          in: query
+          style: form
+          explode: true
+          schema:
+            type: array
+            maxItems: 3
+            uniqueItems: true
+            items:
+              type: string
+              enum: [ACTIVE, REVOKED, EXPIRED]
+        - name: q
+          in: query
+          description: 按执行 UUID 或任务名称搜索。
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 128
         - name: job_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: job_version_id
+          in: query
+          schema:
+            type: string
+            format: uuid
+        - name: requested_by
           in: query
           schema:
             type: string
@@ -1010,6 +1835,11 @@ paths:
           in: query
           schema:
             type: boolean
+        - name: is_rerun
+          in: query
+          description: true 仅返回恢复后再次执行创建的新 Execution。
+          schema:
+            type: boolean
       responses:
         '200':
           description: 执行页
@@ -1028,7 +1858,23 @@ paths:
     post:
       tags: [Executions]
       operationId: createExecution
-      summary: 对明确的已发布 JobVersion 人工执行
+      summary: 对明确的已发布 JobVersion 发起一次性离线全量复制
+      description: |
+        客户端必须提交源端静默确认，以及 Operator/DBA 对目标端排他窗口的有版本、有限期确认；
+        后者承诺从 Worker 最后一次空表观察直到 oracle 的目标一致性读事务完成都没有平台外
+        DML/DDL；已过期或已撤回的声明 fail closed，oracle 目标快照结束时间不得晚于
+        valid_until。人工确认不等于平台技术锁，也不能证明未报告或已回滚的外部写从未发生。
+        API 在同一事务中持久化 QUEUED 请求并为
+        TargetNamespace 创建 TargetCopyLock=RESERVED；部分唯一索引覆盖
+        RESERVED/ACTIVE/RECOVERY_REQUIRED。同一目标的第二个不同幂等键请求由 API 返回
+        409 TARGET_ACTIVE_EXECUTION，不会创建第二个 QUEUED。Worker 领取时原子把 RESERVED
+        转为 ACTIVE，并创建 Attempt/fence、固定凭据版本，
+        重新检查 Schema、ACTIVE TransferPolicy scope_hash 及全部 mapping 子集关系，并以
+        只读查询生成 target_empty_evidence。
+        客户端声明不能代替平台实测目标为空。
+        Worker 领取事务提交前失败必须整体回滚为 QUEUED+RESERVED，且无 Attempt/fence；
+        事务一旦提交，
+        非唯一成功终态不得回 QUEUED、复用 Attempt 或自动重新入队。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -1039,6 +1885,17 @@ paths:
               $ref: '#/components/schemas/ExecutionCreate'
             example:
               job_version_id: b64006fc-5a22-4e48-a0bd-f9cb1440031f
+              source_quiescence_confirmation:
+                confirmed: true
+                confirmed_at: '2026-07-30T02:39:30Z'
+                note: 已暂停订单表写入，保持至核验结束
+              target_exclusivity_confirmation:
+                statement_version: '1.0'
+                confirmed: true
+                confirmed_at: '2026-07-30T02:39:35Z'
+                valid_until: '2026-07-30T06:39:35Z'
+                responsible_party: DBA
+                note: 已冻结目标表平台外 DML/DDL，保持至目标核验快照事务完成
       responses:
         '202':
           description: 已持久化为 QUEUED
@@ -1058,7 +1915,7 @@ paths:
         '422':
           $ref: '#/components/responses/ValidationError'
         '503':
-          $ref: '#/components/responses/ServiceUnavailable'
+          $ref: '#/components/responses/CapacityAdmissionBlocked'
 
   /executions/{execution_id}:
     parameters:
@@ -1086,7 +1943,11 @@ paths:
       tags: [Executions]
       operationId: cancelExecution
       summary: 创建取消请求
-      description: API 不直接推进 Execution 状态；由 Worker 确认并写 CANCEL_REQUESTED。
+      description: |
+        API 不直接推进 Execution 状态。未领取的 QUEUED + PENDING CancelRequest 由
+        reconciler 收敛为 CANCELED/NONE/NOT_STARTED，并把 RESERVED TargetCopyLock 释放为
+        RELEASED；不创建 Attempt/fence 或 RecoveryGate。已经领取的执行由 Worker 确认并写
+        CANCEL_REQUESTED，终止后把锁转为 RECOVERY_REQUIRED 并进入恢复门禁。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
       requestBody:
@@ -1112,16 +1973,186 @@ paths:
         '409':
           $ref: '#/components/responses/Conflict'
 
+  /executions/{execution_id}/target-exclusivity/revoke:
+    parameters:
+      - $ref: '#/components/parameters/ExecutionId'
+    post:
+      tags: [Executions]
+      operationId: revokeExecutionTargetExclusivity
+      summary: 撤回目标外部独占声明或报告窗口已被破坏
+      description: |
+        Operator/Admin 在获知目标平台外 DML/DDL、冻结失效或 DBA 撤回承诺时必须立即调用。
+        API 原子保存撤回事实并写 TARGET_EXCLUSIVITY_REVOKED 审计；平台不能自行证明所有
+        外部写入，因此本接口是 fail-closed 的报告通道。未领取 QUEUED 由 reconciler
+        收敛为 CANCELED/NONE/NOT_STARTED 并释放 RESERVED；已领取执行终止进程并进入恢复
+        门禁；已在 VERIFYING 的 oracle 形成 INCONCLUSIVE/TARGET_EXCLUSIVITY_BROKEN。
+        已终态执行返回 409，不改写历史结论。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/TargetExclusivityRevocationRequest'
+      responses:
+        '202':
+          description: 撤回事实已持久化
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Execution'
+                  - properties:
+                      target_exclusivity_status:
+                        const: REVOKED
+                      target_exclusivity_revoked_at:
+                        $ref: '#/components/schemas/Timestamp'
+                      target_exclusivity_revocation_reason:
+                        type: string
+                        enum:
+                          - OPERATOR_REVOKED
+                          - DBA_REVOKED
+                          - EXTERNAL_DML_DDL_REPORTED
+                          - CHANGE_FREEZE_BROKEN
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+        '422':
+          $ref: '#/components/responses/ValidationError'
+
+  /executions/{execution_id}/recovery:
+    parameters:
+      - $ref: '#/components/parameters/ExecutionId'
+    get:
+      tags: [Executions]
+      operationId: getExecutionRecoveryGate
+      summary: 获取失败执行的人工恢复门禁
+      description: 仅已领取且未以 SUCCEEDED/CONFIRMED/PASSED 结束的 Execution 才有 gate；未领取即取消的 CANCELED 不适用。
+      responses:
+        '200':
+          description: 恢复门禁
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryGate'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+    post:
+      tags: [Executions]
+      operationId: submitExecutionRemediation
+      summary: 提交处置确认（remediation confirmation）并排队 RecoveryProbe
+      description: |
+        已经领取且 TargetCopyLock 已从 RESERVED 转为 ACTIVE，随后进入 RECOVERY_REQUIRED 的
+        FAILED、TIMED_OUT、CANCELED 或 LOST 执行再次执行前需要该门禁；未领取即取消的
+        CANCELED 没有 Attempt/fence/gate，RESERVED 锁已释放，
+        recovery 接口返回 RECOVERY_GATE_NOT_APPLICABLE。
+        即使 data_effect=NONE 也必须如实提交处置确认；无需清理时使用
+        action=NO_CLEANUP_REQUIRED、cleanup_performed=false 并说明 reason。任何声明都不能
+        跳过 Worker 空表复检。
+        API 只持久化 REMEDIATION_SUBMITTED；Worker 取得目标锁后生成 target_empty_evidence，
+        通过才写 VERIFIED。平台不代替目标表所有者执行 truncate、delete、drop 或建表。
+      parameters:
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RemediationConfirmation'
+            example:
+              action: NO_CLEANUP_REQUIRED
+              cleanup_performed: false
+              reason: DataX 启动前即失败，目标所有者确认无需执行清理；仍等待平台空表复检
+              confirmed_at: '2026-07-30T03:00:00Z'
+      responses:
+        '202':
+          description: 已提交处置确认并创建独立 RecoveryProbe 事实
+          headers:
+            Idempotency-Replayed:
+              $ref: '#/components/headers/IdempotencyReplayed'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoverySubmission'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          $ref: '#/components/responses/Conflict'
+
+  /recovery-probes/{recovery_probe_id}:
+    parameters:
+      - name: recovery_probe_id
+        in: path
+        required: true
+        schema:
+          $ref: '#/components/schemas/Uuid'
+    get:
+      tags: [Executions]
+      operationId: getRecoveryProbe
+      summary: 获取恢复空表探针状态
+      description: RecoveryProbe 是独立 PostgreSQL 事实队列，使用自身 Attempt、lease 和 fence；不启动 DataX。
+      responses:
+        '200':
+          description: RecoveryProbe 安全摘要
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecoveryProbe'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
   /executions/{execution_id}/rerun:
     parameters:
       - $ref: '#/components/parameters/ExecutionId'
     post:
       tags: [Executions]
       operationId: rerunExecution
-      summary: 使用原 JobVersion 创建新 Execution
-      description: insert-only 可能产生重复记录；不会自动选择最新 JobVersion。
+      summary: 恢复后使用原 JobVersion 再次执行
+      description: |
+        只允许对已经领取、存在 RecoveryGate 且状态为 FAILED、TIMED_OUT、CANCELED 或
+        LOST 的原执行恢复。未领取即取消的 CANCELED 不走该路径。
+        原执行无论 data_effect 当前判断为何，都必须完成必要外部处置并如实提交处置确认；无需
+        清理时不得虚假声称清理，但仍须关联 RecoveryGate
+        已由 Worker 空表复检为 VERIFIED；状态判断不能代替复检。
+        客户端还须再次确认源端静默，并提交有版本、有限有效期且未撤回的目标排他声明；
+        Worker 在新执行启动前仍会取得同目标活动锁并再次实测目标为空，oracle 目标快照结束时间不得晚于 valid_until。
+        不会自动选择最新 JobVersion，也不提供自动重试。
       parameters:
         - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExecutionRerunCreate'
+            example:
+              source_quiescence_confirmation:
+                confirmed: true
+                confirmed_at: '2026-07-30T03:10:00Z'
+                note: 已再次暂停源表写入
+              target_exclusivity_confirmation:
+                statement_version: '1.0'
+                confirmed: true
+                confirmed_at: '2026-07-30T03:10:05Z'
+                valid_until: '2026-07-30T07:10:05Z'
+                responsible_party: OPERATOR
+                note: 已再次冻结目标表平台外 DML/DDL
+              recovery_gate_id: 44444444-4444-4444-8444-444444444444
       responses:
         '202':
           description: 新 Execution
@@ -1138,6 +2169,8 @@ paths:
           $ref: '#/components/responses/NotFound'
         '409':
           $ref: '#/components/responses/Conflict'
+        '503':
+          $ref: '#/components/responses/CapacityAdmissionBlocked'
 
   /executions/{execution_id}/logs:
     parameters:
@@ -1174,11 +2207,14 @@ paths:
     get:
       tags: [Executions]
       operationId: downloadExecutionLogs
-      summary: 下载服务端生成的完整脱敏日志
+      summary: 下载服务端持久化的脱敏原序日志
       description: |
         所有项目成员可读。响应由服务端从脱敏 LogChunk 组装并产生
         EXECUTION_LOG_EXPORTED 审计。V1 脱敏后未压缩大小上限为 100 MiB；
-        超限返回 413，不静默截断。
+        单次响应超限返回 413。若日志采集阶段已因存储上限截断，服务端必须通过
+        X-Log-Truncated、X-Log-Incomplete、四类字节计数、X-Log-Gap-Count 和
+        X-Log-Truncation-Reason 明示；cursor 和下载均无法恢复已丢弃字节，
+        不得称为完整日志。
       responses:
         '200':
           description: UTF-8 脱敏日志
@@ -1196,6 +2232,44 @@ paths:
               description: 响应正文 SHA-256
               schema:
                 $ref: '#/components/schemas/Sha256'
+            X-Log-Truncated:
+              description: true 表示采集阶段已有字节因明确策略被丢弃
+              schema:
+                type: boolean
+            X-Log-Incomplete:
+              description: true 表示存在任一显式 LogGap；即使 truncated=false 也可能不完整
+              schema:
+                type: boolean
+            X-Log-Raw-Received-Bytes:
+              description: 截止响应时脱敏前仅计数的输入字节；原文不持久化
+              schema:
+                type: integer
+                minimum: 0
+            X-Log-Redacted-Received-Bytes:
+              description: 脱敏后、截断或保留决策前的字节数
+              schema:
+                type: integer
+                minimum: 0
+            X-Log-Stored-Bytes:
+              description: 实际持久化并用于本次下载的脱敏字节数
+              schema:
+                type: integer
+                minimum: 0
+            X-Log-Dropped-Bytes:
+              description: 因日志存储上限或单行上限未持久化的字节数
+              schema:
+                type: integer
+                minimum: 0
+            X-Log-Gap-Count:
+              description: 已登记的 LogGap 数；详细缺口通过日志分页响应读取
+              schema:
+                type: integer
+                minimum: 0
+            X-Log-Truncation-Reason:
+              description: 截断原因；未截断时为 NONE
+              schema:
+                type: string
+                enum: [NONE, EXECUTION_LIMIT, LINE_LIMIT, RING_EVICTION]
           content:
             text/plain:
               schema:
@@ -1310,11 +2384,14 @@ paths:
     get:
       tags: [Health]
       operationId: liveness
-      summary: 进程存活检查
+      summary: 经唯一 loopback web 入口检查 backend 进程存活
+      description: |
+        仅供 Windows launcher 和本机页面通过 127.0.0.1:17860 调用；不检查外部依赖，
+        不得暴露 Windows 路径、容器地址、数据库 DSN、环境变量或 secret。
       security: []
       responses:
         '200':
-          description: 进程可响应
+          description: 经 web 反向代理的 backend 进程可响应
           content:
             application/json:
               schema:
@@ -1324,17 +2401,35 @@ paths:
     get:
       tags: [Health]
       operationId: readiness
-      summary: PostgreSQL、Redis、日志卷、dispatcher、Worker/Runtime 就绪检查
+      summary: PostgreSQL、named volumes、dispatcher、Worker/Linux Runtime 与独立 oracle 就绪检查
+      description: |
+        仅供 Windows launcher 和本机页面通过 127.0.0.1:17860 调用。Docker Desktop、
+        WSL2、虚拟化、宿主端口和 ACL 由 launcher 在 Compose 启动前检查，不在此响应中
+        伪装成 backend 能证明的状态。
+
+        `audit_chain` 以与 AuditEvent 同事务写入的持久水位线检查完整性。正常检查只读取
+        组织、水位线和每组织索引尾部；只有 `PASSED` 水位线、已验证 head 与真实尾部一致且
+        最近完整重放仍新鲜时，该组件才为 `UP`。空审计库是显式 bootstrap 例外。缺失/孤立
+        水位线、尾部漂移、过期/PENDING/FAILED 证明、篡改、超时或 CAS 竞争一律失败关闭。
+
+        当完整证明过期或尚未建立时，单 API 进程至多每 60 秒发起一次、最长 30 秒的完整
+        重放；新事件附加且完整证明新鲜时可只验证未验证后缀。失败/timeout 的完整重放仍占用
+        该 60 秒 cadence，窗口内返回 `AUDIT_CHAIN_FULL_REPLAY_THROTTLED/DOWN`。完整结果最多缓存
+        1 秒；正在计算时并发调用返回 `DOWN`，不排队等待。该行为只适用于 V1 的单 API 进程，不能证明
+        持续检测、数据库管理员无法篡改、真实 DataX E3 或 Windows E4。
       security: []
       responses:
         '200':
-          description: 可接收请求和新执行
+          description: |
+            本机管理平面可用。status=UP 时可接收新执行；status=DEGRADED 时仍可登录、
+            配置和查看诊断，但执行入口必须按组件状态失败关闭，不得把 DEGRADED 显示为
+            “可运行任务”。
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/HealthResponse'
         '503':
-          description: 一个或多个关键组件未就绪
+          description: PostgreSQL、迁移、API 日志卷、审计链当前证明或其他管理平面关键组件不可用
           content:
             application/json:
               schema:
@@ -1350,6 +2445,7 @@ components:
       type: apiKey
       in: cookie
       name: des_refresh
+      description: V1 loopback HTTP 使用 HttpOnly、SameSite=Strict、Path=/api/v1/auth 且无 Domain；若未来改为受信 loopback HTTPS 必须增加 Secure。
 
   headers:
     RequestId:
@@ -1357,6 +2453,26 @@ components:
       schema:
         type: string
         format: uuid
+    RetryAfter:
+      description: |
+        服务端给出的、对内部 admission 状态不透明的 delta-seconds 等待提示。客户端只能用于
+        告知用户何时手动重试，不得据此自动重放原请求。
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 3600
+    DatasourceOperationRetryAfter:
+      description: |
+        数据源外部操作 admission 的固定 delta-seconds 等待提示。它不泄露 permit、队列或 token
+        状态；客户端只能提示用户等待后手动重试，不能自动重放。
+      schema:
+        type: integer
+        const: 60
+    CacheControlNoStore:
+      description: 防止浏览器或中间层缓存包含外部操作拒绝或过期上下文的响应。
+      schema:
+        type: string
+        const: no-store
     ETag:
       description: 弱 ETag，值为 W/"row_version"
       schema:
@@ -1441,6 +2557,9 @@ components:
       name: Idempotency-Key
       in: header
       required: true
+      description: >-
+        同一 actor/作用域/key 的 replay 仍必须与本次路径的 durable resource 及保存 response 精确绑定；
+        Project、Job 或 Execution 不一致时返回 IDEMPOTENCY_CONFLICT，不能复用另一资源的历史 2xx。
       schema:
         type: string
         minLength: 8
@@ -1485,6 +2604,77 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
+    DatasourceOperationStale:
+      description: |
+        `DATASOURCE_OPERATION_STALE` 表示外部工作期间的 datasource、secret/envelope、
+        EndpointPolicy、授权/AuthSession、cursor scope、项目/Job 状态、TargetNamespace、runtime
+        proof、Job draft 或 TransferPolicy 安全绑定已漂移。
+        `retryable=true` 只表示调用方可先刷新相关事实后从原始操作手动重试；服务端不会返回旧
+        metadata 或持久化旧 evidence/测试状态。创建和更新接口仍可能返回其既有的其他 409
+        冲突码，响应 schema 因此同时保留非 stale 的通用 409 形状。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/DatasourceOperationConflictProblem'
+    DatasourceOperationAdmissionLimited:
+      description: |
+        `DATASOURCE_OPERATION_ADMISSION_LIMITED` 表示已认证请求未获得本 API 进程内的外部
+        datasource operation permit。对已有 datasource、Job 校验或 TransferPolicy scope probe，请求会先
+        完成短事务、只读的 A 阶段授权与安全绑定检查，随后才申请 permit；双数据源复合操作必须一次
+        性取得 source/target 两个 key。已完成的 create 幂等回放也可直接返回，因为
+        它不创建任何新外部工作。429 本身发生在 resolver、connector、凭据解密、审计和新的幂等
+        状态写入之前；固定 `Retry-After: 60`，客户端仅能等待后从原始操作手动重试，禁止自动重放。
+      headers:
+        Retry-After:
+          $ref: '#/components/headers/DatasourceOperationRetryAfter'
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/DatasourceOperationAdmissionLimitedProblem'
+    DatasourceOperationDeadlineExceeded:
+      description: |
+        `DATASOURCE_OPERATION_DEADLINE_EXCEEDED` 表示本次外部数据源操作已耗尽总 deadline，且
+        C 阶段仍确认原安全绑定有效。服务端不返回或持久化 B 阶段旧 metadata、evidence、测试状态
+        或 Job validation material；客户端只能由用户从原操作手动重试，禁止自动重放。当前 30 秒
+        配置是外部 I/O 返回后的失败关闭规则；同步 PostgreSQL transport 网络黑洞尚无已验证的
+        client-side 强制中断，因此该响应契约不是“服务端必在 30 秒返回”的发布承诺。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/DatasourceOperationDeadlineExceededProblem'
+    DatasourceOperationUnavailable:
+      description: |
+        外部数据源操作的 `503` 联合响应。`DATASOURCE_OPERATION_DEADLINE_EXCEEDED` 表示总
+        deadline 已耗尽且 C 阶段仍确认安全绑定有效；其他 `503` 表示 connector、DNS/egress、
+        凭据或运行依赖不可用。所有 egress guard/lease/attestation 错误保留稳定平台 code 并为
+        503，只有显式 guard/lease 可用性 code 集合可令 `retryable=true`；策略、命名空间或证明
+        不一致仍失败关闭。若共享 deadline 已耗尽，deadline 结果优先于晚到 egress 错误。所有
+        分支均不允许返回或持久化过期的 B 阶段结果；客户端不得自动重放。
+      headers:
+        X-Request-Id:
+          $ref: '#/components/headers/RequestId'
+        Cache-Control:
+          $ref: '#/components/headers/CacheControlNoStore'
+      content:
+        application/problem+json:
+          schema:
+            oneOf:
+              - $ref: '#/components/schemas/DatasourceOperationDeadlineExceededProblem'
+              - $ref: '#/components/schemas/DatasourceOperationOtherUnavailableProblem'
     Gone:
       description: 日志已按保留策略删除
       content:
@@ -1503,18 +2693,18 @@ components:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
-    DatasourceConnectionFailed:
-      description: 数据源连接、认证或元数据读取失败
-      content:
-        application/problem+json:
-          schema:
-            $ref: '#/components/schemas/Problem'
     ServiceUnavailable:
       description: Worker、Runtime 或关键依赖未就绪
       content:
         application/problem+json:
           schema:
             $ref: '#/components/schemas/Problem'
+    CapacityAdmissionBlocked:
+      description: 普通新 Execution 因持久容量准入门禁被拒绝
+      content:
+        application/problem+json:
+          schema:
+            $ref: '#/components/schemas/CapacityAdmissionProblem'
 
   schemas:
     Uuid:
@@ -1552,18 +2742,27 @@ components:
     JobStatus:
       type: string
       enum: [DRAFT, VALID, PUBLISHED, ARCHIVED]
-    ExecutionState:
+    ProcessState:
       type: string
       enum:
         - QUEUED
         - STARTING
         - RUNNING
-        - CANCEL_REQUESTED
+        - VERIFYING
         - SUCCEEDED
         - FAILED
         - TIMED_OUT
+        - CANCEL_REQUESTED
         - CANCELED
         - LOST
+    DataEffect:
+      type: string
+      description: 目标端影响是否已测得，独立于 DataX 进程状态和内容正确性；CONFIRMED 表示影响已测得，测得值可以是 0 行，绝不等于内容核验通过。空源成功仍为 SUCCEEDED/CONFIRMED/PASSED。
+      enum: [NONE, POSSIBLE, CONFIRMED, UNKNOWN]
+    VerificationState:
+      type: string
+      description: 独立 oracle 的生命周期；oracle 从未启动时为 NOT_STARTED，即使 DataX 已异常退出；已启动但无法形成结论时才为 INCONCLUSIVE。只有 PASSED 可支持 process_state=SUCCEEDED。
+      enum: [NOT_STARTED, VERIFYING, PASSED, FAILED, INCONCLUSIVE]
     FieldError:
       type: object
       additionalProperties: false
@@ -1578,6 +2777,14 @@ components:
         message:
           type: string
           maxLength: 1000
+    CapacityAdmissionDetails:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          enum: [QUEUE_LIMIT, BACKLOG_LIMIT, DISK_YELLOW, DISK_RED, LOG_BUDGET]
     Problem:
       type: object
       additionalProperties: false
@@ -1620,11 +2827,101 @@ components:
           maxItems: 100
           items:
             $ref: '#/components/schemas/FieldError'
+        details:
+          oneOf:
+            - $ref: '#/components/schemas/CapacityAdmissionDetails'
+            - type: 'null'
+    LoginAdmissionLimitedProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            status:
+              const: 429
+            code:
+              const: AUTH_LOGIN_ADMISSION_LIMITED
+            title:
+              const: 登录尝试暂时受限
+            detail:
+              const: 请稍后重试。
+            retryable:
+              const: true
+    DatasourceOperationStaleProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            status:
+              const: 409
+            code:
+              const: DATASOURCE_OPERATION_STALE
+            retryable:
+              const: true
+    DatasourceOperationOtherConflictProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            status:
+              const: 409
+            code:
+              type: string
+              not:
+                const: DATASOURCE_OPERATION_STALE
+    DatasourceOperationConflictProblem:
+      oneOf:
+        - $ref: '#/components/schemas/DatasourceOperationStaleProblem'
+        - $ref: '#/components/schemas/DatasourceOperationOtherConflictProblem'
+    DatasourceOperationAdmissionLimitedProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            status:
+              const: 429
+            code:
+              const: DATASOURCE_OPERATION_ADMISSION_LIMITED
+            retryable:
+              const: true
+    DatasourceOperationDeadlineExceededProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            status:
+              const: 503
+            code:
+              const: DATASOURCE_OPERATION_DEADLINE_EXCEEDED
+            retryable:
+              const: true
+    DatasourceOperationOtherUnavailableProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          properties:
+            status:
+              const: 503
+            code:
+              type: string
+              not:
+                const: DATASOURCE_OPERATION_DEADLINE_EXCEEDED
+    CapacityAdmissionProblem:
+      allOf:
+        - $ref: '#/components/schemas/Problem'
+        - type: object
+          required: [details]
+          properties:
+            status:
+              const: 503
+            code:
+              const: CAPACITY_ADMISSION_BLOCKED
+            details:
+              $ref: '#/components/schemas/CapacityAdmissionDetails'
 
     UserSummary:
       type: object
       additionalProperties: false
-      required: [id, email, display_name]
+      required: [id, email, display_name, must_change_password]
       properties:
         id:
           $ref: '#/components/schemas/Uuid'
@@ -1636,6 +2933,9 @@ components:
           type: string
           minLength: 1
           maxLength: 128
+        must_change_password:
+          type: boolean
+          description: true 时除 refresh/logout/me/change-password 外的业务接口统一返回 PASSWORD_CHANGE_REQUIRED。
     User:
       type: object
       additionalProperties: false
@@ -1890,8 +3190,10 @@ components:
     Member:
       type: object
       additionalProperties: false
-      required: [user, roles]
+      required: [organization_member_id, user, roles]
       properties:
+        organization_member_id:
+          $ref: '#/components/schemas/Uuid'
         user:
           $ref: '#/components/schemas/UserSummary'
         roles:
@@ -1976,6 +3278,7 @@ components:
         - QUEUED
         - STARTING
         - RUNNING
+        - VERIFYING
         - CANCEL_REQUESTED
         - SUCCEEDED
         - FAILED
@@ -1990,6 +3293,9 @@ components:
           type: integer
           minimum: 0
         RUNNING:
+          type: integer
+          minimum: 0
+        VERIFYING:
           type: integer
           minimum: 0
         CANCEL_REQUESTED:
@@ -2018,26 +3324,67 @@ components:
         numerator:
           type: integer
           minimum: 0
-          description: SUCCEEDED
+          description: process_state=SUCCEEDED 且 verification_state=PASSED
         denominator:
           type: integer
           minimum: 0
-          description: SUCCEEDED + FAILED + TIMED_OUT + LOST
+          description: process_state=SUCCEEDED + FAILED + TIMED_OUT + LOST；取消不计
         ratio:
           type: [number, 'null']
           minimum: 0
           maximum: 1
-    DashboardRecordsWritten:
+          description: numerator / denominator；denominator=0 时固定为 null。
+    DashboardVerificationCounts:
       type: object
       additionalProperties: false
-      required: [value, complete, missing_summary_count]
+      required: [NOT_STARTED, VERIFYING, PASSED, FAILED, INCONCLUSIVE]
+      properties:
+        NOT_STARTED:
+          type: integer
+          minimum: 0
+        VERIFYING:
+          type: integer
+          minimum: 0
+        PASSED:
+          type: integer
+          minimum: 0
+        FAILED:
+          type: integer
+          minimum: 0
+        INCONCLUSIVE:
+          type: integer
+          minimum: 0
+    DashboardDataEffectCounts:
+      type: object
+      additionalProperties: false
+      description: CONFIRMED 计数表示目标影响已测得（包含测得 0 行），不表示内容正确；内容正确性必须同时查看 verification_state=PASSED。
+      required: [NONE, POSSIBLE, CONFIRMED, UNKNOWN]
+      properties:
+        NONE:
+          type: integer
+          minimum: 0
+        POSSIBLE:
+          type: integer
+          minimum: 0
+        CONFIRMED:
+          type: integer
+          minimum: 0
+          description: 目标影响已测得的执行数，包括空源成功的 0 行影响。
+        UNKNOWN:
+          type: integer
+          minimum: 0
+    DashboardVerifiedRecords:
+      type: object
+      additionalProperties: false
+      description: 只累计 process_state=SUCCEEDED 且 verification_state=PASSED 的独立 oracle 目标行数。
+      required: [value, complete, missing_verification_count]
       properties:
         value:
           type: integer
           minimum: 0
         complete:
           type: boolean
-        missing_summary_count:
+        missing_verification_count:
           type: integer
           minimum: 0
     DashboardExecutionItem:
@@ -2048,7 +3395,9 @@ components:
         - job_id
         - job_version_id
         - job_name
-        - state
+        - process_state
+        - data_effect
+        - verification_state
         - queued_at
         - started_at
         - finished_at
@@ -2064,8 +3413,12 @@ components:
           type: string
           minLength: 1
           maxLength: 128
-        state:
-          $ref: '#/components/schemas/ExecutionState'
+        process_state:
+          $ref: '#/components/schemas/ProcessState'
+        data_effect:
+          $ref: '#/components/schemas/DataEffect'
+        verification_state:
+          $ref: '#/components/schemas/VerificationState'
         queued_at:
           $ref: '#/components/schemas/Timestamp'
         started_at:
@@ -2078,22 +3431,26 @@ components:
     DashboardTrendBucket:
       type: object
       additionalProperties: false
-      required: [bucket_start, bucket_end, counts]
+      required: [bucket_start, bucket_end, process_counts, verification_counts]
       properties:
         bucket_start:
           $ref: '#/components/schemas/Timestamp'
         bucket_end:
           $ref: '#/components/schemas/Timestamp'
-        counts:
+        process_counts:
           $ref: '#/components/schemas/DashboardExecutionCounts'
+        verification_counts:
+          $ref: '#/components/schemas/DashboardVerificationCounts'
     DashboardRuntime:
       type: object
       additionalProperties: false
-      required: [worker_online, runtime_ready, datax_release, version_match]
+      required: [worker_online, runtime_ready, oracle_ready, datax_release, version_match]
       properties:
         worker_online:
           type: boolean
         runtime_ready:
+          type: boolean
+        oracle_ready:
           type: boolean
         datax_release:
           type: [string, 'null']
@@ -2130,7 +3487,9 @@ components:
           required:
             - from
             - to
-            - states
+            - process_states
+            - verification_states
+            - data_effects
             - exclude_job_status
             - has_published_version
             - unresolved_failure
@@ -2143,12 +3502,24 @@ components:
               oneOf:
                 - $ref: '#/components/schemas/Timestamp'
                 - type: 'null'
-            states:
+            process_states:
               type: array
-              maxItems: 9
+              maxItems: 10
               uniqueItems: true
               items:
-                $ref: '#/components/schemas/ExecutionState'
+                $ref: '#/components/schemas/ProcessState'
+            verification_states:
+              type: array
+              maxItems: 5
+              uniqueItems: true
+              items:
+                $ref: '#/components/schemas/VerificationState'
+            data_effects:
+              type: array
+              maxItems: 4
+              uniqueItems: true
+              items:
+                $ref: '#/components/schemas/DataEffect'
             exclude_job_status:
               oneOf:
                 - $ref: '#/components/schemas/JobStatus'
@@ -2166,9 +3537,11 @@ components:
         - job_counts
         - execution_total
         - execution_state_counts
+        - verification_state_counts
+        - data_effect_counts
         - success_rate
         - unresolved_failure_count
-        - records_written
+        - verified_records
         - recent_executions
         - recent_failures
         - trend
@@ -2187,13 +3560,17 @@ components:
           minimum: 0
         execution_state_counts:
           $ref: '#/components/schemas/DashboardExecutionCounts'
+        verification_state_counts:
+          $ref: '#/components/schemas/DashboardVerificationCounts'
+        data_effect_counts:
+          $ref: '#/components/schemas/DashboardDataEffectCounts'
         success_rate:
           $ref: '#/components/schemas/DashboardSuccessRate'
         unresolved_failure_count:
           type: integer
           minimum: 0
-        records_written:
-          $ref: '#/components/schemas/DashboardRecordsWritten'
+        verified_records:
+          $ref: '#/components/schemas/DashboardVerifiedRecords'
         recent_executions:
           type: array
           maxItems: 10
@@ -2207,7 +3584,7 @@ components:
               - $ref: '#/components/schemas/DashboardExecutionItem'
               - type: object
                 properties:
-                  state:
+                  process_state:
                     type: string
                     enum: [FAILED, TIMED_OUT, LOST]
         trend:
@@ -2225,25 +3602,740 @@ components:
         generated_at:
           $ref: '#/components/schemas/Timestamp'
 
+    EndpointPolicy:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - organization_id
+        - name
+        - current_revision_id
+        - current_revision_no
+        - current_revision
+        - status
+        - row_version
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        organization_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        current_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        current_revision_no:
+          type: integer
+          minimum: 1
+        current_revision:
+          $ref: '#/components/schemas/EndpointPolicyRevision'
+        status:
+          type: string
+          enum: [ACTIVE, DISABLED]
+        row_version:
+          type: integer
+          minimum: 1
+    EndpointPolicyRevision:
+      type: object
+      additionalProperties: false
+      description: 不可变网络准入策略；任何字段变化都创建新 revision，历史引用不跟随 current pointer。
+      required:
+        - id
+        - endpoint_policy_id
+        - revision_no
+        - engine
+        - host_kind
+        - host_value
+        - allowed_cidrs
+        - allowed_ports
+        - tls_required
+        - dns_ttl_ceiling_seconds
+        - resolver_policy_version
+        - egress_policy_version
+        - policy_hash
+        - created_by
+        - created_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        endpoint_policy_id:
+          $ref: '#/components/schemas/Uuid'
+        revision_no:
+          type: integer
+          minimum: 1
+        engine:
+          $ref: '#/components/schemas/Engine'
+        host_kind:
+          type: string
+          enum: [EXACT_FQDN, EXACT_IP]
+        host_value:
+          type: string
+          minLength: 1
+          maxLength: 253
+        allowed_cidrs:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 3
+            maxLength: 49
+        allowed_ports:
+          type: array
+          minItems: 1
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+        tls_required:
+          type: boolean
+        dns_ttl_ceiling_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+        resolver_policy_version:
+          type: string
+          minLength: 1
+          maxLength: 64
+          readOnly: true
+        egress_policy_version:
+          type: string
+          minLength: 1
+          maxLength: 64
+          readOnly: true
+        policy_hash:
+          $ref: '#/components/schemas/Sha256'
+        created_by:
+          $ref: '#/components/schemas/Uuid'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    PhysicalEndpointIdentity:
+      type: object
+      additionalProperties: false
+      description: 不可变物理数据库实例身份；原生 server UUID/system identifier 只以加盐域分离哈希表达。
+      required:
+        - id
+        - organization_id
+        - engine
+        - identity_scheme
+        - server_identity_hash
+        - verification_evidence_hash
+        - created_by
+        - created_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        organization_id:
+          $ref: '#/components/schemas/Uuid'
+        engine:
+          $ref: '#/components/schemas/Engine'
+        identity_scheme:
+          type: string
+          enum: [MYSQL_SERVER_UUID, POSTGRES_SYSTEM_IDENTIFIER]
+        server_identity_hash:
+          $ref: '#/components/schemas/Sha256'
+        verification_evidence_hash:
+          $ref: '#/components/schemas/Sha256'
+        created_by:
+          $ref: '#/components/schemas/Uuid'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    TargetNamespace:
+      type: object
+      additionalProperties: false
+      description: 跨 Datasource/revision/JobVersion 的不可变物理目标表身份和活动锁命名空间。
+      required:
+        - target_namespace_id
+        - physical_endpoint_identity_id
+        - engine
+        - normalized_catalog_name
+        - normalized_schema_name
+        - normalized_table_name
+        - normalization_version
+        - physical_table_identity_hash
+      properties:
+        target_namespace_id:
+          $ref: '#/components/schemas/Uuid'
+        physical_endpoint_identity_id:
+          $ref: '#/components/schemas/Uuid'
+        engine:
+          $ref: '#/components/schemas/Engine'
+        normalized_catalog_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        normalized_schema_name:
+          type: string
+          maxLength: 128
+        normalized_table_name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        normalization_version:
+          const: '1.0'
+        physical_table_identity_hash:
+          $ref: '#/components/schemas/Sha256'
+    EndpointConnectionEvidence:
+      type: object
+      additionalProperties: false
+      description: >-
+        每次 TEST/METADATA/PREFLIGHT/DATAX/ORACLE/RECOVERY_PROBE 阶段的不可变
+        DNS 与出口证据。DATAX 由独立 Java/JDBC 进程执行，当前平台不能从该进程可靠
+        回传 socket peer；此时 peer_observation_status 为 ENFORCED_NOT_OBSERVED、
+        peer_ip 为 null，selected_ip 仅表示已由精确 IP 内核租约强制的唯一允许目的地址，
+        不得解释为观测到的 peer。
+      required:
+        - id
+        - operation_kind
+        - datasource_revision_id
+        - endpoint_policy_revision_id
+        - resolver_policy_version
+        - resolved_ips
+        - selected_ip
+        - peer_observation_status
+        - peer_ip
+        - egress_policy_version
+        - egress_evidence_hash
+        - decision
+        - evidence_hash
+        - observed_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        operation_kind:
+          type: string
+          enum: [TEST, METADATA, PREFLIGHT, DATAX, ORACLE, RECOVERY_PROBE]
+        datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        endpoint_policy_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        resolver_policy_version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        resolved_ips:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            oneOf:
+              - type: string
+                format: ipv4
+              - type: string
+                format: ipv6
+        selected_ip:
+          type: string
+          minLength: 2
+          maxLength: 45
+        peer_observation_status:
+          type: string
+          enum: [OBSERVED, ENFORCED_NOT_OBSERVED]
+        peer_ip:
+          oneOf:
+            - type: string
+              minLength: 2
+              maxLength: 45
+            - type: 'null'
+        egress_policy_version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        egress_evidence_hash:
+          $ref: '#/components/schemas/Sha256'
+        decision:
+          type: string
+          enum: [ALLOWED, DENIED]
+        evidence_hash:
+          $ref: '#/components/schemas/Sha256'
+        observed_at:
+          $ref: '#/components/schemas/Timestamp'
+    EndpointPolicyCreate:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - engine
+        - host_kind
+        - host_value
+        - allowed_cidrs
+        - allowed_ports
+        - tls_required
+        - dns_ttl_ceiling_seconds
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        engine:
+          $ref: '#/components/schemas/Engine'
+        host_kind:
+          type: string
+          enum: [EXACT_FQDN, EXACT_IP]
+        host_value:
+          type: string
+          minLength: 1
+          maxLength: 253
+        allowed_cidrs:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 3
+            maxLength: 49
+        allowed_ports:
+          type: array
+          minItems: 1
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+        tls_required:
+          type: boolean
+        dns_ttl_ceiling_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+    EndpointPolicyPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        host_kind:
+          type: string
+          enum: [EXACT_FQDN, EXACT_IP]
+        host_value:
+          type: string
+          minLength: 1
+          maxLength: 253
+        allowed_cidrs:
+          type: array
+          minItems: 1
+          maxItems: 64
+          uniqueItems: true
+          items:
+            type: string
+            minLength: 3
+            maxLength: 49
+        allowed_ports:
+          type: array
+          minItems: 1
+          maxItems: 16
+          uniqueItems: true
+          items:
+            type: integer
+            minimum: 1
+            maximum: 65535
+        tls_required:
+          type: boolean
+        dns_ttl_ceiling_seconds:
+          type: integer
+          minimum: 1
+          maximum: 3600
+        status:
+          type: string
+          enum: [ACTIVE, DISABLED]
+    EndpointPolicyPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/EndpointPolicy'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+    DatasourceUsageGrant:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - datasource_id
+        - organization_member_id
+        - usage
+        - status
+        - granted_by
+        - granted_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        datasource_id:
+          $ref: '#/components/schemas/Uuid'
+        organization_member_id:
+          $ref: '#/components/schemas/Uuid'
+        usage:
+          type: string
+          enum: [SOURCE_USE, TARGET_USE]
+        status:
+          type: string
+          enum: [ACTIVE, REVOKED]
+        granted_by:
+          $ref: '#/components/schemas/Uuid'
+        granted_at:
+          $ref: '#/components/schemas/Timestamp'
+    DatasourceUsageGrantReplace:
+      type: object
+      additionalProperties: false
+      required: [usages]
+      properties:
+        usages:
+          type: array
+          maxItems: 2
+          uniqueItems: true
+          items:
+            type: string
+            enum: [SOURCE_USE, TARGET_USE]
+    DatasourceUsageGrantPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatasourceUsageGrant'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+    TransferPolicyApproval:
+      type: object
+      additionalProperties: false
+      required: [id, approved_by, decision, comment, decided_at]
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        approved_by:
+          $ref: '#/components/schemas/Uuid'
+        decision:
+          type: string
+          enum: [APPROVED, REJECTED]
+        comment:
+          type: [string, 'null']
+          maxLength: 500
+        decided_at:
+          $ref: '#/components/schemas/Timestamp'
+    TransferPolicyScopeSide:
+      type: object
+      additionalProperties: false
+      required:
+        - physical_endpoint_identity_id
+        - catalog
+        - schema
+        - table
+        - allowed_columns
+      properties:
+        physical_endpoint_identity_id:
+          $ref: '#/components/schemas/Uuid'
+        catalog:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: 引擎原生 catalog/database；MySQL 为 database，PostgreSQL 为连接固定的 database/catalog。
+        schema:
+          type: string
+          maxLength: 128
+          description: PostgreSQL schema；MySQL 使用规范定义的空哨兵。
+        table:
+          type: string
+          minLength: 1
+          maxLength: 128
+        allowed_columns:
+          type: array
+          minItems: 1
+          maxItems: 2048
+          uniqueItems: true
+          description: 按引擎真实标识符规则规范化、排序和去重的显式列；不接受 * 或正则。
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+    TransferPolicyScopeInputSide:
+      type: object
+      additionalProperties: false
+      description: Admin/UI 提交的单侧精确范围；PhysicalEndpointIdentity 由服务端从所选 DatasourceRevision 解析并校验。
+      required: [catalog, schema, table, selection_mode, allowed_columns]
+      properties:
+        catalog:
+          type: string
+          minLength: 1
+          maxLength: 128
+          description: 引擎原生 catalog/database；MySQL 为 database，PostgreSQL 为连接固定的 database/catalog。
+        schema:
+          type: string
+          maxLength: 128
+          description: PostgreSQL schema；MySQL 使用规范定义的空哨兵。
+        table:
+          type: string
+          minLength: 1
+          maxLength: 128
+        selection_mode:
+          type: string
+          enum: [ALL_COLUMNS, SELECTED_COLUMNS]
+        allowed_columns:
+          type: array
+          minItems: 1
+          maxItems: 2048
+          uniqueItems: true
+          description: 两种 selection_mode 都必须提交经当前元数据展开、按引擎规则规范化并排序去重的显式列；不接受 *、正则或延迟解析。
+          items:
+            type: string
+            minLength: 1
+            maxLength: 128
+    TransferPolicyScopeInput:
+      type: object
+      additionalProperties: false
+      required: [schema_version, source, target]
+      properties:
+        schema_version:
+          const: '1.0'
+        source:
+          $ref: '#/components/schemas/TransferPolicyScopeInputSide'
+        target:
+          $ref: '#/components/schemas/TransferPolicyScopeInputSide'
+    TransferPolicyScope:
+      type: object
+      additionalProperties: false
+      required: [schema_version, source, target]
+      properties:
+        schema_version:
+          const: '1.0'
+        source:
+          $ref: '#/components/schemas/TransferPolicyScopeSide'
+        target:
+          $ref: '#/components/schemas/TransferPolicyScopeSide'
+    TransferPolicy:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - project_id
+        - source_datasource_revision_id
+        - target_datasource_revision_id
+        - source_physical_endpoint_identity_id
+        - target_physical_endpoint_identity_id
+        - scope_json
+        - scope_hash
+        - classification
+        - status
+        - requested_by
+        - approvals
+        - activated_at
+        - row_version
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        project_id:
+          $ref: '#/components/schemas/Uuid'
+        source_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        target_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        source_physical_endpoint_identity_id:
+          $ref: '#/components/schemas/Uuid'
+        target_physical_endpoint_identity_id:
+          $ref: '#/components/schemas/Uuid'
+        scope_json:
+          $ref: '#/components/schemas/TransferPolicyScope'
+        scope_hash:
+          $ref: '#/components/schemas/Sha256'
+          description: SHA-256(UTF8("DXTRANSFERPOLICYv1\n") || RFC8785(scope_json))。
+        classification:
+          type: string
+          enum: [STANDARD, SENSITIVE]
+        status:
+          type: string
+          enum: [DRAFT, PENDING_APPROVAL, ACTIVE, REJECTED, REVOKED]
+        requested_by:
+          $ref: '#/components/schemas/Uuid'
+        approvals:
+          type: array
+          maxItems: 16
+          items:
+            $ref: '#/components/schemas/TransferPolicyApproval'
+        activated_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        row_version:
+          type: integer
+          minimum: 1
+    TransferPolicyCreate:
+      type: object
+      additionalProperties: false
+      required:
+        - source_datasource_revision_id
+        - target_datasource_revision_id
+        - requested_scope
+        - classification
+      properties:
+        source_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        target_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        requested_scope:
+          $ref: '#/components/schemas/TransferPolicyScopeInput'
+          description: 服务端校验并规范化为响应中的 scope_json/scope_hash；客户端不得自报 hash。
+        classification:
+          type: string
+          enum: [STANDARD, SENSITIVE]
+    TransferPolicyPatch:
+      type: object
+      additionalProperties: false
+      minProperties: 1
+      properties:
+        source_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        target_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        requested_scope:
+          $ref: '#/components/schemas/TransferPolicyScopeInput'
+        classification:
+          type: string
+          enum: [STANDARD, SENSITIVE]
+        status:
+          const: REVOKED
+    TransferPolicySubmit:
+      type: object
+      additionalProperties: false
+      required: [expected_scope_hash]
+      properties:
+        expected_scope_hash:
+          $ref: '#/components/schemas/Sha256'
+    TransferPolicyDecision:
+      type: object
+      additionalProperties: false
+      required: [decision, expected_scope_hash]
+      properties:
+        decision:
+          type: string
+          enum: [APPROVED, REJECTED]
+        expected_scope_hash:
+          $ref: '#/components/schemas/Sha256'
+          description: 必须等于当前策略 scope_hash；任何范围修订都会使旧审批请求冲突。
+        comment:
+          type: [string, 'null']
+          maxLength: 500
+    TransferPolicyPage:
+      type: object
+      additionalProperties: false
+      required: [items, next_cursor, has_more]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/TransferPolicy'
+        next_cursor:
+          type: [string, 'null']
+        has_more:
+          type: boolean
+
     SslMode:
       type: string
       enum: [DISABLE, REQUIRE, VERIFY_CA, VERIFY_FULL]
-    Datasource:
+    CredentialSecretStatus:
+      type: string
+      enum: [ACTIVE, RETIRED, REVOKED, COMPROMISED]
+    CredentialSecretEnvelopeSummary:
       type: object
       additionalProperties: false
+      description: 只含 Envelope 生命周期与完整性元数据，不含 encrypted_dek 或 KEK 材料。
+      required:
+        - envelope_version
+        - kek_version
+        - wrapping_algorithm
+        - status
+        - wrapped_dek_sha256
+        - created_at
+      properties:
+        envelope_version:
+          type: integer
+          minimum: 1
+        kek_version:
+          type: string
+          minLength: 1
+          maxLength: 64
+        wrapping_algorithm:
+          const: AES-256-KWP
+        status:
+          type: string
+          enum: [ACTIVE, SUPERSEDED]
+        wrapped_dek_sha256:
+          $ref: '#/components/schemas/Sha256'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+    CredentialSecretSummary:
+      type: object
+      additionalProperties: false
+      description: Admin-only 的非秘密凭据版本元数据；永不返回 secret ID、ciphertext、nonce 或 DEK。
+      required:
+        - secret_version
+        - status
+        - status_reason_code
+        - status_changed_at
+        - created_at
+        - active_envelope
+      properties:
+        secret_version:
+          type: integer
+          minimum: 1
+        status:
+          $ref: '#/components/schemas/CredentialSecretStatus'
+        status_reason_code:
+          type: [string, 'null']
+          maxLength: 64
+        status_changed_at:
+          $ref: '#/components/schemas/Timestamp'
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        active_envelope:
+          oneOf:
+            - $ref: '#/components/schemas/CredentialSecretEnvelopeSummary'
+            - type: 'null'
+    CredentialSecretStatusChange:
+      type: object
+      additionalProperties: false
+      required: [status, reason_code]
+      properties:
+        status:
+          type: string
+          enum: [RETIRED, REVOKED, COMPROMISED]
+        reason_code:
+          type: string
+          pattern: '^[A-Z0-9_]+$'
+          minLength: 1
+          maxLength: 64
+    DatasourceRedactedSummary:
+      type: object
+      additionalProperties: false
+      description: 项目可读最小披露形状；不含真实 host、port、database_name、default_schema 或 username。
       required:
         - id
         - project_id
         - name
         - description
         - engine
-        - host
-        - port
-        - database_name
-        - default_schema
-        - username
-        - ssl_mode
+        - endpoint_redacted
         - credential_configured
+        - current_revision_id
+        - current_revision_no
+        - credential_status
+        - last_test_status
+        - last_tested_at
+        - last_test_error_code
         - status
         - row_version
         - created_at
@@ -2262,11 +4354,118 @@ components:
           maxLength: 1000
         engine:
           $ref: '#/components/schemas/Engine'
+        endpoint_redacted:
+          const: REDACTED
+        credential_configured:
+          type: boolean
+        current_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        current_revision_no:
+          type: integer
+          minimum: 1
+        credential_status:
+          type: string
+          enum: [READY, UNAVAILABLE]
+          description: 只表达当前是否存在可供新工作领取的 ACTIVE secret/Envelope。
+        last_test_status:
+          type: [string, 'null']
+          enum: [SUCCEEDED, FAILED, null]
+        last_tested_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        last_test_error_code:
+          type: [string, 'null']
+          maxLength: 64
+        status:
+          $ref: '#/components/schemas/DatasourceStatus'
+        row_version:
+          type: integer
+          minimum: 1
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+    DatasourceAdminDetail:
+      type: object
+      additionalProperties: false
+      description: Admin-only 数据源详情；仍不得包含密码、密文、nonce、DEK 或完整 JDBC URL。
+      required:
+        - id
+        - project_id
+        - name
+        - description
+        - engine
+        - current_revision
+        - current_secret
+        - status
+        - row_version
+        - created_at
+        - updated_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        project_id:
+          $ref: '#/components/schemas/Uuid'
+        name:
+          type: string
+          minLength: 1
+          maxLength: 128
+        description:
+          type: [string, 'null']
+          maxLength: 1000
+        engine:
+          $ref: '#/components/schemas/Engine'
+        current_revision:
+          $ref: '#/components/schemas/DatasourceRevisionAdminDetail'
+        current_secret:
+          $ref: '#/components/schemas/CredentialSecretSummary'
+        status:
+          $ref: '#/components/schemas/DatasourceStatus'
+        row_version:
+          type: integer
+          minimum: 1
+        created_at:
+          $ref: '#/components/schemas/Timestamp'
+        updated_at:
+          $ref: '#/components/schemas/Timestamp'
+    DatasourceRevisionAdminDetail:
+      type: object
+      additionalProperties: false
+      description: Admin-only 不可变连接配置修订；凭据版本独立轮换，且不含任何 secret。
+      required:
+        - id
+        - datasource_id
+        - revision_no
+        - endpoint_policy_revision_id
+        - physical_endpoint_identity_id
+        - engine
+        - host
+        - port
+        - database_name
+        - default_schema
+        - username
+        - ssl_mode
+        - connection_options
+        - config_hash
+        - created_by
+        - created_at
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        datasource_id:
+          $ref: '#/components/schemas/Uuid'
+        revision_no:
+          type: integer
+          minimum: 1
+        endpoint_policy_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        physical_endpoint_identity_id:
+          $ref: '#/components/schemas/Uuid'
+        engine:
+          $ref: '#/components/schemas/Engine'
         host:
           type: string
           minLength: 1
           maxLength: 253
-          pattern: '^[^:/\\\s]+$'
         port:
           type: integer
           minimum: 1
@@ -2285,23 +4484,22 @@ components:
           maxLength: 128
         ssl_mode:
           $ref: '#/components/schemas/SslMode'
-        credential_configured:
-          type: boolean
-          const: true
-        status:
-          $ref: '#/components/schemas/DatasourceStatus'
-        row_version:
-          type: integer
-          minimum: 1
+        connection_options:
+          type: object
+          additionalProperties: false
+          description: 经平台白名单校验的非敏感连接选项；V1 默认空对象。
+        config_hash:
+          $ref: '#/components/schemas/Sha256'
+        created_by:
+          $ref: '#/components/schemas/Uuid'
         created_at:
-          $ref: '#/components/schemas/Timestamp'
-        updated_at:
           $ref: '#/components/schemas/Timestamp'
     DatasourceCreate:
       type: object
       additionalProperties: false
       required:
         - name
+        - endpoint_policy_id
         - engine
         - host
         - port
@@ -2318,6 +4516,8 @@ components:
         description:
           type: [string, 'null']
           maxLength: 1000
+        endpoint_policy_id:
+          $ref: '#/components/schemas/Uuid'
         engine:
           $ref: '#/components/schemas/Engine'
         host:
@@ -2361,6 +4561,12 @@ components:
         description:
           type: [string, 'null']
           maxLength: 1000
+        endpoint_policy_id:
+          $ref: '#/components/schemas/Uuid'
+          description: 修改后创建新的不可变 DatasourceRevision，不覆盖历史修订。
+        engine:
+          $ref: '#/components/schemas/Engine'
+          description: 修改引擎时必须同时选择引擎匹配的 ACTIVE EndpointPolicy。
         host:
           type: string
           minLength: 1
@@ -2401,7 +4607,7 @@ components:
         items:
           type: array
           items:
-            $ref: '#/components/schemas/Datasource'
+            $ref: '#/components/schemas/DatasourceRedactedSummary'
         next_cursor:
           type: [string, 'null']
         has_more:
@@ -2440,7 +4646,21 @@ components:
     ColumnSchema:
       type: object
       additionalProperties: false
-      required: [name, ordinal, native_type, nullable, primary_key]
+      required:
+        - name
+        - ordinal
+        - native_type
+        - logical_type
+        - nullable
+        - primary_key
+        - generated
+        - identity
+        - character_maximum_length
+        - numeric_precision
+        - numeric_scale
+        - datetime_precision
+        - oracle_supported
+        - unsupported_reason
       properties:
         name:
           type: string
@@ -2453,14 +4673,52 @@ components:
           type: string
           minLength: 1
           maxLength: 128
+        logical_type:
+          type: [string, 'null']
+          enum: [INTEGER, DECIMAL, TEXT, BOOLEAN, DATE, TIME, TIMESTAMP, BINARY, null]
+          description: 服务端按 SchemaSnapshot 适配器给出的 V1 oracle 类型；二进制浮点等不支持类型为 null。
         nullable:
           type: boolean
         primary_key:
           type: boolean
+        generated:
+          type: boolean
+        identity:
+          type: boolean
+        character_maximum_length:
+          type: [integer, 'null']
+          minimum: 1
+        numeric_precision:
+          type: [integer, 'null']
+          minimum: 1
+        numeric_scale:
+          type: [integer, 'null']
+          minimum: 0
+        datetime_precision:
+          type: [integer, 'null']
+          minimum: 0
+        oracle_supported:
+          type: boolean
+        unsupported_reason:
+          type: [string, 'null']
+          enum:
+            - BINARY_FLOAT_UNSUPPORTED
+            - NATIVE_TYPE_UNSUPPORTED
+            - GENERATED_COLUMN_UNSUPPORTED
+            - null
     TableSchema:
       type: object
       additionalProperties: false
-      required: [schema_name, table_name, columns, schema_hash, captured_at]
+      required:
+        - schema_name
+        - table_name
+        - physical_table_identity_hash
+        - columns
+        - schema_hash
+        - oracle_compatible
+        - target_insert_compatible
+        - incompatibility_reasons
+        - captured_at
       properties:
         schema_name:
           type: string
@@ -2470,6 +4728,8 @@ components:
           type: string
           minLength: 1
           maxLength: 128
+        physical_table_identity_hash:
+          $ref: '#/components/schemas/Sha256'
         columns:
           type: array
           minItems: 1
@@ -2477,6 +4737,23 @@ components:
             $ref: '#/components/schemas/ColumnSchema'
         schema_hash:
           $ref: '#/components/schemas/Sha256'
+          description: SHA-256(UTF8("DXSCHEMASNAPSHOTv1\n") || RFC8785(schema snapshot))。
+        oracle_compatible:
+          type: boolean
+        target_insert_compatible:
+          type: boolean
+        incompatibility_reasons:
+          type: array
+          uniqueItems: true
+          maxItems: 64
+          items:
+            type: string
+            enum:
+              - UNSUPPORTED_COLUMN_TYPE
+              - GENERATED_COLUMN_PRESENT
+              - ENABLED_TRIGGER_PRESENT
+              - PARTITIONED_TABLE_UNSUPPORTED
+              - ROW_SECURITY_ENABLED
         captured_at:
           $ref: '#/components/schemas/Timestamp'
     TableSchemaPage:
@@ -2506,6 +4783,11 @@ components:
         - draft_spec_hash
         - validated_spec_hash
         - latest_published_version_id
+        - latest_published_version_no
+        - latest_published_reader_plugin
+        - latest_published_writer_plugin
+        - latest_execution_process_state
+        - latest_execution_at
         - row_version
         - created_at
         - updated_at
@@ -2533,6 +4815,21 @@ components:
             - type: 'null'
         latest_published_version_id:
           $ref: '#/components/schemas/NullableUuid'
+        latest_published_version_no:
+          type: [integer, 'null']
+          minimum: 1
+        latest_published_reader_plugin:
+          type: [string, 'null']
+          enum: [mysqlreader, postgresqlreader, null]
+        latest_published_writer_plugin:
+          type: [string, 'null']
+          enum: [mysqlwriter, postgresqlwriter, null]
+        latest_execution_process_state:
+          oneOf:
+            - $ref: '#/components/schemas/ProcessState'
+            - type: 'null'
+        latest_execution_at:
+          $ref: '#/components/schemas/NullableTimestamp'
         row_version:
           type: integer
           minimum: 1
@@ -2668,11 +4965,23 @@ components:
         - version_no
         - spec
         - spec_hash
+        - version_artifact_hash
+        - source_datasource_revision_id
+        - target_datasource_revision_id
+        - source_endpoint_policy_revision_id
+        - target_endpoint_policy_revision_id
+        - source_physical_table_identity_hash
+        - target_namespace_id
+        - transfer_policy_id
+        - transfer_policy_scope_hash
         - source_schema_hash
         - target_schema_hash
         - datax_release
+        - runtime_sha256
         - reader_plugin
+        - reader_plugin_sha256
         - writer_plugin
+        - writer_plugin_sha256
         - published_by
         - published_at
       properties:
@@ -2687,18 +4996,46 @@ components:
           $ref: './job-spec.v1.schema.json'
         spec_hash:
           $ref: '#/components/schemas/Sha256'
+        version_artifact_hash:
+          $ref: '#/components/schemas/Sha256'
+          description: spec、固定数据源修订、Schema/约束快照和 Runtime/插件摘要的规范化制品哈希。
+        source_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+          description: 已发布版本固定的源端不可变连接配置修订。
+        target_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+          description: 已发布版本固定的目标端不可变连接配置修订。
+        source_endpoint_policy_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        target_endpoint_policy_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        source_physical_table_identity_hash:
+          $ref: '#/components/schemas/Sha256'
+        target_namespace_id:
+          $ref: '#/components/schemas/Uuid'
+        transfer_policy_id:
+          $ref: '#/components/schemas/Uuid'
+          description: 发布时已激活且覆盖固定源/目标修订的传输授权。
+        transfer_policy_scope_hash:
+          $ref: '#/components/schemas/Sha256'
         source_schema_hash:
           $ref: '#/components/schemas/Sha256'
         target_schema_hash:
           $ref: '#/components/schemas/Sha256'
         datax_release:
           const: datax_v202309
+        runtime_sha256:
+          $ref: '#/components/schemas/Sha256'
         reader_plugin:
           type: string
           enum: [mysqlreader, postgresqlreader]
+        reader_plugin_sha256:
+          $ref: '#/components/schemas/Sha256'
         writer_plugin:
           type: string
           enum: [mysqlwriter, postgresqlwriter]
+        writer_plugin_sha256:
+          $ref: '#/components/schemas/Sha256'
         published_by:
           $ref: '#/components/schemas/Uuid'
         published_at:
@@ -2717,6 +5054,500 @@ components:
         has_more:
           type: boolean
 
+    SourceQuiescenceConfirmation:
+      type: object
+      additionalProperties: false
+      description: 操作员声明源表从运行前检查开始到独立 oracle 完成始终停止业务写入；actor 来自认证上下文，V1 只定义 confirmed/confirmed_at/note，不虚构过期或撤回生命周期。核验前后指纹不变是必要证据，但该声明和指纹都不等于数据库一致性快照，也不能证明未报告或瞬时后回滚的写入从未发生。
+      required: [confirmed, confirmed_at]
+      properties:
+        confirmed:
+          const: true
+        confirmed_at:
+          $ref: '#/components/schemas/Timestamp'
+        note:
+          type: [string, 'null']
+          maxLength: 500
+    TargetExclusivityConfirmation:
+      type: object
+      additionalProperties: false
+      description: Operator/DBA 作出的有版本、有限有效期的目标平台外独占声明；这是人工前提和报告义务，不是平台技术锁，也不能证明未报告或已经回滚的外部 DML/DDL 从未发生。语义 validator 必须确认 valid_until 晚于 confirmed_at。
+      required: [statement_version, confirmed, confirmed_at, valid_until, responsible_party]
+      properties:
+        statement_version:
+          const: '1.0'
+        confirmed:
+          const: true
+        confirmed_at:
+          $ref: '#/components/schemas/Timestamp'
+        valid_until:
+          $ref: '#/components/schemas/Timestamp'
+          description: 声明的有限截止时间；要形成 PASSED，必须覆盖 target_result.snapshot_finished_at。
+        responsible_party:
+          type: string
+          enum: [OPERATOR, DBA]
+        note:
+          type: [string, 'null']
+          maxLength: 500
+    TargetExclusivityRevocationRequest:
+      type: object
+      additionalProperties: false
+      description: Operator/Admin 在获知平台外目标独占窗口被撤回或破坏时提交的不可抵赖报告；系统从原 Execution 关联确认摘要和目标命名空间。
+      required: [statement_version, responsible_party, reason, reported_at]
+      properties:
+        statement_version:
+          const: '1.0'
+        responsible_party:
+          type: string
+          enum: [OPERATOR, DBA]
+          description: 必须与原 Execution 固化的目标独占确认责任类型一致；服务端不得信任请求覆盖原值。
+        reason:
+          type: string
+          enum:
+            - OPERATOR_REVOKED
+            - DBA_REVOKED
+            - EXTERNAL_DML_DDL_REPORTED
+            - CHANGE_FREEZE_BROKEN
+        reported_at:
+          $ref: '#/components/schemas/Timestamp'
+        note:
+          type: [string, 'null']
+          maxLength: 500
+    RemediationConfirmation:
+      description: 非成功执行后由 Operator/目标所有者对必要外部处置作出的处置确认（remediation confirmation）；无需清理时必须如实记录理由。无论是否执行清理，都不能替代 Worker 的目标空表复检。
+      oneOf:
+        - type: object
+          additionalProperties: false
+          title: 已清理或重建目标
+          required: [action, cleanup_performed, reason, confirmed_at]
+          properties:
+            action:
+              type: string
+              enum: [CLEANED_TARGET, RECREATED_TARGET]
+            cleanup_performed:
+              const: true
+            reason:
+              type: string
+              minLength: 1
+              maxLength: 1000
+            confirmed_at:
+              $ref: '#/components/schemas/Timestamp'
+        - type: object
+          additionalProperties: false
+          title: 经判断无需清理
+          required: [action, cleanup_performed, reason, confirmed_at]
+          properties:
+            action:
+              const: NO_CLEANUP_REQUIRED
+            cleanup_performed:
+              const: false
+            reason:
+              type: string
+              minLength: 1
+              maxLength: 1000
+            confirmed_at:
+              $ref: '#/components/schemas/Timestamp'
+        - type: object
+          additionalProperties: false
+          title: 其他外部处置
+          required: [action, cleanup_performed, reason, confirmed_at]
+          properties:
+            action:
+              const: OTHER_EXTERNAL_ACTION
+            cleanup_performed:
+              type: boolean
+            reason:
+              type: string
+              minLength: 1
+              maxLength: 1000
+            confirmed_at:
+              $ref: '#/components/schemas/Timestamp'
+    TargetEmptyEvidence:
+      type: object
+      additionalProperties: false
+      description: >-
+        Worker 在持有同目标活动锁后、启动 DataX 前执行受控只读查询产生的证据。
+        evidence_hash 固定为
+        SHA-256(UTF8("DXTARGETEMPTYv1\n") ||
+        RFC8785(evidence_without_evidence_hash))；服务端必须重算且不能信任调用方自报。
+      required:
+        - result
+        - checked_at
+        - observed_row_count
+        - target_datasource_revision_id
+        - target_endpoint_policy_revision_id
+        - target_namespace_id
+        - physical_table_identity_hash
+        - connection_evidence_id
+        - evidence_hash
+      properties:
+        result:
+          const: EMPTY
+        checked_at:
+          $ref: '#/components/schemas/Timestamp'
+        observed_row_count:
+          const: 0
+        target_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        target_endpoint_policy_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        target_namespace_id:
+          $ref: '#/components/schemas/Uuid'
+        physical_table_identity_hash:
+          $ref: '#/components/schemas/Sha256'
+        connection_evidence_id:
+          $ref: '#/components/schemas/Uuid'
+        evidence_hash:
+          allOf:
+            - $ref: '#/components/schemas/Sha256'
+          description: 对排除 evidence_hash 后的完整证据对象按 DXTARGETEMPTYv1 域分离前像重算。
+    TargetCopyLockSummary:
+      type: object
+      additionalProperties: false
+      description: TargetNamespace 的复制互斥事实；数据库部分唯一索引覆盖 RESERVED/ACTIVE/RECOVERY_REQUIRED。RESERVED 在 API 创建 QUEUED 时原子产生，Worker 领取时转 ACTIVE 并分配 fence。
+      required:
+        - target_namespace_id
+        - state
+        - reserved_at
+        - activated_at
+        - released_at
+        - fence_epoch
+      properties:
+        target_namespace_id:
+          $ref: '#/components/schemas/Uuid'
+        state:
+          type: string
+          enum: [RESERVED, ACTIVE, RECOVERY_REQUIRED, RELEASED]
+        reserved_at:
+          $ref: '#/components/schemas/Timestamp'
+        activated_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        released_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        fence_epoch:
+          type: [integer, 'null']
+          minimum: 1
+      allOf:
+        - if:
+            properties:
+              state:
+                const: RESERVED
+            required: [state]
+          then:
+            properties:
+              activated_at:
+                type: 'null'
+              released_at:
+                type: 'null'
+              fence_epoch:
+                type: 'null'
+        - if:
+            properties:
+              state:
+                enum: [ACTIVE, RECOVERY_REQUIRED]
+            required: [state]
+          then:
+            properties:
+              activated_at:
+                $ref: '#/components/schemas/Timestamp'
+              released_at:
+                type: 'null'
+              fence_epoch:
+                type: integer
+                minimum: 1
+        - if:
+            properties:
+              state:
+                const: RELEASED
+            required: [state]
+          then:
+            properties:
+              released_at:
+                $ref: '#/components/schemas/Timestamp'
+            oneOf:
+              - properties:
+                  activated_at:
+                    type: 'null'
+                  fence_epoch:
+                    type: 'null'
+              - properties:
+                  activated_at:
+                    $ref: '#/components/schemas/Timestamp'
+                  fence_epoch:
+                    type: integer
+                    minimum: 1
+    ExecutionRuntimeSnapshot:
+      type: object
+      additionalProperties: false
+      description: 不含连接串和密钥的安全运行快照；领取事务提交后，由匹配 fence 的 STARTING Attempt 完成真实 DNS/JDBC/Schema/目标空表 preflight 时、启动 DataX 前一次性固定。
+      required:
+        - job_spec_hash
+        - source_schema_hash
+        - target_schema_hash
+        - source_datasource_revision_id
+        - target_datasource_revision_id
+        - source_endpoint_policy_revision_id
+        - target_endpoint_policy_revision_id
+        - source_physical_endpoint_identity_id
+        - target_namespace
+        - transfer_policy_scope_hash
+        - source_secret_version
+        - target_secret_version
+        - source_secret_envelope_id
+        - target_secret_envelope_id
+        - datax_release
+        - runtime_sha256
+        - reader_plugin
+        - reader_plugin_sha256
+        - writer_plugin
+        - writer_plugin_sha256
+        - source_consistency_mode
+        - target_precondition
+        - write_semantics
+        - duplicate_policy
+        - partial_write_policy
+        - source_quiescence_confirmed_by
+        - source_quiescence_accepted_at
+        - target_exclusivity_confirmed_by
+        - target_exclusivity_responsible_party
+        - target_exclusivity_accepted_at
+        - target_exclusivity_statement_version
+        - target_exclusivity_valid_until
+        - target_exclusivity_confirmation_sha256
+        - target_empty_evidence
+        - target_lock_key_hash
+        - target_fence_epoch
+        - verification_oracle_schema_version
+      properties:
+        job_spec_hash:
+          $ref: '#/components/schemas/Sha256'
+        source_schema_hash:
+          $ref: '#/components/schemas/Sha256'
+        target_schema_hash:
+          $ref: '#/components/schemas/Sha256'
+        source_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        target_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        source_endpoint_policy_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        target_endpoint_policy_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        source_physical_endpoint_identity_id:
+          $ref: '#/components/schemas/Uuid'
+        target_namespace:
+          $ref: '#/components/schemas/TargetNamespace'
+        transfer_policy_scope_hash:
+          $ref: '#/components/schemas/Sha256'
+        source_secret_version:
+          type: integer
+          minimum: 1
+        target_secret_version:
+          type: integer
+          minimum: 1
+        source_secret_envelope_id:
+          $ref: '#/components/schemas/Uuid'
+          description: 非秘密 Envelope 版本身份；不返回 encrypted_dek 或 KEK 材料。
+        target_secret_envelope_id:
+          $ref: '#/components/schemas/Uuid'
+          description: 非秘密 Envelope 版本身份；不返回 encrypted_dek 或 KEK 材料。
+        datax_release:
+          const: datax_v202309
+        runtime_sha256:
+          $ref: '#/components/schemas/Sha256'
+        reader_plugin:
+          type: string
+          enum: [mysqlreader, postgresqlreader]
+        reader_plugin_sha256:
+          $ref: '#/components/schemas/Sha256'
+        writer_plugin:
+          type: string
+          enum: [mysqlwriter, postgresqlwriter]
+        writer_plugin_sha256:
+          $ref: '#/components/schemas/Sha256'
+        source_consistency_mode:
+          const: OPERATOR_QUIESCED
+        target_precondition:
+          const: EMPTY_AND_VERIFIABLE
+        write_semantics:
+          const: INSERT_ONLY_ONCE
+        duplicate_policy:
+          const: REJECT_NONEMPTY_TARGET
+        partial_write_policy:
+          const: MANUAL_REMEDIATE
+        source_quiescence_confirmed_by:
+          $ref: '#/components/schemas/Uuid'
+        source_quiescence_accepted_at:
+          $ref: '#/components/schemas/Timestamp'
+        target_exclusivity_confirmed_by:
+          $ref: '#/components/schemas/Uuid'
+          description: 接受目标排他确认的应用用户身份；DBA 责任类型不改变审计 actor。
+        target_exclusivity_responsible_party:
+          type: string
+          enum: [OPERATOR, DBA]
+        target_exclusivity_accepted_at:
+          $ref: '#/components/schemas/Timestamp'
+        target_exclusivity_statement_version:
+          const: '1.0'
+        target_exclusivity_valid_until:
+          $ref: '#/components/schemas/Timestamp'
+          description: Worker 启动前固化的人工声明截止时间；必须晚于 accepted_at，但不能代替运行期撤回检查。
+        target_exclusivity_confirmation_sha256:
+          $ref: '#/components/schemas/Sha256'
+          description: 对 Execution 固化的目标排他确认计算的安全摘要；人工确认不等于技术锁。
+        target_empty_evidence:
+          $ref: '#/components/schemas/TargetEmptyEvidence'
+        target_lock_key_hash:
+          $ref: '#/components/schemas/Sha256'
+        target_fence_epoch:
+          type: integer
+          minimum: 1
+        verification_oracle_schema_version:
+          const: '1.0'
+    VerificationSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - oracle_version
+        - result
+        - inconclusive_reason
+        - source_row_count
+        - target_row_count
+        - missing_row_count
+        - unexpected_row_count
+        - row_count_equal
+        - multiset_sha256_equal
+        - target_exclusivity_valid
+        - target_snapshot_id
+        - target_snapshot_started_at
+        - target_snapshot_finished_at
+        - source_multiset_sha256
+        - target_multiset_sha256
+        - artifact_sha256
+        - finished_at
+      properties:
+        oracle_version:
+          type: string
+          pattern: '^oracle-v1\.[0-9]+$'
+        result:
+          type: string
+          enum: [PASSED, FAILED, INCONCLUSIVE]
+        inconclusive_reason:
+          type: [string, 'null']
+          enum:
+            - SOURCE_QUIESCENCE_BROKEN
+            - TARGET_LOCK_LOST
+            - TARGET_EXCLUSIVITY_BROKEN
+            - TARGET_SNAPSHOT_INVALID
+            - SOURCE_READ_FAILED
+            - TARGET_READ_FAILED
+            - NORMALIZATION_FAILED
+            - ORACLE_INTERNAL_ERROR
+            - null
+        source_row_count:
+          type: [integer, 'null']
+          minimum: 0
+        target_row_count:
+          type: [integer, 'null']
+          minimum: 0
+        missing_row_count:
+          type: [integer, 'null']
+          minimum: 0
+        unexpected_row_count:
+          type: [integer, 'null']
+          minimum: 0
+        row_count_equal:
+          type: [boolean, 'null']
+        multiset_sha256_equal:
+          type: [boolean, 'null']
+        target_exclusivity_valid:
+          type: [boolean, 'null']
+          description: 版本化声明处于 ACTIVE、未撤回、未过期，覆盖 TargetEmptyEvidence.checked_at 至目标一致性读事务完成，且未发现或获知平台外 DML/DDL；不构成对未报告或已回滚外部写的技术证明。
+        target_snapshot_id:
+          type: [string, 'null']
+          minLength: 1
+          maxLength: 256
+          description: oracle 目标端单一一致性读事务的非秘密快照标识。
+        target_snapshot_started_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        target_snapshot_finished_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        source_multiset_sha256:
+          oneOf:
+            - $ref: '#/components/schemas/Sha256'
+            - type: 'null'
+        target_multiset_sha256:
+          oneOf:
+            - $ref: '#/components/schemas/Sha256'
+            - type: 'null'
+        artifact_sha256:
+          $ref: '#/components/schemas/Sha256'
+          description: 对移除 artifact_sha256 后的 RFC 8785 oracle 产物重算。
+        finished_at:
+          $ref: '#/components/schemas/Timestamp'
+      allOf:
+        - if:
+            properties:
+              result:
+                const: INCONCLUSIVE
+            required: [result]
+          then:
+            properties:
+              inconclusive_reason:
+                type: string
+          else:
+            properties:
+              inconclusive_reason:
+                type: 'null'
+        - if:
+            properties:
+              result:
+                enum: [PASSED, FAILED]
+            required: [result]
+          then:
+            properties:
+              source_row_count:
+                type: integer
+              target_row_count:
+                type: integer
+              missing_row_count:
+                type: integer
+              unexpected_row_count:
+                type: integer
+              row_count_equal:
+                type: boolean
+              multiset_sha256_equal:
+                type: boolean
+              target_exclusivity_valid:
+                type: boolean
+              target_snapshot_id:
+                type: string
+                minLength: 1
+              target_snapshot_started_at:
+                $ref: '#/components/schemas/Timestamp'
+              target_snapshot_finished_at:
+                $ref: '#/components/schemas/Timestamp'
+              source_multiset_sha256:
+                $ref: '#/components/schemas/Sha256'
+              target_multiset_sha256:
+                $ref: '#/components/schemas/Sha256'
+        - if:
+            properties:
+              result:
+                const: PASSED
+            required: [result]
+          then:
+            properties:
+              missing_row_count:
+                const: 0
+              unexpected_row_count:
+                const: 0
+              row_count_equal:
+                const: true
+              multiset_sha256_equal:
+                const: true
+              target_exclusivity_valid:
+                const: true
+
     Execution:
       type: object
       additionalProperties: false
@@ -2727,7 +5558,40 @@ components:
         - job_version_id
         - rerun_of_execution_id
         - trigger_type
-        - state
+        - requested_by
+        - process_state
+        - data_effect
+        - verification_state
+        - target_exclusivity_confirmation
+        - target_exclusivity_status
+        - target_exclusivity_revoked_at
+        - target_exclusivity_revocation_reason
+        - source_datasource_revision_id
+        - target_datasource_revision_id
+        - source_endpoint_policy_revision_id
+        - target_endpoint_policy_revision_id
+        - target_namespace_id
+        - target_copy_lock
+        - source_secret_version
+        - target_secret_version
+        - source_secret_envelope_id
+        - target_secret_envelope_id
+        - source_connection_evidence_id
+        - target_connection_evidence_id
+        - capacity_profile
+        - service_reservation_seconds
+        - queue_eligibility_state
+        - queue_block_reason
+        - queue_state_changed_at
+        - eligible_wait_milliseconds
+        - log_incomplete
+        - log_raw_received_bytes
+        - log_redacted_received_bytes
+        - log_stored_bytes
+        - log_dropped_bytes
+        - resolved_config_hash
+        - runtime_snapshot
+        - verification_summary
         - queued_at
         - started_at
         - finished_at
@@ -2749,8 +5613,106 @@ components:
           $ref: '#/components/schemas/NullableUuid'
         trigger_type:
           const: MANUAL
-        state:
-          $ref: '#/components/schemas/ExecutionState'
+        requested_by:
+          $ref: '#/components/schemas/Uuid'
+        process_state:
+          $ref: '#/components/schemas/ProcessState'
+        data_effect:
+          $ref: '#/components/schemas/DataEffect'
+        verification_state:
+          $ref: '#/components/schemas/VerificationState'
+        target_exclusivity_confirmation:
+          $ref: '#/components/schemas/TargetExclusivityConfirmation'
+          description: 创建 Execution 时固化的人工目标排他前提；实际 actor、接受时间与摘要在运行快照和审计事件中固定。
+        target_exclusivity_status:
+          type: string
+          enum: [ACTIVE, REVOKED, EXPIRED]
+          description: 最近一次执行状态推进或 oracle 结论时评估并持久化的声明状态；终态后不因墙上时钟流逝改写历史结论。
+        target_exclusivity_revoked_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        target_exclusivity_revocation_reason:
+          type: [string, 'null']
+          enum:
+            - OPERATOR_REVOKED
+            - DBA_REVOKED
+            - EXTERNAL_DML_DDL_REPORTED
+            - CHANGE_FREEZE_BROKEN
+            - VALIDITY_WINDOW_EXPIRED
+            - null
+        source_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        target_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        source_endpoint_policy_revision_id:
+          $ref: '#/components/schemas/Uuid'
+          description: 创建 Execution 时从不可变 JobVersion 固定；即使尚未领取也不得为 null。
+        target_endpoint_policy_revision_id:
+          $ref: '#/components/schemas/Uuid'
+          description: 创建 Execution 时从不可变 JobVersion 固定；即使尚未领取也不得为 null。
+        target_namespace_id:
+          $ref: '#/components/schemas/Uuid'
+        target_copy_lock:
+          $ref: '#/components/schemas/TargetCopyLockSummary'
+        source_secret_version:
+          type: [integer, 'null']
+          minimum: 1
+          description: Worker 固定的安全版本号；不返回 secret ID、密文或密钥材料。
+        target_secret_version:
+          type: [integer, 'null']
+          minimum: 1
+          description: Worker 固定的安全版本号；不返回 secret ID、密文或密钥材料。
+        source_secret_envelope_id:
+          $ref: '#/components/schemas/NullableUuid'
+        target_secret_envelope_id:
+          $ref: '#/components/schemas/NullableUuid'
+        source_connection_evidence_id:
+          $ref: '#/components/schemas/NullableUuid'
+        target_connection_evidence_id:
+          $ref: '#/components/schemas/NullableUuid'
+        capacity_profile:
+          type: string
+          enum: [LIGHTWEIGHT, LARGE]
+        service_reservation_seconds:
+          type: integer
+          enum: [360, 3600]
+        queue_eligibility_state:
+          type: string
+          enum: [ELIGIBLE, BLOCKED]
+        queue_block_reason:
+          type: [string, 'null']
+          maxLength: 64
+        queue_state_changed_at:
+          $ref: '#/components/schemas/Timestamp'
+        eligible_wait_milliseconds:
+          type: integer
+          minimum: 0
+        log_incomplete:
+          type: boolean
+        log_raw_received_bytes:
+          type: integer
+          minimum: 0
+        log_redacted_received_bytes:
+          type: integer
+          minimum: 0
+        log_stored_bytes:
+          type: integer
+          minimum: 0
+        log_dropped_bytes:
+          type: integer
+          minimum: 0
+        resolved_config_hash:
+          oneOf:
+            - $ref: '#/components/schemas/Sha256'
+            - type: 'null'
+          description: 注入凭据后的实际配置只计算哈希，完整配置不持久化、不返回。
+        runtime_snapshot:
+          oneOf:
+            - $ref: '#/components/schemas/ExecutionRuntimeSnapshot'
+            - type: 'null'
+        verification_summary:
+          oneOf:
+            - $ref: '#/components/schemas/VerificationSummary'
+            - type: 'null'
         queued_at:
           $ref: '#/components/schemas/Timestamp'
         started_at:
@@ -2772,6 +5734,342 @@ components:
           oneOf:
             - $ref: '#/components/schemas/RunSummary'
             - type: 'null'
+      allOf:
+        - if:
+            properties:
+              process_state:
+                const: QUEUED
+            required: [process_state]
+          then:
+            properties:
+              target_copy_lock:
+                properties:
+                  state:
+                    const: RESERVED
+                  activated_at:
+                    type: 'null'
+                  released_at:
+                    type: 'null'
+                  fence_epoch:
+                    type: 'null'
+              runtime_snapshot:
+                type: 'null'
+              started_at:
+                type: 'null'
+              finished_at:
+                type: 'null'
+        - if:
+            properties:
+              process_state:
+                const: CANCELED
+              target_copy_lock:
+                properties:
+                  state:
+                    const: RELEASED
+                  activated_at:
+                    type: 'null'
+                required: [state, activated_at]
+            required: [process_state, target_copy_lock]
+          then:
+            description: RELEASED 且从未 activated 的目标锁是未领取取消的机器判据；不能再以 runtime_snapshot=null 单独判断，因为已领取但 preflight 尚未完成的 STARTING Attempt 也允许为 null。
+            properties:
+              runtime_snapshot:
+                type: 'null'
+              data_effect:
+                const: NONE
+              verification_state:
+                const: NOT_STARTED
+              target_copy_lock:
+                properties:
+                  state:
+                    const: RELEASED
+                  activated_at:
+                    type: 'null'
+                  released_at:
+                    $ref: '#/components/schemas/Timestamp'
+                  fence_epoch:
+                    type: 'null'
+              started_at:
+                type: 'null'
+              finished_at:
+                $ref: '#/components/schemas/Timestamp'
+              verification_summary:
+                type: 'null'
+        - if:
+            properties:
+              process_state:
+                enum: [STARTING, CANCEL_REQUESTED]
+            required: [process_state]
+          then:
+            description: 这些状态只可能在领取事务提交后出现；领取事务原子生成 Attempt/fence 并激活目标锁。真实 preflight 完成前 runtime_snapshot 允许为 null，完成后一次性固定且不可覆盖。
+            properties:
+              runtime_snapshot:
+                oneOf:
+                  - $ref: '#/components/schemas/ExecutionRuntimeSnapshot'
+                  - type: 'null'
+              target_copy_lock:
+                properties:
+                  state:
+                    const: ACTIVE
+                  activated_at:
+                    $ref: '#/components/schemas/Timestamp'
+                  released_at:
+                    type: 'null'
+                  fence_epoch:
+                    type: integer
+                    minimum: 1
+        - if:
+            properties:
+              process_state:
+                enum: [RUNNING, VERIFYING]
+            required: [process_state]
+          then:
+            description: STARTING 只有在真实 preflight 证据已完整固化后才能进入这些状态。
+            properties:
+              runtime_snapshot:
+                $ref: '#/components/schemas/ExecutionRuntimeSnapshot'
+              target_copy_lock:
+                properties:
+                  state:
+                    const: ACTIVE
+                  activated_at:
+                    $ref: '#/components/schemas/Timestamp'
+                  released_at:
+                    type: 'null'
+                  fence_epoch:
+                    type: integer
+                    minimum: 1
+        - if:
+            properties:
+              process_state:
+                enum: [FAILED, LOST]
+            required: [process_state]
+          then:
+            description: 这些非成功终态可能发生在 preflight 完成前或 DataX 启动后；两者都来自已提交的领取事务并保留恢复门禁，不能以 runtime_snapshot 是否为 null 判断是否领取。
+            properties:
+              runtime_snapshot:
+                oneOf:
+                  - $ref: '#/components/schemas/ExecutionRuntimeSnapshot'
+                  - type: 'null'
+              target_copy_lock:
+                properties:
+                  state:
+                    const: RECOVERY_REQUIRED
+                  activated_at:
+                    $ref: '#/components/schemas/Timestamp'
+                  released_at:
+                    type: 'null'
+                  fence_epoch:
+                    type: integer
+                    minimum: 1
+        - if:
+            properties:
+              process_state:
+                const: TIMED_OUT
+            required: [process_state]
+          then:
+            description: TIMED_OUT 只能发生在 DataX 已启动后，因此必须已有完整 preflight 运行快照并保留恢复门禁。
+            properties:
+              runtime_snapshot:
+                $ref: '#/components/schemas/ExecutionRuntimeSnapshot'
+              target_copy_lock:
+                properties:
+                  state:
+                    const: RECOVERY_REQUIRED
+                  activated_at:
+                    $ref: '#/components/schemas/Timestamp'
+                  released_at:
+                    type: 'null'
+                  fence_epoch:
+                    type: integer
+                    minimum: 1
+        - if:
+            properties:
+              process_state:
+                const: CANCELED
+              target_copy_lock:
+                properties:
+                  state:
+                    const: RECOVERY_REQUIRED
+                required: [state]
+            required: [process_state, target_copy_lock]
+          then:
+            description: RECOVERY_REQUIRED 表示已领取取消；取消可发生在 preflight 完成前，因此 runtime_snapshot 可为 null，但活动 fence/Attempt 事实必须保留。
+            properties:
+              runtime_snapshot:
+                oneOf:
+                  - $ref: '#/components/schemas/ExecutionRuntimeSnapshot'
+                  - type: 'null'
+              target_copy_lock:
+                properties:
+                  activated_at:
+                    $ref: '#/components/schemas/Timestamp'
+                  released_at:
+                    type: 'null'
+                  fence_epoch:
+                    type: integer
+                    minimum: 1
+        - if:
+            properties:
+              target_exclusivity_status:
+                const: ACTIVE
+            required: [target_exclusivity_status]
+          then:
+            properties:
+              target_exclusivity_revoked_at:
+                type: 'null'
+              target_exclusivity_revocation_reason:
+                type: 'null'
+        - if:
+            properties:
+              target_exclusivity_status:
+                const: REVOKED
+            required: [target_exclusivity_status]
+          then:
+            properties:
+              target_exclusivity_revoked_at:
+                $ref: '#/components/schemas/Timestamp'
+              target_exclusivity_revocation_reason:
+                type: string
+                enum:
+                  - OPERATOR_REVOKED
+                  - DBA_REVOKED
+                  - EXTERNAL_DML_DDL_REPORTED
+                  - CHANGE_FREEZE_BROKEN
+        - if:
+            properties:
+              target_exclusivity_status:
+                const: EXPIRED
+            required: [target_exclusivity_status]
+          then:
+            properties:
+              target_exclusivity_revoked_at:
+                type: 'null'
+              target_exclusivity_revocation_reason:
+                const: VALIDITY_WINDOW_EXPIRED
+        - if:
+            properties:
+              process_state:
+                const: SUCCEEDED
+            required: [process_state]
+          then:
+            properties:
+              runtime_snapshot:
+                $ref: '#/components/schemas/ExecutionRuntimeSnapshot'
+              data_effect:
+                const: CONFIRMED
+              verification_state:
+                const: PASSED
+              target_exclusivity_status:
+                const: ACTIVE
+              target_copy_lock:
+                properties:
+                  state:
+                    const: RELEASED
+                  activated_at:
+                    $ref: '#/components/schemas/Timestamp'
+                  released_at:
+                    $ref: '#/components/schemas/Timestamp'
+                  fence_epoch:
+                    type: integer
+                    minimum: 1
+              exit_code:
+                const: 0
+              verification_summary:
+                $ref: '#/components/schemas/VerificationSummary'
+            oneOf:
+              - properties:
+                  summary_parse_status:
+                    const: SUCCEEDED
+                  run_summary:
+                    allOf:
+                      - $ref: '#/components/schemas/RunSummary'
+                      - properties:
+                          records_failed:
+                            const: 0
+              - properties:
+                  summary_parse_status:
+                    const: FAILED
+                  run_summary:
+                    type: 'null'
+                description: 日志汇总解析失败只丢失诊断指标；固定 DataX errorLimit=0、exit 0 与独立 oracle PASSED 仍可形成业务成功。
+        - if:
+            properties:
+              process_state:
+                const: VERIFYING
+            required: [process_state]
+          then:
+            properties:
+              verification_state:
+                enum: [NOT_STARTED, VERIFYING]
+              exit_code:
+                const: 0
+        - if:
+            properties:
+              verification_state:
+                const: NOT_STARTED
+            required: [verification_state]
+          then:
+            properties:
+              verification_summary:
+                type: 'null'
+        - if:
+            properties:
+              verification_state:
+                enum: [PASSED, FAILED, INCONCLUSIVE]
+            required: [verification_state]
+          then:
+            properties:
+              verification_summary:
+                $ref: '#/components/schemas/VerificationSummary'
+        - if:
+            properties:
+              verification_state:
+                const: PASSED
+            required: [verification_state]
+          then:
+            properties:
+              verification_summary:
+                allOf:
+                  - $ref: '#/components/schemas/VerificationSummary'
+                  - properties:
+                      result:
+                        const: PASSED
+        - if:
+            properties:
+              verification_state:
+                const: FAILED
+            required: [verification_state]
+          then:
+            properties:
+              verification_summary:
+                allOf:
+                  - $ref: '#/components/schemas/VerificationSummary'
+                  - properties:
+                      result:
+                        const: FAILED
+        - if:
+            properties:
+              verification_state:
+                const: INCONCLUSIVE
+            required: [verification_state]
+          then:
+            properties:
+              verification_summary:
+                allOf:
+                  - $ref: '#/components/schemas/VerificationSummary'
+                  - properties:
+                      result:
+                        const: INCONCLUSIVE
+        - if:
+            properties:
+              verification_state:
+                enum: [FAILED, INCONCLUSIVE]
+            required: [verification_state]
+          then:
+            properties:
+              process_state:
+                const: FAILED
     RunSummary:
       type: object
       additionalProperties: false
@@ -2792,6 +6090,7 @@ components:
         records_failed:
           type: integer
           minimum: 0
+          description: DataX 统计的脏行数；V1 只允许 0，任何正数都不能进入业务成功。
         bytes_read:
           type: integer
           minimum: 0
@@ -2804,10 +6103,197 @@ components:
     ExecutionCreate:
       type: object
       additionalProperties: false
-      required: [job_version_id]
+      required: [job_version_id, source_quiescence_confirmation, target_exclusivity_confirmation]
       properties:
         job_version_id:
           $ref: '#/components/schemas/Uuid'
+        source_quiescence_confirmation:
+          $ref: '#/components/schemas/SourceQuiescenceConfirmation'
+        target_exclusivity_confirmation:
+          $ref: '#/components/schemas/TargetExclusivityConfirmation'
+    ExecutionRerunCreate:
+      type: object
+      additionalProperties: false
+      required: [source_quiescence_confirmation, target_exclusivity_confirmation, recovery_gate_id]
+      properties:
+        source_quiescence_confirmation:
+          $ref: '#/components/schemas/SourceQuiescenceConfirmation'
+        target_exclusivity_confirmation:
+          $ref: '#/components/schemas/TargetExclusivityConfirmation'
+        recovery_gate_id:
+          $ref: '#/components/schemas/Uuid'
+          description: 必须引用原执行经如实处置确认与 Worker 空表复检得到的 VERIFIED 门禁；确认可明确无需清理。
+    RecoveryGate:
+      type: object
+      additionalProperties: false
+      required:
+        - id
+        - execution_id
+        - target_namespace_id
+        - status
+        - data_effect_at_open
+        - remediation_confirmation
+        - target_empty_evidence
+        - latest_recovery_probe_id
+        - submitted_at
+        - verified_at
+        - reason_code
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        execution_id:
+          $ref: '#/components/schemas/Uuid'
+        target_namespace_id:
+          $ref: '#/components/schemas/Uuid'
+        status:
+          type: string
+          enum: [OPEN, REMEDIATION_SUBMITTED, VERIFIED, REJECTED]
+        data_effect_at_open:
+          $ref: '#/components/schemas/DataEffect'
+        remediation_confirmation:
+          oneOf:
+            - $ref: '#/components/schemas/RemediationConfirmation'
+            - type: 'null'
+        target_empty_evidence:
+          oneOf:
+            - $ref: '#/components/schemas/TargetEmptyEvidence'
+            - type: 'null'
+        latest_recovery_probe_id:
+          $ref: '#/components/schemas/NullableUuid'
+        submitted_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        verified_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        reason_code:
+          type: [string, 'null']
+          maxLength: 64
+    RecoveryProbeAttempt:
+      type: object
+      additionalProperties: false
+      description: RecoveryProbe 的安全 Attempt 摘要；不返回 lease token、主机 PID 或 cgroup 身份。
+      required:
+        - id
+        - recovery_probe_id
+        - attempt_no
+        - fence_epoch
+        - started_at
+        - finished_at
+        - termination_reason
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        recovery_probe_id:
+          $ref: '#/components/schemas/Uuid'
+        attempt_no:
+          type: integer
+          minimum: 1
+        fence_epoch:
+          type: integer
+          minimum: 1
+        started_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        finished_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        termination_reason:
+          type: [string, 'null']
+          maxLength: 64
+    RecoveryProbe:
+      type: object
+      additionalProperties: false
+      description: 不启动 DataX 的独立恢复空表探针；使用自身事实队列、Attempt、lease 和 fence。
+      required:
+        - id
+        - project_id
+        - recovery_gate_id
+        - target_namespace_id
+        - target_datasource_revision_id
+        - target_endpoint_policy_revision_id
+        - process_state
+        - result
+        - fence_epoch
+        - active_attempt
+        - service_reservation_seconds
+        - queue_eligibility_state
+        - queue_block_reason
+        - queue_state_changed_at
+        - eligible_wait_milliseconds
+        - queued_at
+        - finished_at
+        - target_connection_evidence_id
+        - target_empty_evidence
+        - failure_code
+      properties:
+        id:
+          $ref: '#/components/schemas/Uuid'
+        project_id:
+          $ref: '#/components/schemas/Uuid'
+        recovery_gate_id:
+          $ref: '#/components/schemas/Uuid'
+        target_namespace_id:
+          $ref: '#/components/schemas/Uuid'
+        target_datasource_revision_id:
+          $ref: '#/components/schemas/Uuid'
+        target_endpoint_policy_revision_id:
+          $ref: '#/components/schemas/NullableUuid'
+        process_state:
+          type: string
+          enum: [QUEUED, STARTING, RUNNING, SUCCEEDED, FAILED, CANCELED, LOST]
+        result:
+          type: string
+          enum: [NOT_STARTED, EMPTY, NONEMPTY, INCONCLUSIVE]
+        fence_epoch:
+          type: integer
+          minimum: 0
+        active_attempt:
+          oneOf:
+            - $ref: '#/components/schemas/RecoveryProbeAttempt'
+            - type: 'null'
+        service_reservation_seconds:
+          type: integer
+          minimum: 1
+        queue_eligibility_state:
+          type: string
+          enum: [ELIGIBLE, BLOCKED]
+        queue_block_reason:
+          type: [string, 'null']
+          maxLength: 64
+        queue_state_changed_at:
+          $ref: '#/components/schemas/Timestamp'
+        eligible_wait_milliseconds:
+          type: integer
+          minimum: 0
+        queued_at:
+          $ref: '#/components/schemas/Timestamp'
+        finished_at:
+          $ref: '#/components/schemas/NullableTimestamp'
+        target_connection_evidence_id:
+          $ref: '#/components/schemas/NullableUuid'
+        target_empty_evidence:
+          oneOf:
+            - $ref: '#/components/schemas/TargetEmptyEvidence'
+            - type: 'null'
+        failure_code:
+          type: [string, 'null']
+          maxLength: 64
+      allOf:
+        - if:
+            properties:
+              process_state:
+                const: SUCCEEDED
+            required: [process_state]
+          then:
+            properties:
+              result:
+                const: EMPTY
+    RecoverySubmission:
+      type: object
+      additionalProperties: false
+      required: [recovery_gate, recovery_probe]
+      properties:
+        recovery_gate:
+          $ref: '#/components/schemas/RecoveryGate'
+        recovery_probe:
+          $ref: '#/components/schemas/RecoveryProbe'
     ExecutionPage:
       type: object
       additionalProperties: false
@@ -2846,7 +6332,17 @@ components:
     LogLine:
       type: object
       additionalProperties: false
-      required: [sequence, timestamp, stream, level, message]
+      required:
+        - sequence
+        - timestamp
+        - stream
+        - level
+        - message
+        - line_truncated
+        - raw_received_bytes
+        - redacted_received_bytes
+        - stored_bytes
+        - dropped_bytes
       properties:
         sequence:
           type: integer
@@ -2862,6 +6358,74 @@ components:
         message:
           type: string
           maxLength: 16384
+        line_truncated:
+          type: boolean
+        raw_received_bytes:
+          type: integer
+          minimum: 0
+          description: 脱敏前仅计数的输入字节；原文不持久化。
+        redacted_received_bytes:
+          type: integer
+          minimum: 0
+          description: 脱敏后、行级截断前字节。
+        stored_bytes:
+          type: integer
+          minimum: 0
+        dropped_bytes:
+          type: integer
+          minimum: 0
+    LogGap:
+      type: object
+      additionalProperties: false
+      description: 任一日志缺失、不连续、截断或无法安全脱敏都必须显式登记，不能用 eof 隐藏。
+      required:
+        - gap_no
+        - reason
+        - after_sequence
+        - before_sequence
+        - raw_received_bytes
+        - redacted_received_bytes
+        - stored_bytes
+        - dropped_bytes
+        - detected_at
+        - evidence_hash
+      properties:
+        gap_no:
+          type: integer
+          minimum: 1
+        reason:
+          type: string
+          enum:
+            - LINE_LIMIT
+            - EXECUTION_LIMIT
+            - RING_EVICTION
+            - SOURCE_READ_ERROR
+            - DECODE_ERROR
+            - REDACTION_FAILURE
+            - STORAGE_FAILURE
+            - FENCE_LOST
+        after_sequence:
+          type: [integer, 'null']
+          minimum: 1
+        before_sequence:
+          type: [integer, 'null']
+          minimum: 1
+        raw_received_bytes:
+          type: integer
+          minimum: 0
+        redacted_received_bytes:
+          type: integer
+          minimum: 0
+        stored_bytes:
+          type: integer
+          minimum: 0
+        dropped_bytes:
+          type: integer
+          minimum: 0
+        detected_at:
+          $ref: '#/components/schemas/Timestamp'
+        evidence_hash:
+          $ref: '#/components/schemas/Sha256'
     LogPage:
       type: object
       additionalProperties: false
@@ -2870,6 +6434,16 @@ components:
         - next_cursor
         - eof
         - redaction_rules_version
+        - truncated
+        - incomplete
+        - raw_received_bytes
+        - redacted_received_bytes
+        - stored_bytes
+        - reason
+        - dropped_bytes
+        - first_truncated_sequence
+        - gap_count
+        - gaps
         - expires_at
       properties:
         items:
@@ -2885,6 +6459,40 @@ components:
         redaction_rules_version:
           type: string
           maxLength: 32
+        truncated:
+          type: boolean
+          description: true 表示采集阶段已有原序字节未持久化；cursor 不能恢复这些字节。
+        incomplete:
+          type: boolean
+          description: 存在任一 LogGap 即为 true；与 truncated 是不同维度。
+        raw_received_bytes:
+          type: integer
+          minimum: 0
+          description: 截止响应时脱敏前仅计数的输入字节；原文不持久化。
+        redacted_received_bytes:
+          type: integer
+          minimum: 0
+          description: 脱敏后、截断或保留决策前的字节数。
+        stored_bytes:
+          type: integer
+          minimum: 0
+        reason:
+          type: string
+          enum: [NONE, EXECUTION_LIMIT, LINE_LIMIT, RING_EVICTION]
+        dropped_bytes:
+          type: integer
+          minimum: 0
+        first_truncated_sequence:
+          type: [integer, 'null']
+          minimum: 1
+        gap_count:
+          type: integer
+          minimum: 0
+        gaps:
+          type: array
+          maxItems: 1000
+          items:
+            $ref: '#/components/schemas/LogGap'
         expires_at:
           $ref: '#/components/schemas/Timestamp'
 

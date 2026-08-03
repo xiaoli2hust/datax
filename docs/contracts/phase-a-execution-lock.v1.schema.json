@@ -1,0 +1,169 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/phase-a-execution-lock.v1.schema.json",
+  "title": "DataX Enterprise Studio Private Phase-A Execution Lock Read Record V1",
+  "description": "ADR-0011 J0b.1 的私有 lock/fence 前置记录形状。它对应 20260802_0023 中仅供 NOLOGIN datax_phase_a_runner 调用的 SECURITY DEFINER reader des_phase_a_qualification.des_read_phase_a_execution_lock(uuid)；顶层 envelope/state 命名不是 SQL 返回列，SQL 返回 lock_state，私有 adapter 才映射为 state。0023 刻意复用 public.target_copy_locks、public.execution_attempts 和 public.executions.fence_epoch，而不创建平行 namespace lock：同一 TargetNamespace 的 STANDARD 与 PHASE_A_HARNESS 均受一个 partial unique index 约束。仅函数可推进 RESERVED -> ACTIVE -> RECOVERY_REQUIRED -> RELEASED；RECOVERY_REQUIRED 不释放目标，且没有自动 retry/reclaim。0024 可由 issuer-only 原子数据库边界创建 public Execution、PEA 和同一 RESERVED lock，但该 Execution 必须保持 QUEUED/BLOCKED/PHASE_A_PRIVATE_WORKER_NOT_IMPLEMENTED；没有普通 API/UI/Settings/Compose/Launcher、issuer login、private runner、凭据或 DataX 接线。普通 API/Worker/egress 对 private parent、lock 与 attempt 仍受 RLS 隐藏，普通 API 对全局冲突只能返回通用 TARGET_ACTIVE_EXECUTION。此 Schema 只校验受保护 reader 的非秘密形状，不能证明调用、角色隔离、原子性、唯一性、PAG/PEA/current-fact、宿主身份、进程、E3、E4 或发布。不得携带 lease token/hash、凭据、DSN、DataX 配置、命令、日志或结果。2026-08-02 scripts/test-postgres-e2.sh 在一次性 PostgreSQL 15 容器退出 0（选定 pytest 32 passed）仅为 E2；未来仍缺 protected disposition/backup、runner 四检查点、受保护 harness 与真实 DataX E3，当前不得把该锁路径作为持久产品工作流调用。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "purpose",
+    "visibility",
+    "ordinary_path_authorized",
+    "evidence_conclusion",
+    "lock_id",
+    "execution_id",
+    "target_namespace_id",
+    "physical_table_identity_hash",
+    "state",
+    "attempt_id",
+    "fence_epoch",
+    "worker_id",
+    "host_boot_id",
+    "cgroup_identity",
+    "reserved_at",
+    "acquired_at",
+    "heartbeat_at",
+    "lease_expires_at",
+    "released_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_kind": { "const": "PHASE_A_EXECUTION_LOCK" },
+    "purpose": { "const": "PRIVATE_PHASE_A_LOCK_FENCING_PREREQUISITE" },
+    "visibility": { "const": "PROTECTED_PRIVATE" },
+    "ordinary_path_authorized": { "const": false },
+    "evidence_conclusion": { "const": "NOT_E3_OR_E4" },
+    "lock_id": { "$ref": "#/$defs/uuid" },
+    "execution_id": { "$ref": "#/$defs/uuid" },
+    "target_namespace_id": { "$ref": "#/$defs/uuid" },
+    "physical_table_identity_hash": { "$ref": "#/$defs/sha256" },
+    "state": {
+      "enum": ["RESERVED", "ACTIVE", "RECOVERY_REQUIRED", "RELEASED"]
+    },
+    "attempt_id": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/uuid" }]
+    },
+    "fence_epoch": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/positiveInteger" }]
+    },
+    "worker_id": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/workerIdentifier" }]
+    },
+    "host_boot_id": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/workerIdentifier" }]
+    },
+    "cgroup_identity": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/cgroupIdentifier" }]
+    },
+    "reserved_at": { "$ref": "#/$defs/rfc3339Timestamptz" },
+    "acquired_at": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/rfc3339Timestamptz" }]
+    },
+    "heartbeat_at": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/rfc3339Timestamptz" }]
+    },
+    "lease_expires_at": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/rfc3339Timestamptz" }]
+    },
+    "released_at": {
+      "oneOf": [{ "type": "null" }, { "$ref": "#/$defs/rfc3339Timestamptz" }]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "state": { "const": "RESERVED" } } },
+      "then": {
+        "properties": {
+          "attempt_id": { "type": "null" },
+          "fence_epoch": { "type": "null" },
+          "worker_id": { "type": "null" },
+          "host_boot_id": { "type": "null" },
+          "cgroup_identity": { "type": "null" },
+          "acquired_at": { "type": "null" },
+          "heartbeat_at": { "type": "null" },
+          "lease_expires_at": { "type": "null" },
+          "released_at": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": { "enum": ["ACTIVE", "RECOVERY_REQUIRED"] }
+        }
+      },
+      "then": {
+        "required": [
+          "attempt_id",
+          "fence_epoch",
+          "worker_id",
+          "host_boot_id",
+          "cgroup_identity",
+          "acquired_at",
+          "heartbeat_at",
+          "lease_expires_at"
+        ],
+        "properties": {
+          "attempt_id": { "$ref": "#/$defs/uuid" },
+          "fence_epoch": { "$ref": "#/$defs/positiveInteger" },
+          "worker_id": { "$ref": "#/$defs/workerIdentifier" },
+          "host_boot_id": { "$ref": "#/$defs/workerIdentifier" },
+          "cgroup_identity": { "$ref": "#/$defs/cgroupIdentifier" },
+          "acquired_at": { "$ref": "#/$defs/rfc3339Timestamptz" },
+          "heartbeat_at": { "$ref": "#/$defs/rfc3339Timestamptz" },
+          "lease_expires_at": { "$ref": "#/$defs/rfc3339Timestamptz" },
+          "released_at": { "type": "null" }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "state": { "const": "RELEASED" } } },
+      "then": {
+        "properties": {
+          "attempt_id": { "$ref": "#/$defs/uuid" },
+          "fence_epoch": { "$ref": "#/$defs/positiveInteger" },
+          "worker_id": { "$ref": "#/$defs/workerIdentifier" },
+          "host_boot_id": { "$ref": "#/$defs/workerIdentifier" },
+          "cgroup_identity": { "$ref": "#/$defs/cgroupIdentifier" },
+          "acquired_at": { "$ref": "#/$defs/rfc3339Timestamptz" },
+          "heartbeat_at": { "$ref": "#/$defs/rfc3339Timestamptz" },
+          "lease_expires_at": { "$ref": "#/$defs/rfc3339Timestamptz" },
+          "released_at": { "$ref": "#/$defs/rfc3339Timestamptz" }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "positiveInteger": { "type": "integer", "minimum": 1 },
+    "workerIdentifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._:-]{1,128}$"
+    },
+    "cgroupIdentifier": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "pattern": "^[-A-Za-z0-9._:/@+]{1,256}$"
+    },
+    "rfc3339Timestamptz": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?(?:Z|[+-]\\d{2}:\\d{2})$"
+    }
+  }
+}

@@ -1,0 +1,25 @@
+.git
+.github
+.venv
+node_modules
+frontend/dist
+backend/.pytest_cache
+backend/.ruff_cache
+desktop/windows/target
+.local
+.runtime
+reports
+test-results
+playwright-report
+datax-runtime
+runtime-artifacts
+work
+logs
+backups
+*.log
+*.db
+*.sqlite*
+
+# The vendored upstream tree is hash-locked as a whole. Do not let generic
+# artifact patterns remove upstream-tracked files such as core/src/main/log/datax.log.
+!third_party/alibaba-datax/**

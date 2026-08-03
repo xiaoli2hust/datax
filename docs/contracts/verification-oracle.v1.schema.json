@@ -1,0 +1,797 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/verification-oracle.v1.schema.json",
+  "title": "DataX Enterprise Studio Verification Oracle V1",
+  "description": "独立于 DataX 运行摘要的 V1 数据正确性核验结果；只有 oracle 实际启动后才产生本制品。Oracle 从未启动时 Execution.verification_state 必须保持 NOT_STARTED，不得伪造 INCONCLUSIVE 制品；INCONCLUSIVE 只表示 oracle 已启动但无法形成数据结论。Oracle 在源端持续静默、目标活动锁仍有效且 Operator/DBA 的目标排他声明未撤回、未过期并覆盖 Worker 最后一次空表观察至目标端单一一致性读事务完成的前提下，按一对一映射读取源/目标并比较规范化行的多重集；重复行按出现次数参与比较。人工排他声明不是平台技术锁，也不能证明未报告或已经回滚的带外写从未发生。JSON Schema 固定 PASSED 的本地字段约束；源/目标 row_count、distinct_row_digest_count 与 multiset_sha256 的跨字段相等，target_exclusivity.target_snapshot_id 与 target_result.snapshot_id 一致，confirmed_at <= target_empty_checked_at <= target_result.snapshot_started_at <= target_result.snapshot_finished_at <= valid_until，target_exclusivity.status=ACTIVE 且 revoked_at=null，以及 artifact_sha256 重算，由独立语义 validator 强制执行。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "oracle_version",
+    "execution_id",
+    "job_version_id",
+    "started_at",
+    "finished_at",
+    "source_quiescence",
+    "target_lock",
+    "target_exclusivity",
+    "normalization",
+    "mapping_order",
+    "source_result",
+    "target_result",
+    "difference",
+    "result",
+    "artifact_sha256"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "oracle_version": {
+      "type": "string",
+      "pattern": "^oracle-v1\\.[0-9]+$"
+    },
+    "execution_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "job_version_id": {
+      "$ref": "#/$defs/uuid"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "finished_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source_quiescence": {
+      "$ref": "#/$defs/sourceQuiescence"
+    },
+    "target_lock": {
+      "$ref": "#/$defs/targetLock"
+    },
+    "target_exclusivity": {
+      "$ref": "#/$defs/targetExclusivity"
+    },
+    "normalization": {
+      "$ref": "#/$defs/normalization"
+    },
+    "mapping_order": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 2048,
+      "items": {
+        "$ref": "#/$defs/mapping"
+      }
+    },
+    "source_result": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sideResult"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "target_result": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/targetSideResult"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "difference": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/difference"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "result": {
+      "type": "string",
+      "description": "PASSED/FAILED 表示已形成数据结论；INCONCLUSIVE 仅用于 oracle 已启动但因前提破坏、读取失败或内部错误无法形成结论。",
+      "enum": [
+        "PASSED",
+        "FAILED",
+        "INCONCLUSIVE"
+      ]
+    },
+    "inconclusive_reason": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "SOURCE_QUIESCENCE_BROKEN",
+        "TARGET_LOCK_LOST",
+        "TARGET_EXCLUSIVITY_BROKEN",
+        "TARGET_SNAPSHOT_INVALID",
+        "SOURCE_READ_FAILED",
+        "TARGET_READ_FAILED",
+        "NORMALIZATION_FAILED",
+        "ORACLE_INTERNAL_ERROR",
+        null
+      ],
+      "description": "result=INCONCLUSIVE 时必填；Oracle 从未启动由 Execution.verification_state=NOT_STARTED 表示，不属于此枚举。"
+    },
+    "artifact_sha256": {
+      "$ref": "#/$defs/sha256",
+      "description": "对移除 artifact_sha256 字段后的 RFC 8785 规范化产物计算 SHA-256，避免自引用。"
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "sourceQuiescence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "operator_confirmed_at",
+        "preflight_fingerprint",
+        "post_verification_fingerprint",
+        "unchanged"
+      ],
+      "properties": {
+        "mode": {
+          "const": "OPERATOR_QUIESCED"
+        },
+        "operator_confirmed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "preflight_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "post_verification_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        },
+        "unchanged": {
+          "type": "boolean"
+        }
+      }
+    },
+    "targetLock": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lock_key_hash",
+        "fence_epoch",
+        "held_through_verification"
+      ],
+      "properties": {
+        "lock_key_hash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "fence_epoch": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "held_through_verification": {
+          "type": "boolean"
+        }
+      }
+    },
+    "targetExclusivity": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "运行前由 Operator/DBA 作出的有版本、有限有效期的外部目标排他声明及其运行期核验结论。它只覆盖平台无法技术阻断的带外 DML/DDL，不等同于 TargetCopyLock，也不构成对未报告外部写的技术证明。",
+      "required": [
+        "mode",
+        "statement_version",
+        "responsible_party",
+        "confirmed_at",
+        "valid_until",
+        "status",
+        "revoked_at",
+        "revocation_reason",
+        "target_empty_checked_at",
+        "target_snapshot_id",
+        "valid_through_target_snapshot",
+        "confirmation_evidence_sha256"
+      ],
+      "properties": {
+        "mode": {
+          "const": "OPERATOR_OR_DBA_CONFIRMED"
+        },
+        "statement_version": {
+          "const": "1.0"
+        },
+        "responsible_party": {
+          "type": "string",
+          "enum": [
+            "OPERATOR",
+            "DBA"
+          ]
+        },
+        "confirmed_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "valid_until": {
+          "type": "string",
+          "format": "date-time",
+          "description": "必须晚于 confirmed_at；PASSED 时必须不早于 target_result.snapshot_finished_at。"
+        },
+        "status": {
+          "type": "string",
+          "enum": [
+            "ACTIVE",
+            "REVOKED",
+            "EXPIRED"
+          ]
+        },
+        "revoked_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "format": "date-time"
+        },
+        "revocation_reason": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "OPERATOR_REVOKED",
+            "DBA_REVOKED",
+            "EXTERNAL_DML_DDL_REPORTED",
+            "CHANGE_FREEZE_BROKEN",
+            "VALIDITY_WINDOW_EXPIRED",
+            null
+          ]
+        },
+        "target_empty_checked_at": {
+          "type": "string",
+          "format": "date-time",
+          "description": "必须等于 Execution TargetEmptyEvidence.checked_at，即 Worker 最后一次空目标观察。"
+        },
+        "target_snapshot_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1,
+          "maxLength": 256,
+          "description": "非秘密、数据库适配器产生的单一一致性读事务快照标识；必须等于 target_result.snapshot_id。"
+        },
+        "valid_through_target_snapshot": {
+          "type": "boolean",
+          "description": "声明未过期、未被撤回，且从 target_empty_checked_at 到 target_result.snapshot_finished_at 未发现或获知任何平台外 DML/DDL 时为 true；这不证明未报告或已回滚的外部写从未发生。"
+        },
+        "confirmation_evidence_sha256": {
+          "$ref": "#/$defs/sha256",
+          "description": "Execution 中固化的目标排他确认安全摘要。"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "ACTIVE"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "revoked_at": {
+                "type": "null"
+              },
+              "revocation_reason": {
+                "type": "null"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "REVOKED"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "revoked_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "revocation_reason": {
+                "type": "string",
+                "enum": [
+                  "OPERATOR_REVOKED",
+                  "DBA_REVOKED",
+                  "EXTERNAL_DML_DDL_REPORTED",
+                  "CHANGE_FREEZE_BROKEN"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "status": {
+                "const": "EXPIRED"
+              }
+            },
+            "required": [
+              "status"
+            ]
+          },
+          "then": {
+            "properties": {
+              "revoked_at": {
+                "type": "null"
+              },
+              "revocation_reason": {
+                "const": "VALIDITY_WINDOW_EXPIRED"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "normalization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "row_algorithm",
+        "row_preimage",
+        "field_encoding",
+        "collection_semantics",
+        "stable_order",
+        "multiset_preimage",
+        "null_encoding",
+        "text_encoding",
+        "unicode_normalization",
+        "trim_text",
+        "decimal_encoding",
+        "negative_zero",
+        "session_timezone",
+        "timestamp_encoding",
+        "boolean_encoding",
+        "binary_encoding",
+        "field_separator"
+      ],
+      "properties": {
+        "row_algorithm": {
+          "const": "SHA-256"
+        },
+        "row_preimage": {
+          "const": "DOMAIN_NUL_FIELD_COUNT_U32_BE_FIELDS"
+        },
+        "field_encoding": {
+          "const": "TAG_LENGTH_U16_BE_TAG_VALUE_LENGTH_U64_BE_VALUE"
+        },
+        "collection_semantics": {
+          "const": "MULTISET_WITH_COUNTS"
+        },
+        "stable_order": {
+          "const": "ROW_DIGEST_ASC_THEN_COUNT"
+        },
+        "multiset_preimage": {
+          "const": "DOMAIN_NUL_ROW_DIGEST_RAW32_COUNT_U64_BE"
+        },
+        "null_encoding": {
+          "const": "TYPE_TAGGED_NULL"
+        },
+        "text_encoding": {
+          "const": "UTF-8"
+        },
+        "unicode_normalization": {
+          "const": "NFC"
+        },
+        "trim_text": {
+          "const": false
+        },
+        "decimal_encoding": {
+          "const": "CANONICAL_BASE10_NO_EXPONENT_NO_INSIGNIFICANT_ZERO"
+        },
+        "negative_zero": {
+          "const": "NORMALIZE_TO_ZERO"
+        },
+        "session_timezone": {
+          "const": "UTC"
+        },
+        "timestamp_encoding": {
+          "const": "RFC3339_UTC_MICROSECONDS"
+        },
+        "boolean_encoding": {
+          "const": "LOWERCASE_TRUE_FALSE"
+        },
+        "binary_encoding": {
+          "const": "BASE64_RFC4648"
+        },
+        "field_separator": {
+          "const": "LENGTH_PREFIXED"
+        }
+      }
+    },
+    "mapping": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ordinal",
+        "source_column",
+        "target_column",
+        "logical_type"
+      ],
+      "properties": {
+        "ordinal": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2048
+        },
+        "source_column": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "target_column": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "logical_type": {
+          "type": "string",
+          "enum": [
+            "INTEGER",
+            "DECIMAL",
+            "TEXT",
+            "BOOLEAN",
+            "DATE",
+            "TIME",
+            "TIMESTAMP",
+            "BINARY"
+          ]
+        }
+      }
+    },
+    "sideResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "row_count",
+        "distinct_row_digest_count",
+        "multiset_sha256",
+        "read_started_at",
+        "read_finished_at"
+      ],
+      "properties": {
+        "row_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "distinct_row_digest_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "multiset_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "read_started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "read_finished_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "targetSideResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "目标端所有计数与摘要必须在同一个只读一致性事务快照内计算；不得把多个时间点的查询拼成一次核验。",
+      "required": [
+        "row_count",
+        "distinct_row_digest_count",
+        "multiset_sha256",
+        "read_started_at",
+        "read_finished_at",
+        "snapshot_mode",
+        "snapshot_id",
+        "snapshot_started_at",
+        "snapshot_finished_at"
+      ],
+      "properties": {
+        "row_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "distinct_row_digest_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "multiset_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "read_started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "read_finished_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "snapshot_mode": {
+          "const": "SINGLE_CONSISTENT_READ_TRANSACTION"
+        },
+        "snapshot_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "snapshot_started_at": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "snapshot_finished_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      }
+    },
+    "difference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "missing_row_count",
+        "unexpected_row_count",
+        "row_count_equal",
+        "multiset_sha256_equal",
+        "sample_digest_pairs"
+      ],
+      "properties": {
+        "missing_row_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "unexpected_row_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "row_count_equal": {
+          "type": "boolean",
+          "description": "独立 validator 比较 source_result.row_count 与 target_result.row_count 后写入。"
+        },
+        "multiset_sha256_equal": {
+          "type": "boolean",
+          "description": "独立 validator 比较 source_result.multiset_sha256 与 target_result.multiset_sha256 后写入。"
+        },
+        "sample_digest_pairs": {
+          "type": "array",
+          "maxItems": 20,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "row_sha256",
+              "source_count",
+              "target_count"
+            ],
+            "properties": {
+              "row_sha256": {
+                "$ref": "#/$defs/sha256"
+              },
+              "source_count": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "target_count": {
+                "type": "integer",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "result": {
+            "const": "INCONCLUSIVE"
+          }
+        },
+        "required": [
+          "result"
+        ]
+      },
+      "then": {
+        "required": [
+          "inconclusive_reason"
+        ],
+        "properties": {
+          "inconclusive_reason": {
+            "type": "string"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "inconclusive_reason": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "result": {
+            "const": "PASSED"
+          }
+        },
+        "required": [
+          "result"
+        ]
+      },
+      "then": {
+        "properties": {
+          "source_quiescence": {
+            "properties": {
+              "unchanged": {
+                "const": true
+              }
+            }
+          },
+          "source_result": {
+            "$ref": "#/$defs/sideResult"
+          },
+          "target_result": {
+            "$ref": "#/$defs/targetSideResult"
+          },
+          "target_lock": {
+            "properties": {
+              "held_through_verification": {
+                "const": true
+              }
+            }
+          },
+          "target_exclusivity": {
+            "properties": {
+              "status": {
+                "const": "ACTIVE"
+              },
+              "revoked_at": {
+                "type": "null"
+              },
+              "revocation_reason": {
+                "type": "null"
+              },
+              "target_snapshot_id": {
+                "type": "string",
+                "minLength": 1
+              },
+              "valid_through_target_snapshot": {
+                "const": true
+              }
+            }
+          },
+          "difference": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/difference"
+              },
+              {
+                "properties": {
+                  "missing_row_count": {
+                    "const": 0
+                  },
+                  "unexpected_row_count": {
+                    "const": 0
+                  },
+                  "row_count_equal": {
+                    "const": true
+                  },
+                  "multiset_sha256_equal": {
+                    "const": true
+                  },
+                  "sample_digest_pairs": {
+                    "maxItems": 0
+                  }
+                }
+              }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "result": {
+            "const": "FAILED"
+          }
+        },
+        "required": [
+          "result"
+        ]
+      },
+      "then": {
+        "properties": {
+          "source_result": {
+            "$ref": "#/$defs/sideResult"
+          },
+          "target_result": {
+            "$ref": "#/$defs/targetSideResult"
+          },
+          "target_exclusivity": {
+            "properties": {
+              "target_snapshot_id": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
+          },
+          "difference": {
+            "allOf": [
+              {
+                "$ref": "#/$defs/difference"
+              },
+              {
+                "anyOf": [
+                  {
+                    "properties": {
+                      "missing_row_count": {
+                        "minimum": 1
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "unexpected_row_count": {
+                        "minimum": 1
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "row_count_equal": {
+                        "const": false
+                      }
+                    }
+                  },
+                  {
+                    "properties": {
+                      "multiset_sha256_equal": {
+                        "const": false
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      }
+    }
+  ]
+}

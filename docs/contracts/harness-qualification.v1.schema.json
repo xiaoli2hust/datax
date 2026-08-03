@@ -1,0 +1,352 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/harness-qualification.v1.schema.json",
+  "title": "DataX Enterprise Studio Harness Qualification V1",
+  "description": "ADR-0011 的 QH：只给受保护 Phase-A harness 的短期、一次性、Ed25519 签名资格。QH 不是 E3/E4 结论、普通用户能力、Release Qualification 或公开发布批准。签名输入为 UTF8(\"DES-HARNESS-QUALIFICATION-v1\\n\") || RFC8785(document_without_signature)。公钥只能按 issuer_key_id 从已独立验证的 release-payload.v1 内 hqa_keyring 取得；QH 不得自带或引用可配置公钥。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "qualification_id",
+    "purpose",
+    "issuer_key_id",
+    "issued_at",
+    "not_before",
+    "valid_until",
+    "nonce",
+    "payload_binding",
+    "harness",
+    "signature"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_kind": { "const": "HARNESS_QUALIFICATION" },
+    "qualification_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+    },
+    "purpose": { "const": "QUALIFICATION_HARNESS" },
+    "issuer_key_id": {
+      "type": "string",
+      "minLength": 8,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9._-]+$",
+      "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+    },
+    "issued_at": { "$ref": "#/$defs/rfc3339Utc" },
+    "not_before": { "$ref": "#/$defs/rfc3339Utc" },
+    "valid_until": { "$ref": "#/$defs/rfc3339Utc" },
+    "nonce": {
+      "description": "受保护的 durable ledger 必须按 (issuer_key_id, nonce) 原子地唯一消费至少至 valid_until；不得用 payload root 或 qualification_id 重分区。",
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 128,
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+    },
+    "payload_binding": { "$ref": "#/$defs/payloadBinding" },
+    "harness": { "$ref": "#/$defs/harness" },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "value_base64"],
+      "properties": {
+        "algorithm": { "const": "Ed25519" },
+        "value_base64": {
+          "type": "string",
+          "minLength": 88,
+          "maxLength": 88,
+          "pattern": "^[A-Za-z0-9+/]{86}==$"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "rfc3339Utc": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:\\.\\d{1,6})?Z$",
+      "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+    },
+    "safePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*$",
+      "allOf": [
+        { "not": { "pattern": "[\\r\\n]" } },
+        { "not": { "pattern": "(^|/)\\.{1,2}(/|$)" } },
+        { "not": { "pattern": "//" } },
+        { "not": { "pattern": "/$" } }
+      ]
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256"],
+      "properties": {
+        "path": { "$ref": "#/$defs/safePath" },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "source_ref",
+        "commit_sha",
+        "product_version",
+        "release_candidate"
+      ],
+      "properties": {
+        "repository": { "const": "xiaoli2hust/datax" },
+        "source_ref": {
+          "type": "string",
+          "pattern": "^refs/(heads/main|tags/v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*))$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        },
+        "commit_sha": {
+          "type": "string",
+          "minLength": 40,
+          "maxLength": 40,
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "product_version": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        },
+        "release_candidate": {
+          "type": "string",
+          "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)-[0-9a-f]{12}$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        }
+      }
+    },
+    "targetPlatforms": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["windows_host", "linux_runtime"],
+      "properties": {
+        "windows_host": { "const": "windows-x64" },
+        "linux_runtime": { "const": "linux-amd64" }
+      }
+    },
+    "image": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "reference"],
+      "properties": {
+        "role": {
+          "enum": ["api", "egress_guard", "postgres", "web", "worker"]
+        },
+        "reference": {
+          "type": "string",
+          "pattern": "^[a-z0-9][a-z0-9._/-]{0,254}@sha256:[a-f0-9]{64}$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        }
+      }
+    },
+    "upstream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["repository", "commit_sha", "module_path"],
+      "properties": {
+        "repository": { "const": "https://github.com/alibaba/DataX.git" },
+        "commit_sha": {
+          "type": "string",
+          "minLength": 40,
+          "maxLength": 40,
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "module_path": { "$ref": "#/$defs/safePath" }
+      }
+    },
+    "plugin": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "jar",
+        "upstream",
+        "parameter_boundary_contract_version",
+        "dependency_inventory",
+        "license_review"
+      ],
+      "properties": {
+        "name": {
+          "enum": [
+            "mysqlreader",
+            "mysqlwriter",
+            "postgresqlreader",
+            "postgresqlwriter"
+          ]
+        },
+        "jar": { "$ref": "#/$defs/artifact" },
+        "upstream": { "$ref": "#/$defs/upstream" },
+        "parameter_boundary_contract_version": {
+          "type": "string",
+          "pattern": "^[1-9][0-9]*\\.[0-9]+$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        },
+        "dependency_inventory": { "$ref": "#/$defs/artifact" },
+        "license_review": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "workerRuntime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "datax_release",
+        "jdk_version",
+        "runtime_manifest",
+        "runtime_tree_sha256",
+        "plugins"
+      ],
+      "properties": {
+        "datax_release": { "const": "datax_v202309" },
+        "jdk_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120,
+          "pattern": "^[^\\x00-\\x1f\\x7f]+$"
+        },
+        "runtime_manifest": { "$ref": "#/$defs/artifact" },
+        "runtime_tree_sha256": { "$ref": "#/$defs/sha256" },
+        "plugins": { "$ref": "#/$defs/orderedPlugins" }
+      }
+    },
+    "imageSbom": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "artifact"],
+      "properties": {
+        "role": {
+          "enum": ["api", "egress_guard", "postgres", "web", "worker"]
+        },
+        "artifact": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "orderedImages": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/image" }, { "properties": { "role": { "const": "api" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/image" }, { "properties": { "role": { "const": "egress_guard" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/image" }, { "properties": { "role": { "const": "postgres" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/image" }, { "properties": { "role": { "const": "web" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/image" }, { "properties": { "role": { "const": "worker" } } }] }
+      ],
+      "items": false
+    },
+    "orderedPlugins": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/plugin" }, { "properties": { "name": { "const": "mysqlreader" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/plugin" }, { "properties": { "name": { "const": "mysqlwriter" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/plugin" }, { "properties": { "name": { "const": "postgresqlreader" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/plugin" }, { "properties": { "name": { "const": "postgresqlwriter" } } }] }
+      ],
+      "items": false
+    },
+    "orderedImageSboms": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "prefixItems": [
+        { "allOf": [{ "$ref": "#/$defs/imageSbom" }, { "properties": { "role": { "const": "api" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/imageSbom" }, { "properties": { "role": { "const": "egress_guard" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/imageSbom" }, { "properties": { "role": { "const": "postgres" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/imageSbom" }, { "properties": { "role": { "const": "web" } } }] },
+        { "allOf": [{ "$ref": "#/$defs/imageSbom" }, { "properties": { "role": { "const": "worker" } } }] }
+      ],
+      "items": false
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "build_identity",
+        "image_lock",
+        "source_sbom",
+        "image_sboms",
+        "license_inventory"
+      ],
+      "properties": {
+        "build_identity": { "$ref": "#/$defs/artifact" },
+        "image_lock": { "$ref": "#/$defs/artifact" },
+        "source_sbom": { "$ref": "#/$defs/artifact" },
+        "image_sboms": { "$ref": "#/$defs/orderedImageSboms" },
+        "license_inventory": { "$ref": "#/$defs/artifact" }
+      }
+    },
+    "payloadBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "payload_root_sha256",
+        "identity",
+        "target_platforms",
+        "images",
+        "worker_runtime",
+        "artifacts"
+      ],
+      "properties": {
+        "payload_root_sha256": { "$ref": "#/$defs/sha256" },
+        "identity": { "$ref": "#/$defs/identity" },
+        "target_platforms": { "$ref": "#/$defs/targetPlatforms" },
+        "images": { "$ref": "#/$defs/orderedImages" },
+        "worker_runtime": { "$ref": "#/$defs/workerRuntime" },
+        "artifacts": { "$ref": "#/$defs/artifacts" }
+      }
+    },
+    "harness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity",
+        "environment_id",
+        "environment_manifest_sha256",
+        "harness_version"
+      ],
+      "properties": {
+        "identity": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        },
+        "environment_id": {
+          "type": "string",
+          "minLength": 8,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._-]+$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        },
+        "environment_manifest_sha256": { "$ref": "#/$defs/sha256" },
+        "harness_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[A-Za-z0-9._+-]+$",
+          "allOf": [{ "not": { "pattern": "[\\r\\n]" } }]
+        }
+      }
+    }
+  }
+}

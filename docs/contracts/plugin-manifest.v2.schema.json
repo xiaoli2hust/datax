@@ -1,0 +1,668 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/plugin-manifest.v2.schema.json",
+  "title": "DataX Enterprise Studio Plugin Capability Manifest V2",
+  "description": "DataX 能力目录。源码、构建、打包、契约、E3 与 Windows E4 是不同状态；WINDOWS_E4_CERTIFIED 只证明精确最终候选的 Phase-B E4。普通用户执行还必须有同一最终候选的有效公开发布晋级记录。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "name",
+    "display_name",
+    "engine",
+    "direction",
+    "datax_plugin_name",
+    "datax_release",
+    "upstream",
+    "artifact",
+    "runtime",
+    "supply_chain",
+    "connection_fields",
+    "capabilities",
+    "access",
+    "oracle",
+    "certification_state",
+    "ordinary_user_executable",
+    "evidence",
+    "block_reasons"
+  ],
+  "properties": {
+    "schema_version": { "const": "2.0" },
+    "name": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9._-]{2,63}$"
+    },
+    "display_name": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "engine": {
+      "type": "string",
+      "enum": ["MYSQL_8", "POSTGRESQL_15"]
+    },
+    "direction": {
+      "type": "string",
+      "enum": ["READER", "WRITER"]
+    },
+    "datax_plugin_name": {
+      "type": "string",
+      "enum": [
+        "mysqlreader",
+        "mysqlwriter",
+        "postgresqlreader",
+        "postgresqlwriter"
+      ]
+    },
+    "datax_release": { "const": "datax_v202309" },
+    "upstream": { "$ref": "#/$defs/upstream" },
+    "artifact": { "$ref": "#/$defs/artifact" },
+    "runtime": { "$ref": "#/$defs/runtime" },
+    "supply_chain": { "$ref": "#/$defs/supplyChain" },
+    "connection_fields": {
+      "type": "array",
+      "minItems": 6,
+      "maxItems": 8,
+      "items": { "$ref": "#/$defs/connectionField" }
+    },
+    "capabilities": { "$ref": "#/$defs/capabilities" },
+    "access": { "$ref": "#/$defs/access" },
+    "oracle": { "$ref": "#/$defs/oracle" },
+    "certification_state": {
+      "type": "string",
+      "enum": [
+        "SOURCE_PRESENT",
+        "BUILD_VERIFIED",
+        "PACKAGED",
+        "CONTRACTED",
+        "E3_CERTIFIED",
+        "WINDOWS_E4_CERTIFIED",
+        "BLOCKED"
+      ]
+    },
+    "ordinary_user_executable": { "type": "boolean" },
+    "evidence": { "$ref": "#/$defs/evidence" },
+    "block_reasons": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {
+        "type": "string",
+        "pattern": "^[A-Z][A-Z0-9_]{2,127}$"
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "upstream": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "repository",
+        "tag",
+        "commit",
+        "tree",
+        "module",
+        "module_pom_sha256",
+        "plugin_json_sha256"
+      ],
+      "properties": {
+        "repository": { "const": "https://github.com/alibaba/DataX.git" },
+        "tag": { "const": "datax_v202309" },
+        "commit": { "const": "9a1f88751e24314b083a74f1b83ef56d69ce98bd" },
+        "tree": { "const": "534508f96331c4b9f3737ea4e8294cc56aedc67d" },
+        "module": {
+          "type": "string",
+          "enum": [
+            "mysqlreader",
+            "mysqlwriter",
+            "postgresqlreader",
+            "postgresqlwriter"
+          ]
+        },
+        "module_pom_sha256": { "$ref": "#/$defs/sha256" },
+        "plugin_json_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative_path", "sha256"],
+      "properties": {
+        "relative_path": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+\\.jar$"
+        },
+        "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["jdk_major", "python_major"],
+      "properties": {
+        "jdk_major": { "const": 8 },
+        "python_major": { "const": 3 }
+      }
+    },
+    "dependency": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "name",
+        "version",
+        "license_expression",
+        "license_file",
+        "redistribution_status"
+      ],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "version": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "license_expression": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "license_file": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "pattern": "^(?!/)(?!.*\\.\\.)[A-Za-z0-9_./-]+$"
+        },
+        "redistribution_status": {
+          "type": "string",
+          "enum": ["DOCUMENTED", "REVIEW_REQUIRED", "BLOCKED"]
+        }
+      }
+    },
+    "supplyChain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "dependency_inventory_status",
+        "license_review_status",
+        "dependency_inventory_ref",
+        "license_review_ref",
+        "dependencies"
+      ],
+      "properties": {
+        "dependency_inventory_status": {
+          "type": "string",
+          "enum": ["COMPLETE", "INCOMPLETE", "BLOCKED"]
+        },
+        "license_review_status": {
+          "type": "string",
+          "enum": ["CLEARED", "REVIEW_REQUIRED", "BLOCKED"]
+        },
+        "dependency_inventory_ref": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9._/:-]{1,300}$"
+        },
+        "license_review_ref": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9._/:-]{1,300}$"
+        },
+        "dependencies": {
+          "type": "array",
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/dependency" }
+        }
+      }
+    },
+    "connectionField": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["key", "label", "value_type", "required", "sensitive"],
+      "properties": {
+        "key": {
+          "type": "string",
+          "enum": [
+            "host",
+            "port",
+            "database_name",
+            "default_schema",
+            "username",
+            "password",
+            "ssl_mode"
+          ]
+        },
+        "label": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "value_type": {
+          "type": "string",
+          "enum": ["STRING", "INTEGER", "SECRET", "ENUM"]
+        },
+        "required": { "type": "boolean" },
+        "sensitive": { "type": "boolean" },
+        "default": { "type": ["string", "integer", "boolean", "null"] },
+        "enum_values": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "type": "string", "maxLength": 64 }
+        },
+        "constraints": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "minimum": { "type": ["integer", "null"] },
+            "maximum": { "type": ["integer", "null"] },
+            "min_length": { "type": ["integer", "null"], "minimum": 0 },
+            "max_length": { "type": ["integer", "null"], "minimum": 1 },
+            "pattern": { "type": ["string", "null"], "maxLength": 256 }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "key": { "const": "password" } },
+            "required": ["key"]
+          },
+          "then": {
+            "properties": {
+              "value_type": { "const": "SECRET" },
+              "sensitive": { "const": true }
+            }
+          }
+        }
+      ]
+    },
+    "capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_introspection",
+        "full_table_selection",
+        "column_selection",
+        "direct_mapping_only",
+        "target_table_must_exist",
+        "write_modes",
+        "supports_free_sql",
+        "supports_pre_sql",
+        "supports_post_sql",
+        "supports_transformer",
+        "supports_custom_parameters"
+      ],
+      "properties": {
+        "schema_introspection": { "const": true },
+        "full_table_selection": { "const": true },
+        "column_selection": { "const": true },
+        "direct_mapping_only": { "const": true },
+        "target_table_must_exist": { "const": true },
+        "write_modes": {
+          "type": "array",
+          "maxItems": 1,
+          "uniqueItems": true,
+          "items": { "const": "INSERT" }
+        },
+        "supports_free_sql": { "const": false },
+        "supports_pre_sql": { "const": false },
+        "supports_post_sql": { "const": false },
+        "supports_transformer": { "const": false },
+        "supports_custom_parameters": { "const": false }
+      }
+    },
+    "access": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "network_scope",
+        "filesystem_scope",
+        "allows_arbitrary_sql",
+        "allows_host_paths",
+        "allows_shell",
+        "allows_user_plugins"
+      ],
+      "properties": {
+        "network_scope": { "const": "APPROVED_DATABASE_ENDPOINT_ONLY" },
+        "filesystem_scope": { "const": "PRIVATE_RUNTIME_ONLY" },
+        "allows_arbitrary_sql": { "const": false },
+        "allows_host_paths": { "const": false },
+        "allows_shell": { "const": false },
+        "allows_user_plugins": { "const": false }
+      }
+    },
+    "oracle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "schema_version", "required_for_e3"],
+      "properties": {
+        "kind": { "const": "RELATIONAL_MULTISET_V1" },
+        "schema_version": { "const": "1.0" },
+        "required_for_e3": { "const": true }
+      }
+    },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "candidate_id",
+        "candidate_commit",
+        "worker_image_digest",
+        "runtime_sha256",
+        "e3_evidence_ref",
+        "windows_e4_evidence_ref",
+        "release_promotion_ref",
+        "valid_until"
+      ],
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": [
+            "CURRENT_RUNTIME_ATTESTATION",
+            "TRUSTED_RELEASE_ATTESTATION"
+          ]
+        },
+        "candidate_id": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9._-]{8,128}$"
+        },
+        "candidate_commit": {
+          "type": ["string", "null"],
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "worker_image_digest": {
+          "type": ["string", "null"],
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        },
+        "runtime_sha256": { "$ref": "#/$defs/sha256" },
+        "e3_evidence_ref": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9._/:-]{1,300}$"
+        },
+        "windows_e4_evidence_ref": {
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9._/:-]{1,300}$"
+        },
+        "release_promotion_ref": {
+          "description": "同一最终候选的有效公开发布晋级（PR）记录。仅在服务端已验证为可用时返回字符串；缺失、格式无效或候选内不一致时返回 null，并以稳定 block_reasons 失败关闭。E4 资格本身可以尚未具备此记录。",
+          "type": ["string", "null"],
+          "pattern": "^[A-Za-z0-9._/:-]{1,300}$"
+        },
+        "valid_until": {
+          "type": ["string", "null"],
+          "format": "date-time"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "certification_state": { "const": "WINDOWS_E4_CERTIFIED" }
+        },
+        "required": ["certification_state"]
+      },
+      "then": {
+        "properties": {
+          "supply_chain": {
+            "properties": {
+              "dependency_inventory_status": { "const": "COMPLETE" },
+              "license_review_status": { "const": "CLEARED" },
+              "dependency_inventory_ref": { "type": "string" },
+              "license_review_ref": { "type": "string" },
+              "dependencies": {
+                "minItems": 1,
+                "items": {
+                  "properties": {
+                    "redistribution_status": { "const": "DOCUMENTED" }
+                  }
+                }
+              }
+            }
+          },
+          "evidence": {
+            "properties": {
+              "source": {
+                "const": "TRUSTED_RELEASE_ATTESTATION"
+              },
+              "candidate_id": { "type": "string" },
+              "candidate_commit": { "type": "string" },
+              "worker_image_digest": { "type": "string" },
+              "e3_evidence_ref": { "type": "string" },
+              "windows_e4_evidence_ref": { "type": "string" },
+              "valid_until": { "type": "string", "format": "date-time" }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "ordinary_user_executable": { "const": false },
+          "block_reasons": { "minItems": 1 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "certification_state": { "const": "WINDOWS_E4_CERTIFIED" },
+          "evidence": {
+            "properties": {
+              "release_promotion_ref": { "type": "string" }
+            },
+            "required": ["release_promotion_ref"]
+          }
+        },
+        "required": ["certification_state", "evidence"]
+      },
+      "then": {
+        "properties": {
+          "ordinary_user_executable": { "const": true },
+          "block_reasons": { "maxItems": 0 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "certification_state": { "const": "WINDOWS_E4_CERTIFIED" },
+          "ordinary_user_executable": { "const": false },
+          "evidence": {
+            "properties": {
+              "release_promotion_ref": { "type": "null" }
+            },
+            "required": ["release_promotion_ref"]
+          }
+        },
+        "required": [
+          "certification_state",
+          "ordinary_user_executable",
+          "evidence"
+        ]
+      },
+      "then": {
+        "properties": {
+          "block_reasons": {
+            "contains": {
+              "enum": [
+                "RELEASE_PROMOTION_REQUIRED",
+                "RELEASE_PROMOTION_REF_INVALID",
+                "PAIR_RELEASE_PROMOTION_MISMATCH"
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "ordinary_user_executable": { "const": true }
+        },
+        "required": ["ordinary_user_executable"]
+      },
+      "then": {
+        "properties": {
+          "certification_state": { "const": "WINDOWS_E4_CERTIFIED" },
+          "block_reasons": { "maxItems": 0 },
+          "evidence": {
+            "properties": {
+              "release_promotion_ref": { "type": "string" }
+            }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "block_reasons": { "minItems": 1 }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": { "direction": { "const": "READER" } },
+        "required": ["direction"]
+      },
+      "then": {
+        "properties": {
+          "capabilities": {
+            "properties": { "write_modes": { "maxItems": 0 } }
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "capabilities": {
+            "properties": { "write_modes": { "minItems": 1 } }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "engine": { "const": "MYSQL_8" },
+          "direction": { "const": "READER" }
+        },
+        "required": ["engine", "direction"]
+      },
+      "then": {
+        "properties": {
+          "name": { "const": "mysqlreader" },
+          "datax_plugin_name": { "const": "mysqlreader" },
+          "upstream": {
+            "properties": {
+              "module": { "const": "mysqlreader" },
+              "module_pom_sha256": {
+                "const": "c4ffc40c90af4068999178ac7297bb2066de59b8dccfa6e8e956b48327487206"
+              },
+              "plugin_json_sha256": {
+                "const": "86ef9813bfc558048a99e32ffaf4889a48f2f082b0f692dc73770f5385161e8f"
+              }
+            }
+          },
+          "artifact": {
+            "properties": {
+              "relative_path": {
+                "const": "datax/plugin/reader/mysqlreader/mysqlreader-0.0.1-SNAPSHOT.jar"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "engine": { "const": "MYSQL_8" },
+          "direction": { "const": "WRITER" }
+        },
+        "required": ["engine", "direction"]
+      },
+      "then": {
+        "properties": {
+          "name": { "const": "mysqlwriter" },
+          "datax_plugin_name": { "const": "mysqlwriter" },
+          "upstream": {
+            "properties": {
+              "module": { "const": "mysqlwriter" },
+              "module_pom_sha256": {
+                "const": "b83fe2a8eb0d1e535b84914e5fa169722bd085686eb11d63841e92a6d7cf1b2c"
+              },
+              "plugin_json_sha256": {
+                "const": "2c5914e3625f3c32e79d661407ec4644e94905037c78e1aa21391e0174c2d3ed"
+              }
+            }
+          },
+          "artifact": {
+            "properties": {
+              "relative_path": {
+                "const": "datax/plugin/writer/mysqlwriter/mysqlwriter-0.0.1-SNAPSHOT.jar"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "engine": { "const": "POSTGRESQL_15" },
+          "direction": { "const": "READER" }
+        },
+        "required": ["engine", "direction"]
+      },
+      "then": {
+        "properties": {
+          "name": { "const": "postgresqlreader" },
+          "datax_plugin_name": { "const": "postgresqlreader" },
+          "upstream": {
+            "properties": {
+              "module": { "const": "postgresqlreader" },
+              "module_pom_sha256": {
+                "const": "f14129fe23f6ca90bfc36b3c3bf64ff8d53288053af26e666411dde47211a835"
+              },
+              "plugin_json_sha256": {
+                "const": "5f298fb97165625ae5de9c32cb8454128feaa9c7ef8856f943f7683191291b32"
+              }
+            }
+          },
+          "artifact": {
+            "properties": {
+              "relative_path": {
+                "const": "datax/plugin/reader/postgresqlreader/postgresqlreader-0.0.1-SNAPSHOT.jar"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "engine": { "const": "POSTGRESQL_15" },
+          "direction": { "const": "WRITER" }
+        },
+        "required": ["engine", "direction"]
+      },
+      "then": {
+        "properties": {
+          "name": { "const": "postgresqlwriter" },
+          "datax_plugin_name": { "const": "postgresqlwriter" },
+          "upstream": {
+            "properties": {
+              "module": { "const": "postgresqlwriter" },
+              "module_pom_sha256": {
+                "const": "d29dcd149b37c269e8e741184172a69ce80cd6ffc69503440fdd9d4afe49e4c4"
+              },
+              "plugin_json_sha256": {
+                "const": "1ea3e7ef4deebb90b36e4c7b1cb1e91852abbe9d6db0d52eee7a42fa037589f6"
+              }
+            }
+          },
+          "artifact": {
+            "properties": {
+              "relative_path": {
+                "const": "datax/plugin/writer/postgresqlwriter/postgresqlwriter-0.0.1-SNAPSHOT.jar"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

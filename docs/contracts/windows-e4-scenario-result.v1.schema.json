@@ -1,0 +1,108 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/xiaoli2hust/datax/blob/main/docs/contracts/windows-e4-scenario-result.v1.schema.json",
+  "title": "DataX Enterprise Studio Windows E4 Scenario Result Catalog v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "artifact_kind",
+    "profile_catalog_sha256",
+    "release_candidate",
+    "commit_sha",
+    "results"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "artifact_kind": { "const": "WINDOWS_E4_SCENARIO_RESULT_CATALOG" },
+    "profile_catalog_sha256": { "$ref": "#/$defs/sha256" },
+    "release_candidate": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128
+    },
+    "commit_sha": { "$ref": "#/$defs/commitSha" },
+    "results": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/result" }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "commitSha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "testId": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+$"
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profile_id",
+        "result",
+        "executed_at",
+        "environment_id",
+        "environment_manifest_sha256",
+        "windows_baseline_id",
+        "harness_version",
+        "assertion_ids",
+        "assertions_sha256"
+      ],
+      "properties": {
+        "profile_id": { "$ref": "#/$defs/testId" },
+        "result": {
+          "type": "string",
+          "enum": ["PASSED", "FAILED", "NOT_RUN"]
+        },
+        "executed_at": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "format": "date-time" }
+          ]
+        },
+        "environment_id": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "minLength": 1, "maxLength": 128 }
+          ]
+        },
+        "environment_manifest_sha256": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/sha256" }
+          ]
+        },
+        "windows_baseline_id": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "minLength": 1, "maxLength": 256 }
+          ]
+        },
+        "harness_version": {
+          "oneOf": [
+            { "type": "null" },
+            { "type": "string", "minLength": 1, "maxLength": 128 }
+          ]
+        },
+        "assertion_ids": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/testId" }
+        },
+        "assertions_sha256": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/sha256" }
+          ]
+        }
+      }
+    }
+  }
+}

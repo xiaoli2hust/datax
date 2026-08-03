@@ -1,0 +1,63 @@
+[build-system]
+requires = ["pip==26.2", "setuptools==83.0.0", "wheel==0.47.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datax-enterprise-studio"
+version = "0.1.0"
+description = "DataX Enterprise Studio local control plane and worker"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "alembic==1.18.5",
+  "argon2-cffi==25.1.0",
+  "cryptography==49.0.0",
+  "dnspython==2.8.0",
+  "fastapi==0.141.1",
+  "psycopg[binary]==3.3.4",
+  "PyMySQL==1.2.0",
+  "PyJWT[crypto]==2.13.0",
+  "pydantic-settings==2.14.2",
+  "rfc8785==0.1.4",
+  "sqlalchemy==2.0.51",
+  "uvicorn[standard]==0.52.0",
+]
+
+[project.optional-dependencies]
+dev = [
+  "httpx==0.28.1",
+  "jsonschema==4.26.0",
+  "openapi-spec-validator==0.9.0",
+  "pytest==9.1.1",
+  "pytest-cov==7.1.0",
+  "pyyaml==6.0.3",
+  "ruff==0.16.0",
+]
+
+[project.scripts]
+datax-studio-bootstrap-admin = "datax_studio.auth.cli:main"
+datax-studio-recover-admin = "datax_studio.auth.recovery_cli:main"
+datax-studio-retention-maintenance = "datax_studio.maintenance.retention:main"
+datax-studio-system-backup = "datax_studio.system_backup:main"
+datax-studio-worker = "datax_studio.worker.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-q --strict-markers --disable-warnings"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["datax_studio"]
+
+[tool.coverage.run]
+branch = true
+source = ["datax_studio"]

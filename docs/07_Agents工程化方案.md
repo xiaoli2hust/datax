@@ -2,7 +2,7 @@
 
 > 文档状态：V2 设计基线
 >
-> 适用范围：AI 辅助能力，不属于 V1 交付范围
+> 适用范围：AI 辅助能力，不属于 V1 交付范围；必须继承 V1.2 Windows 本地工作站与安全一次性全量复制语义
 >
 > 核心约束：未配置或不可用 AI Provider 时，V1 全部手工功能仍须正常使用
 
@@ -16,7 +16,16 @@ Agents 用于辅助数据工程师理解元数据、生成任务草稿、分析�
 2. 任何 Agent 草稿必须经过确定性校验、权限检查和人工确认，才能导入平台的可编辑 `JobDraft`；之后仍须走 V1 的校验与发布流程才能生成不可变 `JobVersion`。
 3. 任务的实际运行仍由具备执行权限的用户在 V1 手工触发流程中完成。
 4. Agent 只能使用平台提供的白名单工具，不能生成或执行自由 SQL、`preSql`、`postSql`、Shell 命令、自定义插件、文件路径或任意 URL。
-5. Agent 不得突破 V1 能力边界。V2 初始阶段仅支持 MySQL 8 与 PostgreSQL 15 作为 Reader/Writer、完整表或选列直连映射、目标表预存在、insert-only、`channel` 范围 `1..16`、timeout 范围 `60..604800` 秒、确定性的脏数据条数/比例阈值。
+5. Agent 不得突破 V1 能力边界。V2 初始阶段仅支持 MySQL 8 与 PostgreSQL 15 作为
+   Reader/Writer、完整表或选列直连映射、源端静默/目标外部独占声明、目标表预存在且
+   可核验、`insert-only` 一次性复制、`channel` 范围 `1..16`、timeout 范围
+   `60..604800` 秒、固定 `dirty_data_limit=0/0`。草稿阶段不以目标当时为空作为通过
+   条件；空表只在每次运行前由 Worker 实测。Agent 不得把非空目标追加、重复运行或周期
+   运行描述为“同步”。
+6. 目标外部独占声明只能由 Operator/DBA 作出，固定 `statement_version='1.0'`、有限
+   `valid_until` 与 `ACTIVE/REVOKED/EXPIRED` 生命周期。Agent 不得替人确认、撤回或
+   伪造 `TARGET_EXCLUSIVITY_CONFIRMED/TARGET_EXCLUSIVITY_REVOKED` 审计，也不得把
+   “未收到破坏报告”解释为平台已证明期间没有任意瞬时、未报告或已回滚的外部 DML/DDL。
 
 V2 首批 Agent：
 
@@ -39,9 +48,25 @@ V2 首批 Agent：
 - **Deterministic gate**：模型输出不可信；JSON Schema、业务规则和权限策略由确定性代码校验。
 - **Untrusted context**：表名、字段名、注释、错误日志和用户输入均作为数据处理，不能当作指令。
 - **Evidence-first**：诊断和建议必须引用可追溯证据，并明确不确定性。
-- **Privacy by default**：默认不向 Provider 发送凭据、连接串、样例数据或完整原始日志。
+- **Privacy by default**：默认不向 Provider 发送凭据、连接串、样例数据或完整的脱敏后原序日志，只发送经策略限量的必要片段。
 - **Fail closed**：权限、审计、校验或 Provider 状态不明确时，不产生可采纳草稿，更不能执行。
 - **No hidden reasoning retention**：不记录模型隐藏推理过程；只保存必要的脱敏输入摘要、结构化输出和决策证据。
+
+### 2.1 Windows 本地工作站继承边界
+
+- Agent Orchestrator、Provider Adapter 和工具适配器只在固定摘要的 Linux 容器内运行；
+  `launcher.exe` 不执行模型生成内容、工具命令或 DataX，也不把 Windows 宿主当作 Agent
+  工具执行面。
+- V2 沿用 V1.2 的唯一入口 `http://127.0.0.1:17860`。仅 Web 容器映射该 IPv4
+  loopback；Agent/API/Worker/PostgreSQL 不映射宿主端口，不建立 LAN/WAN 入口。
+- Agent 工具不得访问 Docker Socket、Windows 命名管道、注册表、剪贴板、用户目录、
+  UNC/网络盘或任意宿主路径。确需新增宿主能力时，必须先更新威胁模型和 Accepted ADR。
+- Provider 凭据保存于平台受保护的 secret/Envelope 边界，不由 Setup 或 Launcher
+  采集、显示、导出或写入其诊断日志。AI 未配置或不可用时，Launcher 与全部 V1 手工流程
+  仍可正常启动。
+- Windows 睡眠/恢复、Docker Desktop/WSL2 停止或重启时，正在进行的 Agent Run
+  必须进入明确的不可用/待对账状态；恢复后先核对 run、tool-call 幂等身份和审计，再决定
+  失败关闭或显式恢复，禁止静默重放有副作用调用。
 
 ## 3. 总体架构
 
@@ -144,6 +169,8 @@ Provider 配置必须使用以下可见状态：
 - 默认禁止自动跨 Provider 降级；若管理员明确配置候选 Provider，降级也必须满足相同的数据区域、隐私和评测门槛，并在 UI 中明确显示。
 - 仅对无副作用的 Provider 请求重试；重试次数、退避、超时和 Token/费用上限必须配置化。
 - 模型或提示模板升级前必须执行完整回归评测，不得直接替换线上别名。
+- Provider 出口只由容器内白名单策略控制；不得借用 Windows 系统代理、用户浏览器会话、
+  Docker Desktop 管理接口或宿主凭据绕过数据区域和 egress 规则。
 
 ## 6. 工具统一契约
 
@@ -271,12 +298,13 @@ Provider 配置必须使用以下可见状态：
 ```json
 {
   "input": {
-    "name": "订单同步草稿",
+    "name": "订单一次性复制草稿",
     "description": "由 Agent 生成，等待人工确认",
     "job_spec": {
       "schema_version": "1.0",
       "source": {
         "datasource_id": "11111111-1111-4111-8111-111111111111",
+        "datasource_revision_id": "11111111-1111-4111-8111-111111111112",
         "plugin_name": "mysqlreader",
         "table": {
           "schema_name": "orders",
@@ -285,6 +313,7 @@ Provider 配置必须使用以下可见状态：
       },
       "target": {
         "datasource_id": "22222222-2222-4222-8222-222222222222",
+        "datasource_revision_id": "22222222-2222-4222-8222-222222222223",
         "plugin_name": "postgresqlwriter",
         "table": {
           "schema_name": "public",
@@ -302,12 +331,20 @@ Provider 配置必须使用以下可见状态：
           "target_ordinal": 1,
           "target_type": "bigint",
           "target_nullable": false,
+          "oracle_logical_type": "INTEGER",
           "compatibility": "EXACT"
         }
       ],
+      "source_consistency_mode": "OPERATOR_QUIESCED",
+      "target_precondition": "EMPTY_AND_VERIFIABLE",
+      "write_semantics": "INSERT_ONLY_ONCE",
+      "duplicate_policy": "REJECT_NONEMPTY_TARGET",
+      "partial_write_policy": "MANUAL_REMEDIATE",
       "write_policy": {
         "mode": "INSERT",
-        "target_table_must_exist": true
+        "target_table_must_exist": true,
+        "target_table_must_be_empty": true,
+        "platform_may_mutate_target_before_run": false
       },
       "execution_policy": {
         "channel": 1,
@@ -349,10 +386,13 @@ Provider 配置必须使用以下可见状态：
 - 自由 SQL、`where` 自由表达式、`preSql`、`postSql`。
 - 自定义插件或任意插件参数。
 - 不存在的目标表。
-- 源和目标为同一 datasource、同一 schema、同一 table。
+- 无法核验、存在会修改映射列的触发器，或不符合 V1 安全画像的目标表。草稿阶段不因
+  目标当时非空而拒绝；运行前空表门禁仍不可绕过。
+- 源和目标解析为同一 PhysicalEndpointIdentity 下的同一规范化表身份；不同
+  datasource/revision/hostname/IP 别名不能绕过 TargetNamespace 判断。
 - `channel` 小于 1 或大于 16。
 - timeout 小于 60 秒或大于 604800 秒。
-- 脏数据条数小于 0 或大于 1000000、比例小于 0 或大于 1，或使用模型无法解释的自定义规则。
+- 任意非零脏数据条数/比例，或使用模型无法解释的自定义规则。
 
 ### 6.6 `job.draft.validate`
 
@@ -373,7 +413,9 @@ Provider 配置必须使用以下可见状态：
 - JSON Schema 校验。
 - 项目和权限校验。
 - 数据源与表存在性校验。
+- 源/目标 DatasourceRevision、数据源用途和源到目标传输授权校验。
 - 字段存在性、顺序和类型兼容校验。
+- 一次性复制策略、目标表安全画像和目标空表运行前复检要求。
 - V1 能力边界策略校验。
 - 敏感配置与禁止字段扫描。
 
@@ -405,7 +447,7 @@ Provider 配置必须使用以下可见状态：
 }
 ```
 
-返回可包含状态、开始/结束时间、DataX 统计摘要和错误分类，不得包含完整命令行、临时 JSON 路径、凭据或未脱敏异常。
+返回可包含 `process_state`、`data_effect`、`verification_state`、开始/结束时间、独立核验摘要、DataX 统计摘要和错误分类，不得把退出码 0 单独描述为数据成功，也不得包含完整命令行、临时 JSON 路径、凭据或未脱敏异常。
 
 ### 6.9 `execution.logs.read`
 
@@ -422,7 +464,7 @@ Provider 配置必须使用以下可见状态：
 }
 ```
 
-日志服务必须先执行密钥、连接串、Token、邮箱、手机号等已配置规则的脱敏，再返回 Agent。单次和单个 Agent Run 的日志量必须设上限。
+日志服务必须先执行密钥、连接串、Token、邮箱、手机号等已配置规则的脱敏，再返回 Agent。单次和单个 Agent Run 的日志量必须设上限；发生截断时同时返回 `truncated`、`original_bytes`、`dropped_bytes` 和 `reason`，Agent 不得声称已分析完整日志。
 
 ### 6.10 明确禁止的工具
 
@@ -461,13 +503,18 @@ V2 首批版本不得向 Agent 注册以下工具：
 
 Agent 草稿采纳不由 Agent Tool 完成，而由正常平台 API 导入为 `JobDraft`，并满足：
 
-1. UI 展示源、目标、字段、写入方式、触发方式、校验结果和全部差异。
+1. UI 展示源、目标、固定 DatasourceRevision、字段、一次性写入方式、源静默要求、目标空表要求、触发方式、校验结果和全部差异。
 2. 操作者拥有目标项目的任务编辑权限。
 3. 操作者确认的对象绑定 `draft_id`、`draft_version`、`draft_hash`、项目和有效期。
 4. 草稿在确认后发生任何变化，原确认立即失效。
 5. 平台再次执行确定性校验，校验结果与确认对象一致后才导入或更新 `JobDraft`。
 6. Agent 不具备校验通过声明权或发布权；Developer/Admin 必须在 V1 页面完成校验并显式发布，发布产生不可变 `JobVersion`。
-7. 采纳 Agent 草稿不等于发布，发布也不等于运行；运行仍需 Admin 或 Operator 从 V1 页面手工触发。
+7. 采纳 Agent 草稿不等于发布，发布也不等于运行；运行仍需 Admin 或 Operator 从 V1 页面
+   手工触发并确认源端静默，Operator/DBA 还需提交 `statement_version='1.0'` 且带有限
+   `valid_until` 的目标外部独占声明；服务端必须复检目标为空、声明处于 `ACTIVE`、
+   传输授权有效，且同一 TargetNamespace 没有其他未释放的
+   `RESERVED/ACTIVE/RECOVERY_REQUIRED` 锁。获知目标窗口破坏后由 Operator/Admin 使用
+   正常执行接口撤回/报告并产生 `TARGET_EXCLUSIVITY_REVOKED` 审计，不由 Agent 代办。
 
 ## 8. 提示注入与输出安全
 
@@ -562,6 +609,8 @@ actor → agent_run → provider_call → tool_calls
 | 审计不可用 | Fail closed | 无审计运行 |
 | 上下文过长 | 分页、摘要并保留证据引用，或明确停止 | 静默截断后给出确定结论 |
 | 费用/Token 超限 | 停止并显示限额原因 | 自动切换到未经批准模型 |
+| Windows 睡眠或 Docker/WSL2 中断 | 标记运行不可用并停止接收新调用，恢复后先对账 | 把旧调用静默重放或显示成功 |
+| Launcher/容器边界检查失败 | 保留 V1 手工入口，禁用 Agent 并给出可操作错误 | 在 Windows 宿主执行工具或放宽端口/挂载 |
 
 ## 12. 评测与发布硬门槛
 
@@ -594,6 +643,9 @@ actor → agent_run → provider_call → tool_calls
 10. Provider 未配置、不可用和输出损坏用例进入明确手工降级路径的比例 100%。
 11. Agent Run、Provider、Tool、Validation、Draft 与确认审计关联完整率 100%。
 12. 所有 Provider/模型/提示模板变更均通过同一回归集，无未审批的线上漂移。
+13. Windows 宿主路径、Docker Socket、命名管道和非 loopback 端口访问成功次数为 0。
+14. 睡眠/恢复、Docker Desktop restart 和 `wsl --shutdown` 故障注入中，无工具重复副作用、
+    无审计断链，未完成调用均有明确最终状态。
 
 ### 12.3 证据
 
@@ -605,16 +657,23 @@ actor → agent_run → provider_call → tool_calls
 - 权限/项目隔离测试报告。
 - 提示注入和敏感数据泄漏测试报告。
 - Provider 故障注入和手工降级录像或自动化证据。
-- 至少一次完整的“用户意图 → Agent 草稿 → 确定性校验 → 差异预览 → 人工采纳为 JobDraft → V1 校验/发布 JobVersion → 用户手工运行”真实闭环，其中 Agent 不直接接触 DataX Worker。
+- 干净 Windows 11 x64 VM 上已签名 Setup/Launcher、固定镜像摘要、仅
+  `127.0.0.1:17860` 暴露，以及睡眠/Docker/WSL2 中断恢复的证据。macOS/Linux
+  测试、容器构建成功或安装包存在不能替代该 Windows 证据。
+- 至少一次完整的“用户意图 → Agent 草稿 → 确定性校验 → 差异预览 → 人工采纳为 JobDraft → V1 校验/发布 JobVersion → 用户确认源静默 → 服务端复检目标为空 → 手工运行 → 独立 oracle 核验”真实闭环，其中 Agent 不直接接触 DataX Worker。
 
 ## 13. V2 完成定义
 
 只有同时满足以下条件，Agent 能力才可称为工程化完成：
 
-- V1 在完全关闭 AI 时可独立安装、启动和完成真实 DataX 闭环。
+- V1 在完全关闭 AI 时可通过已签名 Setup/Launcher 在干净 Windows 11 x64 VM 独立安装、
+  启动，并完成真实 DataX 一次性复制、数据影响识别和独立核验闭环。
 - Provider Adapter、Tools、Policy Gate、Validator、Audit 均有版本化契约和自动化测试。
 - 所有角色、项目隔离、草稿采纳和人工运行路径均通过授权测试。
 - 隐私数据流、保留策略和管理员配置已实现并经过安全评审。
 - 第 12 节全部硬门槛通过。
-- UI 明确区分“AI 草稿”“JobDraft”“已发布 JobVersion”“执行实例”，无可能误导为已发布或已执行的状态文案。
+- UI 明确区分“AI 草稿”“JobDraft”“已发布 JobVersion”“执行进程状态”“数据影响”“核验结果”，无可能把已发布、进程退出或未核验结果误导为数据成功的文案。
 - README、配置说明、运行手册、降级手册和已知限制与实现一致。
+- V2 发布制品复用 V1.2 的 Windows 数据保留、卸载、签名、哈希、SBOM、固定镜像、
+  loopback-only 和恢复门禁；这些门禁未完成时只能报告 Agent 工程测试结果，不能称为
+  Windows 可交付版本。

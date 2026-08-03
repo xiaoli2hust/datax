@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+from pathlib import Path
+
+import yaml
+
+REPOSITORY_ROOT = Path(__file__).parents[2]
+
+
+def test_worker_secret_tmpfs_and_resource_limits_are_fixed() -> None:
+    compose = yaml.safe_load(
+        (REPOSITORY_ROOT / "deploy/windows/compose.yaml").read_text(encoding="utf-8")
+    )
+    worker = compose["services"]["worker"]
+
+    assert worker["environment"]["DES_SENSITIVE_RUNTIME_ROOT"] == "/tmp/datax-studio-sensitive"
+    assert worker["tmpfs"] == ["/tmp:rw,noexec,nosuid,size=256m"]
+    assert worker["mem_limit"] == "2g"
+    assert worker["cpus"] == 2.0
+    assert worker["pids_limit"] == 256
+    assert worker["ulimits"]["nofile"] == {"soft": 4096, "hard": 8192}
+
+
+def test_persistent_workspace_is_not_the_secret_runtime_root() -> None:
+    compose = yaml.safe_load(
+        (REPOSITORY_ROOT / "deploy/windows/compose.yaml").read_text(encoding="utf-8")
+    )
+    worker = compose["services"]["worker"]
+
+    assert "workspace-data:/var/lib/datax-studio/runs" in worker["volumes"]
+    assert all("/tmp" not in volume for volume in worker["volumes"])
+    assert worker["environment"]["DES_WORKSPACE_VOLUME_PATH"] == ("/var/lib/datax-studio/runs")
+
+
+def test_runtime_volume_names_have_launcher_controlled_generation_hooks() -> None:
+    compose = yaml.safe_load(
+        (REPOSITORY_ROOT / "deploy/windows/compose.yaml").read_text(encoding="utf-8")
+    )
+
+    assert compose["volumes"]["postgres-data"]["name"] == (
+        "${DES_POSTGRES_VOLUME_NAME:-des-postgres-data}"
+    )
+    assert compose["volumes"]["log-data"]["name"] == (
+        "${DES_LOG_VOLUME_NAME:-des-log-data}"
+    )
+    assert compose["volumes"]["workspace-data"]["name"] == (
+        "${DES_WORKSPACE_VOLUME_NAME:-des-workspace-data}"
+    )
+
+
+def test_database_owner_secret_is_not_mounted_into_runtime_services() -> None:
+    compose = yaml.safe_load(
+        (REPOSITORY_ROOT / "deploy/windows/compose.yaml").read_text(encoding="utf-8")
+    )
+    services = compose["services"]
+
+    assert services["migrate"]["environment"]["DES_DATABASE_USER"] == "datax_studio"
+    assert services["keyring-bootstrap"]["environment"]["DES_DATABASE_USER"] == "datax_api"
+    assert services["api"]["environment"]["DES_DATABASE_USER"] == "datax_api"
+    assert services["worker"]["environment"]["DES_DATABASE_USER"] == "datax_worker"
+    assert services["api"]["environment"]["DES_DATABASE_PASSWORD_FILE"] == (
+        "/run/secrets/database_password"
+    )
+    assert services["worker"]["environment"]["DES_DATABASE_PASSWORD_FILE"] == (
+        "/run/secrets/database_password"
+    )
+
+    def sources(service: str) -> set[str]:
+        result: set[str] = set()
+        for entry in services[service]["secrets"]:
+            result.add(entry if isinstance(entry, str) else entry["source"])
+        return result
+
+    assert "postgres_password" in sources("migrate")
+    assert "postgres_password" not in sources("api")
+    assert "postgres_password" not in sources("worker")
+    assert "postgres_password" not in sources("keyring-bootstrap")
+    assert "api_database_password" in sources("api")
+    assert "api_database_password" in sources("keyring-bootstrap")
+    assert "worker_database_password" in sources("worker")
+    assert "api_database_password" not in sources("worker")
+    assert "worker_database_password" not in sources("api")
+
+
+def test_keyring_bootstrap_has_only_the_first_launch_secret_and_resource_closure() -> None:
+    compose = yaml.safe_load(
+        (REPOSITORY_ROOT / "deploy/windows/compose.yaml").read_text(encoding="utf-8")
+    )
+    bootstrap = compose["services"]["keyring-bootstrap"]
+    sources = {
+        entry if isinstance(entry, str) else entry["source"]
+        for entry in bootstrap["secrets"]
+    }
+
+    assert bootstrap["command"] == [
+        "python",
+        "-m",
+        "datax_studio.credentials.bootstrap_cli",
+        "--json",
+    ]
+    assert bootstrap["restart"] == "no"
+    assert sources == {
+        "api_database_password",
+        "idempotency_hmac_key",
+        "credential_kek_v1",
+    }
+    assert "volumes" not in bootstrap
+    assert bootstrap["read_only"] is True
+    assert bootstrap["tmpfs"] == ["/tmp:rw,noexec,nosuid,size=8m"]
+    assert bootstrap["pids_limit"] == 64
+    assert bootstrap["cap_drop"] == ["ALL"]
+    assert bootstrap["security_opt"] == ["no-new-privileges:true"]
+    assert bootstrap["depends_on"] == {
+        "migrate": {"condition": "service_completed_successfully"},
+        "egress-guard": {"condition": "service_healthy"},
+    }
+    assert bootstrap["network_mode"] == "service:egress-guard"
+    assert "networks" not in bootstrap
+    services = compose["services"]
+    for service in ("api", "worker"):
+        assert services[service]["depends_on"]["keyring-bootstrap"] == {
+            "condition": "service_completed_successfully"
+        }
+
+
+def test_worker_has_the_complete_minimum_secret_closure() -> None:
+    compose = yaml.safe_load(
+        (REPOSITORY_ROOT / "deploy/windows/compose.yaml").read_text(encoding="utf-8")
+    )
+    worker_sources = {
+        entry if isinstance(entry, str) else entry["source"]
+        for entry in compose["services"]["worker"]["secrets"]
+    }
+
+    # Worker bootstrap constructs ControlService and CredentialService before
+    # it can reconcile or claim work. Keep the exact set explicit so a future
+    # Compose edit cannot silently reintroduce a crash loop or overmount API
+    # authentication keys.
+    assert worker_sources == {
+        "worker_database_password",
+        "idempotency_hmac_key",
+        "credential_kek_v1",
+        "egress_lease_creation_capability",
+    }

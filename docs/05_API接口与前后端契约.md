@@ -1,24 +1,48 @@
 # DataX Enterprise Studio API 接口与前后端契约
 
-> 文档状态：V1 实施基线
+> 文档状态：V1.2 Windows 本地工作站工程候选；Discovery Gate 未取证，试点/发布 `BLOCKED`
 >
 > API 版本：`v1`
 >
 > 规范文件：[`contracts/openapi.yaml`](./contracts/openapi.yaml)
 > JobSpec：[`contracts/job-spec.v1.schema.json`](./contracts/job-spec.v1.schema.json)
+> 独立核验：[`contracts/verification-oracle.v1.schema.json`](./contracts/verification-oracle.v1.schema.json)
+> 验收清单：[`contracts/acceptance-manifest.v1.schema.json`](./contracts/acceptance-manifest.v1.schema.json)
+
+> 当前实现边界：数据源、任务、执行/日志/恢复 HTTP 路由及前端正式 API 适配已有工程
+> 候选代码；这只说明契约消费者/生产者存在，不表示真实数据库、固定 DataX、浏览器或
+> Windows E3/E4 已验收。系统 DATA/SECRETS 导出由 Launcher/helper 承担，不进入业务
+> OpenAPI；双包认证 journal 与全新空 staging 已达到 E1，但真实 `pg_restore`、证据
+> 重算、卷/secret 原子提交、完整恢复和覆盖升级仍失败关闭。
 
 ## 1. 契约优先级
 
-`contracts/openapi.yaml` 和三个 JSON Schema 是机器可校验的权威格式。本文解释交互语义、权限、错误和前端处理方式；若示例与机器契约冲突，先修复两者再编码，不能静默选择其中一个。
+机器契约负责字段、类型、枚举和约束形状；PRD 负责产品结果与范围，ADR 负责不可变架构决策，本文负责 HTTP 交互语义。任何来源发生冲突都必须阻断实现并在同一变更中修复，不能让格式契约覆盖产品结果，也不能让自然语言绕过机器约束。
 
-V1 API 只提供离线批同步的人工操作，不暴露调度、DAG、告警、AI、插件安装、任意 SQL、Transformer 或原始 DataX JSON 执行接口。
+V1 API 只提供安全的一次性离线全量复制：操作员确认源端静默，Operator/DBA 提交有版本、
+有限有效期的目标外部独占声明；API 创建 `QUEUED` 时原子预留同目标锁，Worker 领取后
+实测目标表为空，DataX 只执行一次 insert-only 写入，随后由独立 oracle 核验。目标声明
+是带报告义务的人工前提，不是平台技术锁或外部写入未发生的技术证明；平台无法检测全部
+未报告或已经回滚的外部 DML/DDL。`TargetCopyLock` 只串行平台内工作。API 不暴露调度、
+DAG、告警、AI、插件安装、任意 SQL、Transformer、自动清理或原始 DataX JSON 执行接口。
+
+V1 是 Windows 11 x64 本地工作站产品。业务 API 只通过 Compose `web` 反向代理暴露在
+`http://127.0.0.1:17860/api/v1`；`api`、`worker`、`postgres` 不映射任何 Windows
+宿主端口。`Setup.exe`/`launcher.exe` 的安装、前置检查、Compose 生命周期、备份和诊断
+不是业务 HTTP API，不能借本规范新增远程管理入口。全新空库的首次 Admin 由 launcher
+GUI 经固定容器 `bootstrap-admin` helper 创建，临时密码只走子进程标准输入；不通过
+浏览器/API，也不进入参数、环境、日志或持久配置。若所有组织级 Admin 均因登录失败被
+锁定，只允许本机操作者通过容器内 `datax-studio-recover-admin` CLI 恢复一名已锁定
+Admin；新临时密码同样只走标准输入。只要仍有一名有效 Admin，该 CLI 必须拒绝执行；
+它不提供 HTTP 路由，也不能恢复已停用用户。
 
 ## 2. 通用约定
 
 | 主题 | 约定 |
 |---|---|
-| Base URL | `/api/v1` |
-| 协议 | 生产 HTTPS；本地可由同源 reverse proxy 提供 HTTP |
+| Base URL | `http://127.0.0.1:17860/api/v1`；前端代码使用同源相对路径 `/api/v1` |
+| 传输边界 | 仅 Windows 本机 loopback HTTP；不得绑定 `0.0.0.0`、`::`、LAN IP 或对外反向代理 |
+| Host / Origin | Host 只允许 `127.0.0.1:17860`；有 Origin 的请求必须精确同源；默认不启用 CORS |
 | 内容类型 | `application/json; charset=utf-8` |
 | ID | UUID v4 字符串 |
 | 时间 | UTC RFC 3339，例如 `2026-07-30T02:30:00Z` |
@@ -33,6 +57,12 @@ V1 API 只提供离线批同步的人工操作，不暴露调度、DAG、告警�
 
 前端不得依赖错误 message 做分支，必须使用稳定 `code`。不得解析 cursor、ETag、JWT 或服务端生成的日志 storage key 来推导业务状态。
 
+`web` 是唯一有宿主端口的 Compose 服务，映射必须精确为
+`127.0.0.1:17860:<container-port>`。`api` 只信任来自固定 `web` 服务身份的代理流量，
+并拒绝客户端伪造的 `Forwarded`、`X-Forwarded-*`；`web` 必须覆盖而不是追加这些头。
+直接访问容器 IP、Docker Desktop 转发的随机端口或 Windows LAN 地址均不属于支持契约。
+数据库 JDBC TLS、服务器证书验证和网络出口策略不因浏览器使用 loopback HTTP 而放宽。
+
 ## 3. 认证与会话
 
 ### 3.1 Access token
@@ -41,11 +71,16 @@ V1 API 只提供离线批同步的人工操作，不暴露调度、DAG、告警�
 - 前端只保存在内存，不写 localStorage、sessionStorage、IndexedDB 或 URL。
 - JWT 至少包含 `sub`、`org_id`、`session_id`、`iat`、`exp`、`jti`。
 - 项目角色每次在服务端查询或从可立即失效的授权缓存读取，不能只信任长期 token 中的角色。
+- 登录和 `/auth/me` 返回 `must_change_password`；该值为 true 时，除 refresh、logout、
+  me、change-password 外的业务接口统一返回 `403 PASSWORD_CHANGE_REQUIRED`。
 
 ### 3.2 Refresh token
 
 - 登录成功后由 `Set-Cookie` 写入 `des_refresh`。
-- Cookie 必须为 `HttpOnly; Secure; SameSite=Lax; Path=/api/v1/auth`。
+- V1 固定 loopback HTTP，因此 Cookie 必须为
+  `HttpOnly; SameSite=Strict; Path=/api/v1/auth`，且不得设置 `Domain`。HTTP 交付不能
+  虚假声明浏览器会执行 `Secure`；后续若改为受信 loopback HTTPS，必须增加 `Secure`
+  且继续只绑定 loopback。
 - `POST /auth/refresh` 旋转 refresh token；旧 token 重放会撤销整个 token family。
 - 前端收到 `401 AUTH_TOKEN_EXPIRED` 时最多自动 refresh 一次，再重放原 GET 或本身安全幂等的请求。
 - 非幂等写请求只有在携带原 `Idempotency-Key` 时才可自动重放。
@@ -70,12 +105,76 @@ Content-Type: application/json
   "user": {
     "id": "8a70a0eb-0f0d-4a26-a3e3-1b84ebbd92c4",
     "email": "operator@example.com",
-    "display_name": "值班工程师"
+    "display_name": "值班工程师",
+    "must_change_password": false
   }
 }
 ```
 
-密码只允许出现在 TLS 请求体的瞬时内存中，不得进入日志、Trace、错误或审计。
+密码只允许出现在本机 loopback 请求体和服务端瞬时内存中，不得进入日志、Trace、错误或
+审计。loopback 不是加密通道，V1 的安全边界是假定 Windows 登录会话与本机进程可信；
+同机恶意进程仍是明确剩余风险，不能把 `127.0.0.1` 描述成 TLS。
+
+### 3.4 登录入口准入
+
+在路由、依赖、懒加载的 `AuthService`、数据库会话、组织锁、Argon2id 和 `AuditEvent`
+之前，`POST /auth/login` 必须先通过单一 API 进程内的全局、账号无关准入。V1 固定一个
+API 容器和一个 Uvicorn 进程；默认控制为 burst `5`、每分钟 `5` 个令牌和一个非阻塞验证
+并发槽。它不以邮箱、密码、IP、User-Agent 或浏览器身份分桶，也不保存这些值。Host/Origin
+先被拒绝的请求不消耗该配额。
+
+未获准的请求固定返回 `429 AUTH_LOGIN_ADMISSION_LIMITED`、`Retry-After: 60`、
+`application/problem+json`、`X-Request-Id` 与 `Cache-Control: no-store`。这是尚未进入
+认证决策的入站拒绝，而不是 `AUTH_INVALID_CREDENTIALS`：不得创建 session、验密码、修改
+失败计数或锁定状态、写 `AuditEvent`、设置 Cookie 或 `WWW-Authenticate`。`retryable=true`
+只表示用户可在等待后重新输入密码并手动提交；前端不得自动重放登录或保留密码。获准后实际
+执行的登录成功/失败仍按既有会话与审计规则处理。
+
+该进程内控制仅适用于 V1 的单 API 部署，不能用 Uvicorn workers、Compose scale、额外 API
+容器或旁路入口扩大部署；多进程/HA 需要新的 Accepted ADR、共享准入与重放租约设计。
+
+### 3.5 数据源外部操作的 A/B/C 与准入
+
+五个直接的已认证 Credential Service 入口属于同一数据源外部操作面：创建数据源、带探针的
+数据源更新、连接测试、Schema/表列读取，以及任务草稿校验中的两端 Schema 采集。创建传输策略
+及会重算 source/target/requested_scope 的传输策略 PATCH 会委托两端 Schema 探测，因此也必须遵循
+[ADR-0014](./adr/0014-数据源外部操作短事务与准入边界.md) 的 A/B/C 契约：
+
+- **A**：在短产品数据库事务中重新授权并冻结非秘密、安全相关快照；不得 DNS、解密、连接或读取外部数据库。
+- **B**：已有凭据先在新的极短事务内做严格 current-credential barrier（锁定、复制、提交），随后
+  在无产品数据库锁的条件下执行 DNS/egress、解密和 connector；创建使用冻结的候选请求凭据。每次
+  操作受总 deadline 约束；需要两端 Schema 的任务校验和传输策略 scope probe 必须共享同一 deadline。
+- **C**：在新的短事务中重新授权并逐项复核快照。Organization 和调用者 User 的状态/row version、
+  当前 `AuthSession`、项目/Job 状态或 row version、数据源/修订、EndpointPolicy、secret/envelope、
+  UsageGrant、cursor scope、
+  TargetNamespace、Job 草稿、TransferPolicy 或运行时证明漂移时，必须拒绝旧结果。任务校验
+  只能在该 C 事务已复核后原子写入当前 `SyncJob.validation_report/status`、connection evidence
+  和审计；它不会创建或修改 `JobVersion`。
+
+创建在 completed-idempotency replay 读取后、候选外部工作前取得本 API 进程内 permit；已有
+datasource 的 test、metadata、带 probe 的 PATCH、任务校验和传输策略 scope probe 先完成只读 A 身份/授权验证、释放锁，
+再取得全局、organization 与真实 datasource 在途 permit。纯描述性或 DISABLED-only PATCH 不取
+permit，未知/无权 datasource UUID 也不能进入保留桶；同 organization/datasource 最多一个外部操作，
+任务校验和传输策略 scope probe 必须按稳定顺序原子取得 source 与 target 两个 datasource permit。未获 permit 固定返回
+`429 DATASOURCE_OPERATION_ADMISSION_LIMITED`，带固定 `Retry-After: 60`、`X-Request-Id` 与
+`Cache-Control: no-store`，且不得执行 resolver/connector/解密、写审计或幂等状态；已完成创建
+幂等 replay 是无外部 I/O 的只读返回，可以绕过 admission。
+
+B 阶段结束后的任一安全绑定漂移固定返回 `409 DATASOURCE_OPERATION_STALE`，
+`retryable=true`，并带 `X-Request-Id` 与 `Cache-Control: no-store`；不得返回旧 Schema、
+写旧 connection evidence、覆盖 `last_test_*` 或接受陈旧 validation material。两个响应的
+`retryable` 都只允许用户等待或刷新相关事实后**从原始操作显式手动重试**；前端和 API client
+不得自动重放。总 deadline 到期且 C 复核仍有效时固定返回
+`503 DATASOURCE_OPERATION_DEADLINE_EXCEEDED`（`retryable=true`、`X-Request-Id`、
+`Cache-Control: no-store`），不返回或持久化 B 阶段旧结果。全部 egress attestation 错误保留稳定
+平台 code 并返回 503；仅明确的 guard/lease 可用性错误可人工重试，且在预算已耗尽时 deadline
+结果优先。Windows 发布配置把总 deadline 固定为 30 秒；Settings 仅允许 5–120 秒的受限值。
+这是外部操作返回后的结果规则，不是同步 PostgreSQL 网络黑洞下可验证的 30 秒强制返回承诺；该
+transport 缺口仍是 `ASR-013` 发布阻塞。
+
+五个直接入口及传输策略双端 scope probe 的候选源码、OpenAPI 和 E1 回归现已覆盖上述路径；隔离
+PostgreSQL 已有受控阻塞 probe + `FOR UPDATE NOWAIT` 的单个 E2 不持锁场景，但完整的取消/撤回/
+revoke/更新并发矩阵和真 MySQL/PostgreSQL E3 仍未取证，`ASR-013` 保持 `IN_PROGRESS`，不能把本节当作漏洞关闭声明。
 
 ## 4. RBAC
 
@@ -86,16 +185,19 @@ Content-Type: application/json
 | 创建、停用、解锁和重置用户密码 | ✓ |  |  |  |
 | 创建/归档项目、管理成员 | ✓ |  |  |  |
 | 查看项目和脱敏数据源 | ✓ | ✓ | ✓ | ✓ |
-| 创建/更新/测试数据源、轮换密码 | ✓ | ✓ |  |  |
+| 管理 EndpointPolicy、创建/更新/测试/启停数据源、轮换密码 | ✓ |  |  |  |
+| 授予 `SOURCE_USE / TARGET_USE` | ✓ |  |  |  |
+| 申请/审批/撤销 TransferPolicy | ✓ |  |  |  |
+| 使用已授权数据源创建任务 | ✓ | ✓ |  |  |
 | 创建/修改任务草稿 | ✓ | ✓ |  |  |
 | 校验、预览、发布 JobVersion | ✓ | ✓ |  |  |
 | 查看任务和历史版本 | ✓ | ✓ | ✓ | ✓ |
-| 创建 Execution / 人工重跑 | ✓ |  | ✓ |  |
+| 创建 Execution / 提交恢复 / 恢复后再次执行 | ✓ |  | ✓ |  |
 | 取消 Execution | ✓ |  | ✓ |  |
 | 查看 Execution 与日志 | ✓ | ✓ | ✓ | ✓ |
 | 查看项目审计 | ✓ | ✓ | ✓ | ✓ |
 
-隐藏按钮不是权限控制。API 对资源存在性和权限同时校验；对无权访问的跨项目 UUID 返回 `404 NOT_FOUND`，避免泄露资源存在。
+隐藏按钮不是权限控制。Developer 即使能编辑任务，也不能创建外部端点或自行授予数据源使用权；发布和执行前均须重新校验当前成员的 SOURCE/TARGET 使用授权与 ACTIVE TransferPolicy。`SENSITIVE` 传输需要两名不同 Admin 批准，申请人不能自批。API 对资源存在性和权限同时校验；对无权访问的跨项目 UUID 返回 `404 NOT_FOUND`，避免泄露资源存在。
 
 ## 5. 分页与过滤
 
@@ -129,17 +231,28 @@ GET /api/v1/projects/{project_id}/executions?state=FAILED&limit=50&cursor=<opaqu
 
 以下操作强制携带 8..128 字符的 `Idempotency-Key`：
 
-- 创建 Project、Datasource、SyncJob；
-- 创建 User、解锁用户、重置用户密码；
-- 发布 JobVersion；
-- 创建 Execution 或人工重跑；
-- 请求取消 Execution。
+- 创建 User、Project、EndpointPolicy、Datasource、TransferPolicy、SyncJob；
+- 解锁用户、重置用户密码；
+- 变更 CredentialSecret 状态、提交或审批 TransferPolicy、发布 JobVersion；
+- 创建 Execution、请求取消或撤回目标独占声明、提交 recovery/remediation、恢复后再次执行（机器路径保留 `rerun`）。
 
 同一用户、路由作用域和 key 在 24 小时内：
 
 - 请求体哈希相同：返回首次状态码和响应，带 `Idempotency-Replayed: true`。
 - 请求体哈希不同：返回 `409 IDEMPOTENCY_CONFLICT`。
 - 请求仍处理中：返回 `409 IDEMPOTENCY_IN_PROGRESS`，可按 `Retry-After` 重试。
+
+若模板化路由的 scope 未包含所有路径资源，服务端还必须从持久化资源和已保存响应中复核本次
+请求的具体目标：User 解锁/重置密码必须仍属于请求 User；CredentialSecret 状态变更必须仍属于
+请求 datasource 与 secret version；创建 Job/Datasource 必须仍属于请求 Project，发布必须仍属于请求
+Job，取消、目标独占撤回和 recovery/remediation 必须精确属于请求 Execution，rerun 必须精确指向
+请求的原 Execution。任一 resource/response 不一致都返回 `409 IDEMPOTENCY_CONFLICT`；不得把另一
+资源的历史 2xx 响应当作合法 replay。
+
+PostgreSQL 在读取或创建幂等记录前，必须对 `actor_id + scope + key` 的域分离摘要取得
+事务级 advisory try-lock；未取得时立即返回稳定的 `IDEMPOTENCY_IN_PROGRESS`，不得等待
+唯一键竞态或把任意 `IntegrityError` 误报成业务冲突。过期记录只能在该锁内删除并重建。
+SQLite 仅用于单元测试，以同键进程内 try-lock 模拟相同的非阻塞语义。
 
 连接测试、校验和预览不创建持久业务版本，不强制 Idempotency-Key，但每次仍产生审计。
 
@@ -176,6 +289,7 @@ GET 单个 Project、Datasource、SyncJob 时返回 `ETag: W/"<row_version>"`。
 | `request_id` | UUID | 关联日志 |
 | `retryable` | boolean | 是否可在保持幂等语义下重试 |
 | `field_errors` | array | 字段级错误，默认空数组 |
+| `details` | object/null | 仅稳定、脱敏的结构化细节；容量拒绝只允许公开 `reason` 枚举 |
 
 常用错误码：
 
@@ -184,21 +298,37 @@ GET 单个 Project、Datasource、SyncJob 时返回 `ETag: W/"<row_version>"`。
 | 400 | `CURSOR_INVALID` | cursor 无效或条件不一致 |
 | 400 | `IDEMPOTENCY_KEY_INVALID` | key 格式错误 |
 | 401 | `AUTH_INVALID_CREDENTIALS` | 登录失败，不区分账号是否存在 |
+| 429 | `AUTH_LOGIN_ADMISSION_LIMITED` | 尚未进入认证决策的全局登录入口准入拒绝；固定 `Retry-After: 60`，不创建 session、不验密码、不改失败计数、不写审计，且不设置 Cookie 或 `WWW-Authenticate`；只允许人工等待后重新输入密码提交，不能自动重放 |
+| 429 | `DATASOURCE_OPERATION_ADMISSION_LIMITED` | 已认证的数据源外部操作未获得进程内 global/organization/datasource permit；固定 `Retry-After: 60`、`X-Request-Id` 和 `Cache-Control: no-store`，不发起外部 I/O、不解密、不写审计或幂等状态；等待后只能从原按钮手动重试 |
 | 401 | `AUTH_TOKEN_EXPIRED` | access token 到期 |
+| 403 | `PASSWORD_CHANGE_REQUIRED` | 当前账号必须先修改临时密码 |
 | 403 | `FORBIDDEN` | 已认证但无操作权限 |
 | 404 | `NOT_FOUND` | 资源不存在或不可见 |
 | 409 | `VERSION_CONFLICT` | ETag/row_version 冲突 |
 | 409 | `IDEMPOTENCY_CONFLICT` | 同 key 不同请求 |
+| 409 | `IDEMPOTENCY_IN_PROGRESS` | 同一 actor/scope/key 正在事务内处理；保留 key 并按 `Retry-After` 重试 |
+| 409 | `DATASOURCE_OPERATION_STALE` | 数据源外部 I/O 返回后，AuthSession、项目/Job 状态、datasource/revision/policy/secret/envelope/grant/cursor、TargetNamespace 或 Job/TransferPolicy/runtime 快照已漂移；不返回或持久化旧结果，刷新相关事实后只能手动重新发起原操作 |
+| 409 | `JOB_ARCHIVED` / `JOB_PUBLISHED` | 已归档或已发布 Job 不能启动或接受草稿校验；服务端在任何外部 I/O 前拒绝，用户必须先按 Job 编辑语义生成可校验的新 DRAFT |
 | 409 | `JOB_NOT_PUBLISHED` | 无可执行版本 |
 | 409 | `EXECUTION_NOT_CANCELABLE` | 当前状态不能取消 |
+| 409 | `TARGET_ACTIVE_EXECUTION` | 同一 TargetNamespace 已有 `RESERVED/ACTIVE/RECOVERY_REQUIRED` 锁；不同幂等键请求在 API 事务内拒绝，不创建第二个 QUEUED |
+| 409 | `TARGET_NOT_EMPTY` | Worker 实测目标表非空，拒绝启动 |
+| 409 | `RECOVERY_NOT_VERIFIED` | 失败执行尚未提交如实处置确认或尚未通过平台空表复检 |
+| 409 | `RECOVERY_GATE_NOT_APPLICABLE` | Execution 未被 Worker 领取即取消；不创建 Attempt/fence/gate，创建时已有的 `RESERVED` 锁已转为 `RELEASED`，不适用恢复路径 |
+| 409 | `TRANSFER_POLICY_NOT_ACTIVE` | 源修订到目标修订的传输策略未激活或已撤销 |
 | 410 | `LOG_EXPIRED` | 日志正文已按策略删除 |
 | 422 | `VALIDATION_ERROR` | 通用请求校验失败 |
 | 422 | `JOB_SPEC_INVALID` | JobSpec 结构或语义错误 |
+| 503 | `DATASOURCE_OPERATION_DEADLINE_EXCEEDED` | 外部数据源操作耗尽总 deadline，且 C 复核仍证明原快照有效；不得返回或写入 B 阶段旧 metadata/evidence/测试或校验结果，只能人工从原操作重试 |
+| 503 | `EGRESS_*` | egress guard/lease/attestation 平台失败保留稳定 code；只有明确可用性子集 `retryable=true`，策略、命名空间或证明不一致仍失败关闭且不可自动重放 |
+| 422 | `SOURCE_QUIESCENCE_CONFIRMATION_REQUIRED` | 未确认源端将从运行前检查开始到独立 oracle 完成始终静默 |
+| 422 | `TARGET_EXCLUSIVITY_CONFIRMATION_REQUIRED` | 未由 Operator/DBA 确认从 Worker 最后空表观察到 oracle 目标一致性读事务完成期间无平台外 DML/DDL |
 | 422 | `TYPE_MAPPING_UNSUPPORTED` | 字段类型不兼容 |
 | 422 | `SOURCE_TARGET_SAME_TABLE` | insert-only 源目标指向同一物理表 |
 | 422 | `SCHEMA_DRIFT_DETECTED` | 运行前 Schema 与版本快照不同 |
-| 502 | `DATASOURCE_CONNECTION_FAILED` | 数据库连接/认证失败 |
+| 503 | `DATASOURCE_METADATA_UNAVAILABLE` | Schema/传输策略范围所需的真实数据库元数据当前不可用；不返回替代 metadata，也不创建或修改策略 |
 | 503 | `RUNTIME_UNAVAILABLE` | Worker/Runtime 未就绪 |
+| 503 | `CAPACITY_ADMISSION_BLOCKED` | 普通新 Execution 未通过容量准入；`details.reason` 仅为 `QUEUE_LIMIT/BACKLOG_LIMIT/DISK_YELLOW/DISK_RED/LOG_BUDGET` |
 | 503 | `SERVICE_UNAVAILABLE` | 关键依赖不可用 |
 
 错误中不得回显密码、token、完整 JDBC URL、完整 DataX JSON、SQL、堆栈或本机路径。
@@ -211,9 +341,9 @@ GET 单个 Project、Datasource、SyncJob 时返回 `ETag: W/"<row_version>"`。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| POST | `/auth/login` | 登录并创建 refresh session |
+| POST | `/auth/login` | 先经账号无关入口准入；获准后登录并创建 refresh session |
 | POST | `/auth/refresh` | 旋转 refresh token |
-| POST | `/auth/logout` | 撤销当前 session |
+| POST | `/auth/logout` | 幂等撤销 bearer/refresh 能精确证明的 session；凭证缺失、无效、过期或已撤销仍返回 204 并清 Cookie |
 | GET | `/auth/me` | 当前用户、可见项目与角色 |
 | POST | `/auth/change-password` | 校验旧密码并修改本人密码；撤销其他 session |
 
@@ -229,7 +359,11 @@ GET 单个 Project、Datasource、SyncJob 时返回 `ETag: W/"<row_version>"`。
 | POST | `/users/{user_id}/unlock` | Admin | 清零登录失败计数并解除锁定 |
 | POST | `/users/{user_id}/reset-password` | Admin | 设置 write-only 临时密码、要求下次改密并撤销全部 session |
 
-Admin 创建或重置密码时，临时密码只在 TLS 请求体中出现，响应不生成或回显密码。本人改密成功后保留当前 session、撤销其他 session；Admin 重置或停用用户时撤销全部 session。所有成功、失败和拒绝结果均写审计。
+Admin 创建或重置密码时，临时密码只在本机同源 loopback HTTP 请求体中出现，响应不生成
+或回显密码。V1 不宣称远程 TLS 服务；若未来开放远程入口，必须先以 ADR 和威胁模型引入
+HTTPS。本人改密成功后保留当前 session、撤销其他 session；Admin 重置或停用用户时撤销
+全部 session。除尚未进入认证决策的 `AUTH_LOGIN_ADMISSION_LIMITED` 外，成功、失败和
+已进入业务/权限判断的拒绝结果均写审计。
 
 ### 8.3 Project
 
@@ -242,6 +376,10 @@ Admin 创建或重置密码时，临时密码只在 TLS 请求体中出现，响
 | GET | `/projects/{project_id}/members` | Admin | 成员和角色 |
 | PUT | `/projects/{project_id}/members/{user_id}/roles` | Admin | 原子替换项目角色集合；空数组移除项目访问 |
 
+成员响应必须同时返回稳定的 `organization_member_id` 和 `user.id`：角色替换路径使用
+`user.id`，数据源用途授权路径使用 `organization_member_id`。前端不得猜测两者相同，
+也不得从审计事件或其他项目枚举成员内部 ID。
+
 ### 8.4 Dashboard
 
 `GET /projects/{project_id}/dashboard?from=<RFC3339>&to=<RFC3339>` 对所有项目成员开放。`from`、`to` 必填，按 Execution 的 `queued_at` 使用半开区间 `[from, to)`；`from < to` 且窗口最长 31 天。UI 默认传最近 24 小时，服务端不隐式替换时间范围。
@@ -249,29 +387,59 @@ Admin 创建或重置密码时，临时密码只在 TLS 请求体中出现，响
 固定口径：
 
 - 任务计数以请求时点当前项目的 SyncJob 状态统计；`executable` 表示未归档且至少存在一个 JobVersion。
-- Execution 状态计数只包含 `queued_at` 位于窗口内的执行，并返回全部九个状态，缺失状态为 0。
-- 成功率分子为 `SUCCEEDED`；分母为 `SUCCEEDED + FAILED + TIMED_OUT + LOST`。分母为 0 时 `ratio=null`。
+- Execution 状态计数只包含 `queued_at` 位于窗口内的执行，并返回 `process_state` 全部十个状态（含 `VERIFYING`），缺失状态为 0；同时展示 `data_effect` 与 `verification_state`，不得从进程状态猜测数据结果。
+- “已核验复制成功率”固定为
+  `count(process_state=SUCCEEDED AND verification_state=PASSED) /
+  count(process_state IN [SUCCEEDED, FAILED, TIMED_OUT, LOST])`；取消不计，分母为 0 时
+  `ratio=null`。因此 DataX 进程失败即使未进入核验也进入分母。
 - 最近失败只取窗口内当前状态为 `FAILED/TIMED_OUT/LOST` 的最近 10 条。
-- `unresolved_failure_count` 统计尚无成功人工重跑的失败、超时或丢失执行。
-- 响应 `drilldowns` 返回结构化列表筛选；前端必须原样应用相同 project、from、to、states，不能自行改变口径。
+- `unresolved_failure_count` 统计恢复门禁尚未 `VERIFIED` 的 `FAILED/TIMED_OUT/LOST`；恢复后再次执行成功不能反向抹去原执行的数据影响事实。
+- `verified_records` 只累计 `process_state=SUCCEEDED` 且 `verification_state=PASSED` 的 oracle `target_row_count`，不累计 DataX 自报的未核验写入数。
+- 响应同时返回 process、data effect、verification 三组计数；`drilldowns` 必须原样应用相同 project、from、to、process_states、data_effects、verification_states，不能自行改变口径。
 
 所有卡片均可下钻到 `/projects/{project_id}/jobs` 或 `/projects/{project_id}/executions`。执行列表相应支持 `from`、`to`、重复 `state` 和 `unresolved_failure` 查询参数。
 
 ### 8.5 Plugin
 
-`GET /plugins` 返回四个只读认证 manifest：MySQL Reader/Writer、PostgreSQL Reader/Writer。没有 POST、上传、启用第三方插件或安装接口。
+`GET /plugins` 的 operationId 为 `listPluginCapabilities`，返回四个只读
+`plugin-manifest.v2`。响应分开 `certification_state`、
+`ordinary_user_executable`、`evidence` 和 `block_reasons`，并包含上游模块/哈希、
+依赖许可状态、网络/文件范围和 oracle 契约。当前生产默认无受信
+Windows E4 证据源，因此 Runtime 健康的四插件最多为 `PACKAGED`、
+`ordinary_user_executable=false`。公开 Schema 不接受或返回测试注入证据。
+没有 POST、上传、启用第三方插件或安装接口。
+
+`POST /jobs/{job_id}/executions` 在创建 `QUEUED+RESERVED` 之前校验发布版本
+绑定的 Reader/Writer Phase-B `WINDOWS_E4_CERTIFIED` 资格，以及两端一致的
+`evidence.release_promotion_ref`；`POST /executions/{execution_id}/rerun` 在创建
+新的恢复执行前做同一校验。Worker 在领取事务和建立工作区/解密凭据前各复检一次。
+E4 已具备但缺少该引用时，能力目录必须保持
+`ordinary_user_executable=false` 并给出 `RELEASE_PROMOTION_REQUIRED`。这四个检查点
+遇到降级、哈希/候选不匹配、证据过期、依赖未盘点、许可未审查、发布晋级引用缺失/格式
+无效或 Reader/Writer 引用不一致时，统一失败关闭为
+`PLUGIN_WINDOWS_E4_CERTIFICATION_REQUIRED`。
+
+当前候选中的 `release_promotion_ref` 仍是**不透明引用**：实现只校验其存在性、格式和
+Reader/Writer 配对一致性，尚没有受信 reader，也没有带签名、可独立校验的候选根/最终
+`F` 绑定。因此该字段存在本身不能证明“同一最终 `F` 的有效公开发布晋级（PR）”。生产
+证据源仍默认 deny-all，未由此放开任何普通用户能力；后续受信发布纵向切片必须原子引入
+结构化、签名的发布晋级契约及其 reader，并同步加强四个检查点和负向验收。
 
 ### 8.6 Datasource
 
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
 | GET | `/projects/{project_id}/datasources` | 项目可读 | 分页列表，永不返回密码 |
-| POST | `/projects/{project_id}/datasources` | Admin/Developer | 创建并加密密码 |
-| GET | `/datasources/{datasource_id}` | 项目可读 | 脱敏详情 |
-| PATCH | `/datasources/{datasource_id}` | Admin/Developer | 更新/轮换密码，需 If-Match |
-| DELETE | `/datasources/{datasource_id}` | Admin/Developer | 软删除；有活动引用时 409 |
-| POST | `/datasources/{datasource_id}/test` | Admin/Developer | 受限连接测试 |
-| GET | `/datasources/{datasource_id}/schema/tables` | Admin/Developer | 游标读取表和列元数据 |
+| POST | `/projects/{project_id}/datasources` | Admin | 命中 ACTIVE EndpointPolicy 后，以 A/B/C 探针复核成功才创建首个不可变修订并加密密码；准入/陈旧响应不写对象或幂等保留 |
+| GET | `/datasources/{datasource_id}` | 项目可读 | `DatasourceRedactedSummary`；不返回真实 host/port/database/schema/username |
+| GET | `/datasources/{datasource_id}/admin-detail` | Admin | `DatasourceAdminDetail`；可读非秘密连接定位，仍不返回任何 secret |
+| PATCH | `/datasources/{datasource_id}` | Admin | 连接字段变化在 A/B/C 探针复核成功后创建新 DatasourceRevision；密码单独轮换，需 If-Match；旧探针结果不得写入已漂移的候选 |
+| DELETE | `/datasources/{datasource_id}` | Admin | 软删除；有活动引用时 409 |
+| GET | `/datasources/{datasource_id}/revisions/{revision_id}` | Admin | 读取真实连接定位字段的不可变修订原始详情 |
+| GET | `/datasources/{datasource_id}/credential-secrets` | Admin | 只读 `ACTIVE/RETIRED/REVOKED/COMPROMISED` 生命周期与 Envelope 摘要 |
+| POST | `/datasources/{datasource_id}/credential-secrets/{version}/status` | Admin | 已先切换为另一枚 current secret 的历史 `ACTIVE→RETIRED/REVOKED/COMPROMISED`，`RETIRED→REVOKED/COMPROMISED`；直接退役 current secret 返回 `CREDENTIAL_STATUS_CONFLICT`。紧急终态同事务禁用 current 数据源并为受影响的已绑定与未领取工作建立持久终止事实；不可重新激活或降级 |
+| POST | `/datasources/{datasource_id}/test` | Admin | A/B/C 复检 EndpointPolicy、DNS 与出口规则后受限连接测试；普通已获准的数据库连通/鉴权失败才以 `200 + status=FAILED` 表达，egress 平台失败必须保留 503 code，陈旧/超时结果不覆盖当前测试事实 |
+| GET | `/datasources/{datasource_id}/schema/tables` | 有 `SOURCE_USE/TARGET_USE` | 游标读取表和列元数据；用途/cursor/grant 漂移时不披露旧页 |
 
 创建请求：
 
@@ -279,6 +447,7 @@ Admin 创建或重置密码时，临时密码只在 TLS 请求体中出现，响
 {
   "name": "订单库",
   "description": "只读订单源",
+  "endpoint_policy_id": "33333333-3333-4333-8333-333333333333",
   "engine": "MYSQL_8",
   "host": "mysql.internal.example",
   "port": 3306,
@@ -290,7 +459,7 @@ Admin 创建或重置密码时，临时密码只在 TLS 请求体中出现，响
 }
 ```
 
-响应：
+Admin 创建后的响应使用 `DatasourceAdminDetail`；项目可读的列表和普通详情固定使用最小披露的 `DatasourceRedactedSummary`。后者示例：
 
 ```json
 {
@@ -299,13 +468,14 @@ Admin 创建或重置密码时，临时密码只在 TLS 请求体中出现，响
   "name": "订单库",
   "description": "只读订单源",
   "engine": "MYSQL_8",
-  "host": "mysql.internal.example",
-  "port": 3306,
-  "database_name": "sales",
-  "default_schema": "sales",
-  "username": "datax_reader",
-  "ssl_mode": "VERIFY_FULL",
+  "endpoint_redacted": "REDACTED",
   "credential_configured": true,
+  "current_revision_id": "11111111-1111-4111-8111-111111111112",
+  "current_revision_no": 1,
+  "credential_status": "READY",
+  "last_test_status": "SUCCEEDED",
+  "last_tested_at": "2026-07-30T02:31:00Z",
+  "last_test_error_code": null,
   "status": "ACTIVE",
   "row_version": 1,
   "created_at": "2026-07-30T02:30:00Z",
@@ -313,7 +483,29 @@ Admin 创建或重置密码时，临时密码只在 TLS 请求体中出现，响
 }
 ```
 
+`DatasourceAdminDetail` 把真实定位字段放在 `current_revision` 中，并固定引用
+`endpoint_policy_revision_id` 与 `physical_endpoint_identity_id`；凭据仅以
+`CredentialSecretSummary` 表达版本、状态和 ACTIVE Envelope 的非秘密元数据。即使是
+Admin 响应，也禁止返回 password、ciphertext、nonce、encrypted DEK、KEK、完整 JDBC URL
+或已注入的 DataX JSON。普通项目成员不能通过 revision 路由绕过最小披露。
+
 PATCH 中不包含 `password` 表示不轮换；`password: null` 或空字符串返回 422，不能被解释为清空。
+
+PATCH 可修改 `endpoint_policy_id / engine / host / port / database_name / default_schema /
+username / ssl_mode`。这些字段合并当前修订形成候选配置；服务端必须先绑定所选
+EndpointPolicy 的当前 ACTIVE 不可变修订，完成 DNS、精确出口、TLS/认证和引擎原生物理
+身份探针。成功后才新增 `DatasourceRevision`、保存 TEST 连接证据并原子切换
+`current_revision_id`；失败时整个事务回滚。未提交 `password` 时，探针按需解密并安全
+复用当前 ACTIVE secret；提交新密码时先用新密码探针，成功后才新增 secret 并退役旧版本。
+旧 DatasourceRevision 和历史 secret 永不被覆盖。`status=ACTIVE` 的恢复同样要求真实探针，
+不能只改状态字段。
+
+数据源列表按 `created_at desc, id desc` 使用签名 cursor；cursor 绑定调用用户、项目、
+`engine` 筛选和排序。元数据列表按 `schema_name asc, table_name asc` 使用签名 cursor；
+cursor 绑定调用用户、Datasource、当前 DatasourceRevision、`schema_name/table_name`
+筛选和排序。游标被篡改、
+跨用户/数据源复用或改变筛选条件时返回 `400 CURSOR_INVALID`，服务端不得忽略 cursor
+重新返回第一页。
 
 连接测试的网络/认证失败是一个可审计的测试结果，正常返回 200：
 
@@ -329,9 +521,64 @@ PATCH 中不包含 `password` 表示不轮换；`password: null` 或空字符串
 }
 ```
 
-Schema 响应中的列类型是数据库原生规范化字符串，不允许前端自行判定兼容性；兼容性以 Job validate 响应为准。
+Schema 响应中的列类型是数据库原生规范化字符串，不允许前端自行判定兼容性；兼容性以 Job validate 响应为准。元数据请求必须带 `usage=SOURCE_USE|TARGET_USE`；Developer 按精确用途授权，Admin 可按任一用途检查。分页 cursor 绑定该 usage，不能把 SOURCE_USE 的 cursor 改用于 TARGET_USE。
 
-### 8.7 SyncJob、校验、预览和版本
+### 8.7 数据移动授权
+
+| 方法 | 路径 | 权限 | 说明 |
+|---|---|---|---|
+| GET/POST | `/endpoint-policies` | Admin | 列出/创建可变策略身份；创建首个不可变 EndpointPolicyRevision |
+| GET/PATCH | `/endpoint-policies/{id}` | Admin | 查看、修改或停用策略；网络字段变化创建新 revision，需 If-Match |
+| GET | `/endpoint-policies/{id}/revisions/{revision_id}` | Admin | 读取不可变 FQDN/IP、CIDR、端口、TLS、resolver 与 egress 策略 |
+| GET | `/physical-endpoint-identities/{id}` | Admin | 读取不含原生标识明文的 PhysicalEndpointIdentity 证据摘要 |
+| GET | `/target-namespaces/{id}` | Admin | 读取不可变 TargetNamespace 与 `physical_table_identity_hash` |
+| GET | `/endpoint-connection-evidence/{id}` | Admin | 读取不可变 DNS、selected/peer IP 与 egress 连接证据；项目成员仅见证据 ID |
+| GET | `/datasources/{id}/grants` | Admin | 查看数据源使用授权 |
+| PUT | `/datasources/{id}/grants/{member_id}` | Admin | 原子替换 `SOURCE_USE/TARGET_USE` |
+| GET/POST | `/projects/{id}/transfer-policies` | Admin | 列出/创建源修订到目标修订策略；完整物理端点、表列 scope 和审批信息不向普通项目成员返回 |
+| POST | `/transfer-policies/{id}/submit` | Admin | 提交审批 |
+| POST | `/transfer-policies/{id}/approvals` | 不同 Admin | STANDARD 一人批准，SENSITIVE 两名不同 Admin 批准 |
+
+EndpointPolicy 创建和修改请求只提交主机、CIDR、端口、TLS 与 DNS TTL 等业务约束；
+`resolver_policy_version` 和 `egress_policy_version` 由安装包中的受信服务端常量写入不可变
+revision，客户端不得提交或覆盖。两个版本仍在 revision 响应中只读返回，供界面展示和
+连接证据核对；实际出口是否有效必须再由同一网络命名空间内的新鲜 egress guard
+attestation 证明，不能由版本字符串或环境变量自证。
+
+创建/修改请求使用 `requested_scope`，两侧都必须提交
+`catalog/database + schema + table + selection_mode + allowed_columns`。`ALL_COLUMNS` 也必须
+先从当前元数据展开为显式 `allowed_columns` 后提交；UI 不发送 `*`、正则或“运行时全部列”。
+服务端校验表属于所选 DatasourceRevision，解析 `PhysicalEndpointIdentity`，按引擎标识符
+规则规范化、排序和去重后生成响应中的 `scope_json`；客户端不能自报 `scope_hash`。
+
+规范化 `TransferPolicy.scope_json` 必须精确包含 source/target 的
+`physical_endpoint_identity_id + catalog + schema + table + allowed_columns`，列数组必须
+显式、排序、去重且不得使用 `*`；服务端按
+`SHA-256("DXTRANSFERPOLICYv1\n" || RFC8785(scope_json))` 生成 `scope_hash`。
+提交审批和每次审批请求都必须带 `expected_scope_hash`。修改 source/target revision、
+`requested_scope` 或 classification 会原子清空旧审批、退回 DRAFT 并重算 hash；旧页面的
+提交/审批请求返回冲突。STANDARD 需一名非申请人 Admin，SENSITIVE 需两名不同且均非申请人
+Admin。
+
+任务 validate、发布和执行前均检查：端点策略为 ACTIVE、操作者具有相应数据源用途授权、
+源修订到目标修订存在当前 `scope_hash` 的 ACTIVE TransferPolicy，且 source/target 的每个
+mapping 都是两侧精确 scope 的子集。越界一列也必须拒绝。每个
+TEST/METADATA/PREFLIGHT/DATAX/ORACLE/RECOVERY_PROBE 连接都保存
+`EndpointConnectionEvidence`，固定 EndpointPolicyRevision、全部解析 IP、selected/peer IP
+与 egress 证据；不能只在创建数据源时验证一次。平台直接持有 socket 的阶段必须写
+`peer_observation_status=OBSERVED` 且 `peer_ip=selected_ip`。独立 Java/JDBC DataX
+阶段当前不能可靠回传实际 socket peer，只能在两端精确 IP 内核租约均生效、进程尚未启动
+时写 `ENFORCED_NOT_OBSERVED + peer_ip=null`；这表示 selected IP 是唯一允许目的地址，
+不表示已观测到 Java peer 或连接成功。API/UI/证据校验器不得把 selected_ip 填入 peer_ip
+伪装观测结果。
+
+在实现驱动级 selected-IP socket 固定并保留原 FQDN TLS 身份校验、或把 DataX 拆入不放行
+control 子网的独立 netns 之前，执行前 preflight 对任一 `EXACT_FQDN` 返回稳定错误
+`DATAX_ENDPOINT_PINNING_UNSUPPORTED`，对 `EXACT_IP + VERIFY_FULL` 返回
+`DATAX_VERIFY_FULL_IP_UNCERTIFIED`；两者都必须在 DataX 进程创建前失败且
+`verification_state=NOT_STARTED`。这是当前 fail-closed 实现限制，不改变产品目标契约。
+
+### 8.8 复制任务（内部 `SyncJob`）、校验、预览和版本
 
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
@@ -339,7 +586,7 @@ Schema 响应中的列类型是数据库原生规范化字符串，不允许前�
 | POST | `/projects/{project_id}/jobs` | Admin/Developer | 创建任务和首个草稿 |
 | GET | `/jobs/{job_id}` | 项目可读 | 当前草稿和发布信息 |
 | PATCH | `/jobs/{job_id}` | Admin/Developer | 修改元数据/草稿，需 If-Match，状态回 DRAFT |
-| POST | `/jobs/{job_id}/validate` | Admin/Developer | 校验当前已保存草稿 |
+| POST | `/jobs/{job_id}/validate` | Admin/Developer | 原子取得两端 datasource permit，按 A/B/C 校验当前已保存草稿；陈旧 Schema material 不得被接受，已归档/发布任务在外部 I/O 前拒绝 |
 | POST | `/jobs/{job_id}/preview` | Admin/Developer | 生成不可执行、已脱敏 DataX JSON |
 | GET | `/jobs/{job_id}/versions` | 项目可读 | 不可变版本列表 |
 | POST | `/jobs/{job_id}/versions` | Admin/Developer | 发布当前 VALID 草稿 |
@@ -347,7 +594,22 @@ Schema 响应中的列类型是数据库原生规范化字符串，不允许前�
 
 创建/更新的 `draft_spec` 必须符合 JobSpec schema。保存只做结构和基本资源校验；完整数据库 Schema/类型校验由 validate 完成。
 
-脏数据比例在 UI 可按百分数输入，提交 JobSpec 前必须转换为 `0..1`，并四舍五入到最多 6 位小数；服务端按同一规范化规则计算 `draft_spec_hash`，避免等价值因浮点表示不同产生不同版本哈希。
+任务列表支持 `q`（任务名、源表名、目标表名）、`status`、`exclude_status`、
+`has_published_version`、`reader_plugin`、`writer_plugin` 和
+`latest_execution_state`。任务列表和版本历史均按服务端不透明 cursor 翻页；cursor
+绑定项目、授权主体、筛选条件与排序，筛选变化后复用旧 cursor 必须返回
+`400 CURSOR_INVALID`。前端不得只筛当前页后宣称结果完整。
+
+任务摘要必须同时返回 `latest_published_reader_plugin` 与
+`latest_published_writer_plugin`；运行按钮只能按这两个不可变 JobVersion 绑定值查询当前
+认证目录，不能用发布后仍可修改的 `draft_spec` 代替已发布版本。
+
+归档仍通过 `PATCH /jobs/{job_id}` 和 `If-Match` 完成。存在非终态 Execution 时返回
+`409 JOB_ACTIVE_EXECUTION`；归档只改变可变 `SyncJob` 生命周期，不删除或覆盖任何
+`JobVersion`。版本历史响应的 `published_by / published_at` 是只读发布事实，前端必须
+展示且不能以当前登录人替换。
+
+V1 的 `execution_policy.dirty_data_limit.record_count` 与 `percentage` 都固定为 `0`。UI 不提供正数阈值输入，API/Schema 拒绝任何非零值；DataX 报告任一脏行时 Execution 不得进入业务成功。正数容忍阈值只可在 POST-V1 经新 ADR、PRD、契约和测试后引入。
 
 Validate 响应：
 
@@ -405,17 +667,28 @@ Preview 响应只用于展示：
 
 若当前草稿不是 VALID、哈希变化、数据源被禁用或 Schema 已漂移，返回 409/422，不创建半成品版本。
 
-### 8.8 Execution、取消和重跑
+### 8.9 Execution、取消、恢复和恢复后再次执行
 
 | 方法 | 路径 | 权限 | 说明 |
 |---|---|---|---|
-| GET | `/projects/{project_id}/executions` | 所有项目成员 | 分页与状态筛选 |
+| GET | `/projects/{project_id}/executions` | 所有项目成员 | 分页；执行编号/任务、三维状态、目标独占、任务/版本、触发人、时间和恢复来源筛选 |
 | POST | `/jobs/{job_id}/executions` | Operator/Admin | 对明确 JobVersion 人工执行 |
 | GET | `/executions/{execution_id}` | 所有项目成员 | 状态、摘要和失败信息 |
 | POST | `/executions/{execution_id}/cancel` | Operator/Admin | 创建取消请求，不由 API 直接推进状态 |
-| POST | `/executions/{execution_id}/rerun` | Operator/Admin | 创建引用相同 JobVersion 的新 Execution |
+| POST | `/executions/{execution_id}/target-exclusivity/revoke` | Operator/Admin | 撤回目标外部独占声明或报告已知窗口破坏；写不可变审计 |
+| GET/POST | `/executions/{execution_id}/recovery` | Operator/Admin | 查看/提交处置确认（`remediation_confirmation`）；无需清理时如实记录理由；POST 创建独立 RecoveryProbe 事实 |
+| GET | `/recovery-probes/{recovery_probe_id}` | 项目可读 | 查看独立 probe 的队列、fence、空表结果与安全连接证据摘要 |
+| POST | `/executions/{execution_id}/rerun` | Operator/Admin | 机器路径保留 `rerun`；用户动作是“恢复后再次执行”，绑定 VERIFIED gate 并创建新 Execution |
 | GET | `/executions/{execution_id}/logs` | 所有项目成员 | 游标读取脱敏日志 |
 | GET | `/executions/{execution_id}/logs/download` | 所有项目成员 | 服务端生成并审计脱敏文本下载 |
+
+执行列表支持 `q`、可重复的 `process_state / data_effect /
+verification_state / target_exclusivity_status`、`job_id`、
+`job_version_id`、`requested_by`、半开区间 `from / to`、`is_rerun` 和
+`unresolved_failure`。cursor 必须绑定上述全部筛选、项目、授权主体与
+`queued_at DESC, id DESC` 排序；筛选或主体不一致时 fail closed 为
+`CURSOR_INVALID`。列表和详情同时返回 `requested_by`，并始终并列返回
+`process_state / data_effect / verification_state`。
 
 执行请求：
 
@@ -424,7 +697,20 @@ POST /api/v1/jobs/6f499e28-b9a1-4cc7-af55-e347014816a4/executions
 Idempotency-Key: 01J43MRE4Q3W8FNF4PMY90M4W4
 
 {
-  "job_version_id": "b64006fc-5a22-4e48-a0bd-f9cb1440031f"
+  "job_version_id": "b64006fc-5a22-4e48-a0bd-f9cb1440031f",
+  "source_quiescence_confirmation": {
+    "confirmed": true,
+    "confirmed_at": "2026-07-30T02:39:30Z",
+    "note": "已暂停源表写入，保持至核验结束"
+  },
+  "target_exclusivity_confirmation": {
+    "statement_version": "1.0",
+    "confirmed": true,
+    "confirmed_at": "2026-07-30T02:39:35Z",
+    "valid_until": "2026-07-30T06:39:35Z",
+    "responsible_party": "DBA",
+    "note": "已冻结目标表平台外 DML/DDL，保持至目标核验快照事务完成"
+  }
 }
 ```
 
@@ -438,7 +724,53 @@ Idempotency-Key: 01J43MRE4Q3W8FNF4PMY90M4W4
   "job_version_id": "b64006fc-5a22-4e48-a0bd-f9cb1440031f",
   "rerun_of_execution_id": null,
   "trigger_type": "MANUAL",
-  "state": "QUEUED",
+  "process_state": "QUEUED",
+  "data_effect": "NONE",
+  "verification_state": "NOT_STARTED",
+  "target_exclusivity_confirmation": {
+    "statement_version": "1.0",
+    "confirmed": true,
+    "confirmed_at": "2026-07-30T02:39:35Z",
+    "valid_until": "2026-07-30T06:39:35Z",
+    "responsible_party": "DBA",
+    "note": "已冻结目标表平台外 DML/DDL，保持至目标核验快照事务完成"
+  },
+  "target_exclusivity_status": "ACTIVE",
+  "target_exclusivity_revoked_at": null,
+  "target_exclusivity_revocation_reason": null,
+  "source_datasource_revision_id": "11111111-1111-4111-8111-111111111112",
+  "target_datasource_revision_id": "22222222-2222-4222-8222-222222222223",
+  "source_endpoint_policy_revision_id": "11111111-1111-4111-8111-111111111113",
+  "target_endpoint_policy_revision_id": "22222222-2222-4222-8222-222222222224",
+  "target_namespace_id": "55555555-5555-4555-8555-555555555555",
+  "target_copy_lock": {
+    "target_namespace_id": "55555555-5555-4555-8555-555555555555",
+    "state": "RESERVED",
+    "reserved_at": "2026-07-30T02:40:00Z",
+    "activated_at": null,
+    "released_at": null,
+    "fence_epoch": null
+  },
+  "source_secret_version": null,
+  "target_secret_version": null,
+  "source_secret_envelope_id": null,
+  "target_secret_envelope_id": null,
+  "source_connection_evidence_id": null,
+  "target_connection_evidence_id": null,
+  "capacity_profile": "LARGE",
+  "service_reservation_seconds": 3600,
+  "queue_eligibility_state": "ELIGIBLE",
+  "queue_block_reason": null,
+  "queue_state_changed_at": "2026-07-30T02:40:00Z",
+  "eligible_wait_milliseconds": 0,
+  "log_incomplete": false,
+  "log_raw_received_bytes": 0,
+  "log_redacted_received_bytes": 0,
+  "log_stored_bytes": 0,
+  "log_dropped_bytes": 0,
+  "resolved_config_hash": null,
+  "runtime_snapshot": null,
+  "verification_summary": null,
   "queued_at": "2026-07-30T02:40:00Z",
   "started_at": null,
   "finished_at": null,
@@ -450,11 +782,113 @@ Idempotency-Key: 01J43MRE4Q3W8FNF4PMY90M4W4
 }
 ```
 
-取消请求返回 `202` 和 CancelRequest；Execution 可能仍显示原状态，直到 Worker 写入 `CANCEL_REQUESTED`。前端应展示“取消请求已提交”，不能立即显示“已取消”。
+`TargetExclusivityConfirmation` 必须同时包含
+`statement_version="1.0" / confirmed_at / valid_until / responsible_party`，且
+`valid_until > confirmed_at`。Execution 对外状态为 `ACTIVE / REVOKED / EXPIRED`：
+`ACTIVE` 时 `revoked_at/reason` 均为 null；`REVOKED` 时二者必填；`EXPIRED` 时
+`revoked_at=null` 且 reason 固定为 `VALIDITY_WINDOW_EXPIRED`。终态 Execution 保留作出
+结论时的状态，不因查询时墙上时钟已经越过有效期而改写历史。
 
-人工重跑不复用原 Execution ID，不重新解析“最新版本”，而是绑定原 Execution 的同一 JobVersion。由于 V1 为 insert-only，UI 和 API 响应必须提示可能产生重复记录。
+Operator/DBA 知悉冻结被撤回或窗口内发生平台外 DML/DDL 时必须报告：
 
-### 8.9 日志游标
+```http
+POST /api/v1/executions/19bda447-c18e-4bca-bd45-11aed51eb33c/target-exclusivity/revoke
+Idempotency-Key: 01J43MRF4Q3W8FNF4PMY90M4W5
+
+{
+  "statement_version": "1.0",
+  "responsible_party": "DBA",
+  "reason": "EXTERNAL_DML_DDL_REPORTED",
+  "reported_at": "2026-07-30T03:15:00Z",
+  "note": "发现维护账号在窗口内执行过目标表 DDL"
+}
+```
+
+`reason` 仅允许 `OPERATOR_REVOKED`、`DBA_REVOKED`、
+`EXTERNAL_DML_DDL_REPORTED` 或 `CHANGE_FREEZE_BROKEN`。`responsible_party` 必须与原
+Execution 固化的确认责任类型一致，服务端以原值为准。API 原子保存
+`REVOKED`、`revoked_at/reason`、`TARGET_EXCLUSIVITY_REVOKED` 审计和独立
+`WorkTerminationRequest`，但不直接写三组执行状态：未领取执行由 reconciler 取消并释放
+`RESERVED`；已领取执行由 Worker 终止并进入恢复门禁；`VERIFYING` 中的报告使 oracle
+形成 `INCONCLUSIVE/TARGET_EXCLUSIVITY_BROKEN`。安全终止原因优先于并发人工取消。该 API
+不能把数据库提交与 OS `Popen` 或阻塞 JDBC 变成原子动作；Worker 只在有界控制点停止，无法
+及时返回时保守收敛为 `LOST`。终态请求返回 409。
+
+API 创建 Execution 的事务必须同时写 `QUEUED` 与
+`TargetCopyLock(state=RESERVED)`；`TargetNamespace` 部分唯一索引覆盖
+`RESERVED/ACTIVE/RECOVERY_REQUIRED`。同目标第二个不同 `Idempotency-Key` 请求在 API
+返回 `409 TARGET_ACTIVE_EXECUTION`，不得创建多个同目标 QUEUED 再等待 Worker 失败；同一
+幂等键只重放原 Execution。Worker 领取事务原子执行 `RESERVED→ACTIVE`，并创建 Attempt、
+单调 fence 与运行快照。
+
+取消请求返回 `202` 和 CancelRequest。对于未领取的 `QUEUED + PENDING` 请求，reconciler
+直接收敛为 `CANCELED/NONE/NOT_STARTED`，把 RESERVED 锁更新为 `RELEASED`，且不创建
+Attempt/fence 或 RecoveryGate；已经领取的执行才由 Worker 写入 `CANCEL_REQUESTED`、
+终止进程树并把锁转为 `RECOVERY_REQUIRED`。前端应先展示“取消请求已提交”，不能立即显示“已取消”，也不能仅看到
+`CANCELED` 就开放 recovery：必须以服务端是否存在 RecoveryGate 为准。
+
+状态必须拆分展示：
+
+- `process_state`：`QUEUED / STARTING / RUNNING / VERIFYING / SUCCEEDED / FAILED / TIMED_OUT / CANCEL_REQUESTED / CANCELED / LOST`。
+- `data_effect`：`NONE / POSSIBLE / CONFIRMED / UNKNOWN`。其中 `CONFIRMED` 只表示目标影响已测得，测得值可以是 0 行；它不表示发生了非零写入，也不表示内容正确。空源成功仍是 `SUCCEEDED/CONFIRMED/PASSED`。
+- `verification_state`：`NOT_STARTED / VERIFYING / PASSED / FAILED / INCONCLUSIVE`。Oracle 从未启动时始终为 `NOT_STARTED`，即使 DataX 已异常退出；只有 oracle 已启动却因静默破坏、排他前提破坏、锁丢失或读取失败而无法形成数据结论时才是 `INCONCLUSIVE`。
+
+DataX 退出码 0 后 `process_state` 只能进入 `VERIFYING`；在 oracle 真正启动前
+`verification_state` 仍为 `NOT_STARTED`，启动后才为 `VERIFYING`。独立 `oracle-v1`
+数据比对通过、目标声明状态仍为 `ACTIVE`、`revoked_at/reason` 为空、目标一致性快照
+`finished_at <= valid_until` 且脏行数为 0 后，才进入
+`SUCCEEDED + CONFIRMED + PASSED`。`REVOKED / EXPIRED` 或快照越过截止时间时不得
+`PASSED`。Oracle 得出差异时为 `FAILED`，已启动但无法形成结论时为 `INCONCLUSIVE`；
+两者都使 `process_state=FAILED`。不得把 DataX 写入统计冒充核验结果。
+
+领取是单个 PostgreSQL 事务：事务提交前任一失败必须整体回滚，Execution 仍是未领取的
+`QUEUED`，原 API 预留保持 `TargetCopyLock=RESERVED`，不存在 Attempt、fence 或已固定
+secret/Envelope。领取事务一旦
+提交，除唯一 `SUCCEEDED/CONFIRMED/PASSED` 外的任何终态都不得回到 `QUEUED`、不得复用
+Attempt 或自动重新入队，统一进入恢复门禁。
+
+已领取执行的失败、超时、取消、丢失或核验失败可能已产生部分写入。Operator 先通过
+recovery 接口提交 `remediation_confirmation`，字段固定为
+`action/cleanup_performed/reason/confirmed_at`。需要清理时如实记录实际动作；确认无需清理时
+使用 `NO_CLEANUP_REQUIRED + cleanup_performed=false` 并写明理由，不能被强制虚假声称已
+清理。API 只创建独立
+`RecoveryProbe(QUEUED)`，Worker 使用 probe 自身的 Attempt、lease 和单调 fence 在目标锁
+下实测为空。只有 `SUCCEEDED + EMPTY` 才能把 RecoveryGate 原子写为 `VERIFIED`。机器
+`rerun` 请求随后才能携带该 gate ID。未领取即取消的 Execution 没有 gate，不走 recovery
+或 `rerun`。恢复后再次执行不复用原 Execution ID、不解析“最新版本”，而是绑定原
+JobVersion；新执行启动前仍需重新提交源静默确认，以及声明版本为 `1.0`、具备新
+`valid_until` 的目标排他确认，复检目标为空并取得同一 TargetNamespace 活动锁。目标排他
+确认、接受 actor/时间和摘要固化在 Execution 运行快照，并产生
+`TARGET_EXCLUSIVITY_CONFIRMED` 审计事件。领取事务提交后、真实 preflight 尚未完成的
+`STARTING` Execution 可返回 `runtime_snapshot=null`；这不表示未领取，调用方必须结合
+Attempt 和目标锁的 `activated_at/fence_epoch` 判断。当前 fenced Attempt 完成 preflight
+后才一次性写入只读 `runtime_snapshot`，其中至少包含以下目标声明片段（完整对象还包含
+Runtime、插件、revision、policy、secret envelope、目标空表证据与 fence）：
+
+```json
+{
+  "target_exclusivity_confirmed_by": "33333333-3333-4333-8333-333333333333",
+  "target_exclusivity_responsible_party": "DBA",
+  "target_exclusivity_accepted_at": "2026-07-30T02:40:10Z",
+  "target_exclusivity_statement_version": "1.0",
+  "target_exclusivity_valid_until": "2026-07-30T06:39:35Z",
+  "target_exclusivity_confirmation_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+}
+```
+
+完整运行快照写入后不可变；`RUNNING` 及之后状态必须已有完整快照。后续撤回/过期由
+Execution 生命周期字段和追加式审计表达。Oracle 的
+`target_result` 必须记录单一一致性读事务的 `snapshot_id` 及开始/结束边界；多时点查询
+拼接不得通过。
+
+Execution 对外返回源/目标 `DatasourceRevision`、EndpointPolicyRevision、
+TargetNamespace、CredentialSecret/Envelope 的非秘密版本身份、连接证据 ID、
+TransferPolicy `scope_hash`、容量档位/eligible 等待、日志四计数、`resolved_config_hash`
+和不含连接串/密钥的 `runtime_snapshot`，使历史结果可以追踪；完整已注入 DataX 配置永不返回或持久化。普通新 Execution 若触发容量门禁，返回
+`503 CAPACITY_ADMISSION_BLOCKED`，安全 `details.reason` 仅允许
+`QUEUE_LIMIT/BACKLOG_LIMIT/DISK_YELLOW/DISK_RED/LOG_BUDGET`。
+
+### 8.10 日志游标
 
 请求：
 
@@ -472,12 +906,27 @@ GET /api/v1/executions/19bda447-c18e-4bca-bd45-11aed51eb33c/logs?limit=200&curso
       "timestamp": "2026-07-30T02:41:03.120Z",
       "stream": "STDOUT",
       "level": "INFO",
-      "message": "任务平均流量: 12.4MB/s"
+      "message": "任务平均流量: 12.4MB/s",
+      "line_truncated": false,
+      "raw_received_bytes": 31,
+      "redacted_received_bytes": 31,
+      "stored_bytes": 31,
+      "dropped_bytes": 0
     }
   ],
   "next_cursor": "eyJleGVjdXRpb25faWQiOiIuLi4iLCJuZXh0X3NlcXVlbmNlIjoxMDQzfQ",
   "eof": false,
   "redaction_rules_version": "1.0",
+  "truncated": false,
+  "incomplete": false,
+  "raw_received_bytes": 8192,
+  "redacted_received_bytes": 8192,
+  "stored_bytes": 8192,
+  "reason": "NONE",
+  "dropped_bytes": 0,
+  "first_truncated_sequence": null,
+  "gap_count": 0,
+  "gaps": [],
   "expires_at": "2026-08-29T02:40:00Z"
 }
 ```
@@ -490,33 +939,78 @@ GET /api/v1/executions/19bda447-c18e-4bca-bd45-11aed51eb33c/logs?limit=200&curso
 - 日志默认保留 30 天；正文到期返回 `410 LOG_EXPIRED`，Execution 摘要仍可查看。
 - V1 使用 HTTP cursor 轮询，不提供旧提纲中的 WebSocket `/logs/{id}`。
 - V1 关键词搜索仅搜索浏览器已通过 cursor 加载的脱敏内容，不承诺服务端全文检索；UI 必须显示当前搜索覆盖范围。
-- 下载由服务端从全部脱敏 LogChunk 重新组装 UTF-8 文本，响应为 `text/plain` attachment，并返回脱敏规则版本与 SHA-256。
-- V1 单次下载上限为 100 MiB（脱敏后未压缩大小）；超过时返回 `413 LOG_EXPORT_TOO_LARGE`，不得静默截断，用户仍可通过 cursor 分页查看。
+- 页面和下载都只能称为“脱敏后的原序日志”，不能称为未脱敏原始日志。
+- 每行、每个 LogChunk、每个 LogGap 与 Execution 汇总都分别累计
+  `raw_received_bytes`（脱敏前只计数）、`redacted_received_bytes`（脱敏后截断前）、
+  `stored_bytes` 和 `dropped_bytes`；独立 validator 强制
+  `dropped_bytes = redacted_received_bytes - stored_bytes`。raw 与 redacted 可因占位符
+  长度变化而不同，不能用差值推断秘密长度。
+- 任一日志缺失、不连续、截断、解码/脱敏/存储失败或 fence 丢失都必须返回显式
+  `LogGap`，并使 `incomplete=true`；`eof=true` 不能暗示日志完整。
+- `truncated=true` 时必须同时返回四类字节计数、`dropped_bytes` 和
+  `reason=EXECUTION_LIMIT|LINE_LIMIT|RING_EVICTION`；这些字节未持久化，cursor 与下载均
+  不能恢复，UI 必须持续显示不完整标识。
+- 下载由服务端从已持久化的脱敏 LogChunk 重新组装 UTF-8 文本，响应为 `text/plain`
+  attachment，并返回脱敏规则版本、SHA-256、`X-Log-Incomplete`、四类字节计数、
+  `X-Log-Gap-Count` 与相同截断元数据。
+- V1 单次下载上限为 100 MiB（已持久化脱敏内容的未压缩大小）；超过时返回 `413 LOG_EXPORT_TOO_LARGE`，不能把响应上限与采集阶段日志截断混为一谈。
 - 下载成功、失败和拒绝均写 `EXECUTION_LOG_EXPORTED` 审计；到期日志返回 `410 LOG_EXPIRED`。
 
-### 8.10 Audit
+### 8.11 Audit
 
 `GET /projects/{project_id}/audit-events` 支持 `action`、`outcome`、`actor_id`、`from`、`to` 和 cursor。响应事件符合 `audit-event.v1.schema.json`。
 
 所有项目成员均可读取已授权项目的审计。`GET /audit-events` 仅供组织级 Admin 跨项目筛选。审计默认保留 730 天。前端不得显示或导出 `event_hash` 之外的密钥材料，不提供编辑/删除接口。
 
-### 8.11 Health
+### 8.12 Health
+
+两个路由只用于 Windows launcher 和本机页面，经
+`http://127.0.0.1:17860/api/v1` 同源入口访问；无认证不等于允许 LAN/公网访问。Docker
+Desktop、WSL2、虚拟化、Compose 版本、端口和宿主 ACL 属于 launcher 启动前检查，不伪装
+成 backend 自己能够证明的组件状态。
 
 | 方法 | 路径 | 认证 | 含义 |
 |---|---|---|---|
-| GET | `/health/live` | 否 | 进程可响应 |
-| GET | `/health/ready` | 否 | PostgreSQL、Redis、日志卷、dispatcher、Worker/Runtime 就绪 |
+| GET | `/health/live` | 否（loopback-only） | 经 `web` 反向代理的 backend 进程可响应 |
+| GET | `/health/ready` | 否（loopback-only） | 管理平面关键门及 dispatcher、Worker/固定 Linux Runtime、独立 oracle、egress 等能力状态 |
 
-Health 响应不得暴露主机地址、密码、容器环境变量或堆栈。ready 失败返回 503 和组件级安全状态码。
+Health 响应不得暴露 Windows 用户名、`%LOCALAPPDATA%` 绝对路径、主机/容器地址、数据库
+DSN、密码、容器环境变量、Docker secret 路径或堆栈。管理平面关键门失败返回
+`503/DOWN`；管理平面可用但执行能力被阻断返回 `200/DEGRADED`，此时 launcher 可打开
+浏览器用于配置和诊断，但页面与执行 API 必须明确阻断新任务，不能显示“任务可运行”。
+容器仅为 running 或 live=200 不能替代 readiness。
+
+`audit_chain` 组件以与审计事件同事务推进的持久水位线表达已知 head、已验证 head、最近
+完整重放和失败状态。正常 `/health/ready` 只读取组织、水位线和每组织索引尾部，不读取
+整条审计事件内容或逐请求全量重算。只有水位线 `PASSED`、已验证 head 与真实尾部一致且
+完整重放仍新鲜时才报告该组件 `UP`；空审计库是显式 bootstrap 例外。缺失或孤立水位线、
+尾部漂移、过期/PENDING/FAILED 证明、篡改、超时或 CAS 竞争一律失败关闭。
+
+当完整证明过期或尚未建立时，单一 API 进程至多每 60 秒发起一次、最长 30 秒的有界完整
+重放；在新事件附加且完整证明仍新鲜时可只重放未验证后缀。失败或 timeout 的完整重放仍
+占用该 60 秒 cadence，窗口内返回 `AUDIT_CHAIN_FULL_REPLAY_THROTTLED/DOWN`。重放中的并发调用不会排队等待，
+而返回 `DOWN`（例如 `AUDIT_CHAIN_VERIFICATION_IN_PROGRESS` 或
+`READINESS_CHECK_IN_PROGRESS`）；完整 Health 响应最多缓存 1 秒。这些是 V1 单 API 进程
+的本机控制，不证明持续检测、数据库管理员无法篡改，亦不构成真实 DataX E3 或 Windows E4
+验收。数据库外 WORM/签名锚点仍是独立发布门禁。
+
+launcher 的“停止服务”不通过新增远程 HTTP 端点实现。它只能调用安装包内固定、签名且
+参数不可由用户扩展的 Compose/容器 lifecycle helper：先让 Worker 停止新领取，等待活动
+Attempt 结束后再 graceful stop。仍有活动工作时默认拒绝直接停止；明确强制停止后，下次
+启动必须由 Worker/reconciler 将无法证明连续受控的 Attempt 收敛为 `LOST` 并保留恢复
+门禁。
 
 ## 9. 前端状态处理
 
-- 按 API 状态枚举渲染，不从日志文本猜测成功或失败。
+- 分别按 `process_state / data_effect / verification_state` 渲染，不从日志文本或 DataX exit code 猜测数据成功。
 - SyncJob 编辑后立即按响应切换为 DRAFT；只有 validate 响应成功后显示 VALID。
 - 发布成功后展示新 version_no，不覆盖旧版本。
-- Execution 在 `CANCEL_REQUESTED` 前可能已存在待处理 CancelRequest；分别展示。
-- `LOST` 不自动显示重试成功；人工重跑是新记录。
+- Execution 在 `CANCEL_REQUESTED` 前可能已存在待处理 CancelRequest；分别展示。只有服务端返回 RecoveryGate 时才展示恢复入口，不能仅按 `CANCELED` 状态推断。
+- `VERIFYING` 不显示成功；`LOST` 不自动重跑；用户发起恢复后再次执行前必须通过恢复门禁并产生新记录。
 - 401 只自动 refresh 一次；403 展示无权限；404 不推断资源属于其他项目。
+- `DATASOURCE_OPERATION_ADMISSION_LIMITED` 展示 `Retry-After` 等待提示，
+  `DATASOURCE_OPERATION_STALE` 提示刷新相关事实，
+  `DATASOURCE_OPERATION_DEADLINE_EXCEEDED` 提示本次外部操作到期；三者均不自动重放，用户只能从原操作按钮显式重试。
 - 409 VERSION_CONFLICT 先保留用户本地编辑，再刷新并提示人工合并。
 - 422 使用 `field_errors[].path` 定位表单；未知 path 展示在页面级错误区。
 - 日志断线后使用最后一个服务端 cursor 续传，不能用本地行号拼 cursor。
@@ -532,11 +1026,41 @@ Health 响应不得暴露主机地址、密码、容器环境变量或堆栈。r
 ## 11. 契约验收
 
 1. OpenAPI 3.1 可解析，所有 `$ref` 可解析到存在的本地 schema。
-2. 示例 JobSpec 可通过 JSON Schema；加入任意 SQL、未知插件或未知字段会失败。
+2. 示例 JobSpec 可通过 JSON Schema，且五项传输策略固定为 `OPERATOR_QUIESCED / EMPTY_AND_VERIFIABLE / INSERT_ONLY_ONCE / REJECT_NONEMPTY_TARGET / MANUAL_REMEDIATE`；加入任意 SQL、未知插件或未知字段会失败。
 3. 所有列表接口都有稳定排序、cursor、limit 和跨授权主体校验。
 4. 所有强制幂等接口覆盖首次、重放、处理中和冲突测试。
 5. 所有 PATCH 覆盖正确 ETag、缺失 If-Match 和版本冲突测试。
 6. 四类角色和多角色并集均有允许/拒绝 API 测试。
-7. Datasource 的创建、更新、测试、Schema、错误和审计中没有密码回显。
-8. Execution 创建、取消、worker 延迟确认、日志续传、日志到期和 LOST 状态均有契约测试。
-9. API 实现生成的审计事件通过 AuditEvent schema，日志和审计不包含 secret。
+7. 项目可读 Datasource 响应只符合 `DatasourceRedactedSummary`，真实
+   host/port/database/schema/username 只允许 AdminDetail 与 Admin-only revision 路由；
+   所有响应、错误、日志和审计均没有密码或密钥材料。
+8. EndpointPolicyRevision、PhysicalEndpointIdentity、TargetNamespace、TransferPolicy
+   精确 scope、CredentialSecret 生命周期、RecoveryProbe、LogGap 与四类日志计数均有
+   正反契约测试。
+9. Execution 创建原子写入 QUEUED+RESERVED、同目标不同幂等键 API 冲突、Worker 原子
+   `RESERVED→ACTIVE+Attempt+fence`、未领取取消释放预留、源静默确认、有版本/有限期的
+   目标排他确认、`ACTIVE/REVOKED/EXPIRED` 与撤回/报告接口、空表证据、三类状态、
+   `RUNNING→VERIFYING→SUCCEEDED`、取消、恢复门禁、恢复后再次执行、容量拒绝、日志
+   缺口/截断/续传/到期和 LOST 均有契约测试。
+10. 独立核验产物通过 `verification-oracle.v1.schema.json`：`artifact_sha256` 必填；
+    oracle 未启动时没有伪造产物且状态为 `NOT_STARTED`，`INCONCLUSIVE` 只用于已启动但无法
+    形成结论并且必有原因；读取尚未形成的单侧结果/差异字段可为 null，禁止填充伪造的 0/hash。
+    `PASSED` 固定源静默/目标锁/目标排他窗口为 true、声明状态为 `ACTIVE`、
+    `revoked_at` 为 null、`target_result.snapshot_finished_at <= valid_until`、脏行数与差异为
+    0、`row_count_equal/multiset_sha256_equal=true`。目标结果还必须来自一个有明确 ID 和
+    时间边界的一致性读事务；独立语义 validator 另行强制源/目标字段实际相等、确认窗口覆盖
+    最后空表观察至快照完成，以及制品哈希重算。该证据不被解释为能够检测所有未报告或
+    已经回滚的外部 DML/DDL。
+11. 候选版本证据通过 `acceptance-manifest.v1.schema.json`。独立 CI validator 用
+    `requirements_catalog_sha256` 固定需求目录，把 V1-MUST 需求集合与 manifest entries
+    做集合比对，并验证 coverage 计数、`catalog_exact_match`、缺失 ID 和重复“需求 ID +
+    测试 ID”对；PASS 时两个缺口数组必须为空且 `catalog_exact_match=true`。
+12. API 实现生成的审计事件通过 AuditEvent schema，日志和审计不包含 secret。
+13. OpenAPI server 只声明 `http://127.0.0.1:17860/api/v1`；
+    Compose/宿主监听测试证明只有 `web` 映射该 loopback 端口，`api`、`worker`、
+    `postgres` 没有宿主端口。
+14. 非允许 Host、跨 Origin、CORS 预检、伪造 Forwarded 头和从 LAN IP 访问均被拒绝；
+    health 响应不泄露 Windows 路径、容器地址、DSN 或 secret。
+15. launcher 只在 ready=200 后打开浏览器；Docker/WSL2 缺失、端口冲突、named volume/
+    Runtime 不就绪时显示失败；首次 Admin 只经 launcher GUI/标准输入的固定 helper 创建；
+    强制停止后的已领取工作收敛为 `LOST` 而不是自动续跑。

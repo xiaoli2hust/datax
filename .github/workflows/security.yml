@@ -1,0 +1,186 @@
+name: Security gates
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - "agent/**"
+  schedule:
+    - cron: "23 3 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  secret-scan:
+    name: Repository secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install checksum-pinned Gitleaks
+        run: bash scripts/security/install_gitleaks.sh "${RUNNER_TEMP}/gitleaks"
+
+      - name: Scan committed history
+        run: >-
+          "${RUNNER_TEMP}/gitleaks"
+          git
+          --exit-code 1
+          --no-banner
+          --redact
+          --verbose
+          .
+
+  dependency-audit:
+    name: Dependency vulnerability audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12.13"
+          cache: pip
+          cache-dependency-path: scripts/security/requirements.lock
+
+      - name: Install hash-locked Python audit tooling
+        run: >-
+          python -m pip install
+          --disable-pip-version-check
+          --require-hashes
+          -r scripts/security/requirements.lock
+
+      - name: Audit hash-locked Python dependencies
+        run: >-
+          python -m pip_audit
+          --strict
+          --progress-spinner off
+          --require-hashes
+          --no-deps
+          --disable-pip
+          --requirement backend/build-requirements.lock
+          --requirement backend/requirements.lock
+          --requirement backend/requirements-dev.lock
+          --requirement scripts/security/requirements.lock
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "24"
+
+      - name: Activate the repository-pinned pnpm
+        run: |
+          corepack enable
+          corepack prepare pnpm@11.9.0 --activate
+
+      - name: Audit all JavaScript dependencies
+        run: pnpm audit --audit-level high
+
+      - name: Install checksum-pinned OSV-Scanner
+        run: bash scripts/security/install_osv_scanner.sh "${RUNNER_TEMP}/osv-scanner"
+
+      - name: Audit the Windows Launcher Cargo lock
+        run: >-
+          "${RUNNER_TEMP}/osv-scanner"
+          scan source
+          --lockfile desktop/windows/Cargo.lock
+          --format json
+          --verbosity warn
+          --output-file "${RUNNER_TEMP}/cargo-osv.json"
+
+  worker-runtime-audit:
+    name: Worker runtime dependency audit
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the exact patched Worker runtime
+        env:
+          WORKER_IMAGE: datax-studio-worker:security-${{ github.sha }}
+        run: >-
+          docker build
+          --platform linux/amd64
+          --file backend/Dockerfile.worker
+          --tag "${WORKER_IMAGE}"
+          .
+
+      - name: Install checksum-pinned SBOM and vulnerability tools
+        run: |
+          bash scripts/release/install_syft.sh "${RUNNER_TEMP}/syft"
+          bash scripts/security/install_osv_scanner.sh "${RUNNER_TEMP}/osv-scanner"
+
+      - name: Generate and evaluate the final Worker image SBOM
+        shell: bash
+        env:
+          WORKER_IMAGE: datax-studio-worker:security-${{ github.sha }}
+        run: |
+          set -euo pipefail
+          report_directory="${RUNNER_TEMP}/worker-runtime-security"
+          mkdir -p "${report_directory}"
+          "${RUNNER_TEMP}/syft" scan "docker:${WORKER_IMAGE}" \
+            --output "spdx-json=${report_directory}/worker.spdx.json"
+          set +e
+          "${RUNNER_TEMP}/osv-scanner" scan source \
+            --sbom "${report_directory}/worker.spdx.json" \
+            --format json \
+            --verbosity warn \
+            --output-file "${report_directory}/worker.osv.json"
+          scanner_status=$?
+          set -e
+          if [[ "${scanner_status}" -ne 0 && "${scanner_status}" -ne 1 ]]; then
+            echo "OSV-Scanner failed to produce a complete Worker report" >&2
+            exit "${scanner_status}"
+          fi
+          python3 scripts/security/evaluate_osv_report.py \
+            --report "${report_directory}/worker.osv.json" \
+            --exceptions scripts/security/osv-application-exceptions.json \
+            --output "${report_directory}/worker.application-policy.json"
+
+  codeql:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        language:
+          - javascript-typescript
+          - python
+          - rust
+          - actions
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+
+      - name: Analyze source
+        uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4

@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://datax-enterprise-studio.local/schemas/runtime-generation.v1.schema.json",
+  "title": "DataX Enterprise Studio Runtime Generation V1",
+  "description": "Windows Launcher 原子提交的活动运行代际指针。存在该文件只表示选择了一个自洽集合，不等于恢复 E4 已通过。",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "generation_id",
+    "installation_id",
+    "source",
+    "restore_journal_id",
+    "secret_directory",
+    "volumes",
+    "committed_at",
+    "state_sha256"
+  ],
+  "properties": {
+    "schema_version": { "const": "1.0" },
+    "generation_id": { "$ref": "#/$defs/generationId" },
+    "installation_id": { "$ref": "#/$defs/sha256" },
+    "source": { "enum": ["FRESH", "LEGACY", "RESTORE"] },
+    "restore_journal_id": {
+      "oneOf": [
+        { "$ref": "#/$defs/generationId" },
+        { "type": "null" }
+      ]
+    },
+    "secret_directory": {
+      "oneOf": [
+        { "const": "secrets" },
+        { "type": "string", "pattern": "^generations/[0-9a-f]{32}/secrets$" }
+      ]
+    },
+    "volumes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["postgres", "logs", "workspace"],
+      "properties": {
+        "postgres": {
+          "type": "string",
+          "pattern": "^des-(?:postgres-data|postgres-[0-9a-f]{32})$"
+        },
+        "logs": {
+          "type": "string",
+          "pattern": "^des-(?:log-data|log-[0-9a-f]{32})$"
+        },
+        "workspace": {
+          "type": "string",
+          "pattern": "^des-(?:workspace-data|workspace-[0-9a-f]{32})$"
+        }
+      }
+    },
+    "committed_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "Z$"
+    },
+    "state_sha256": { "$ref": "#/$defs/sha256" }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "source": { "const": "RESTORE" } } },
+      "then": {
+        "properties": {
+          "restore_journal_id": { "$ref": "#/$defs/generationId" },
+          "secret_directory": {
+            "type": "string",
+            "pattern": "^generations/[0-9a-f]{32}/secrets$"
+          }
+        }
+      },
+      "else": { "properties": { "restore_journal_id": { "type": "null" } } }
+    },
+    {
+      "if": { "properties": { "source": { "const": "LEGACY" } } },
+      "then": {
+        "properties": {
+          "secret_directory": { "const": "secrets" },
+          "volumes": {
+            "properties": {
+              "postgres": { "const": "des-postgres-data" },
+              "logs": { "const": "des-log-data" },
+              "workspace": { "const": "des-workspace-data" }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "source": { "enum": ["FRESH", "RESTORE"] }
+        }
+      },
+      "then": {
+        "properties": {
+          "secret_directory": {
+            "type": "string",
+            "pattern": "^generations/[0-9a-f]{32}/secrets$"
+          },
+          "volumes": {
+            "properties": {
+              "postgres": {
+                "type": "string",
+                "pattern": "^des-postgres-[0-9a-f]{32}$"
+              },
+              "logs": {
+                "type": "string",
+                "pattern": "^des-log-[0-9a-f]{32}$"
+              },
+              "workspace": {
+                "type": "string",
+                "pattern": "^des-workspace-[0-9a-f]{32}$"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "generationId": { "type": "string", "pattern": "^[0-9a-f]{32}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

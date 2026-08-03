@@ -1,0 +1,1939 @@
+{
+  "catalog_kind": "DATAX_COMPLETE_CAPABILITY_TARGET_SET",
+  "completion_rule": {
+    "ordinary_user_execution_requires": [
+      "BUILD_VERIFIED",
+      "LICENSE_REVIEWED",
+      "CONTRACTED",
+      "E3_CERTIFIED",
+      "WINDOWS_E4_CERTIFIED",
+      "RELEASE_PROMOTED_FOR_SAME_FINAL_PACKAGE"
+    ],
+    "statement_rule": "Every target item not explicitly unsupported by an accepted ADR must be Windows E4 certified and release promoted for the same final package."
+  },
+  "counts": {
+    "CORE_EXECUTION_SURFACE": 5,
+    "NATIVE_TRANSFORMER": 6,
+    "READER_PLUGIN": 31,
+    "WRITER_PLUGIN": 41,
+    "explicitly_unsupported_v1": 6,
+    "item_count": 83,
+    "windows_e4_certified_count": 0
+  },
+  "items": [
+    {
+      "id": "CORE_ARBITRARY_JOB_JSON",
+      "kind": "CORE_EXECUTION_SURFACE",
+      "module": "core",
+      "name": "Arbitrary DataX job JSON",
+      "ordinary_user_executable": false,
+      "plugin_name": null,
+      "required_e3_test_id": "E3-CAP-ARBITRARY-JOB-JSON",
+      "required_e4_test_id": "E4-CAP-ARBITRARY-JOB-JSON",
+      "risk_category": "ARBITRARY_EXECUTION_CONFIGURATION",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/Engine.java",
+          "sha256": "9ec430d6fda5b036bf0af23aba166b336d213a354b143d09d9c74df7100cb315"
+        }
+      ],
+      "v1_disposition": "EXPLICITLY_UNSUPPORTED_V1"
+    },
+    {
+      "id": "CORE_EXTERNAL_TRANSFORMER_LOADING",
+      "kind": "CORE_EXECUTION_SURFACE",
+      "module": "core",
+      "name": "External transformer JAR loading",
+      "ordinary_user_executable": false,
+      "plugin_name": null,
+      "required_e3_test_id": "E3-CAP-EXTERNAL-TRANSFORMER-LOADING",
+      "required_e4_test_id": "E4-CAP-EXTERNAL-TRANSFORMER-LOADING",
+      "risk_category": "USER_SUPPLIED_CODE",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/TransformerRegistry.java",
+          "sha256": "df7cce1354d52e242d6e954f096b7bff2f6c322a0ec957655c8832783dacff04"
+        }
+      ],
+      "v1_disposition": "EXPLICITLY_UNSUPPORTED_V1"
+    },
+    {
+      "id": "CORE_POST_SQL",
+      "kind": "CORE_EXECUTION_SURFACE",
+      "module": "core",
+      "name": "Plugin postSql hooks",
+      "ordinary_user_executable": false,
+      "plugin_name": null,
+      "required_e3_test_id": "E3-CAP-POST-SQL",
+      "required_e4_test_id": "E4-CAP-POST-SQL",
+      "risk_category": "ARBITRARY_SQL",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/odpsreader/src/main/java/com/alibaba/datax/plugin/reader/odpsreader/OdpsReader.java",
+          "sha256": "8e214f50ec976d316d2781a9ac10bc80c3dbf230c17ddaec9db20cc46c8aab85"
+        },
+        {
+          "path": "third_party/alibaba-datax/postgresqlwriter/src/main/resources/plugin_job_template.json",
+          "sha256": "6eb38c4bad42f87a52230b823c56509b26e264e0178456b318eb38228d12459c"
+        }
+      ],
+      "v1_disposition": "EXPLICITLY_UNSUPPORTED_V1"
+    },
+    {
+      "id": "CORE_PRE_SQL",
+      "kind": "CORE_EXECUTION_SURFACE",
+      "module": "core",
+      "name": "Plugin preSql hooks",
+      "ordinary_user_executable": false,
+      "plugin_name": null,
+      "required_e3_test_id": "E3-CAP-PRE-SQL",
+      "required_e4_test_id": "E4-CAP-PRE-SQL",
+      "risk_category": "ARBITRARY_SQL",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/mysqlwriter/src/main/resources/plugin_job_template.json",
+          "sha256": "47e62a52776fdd7288705132c6ff39dfaee50fa475e5e069151de1e683d3e2d9"
+        },
+        {
+          "path": "third_party/alibaba-datax/postgresqlwriter/src/main/resources/plugin_job_template.json",
+          "sha256": "6eb38c4bad42f87a52230b823c56509b26e264e0178456b318eb38228d12459c"
+        }
+      ],
+      "v1_disposition": "EXPLICITLY_UNSUPPORTED_V1"
+    },
+    {
+      "id": "CORE_QUERY_SQL",
+      "kind": "CORE_EXECUTION_SURFACE",
+      "module": "core",
+      "name": "Reader querySql",
+      "ordinary_user_executable": false,
+      "plugin_name": null,
+      "required_e3_test_id": "E3-CAP-QUERY-SQL",
+      "required_e4_test_id": "E4-CAP-QUERY-SQL",
+      "risk_category": "ARBITRARY_SQL",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/rdbmsreader/src/main/resources/plugin_job_template.json",
+          "sha256": "17d7b324438710d6c57e0b50a6cd0249664b0f7ddc1c5cc4f45dd1bed4db02a7"
+        },
+        {
+          "path": "third_party/alibaba-datax/tdenginereader/src/main/java/com/alibaba/datax/plugin/reader/TDengineReader.java",
+          "sha256": "1e11654f65603e87dd1153e6fed89ead5f4baaf410fce8ac47b4b7a5ec21c191"
+        }
+      ],
+      "v1_disposition": "EXPLICITLY_UNSUPPORTED_V1"
+    },
+    {
+      "id": "NATIVE_TRANSFORMER_DIGEST",
+      "kind": "NATIVE_TRANSFORMER",
+      "module": "core",
+      "name": "dx_digest",
+      "ordinary_user_executable": false,
+      "plugin_name": null,
+      "required_e3_test_id": "E3-CAP-NATIVE-DIGEST",
+      "required_e4_test_id": "E4-CAP-NATIVE-DIGEST",
+      "risk_category": "DATA_TRANSFORMATION",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/DigestTransformer.java",
+          "sha256": "088e7d100a163d2dbdfcd07c54407912d081eba13f9b53a73f5d203cc98ca61c"
+        },
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/TransformerRegistry.java",
+          "sha256": "df7cce1354d52e242d6e954f096b7bff2f6c322a0ec957655c8832783dacff04"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "NATIVE_TRANSFORMER_FILTER",
+      "kind": "NATIVE_TRANSFORMER",
+      "module": "core",
+      "name": "dx_filter",
+      "ordinary_user_executable": false,
+      "plugin_name": null,
+      "required_e3_test_id": "E3-CAP-NATIVE-FILTER",
+      "required_e4_test_id": "E4-CAP-NATIVE-FILTER",
+      "risk_category": "DATA_TRANSFORMATION",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/FilterTransformer.java",
+          "sha256": "c056bd660a37b383689e4d96c706c5dc1a729d73ab23d69d59c825a458ae7c75"
+        },
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/TransformerRegistry.java",
+          "sha256": "df7cce1354d52e242d6e954f096b7bff2f6c322a0ec957655c8832783dacff04"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "NATIVE_TRANSFORMER_GROOVY",
+      "kind": "NATIVE_TRANSFORMER",
+      "module": "core",
+      "name": "dx_groovy",
+      "ordinary_user_executable": false,
+      "plugin_name": null,
+      "required_e3_test_id": "E3-CAP-NATIVE-GROOVY",
+      "required_e4_test_id": "E4-CAP-NATIVE-GROOVY",
+      "risk_category": "USER_SUPPLIED_CODE",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/GroovyTransformer.java",
+          "sha256": "40400e0905f1659d52f5566d3eb16f994298381e4bf34fd314784a7b3a8126c4"
+        },
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/TransformerRegistry.java",
+          "sha256": "df7cce1354d52e242d6e954f096b7bff2f6c322a0ec957655c8832783dacff04"
+        }
+      ],
+      "v1_disposition": "EXPLICITLY_UNSUPPORTED_V1"
+    },
+    {
+      "id": "NATIVE_TRANSFORMER_PAD",
+      "kind": "NATIVE_TRANSFORMER",
+      "module": "core",
+      "name": "dx_pad",
+      "ordinary_user_executable": false,
+      "plugin_name": null,
+      "required_e3_test_id": "E3-CAP-NATIVE-PAD",
+      "required_e4_test_id": "E4-CAP-NATIVE-PAD",
+      "risk_category": "DATA_TRANSFORMATION",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/PadTransformer.java",
+          "sha256": "87b5775ccb65ada534ffe8f839abb4d1693cfc416f1a5a886cae71d571678195"
+        },
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/TransformerRegistry.java",
+          "sha256": "df7cce1354d52e242d6e954f096b7bff2f6c322a0ec957655c8832783dacff04"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "NATIVE_TRANSFORMER_REPLACE",
+      "kind": "NATIVE_TRANSFORMER",
+      "module": "core",
+      "name": "dx_replace",
+      "ordinary_user_executable": false,
+      "plugin_name": null,
+      "required_e3_test_id": "E3-CAP-NATIVE-REPLACE",
+      "required_e4_test_id": "E4-CAP-NATIVE-REPLACE",
+      "risk_category": "DATA_TRANSFORMATION",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/ReplaceTransformer.java",
+          "sha256": "f83a2f81116e39d2522668471b7e55dd969d4e2c93e70d5cfc6d02ff83299875"
+        },
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/TransformerRegistry.java",
+          "sha256": "df7cce1354d52e242d6e954f096b7bff2f6c322a0ec957655c8832783dacff04"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "NATIVE_TRANSFORMER_SUBSTR",
+      "kind": "NATIVE_TRANSFORMER",
+      "module": "core",
+      "name": "dx_substr",
+      "ordinary_user_executable": false,
+      "plugin_name": null,
+      "required_e3_test_id": "E3-CAP-NATIVE-SUBSTR",
+      "required_e4_test_id": "E4-CAP-NATIVE-SUBSTR",
+      "risk_category": "DATA_TRANSFORMATION",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/SubstrTransformer.java",
+          "sha256": "281a7c07c3d2031a85e631316e4e06b59f495d6c0923011729a22886d2ecbf94"
+        },
+        {
+          "path": "third_party/alibaba-datax/core/src/main/java/com/alibaba/datax/core/transport/transformer/TransformerRegistry.java",
+          "sha256": "df7cce1354d52e242d6e954f096b7bff2f6c322a0ec957655c8832783dacff04"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_CASSANDRA",
+      "kind": "READER_PLUGIN",
+      "module": "cassandrareader",
+      "name": "cassandrareader",
+      "ordinary_user_executable": false,
+      "plugin_name": "cassandrareader",
+      "required_e3_test_id": "E3-CAP-READER-CASSANDRAREADER",
+      "required_e4_test_id": "E4-CAP-READER-CASSANDRAREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/cassandrareader/pom.xml",
+          "sha256": "15bb5ea8dd164c492210452c051e4dc647c1ff5ac38190648e7cc9b0e096156c"
+        },
+        {
+          "path": "third_party/alibaba-datax/cassandrareader/src/main/resources/plugin.json",
+          "sha256": "0de2a95bb0035b50a7061fbfc66946947949103b0dccb85a3fa27256e0c69660"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_CLICKHOUSE",
+      "kind": "READER_PLUGIN",
+      "module": "clickhousereader",
+      "name": "clickhousereader",
+      "ordinary_user_executable": false,
+      "plugin_name": "clickhousereader",
+      "required_e3_test_id": "E3-CAP-READER-CLICKHOUSEREADER",
+      "required_e4_test_id": "E4-CAP-READER-CLICKHOUSEREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/clickhousereader/pom.xml",
+          "sha256": "d0312f0d86dc3e8cf2eb41271d302f46e834b93baf934e1ed0ad59f0e83d1b03"
+        },
+        {
+          "path": "third_party/alibaba-datax/clickhousereader/src/main/resources/plugin.json",
+          "sha256": "d46a9eb295cfd1906e800e8532dfa8a4124c2c59c0d0fc15eb76b44fc6c18d87"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_DATAHUB",
+      "kind": "READER_PLUGIN",
+      "module": "datahubreader",
+      "name": "datahubreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "datahubreader",
+      "required_e3_test_id": "E3-CAP-READER-DATAHUBREADER",
+      "required_e4_test_id": "E4-CAP-READER-DATAHUBREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/datahubreader/pom.xml",
+          "sha256": "a43e0d922ab7d76a4433ea3ab2589c983e687c9a131d12d10e02ab604861a30e"
+        },
+        {
+          "path": "third_party/alibaba-datax/datahubreader/src/main/resources/plugin.json",
+          "sha256": "60191df169bc6b58a289f9428d4318fddcd088577a4bf2311bd39a4c80dab557"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_DRDS",
+      "kind": "READER_PLUGIN",
+      "module": "drdsreader",
+      "name": "drdsreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "drdsreader",
+      "required_e3_test_id": "E3-CAP-READER-DRDSREADER",
+      "required_e4_test_id": "E4-CAP-READER-DRDSREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/drdsreader/pom.xml",
+          "sha256": "8ceee186fc676a327ecad46d36b8114c4629d4ea4efee573d0e6f6b97e734875"
+        },
+        {
+          "path": "third_party/alibaba-datax/drdsreader/src/main/resources/plugin.json",
+          "sha256": "a1b3dcf38155f02d816f07bf0aef7f15295c677e5f1408fb8da70325d53b5480"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_FTP",
+      "kind": "READER_PLUGIN",
+      "module": "ftpreader",
+      "name": "ftpreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "ftpreader",
+      "required_e3_test_id": "E3-CAP-READER-FTPREADER",
+      "required_e4_test_id": "E4-CAP-READER-FTPREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/ftpreader/pom.xml",
+          "sha256": "1489eddc6e01359ff379032b7719007cbce42542ed35a52e95daa90ce3ffe98b"
+        },
+        {
+          "path": "third_party/alibaba-datax/ftpreader/src/main/resources/plugin.json",
+          "sha256": "78c318ab8135d202c7100d7569cdbf834b7aa29be46b6e498dfb11a35c23326d"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_GAUSSDB",
+      "kind": "READER_PLUGIN",
+      "module": "gaussdbreader",
+      "name": "gaussdbreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "gaussdbreader",
+      "required_e3_test_id": "E3-CAP-READER-GAUSSDBREADER",
+      "required_e4_test_id": "E4-CAP-READER-GAUSSDBREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/gaussdbreader/pom.xml",
+          "sha256": "4fb5f66ed819632c6a85d00e5b497a1931c3919cdbe9e3ad3c54835017e9550c"
+        },
+        {
+          "path": "third_party/alibaba-datax/gaussdbreader/src/main/resources/plugin.json",
+          "sha256": "1fc029fd36e9608216e71c3f6181324e8968a7155709e0ca777939308378d046"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_GDB",
+      "kind": "READER_PLUGIN",
+      "module": "gdbreader",
+      "name": "gdbreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "gdbreader",
+      "required_e3_test_id": "E3-CAP-READER-GDBREADER",
+      "required_e4_test_id": "E4-CAP-READER-GDBREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/gdbreader/pom.xml",
+          "sha256": "9c131f1520eb9515c4b4509a9b93b70a0927f54580b3671a1d5ee25ad3f6de45"
+        },
+        {
+          "path": "third_party/alibaba-datax/gdbreader/src/main/resources/plugin.json",
+          "sha256": "e994505cc24c6ff32f4c2dcd4532c84e89c4db2e47bfe1d6fc487aef4241b735"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_HBASE094X",
+      "kind": "READER_PLUGIN",
+      "module": "hbase094xreader",
+      "name": "hbase094xreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "hbase094xreader",
+      "required_e3_test_id": "E3-CAP-READER-HBASE094XREADER",
+      "required_e4_test_id": "E4-CAP-READER-HBASE094XREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/hbase094xreader/pom.xml",
+          "sha256": "9e2a84860eef942e8a81a0ca391803ce9e2ffd9875ba52d543c605683535d34d"
+        },
+        {
+          "path": "third_party/alibaba-datax/hbase094xreader/src/main/resources/plugin.json",
+          "sha256": "213c8b539ce9d8070777e28178ee79461af2c7af651c268f641bb143b90426c8"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_HBASE11X",
+      "kind": "READER_PLUGIN",
+      "module": "hbase11xreader",
+      "name": "hbase11xreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "hbase11xreader",
+      "required_e3_test_id": "E3-CAP-READER-HBASE11XREADER",
+      "required_e4_test_id": "E4-CAP-READER-HBASE11XREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/hbase11xreader/pom.xml",
+          "sha256": "dc2e9eaf59882d76f979b7fc1a28737209494b87e4c280642d783d30e516c4e4"
+        },
+        {
+          "path": "third_party/alibaba-datax/hbase11xreader/src/main/resources/plugin.json",
+          "sha256": "a4fcf2312cc1a7aa6edf8a4f2bd0d6bfee699e9a57104e52cfddccb934252b78"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_HBASE11XSQL",
+      "kind": "READER_PLUGIN",
+      "module": "hbase11xsqlreader",
+      "name": "hbase11xsqlreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "hbase11xsqlreader",
+      "required_e3_test_id": "E3-CAP-READER-HBASE11XSQLREADER",
+      "required_e4_test_id": "E4-CAP-READER-HBASE11XSQLREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/hbase11xsqlreader/pom.xml",
+          "sha256": "ed8c08d3550863e30869a12629b442dc0a85a154287f5a5a3a36fe157c67b7db"
+        },
+        {
+          "path": "third_party/alibaba-datax/hbase11xsqlreader/src/main/resources/plugin.json",
+          "sha256": "490613589fc7933c3b8f5cd2d3d26bd57159bdd475a03e81afbdca08e5d87a5f"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_HBASE20XSQL",
+      "kind": "READER_PLUGIN",
+      "module": "hbase20xsqlreader",
+      "name": "hbase20xsqlreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "hbase20xsqlreader",
+      "required_e3_test_id": "E3-CAP-READER-HBASE20XSQLREADER",
+      "required_e4_test_id": "E4-CAP-READER-HBASE20XSQLREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/hbase20xsqlreader/pom.xml",
+          "sha256": "ebda012919a66d131ae3cf559580fc8131a5e8bc57b036073996007102f6a052"
+        },
+        {
+          "path": "third_party/alibaba-datax/hbase20xsqlreader/src/main/resources/plugin.json",
+          "sha256": "90e62ab92c6e6bdc57921899aeb4f013186b014efa9bba82b7871e8ff3a7b9e8"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_HDFS",
+      "kind": "READER_PLUGIN",
+      "module": "hdfsreader",
+      "name": "hdfsreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "hdfsreader",
+      "required_e3_test_id": "E3-CAP-READER-HDFSREADER",
+      "required_e4_test_id": "E4-CAP-READER-HDFSREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/hdfsreader/pom.xml",
+          "sha256": "562dc8c3349b7ad88256d85383daa8c11c7c6e10ebc9f6c42af77b41632bb159"
+        },
+        {
+          "path": "third_party/alibaba-datax/hdfsreader/src/main/resources/plugin.json",
+          "sha256": "a2114b491306a3e08dec4b2cbae20caaf46955d9922602dad50b99f7221e3fd7"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_KINGBASEES",
+      "kind": "READER_PLUGIN",
+      "module": "kingbaseesreader",
+      "name": "kingbaseesreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "kingbaseesreader",
+      "required_e3_test_id": "E3-CAP-READER-KINGBASEESREADER",
+      "required_e4_test_id": "E4-CAP-READER-KINGBASEESREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/kingbaseesreader/pom.xml",
+          "sha256": "f71b7af3dae4a1d3e42f32a540c57b0c7cb87ae25b9f6b088654cb9cf937db70"
+        },
+        {
+          "path": "third_party/alibaba-datax/kingbaseesreader/src/main/resources/plugin.json",
+          "sha256": "9a7b0db7f47c4c596e9f1b0adc8bc3a5b86f2d6d3bf68b60fdae816eb8600e5a"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_LOGHUB",
+      "kind": "READER_PLUGIN",
+      "module": "loghubreader",
+      "name": "loghubreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "loghubreader",
+      "required_e3_test_id": "E3-CAP-READER-LOGHUBREADER",
+      "required_e4_test_id": "E4-CAP-READER-LOGHUBREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/loghubreader/pom.xml",
+          "sha256": "c0bd40816a671da5951553d79c19e8516d5c1b6e231f758afb373627e2960d11"
+        },
+        {
+          "path": "third_party/alibaba-datax/loghubreader/src/main/resources/plugin.json",
+          "sha256": "b7c098871da156976720642c0a0e403e9848968785a14c3f6aab631d5b139e9e"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_MONGODB",
+      "kind": "READER_PLUGIN",
+      "module": "mongodbreader",
+      "name": "mongodbreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "mongodbreader",
+      "required_e3_test_id": "E3-CAP-READER-MONGODBREADER",
+      "required_e4_test_id": "E4-CAP-READER-MONGODBREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/mongodbreader/pom.xml",
+          "sha256": "df541052392d98561fd0025cee4741cd4f17977c417156977ed3463d2672d21c"
+        },
+        {
+          "path": "third_party/alibaba-datax/mongodbreader/src/main/resources/plugin.json",
+          "sha256": "ea9fc6c75ebcc829022bcd1418d04da182d22db1227424d384956a476a70ede3"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_MYSQL",
+      "kind": "READER_PLUGIN",
+      "module": "mysqlreader",
+      "name": "mysqlreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "mysqlreader",
+      "required_e3_test_id": "E2E-RUN-001",
+      "required_e4_test_id": "E2E-WIN-DX-001",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/mysqlreader/pom.xml",
+          "sha256": "c4ffc40c90af4068999178ac7297bb2066de59b8dccfa6e8e956b48327487206"
+        },
+        {
+          "path": "third_party/alibaba-datax/mysqlreader/src/main/resources/plugin.json",
+          "sha256": "86ef9813bfc558048a99e32ffaf4889a48f2f082b0f692dc73770f5385161e8f"
+        }
+      ],
+      "v1_disposition": "V1_SCOPE_CANDIDATE"
+    },
+    {
+      "id": "READER_PLUGIN_OCEANBASEV10",
+      "kind": "READER_PLUGIN",
+      "module": "oceanbasev10reader",
+      "name": "oceanbasev10reader",
+      "ordinary_user_executable": false,
+      "plugin_name": "oceanbasev10reader",
+      "required_e3_test_id": "E3-CAP-READER-OCEANBASEV10READER",
+      "required_e4_test_id": "E4-CAP-READER-OCEANBASEV10READER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/oceanbasev10reader/pom.xml",
+          "sha256": "a5aa21604c77c10380aaeb91f3b9585dc483956a8b6a965fac2e3b3cf55432c7"
+        },
+        {
+          "path": "third_party/alibaba-datax/oceanbasev10reader/src/main/resources/plugin.json",
+          "sha256": "c3e6e23385b0e26325100ea2c904c601ef322c04c637b3bc02fcf0640d5cbade"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_ODPS",
+      "kind": "READER_PLUGIN",
+      "module": "odpsreader",
+      "name": "odpsreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "odpsreader",
+      "required_e3_test_id": "E3-CAP-READER-ODPSREADER",
+      "required_e4_test_id": "E4-CAP-READER-ODPSREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/odpsreader/pom.xml",
+          "sha256": "ddeb8e1f40db89a336d82898816b3545c7541b4462a4ac65feaefd204e37919c"
+        },
+        {
+          "path": "third_party/alibaba-datax/odpsreader/src/main/resources/plugin.json",
+          "sha256": "88b5e6f6d264a923fdeb2bf489db06a997ea71b6ba7265222bda2f94a282917e"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_OPENTSDB",
+      "kind": "READER_PLUGIN",
+      "module": "opentsdbreader",
+      "name": "opentsdbreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "opentsdbreader",
+      "required_e3_test_id": "E3-CAP-READER-OPENTSDBREADER",
+      "required_e4_test_id": "E4-CAP-READER-OPENTSDBREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/opentsdbreader/pom.xml",
+          "sha256": "b3adb9ec2ba35696bab298b627171e77b17328f727543fda3c534004686084dd"
+        },
+        {
+          "path": "third_party/alibaba-datax/opentsdbreader/src/main/resources/plugin.json",
+          "sha256": "554fc1e7ebee40c73f466adaa3dd6897f44c88b25724df2cab3080610a22d92f"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_ORACLE",
+      "kind": "READER_PLUGIN",
+      "module": "oraclereader",
+      "name": "oraclereader",
+      "ordinary_user_executable": false,
+      "plugin_name": "oraclereader",
+      "required_e3_test_id": "E3-CAP-READER-ORACLEREADER",
+      "required_e4_test_id": "E4-CAP-READER-ORACLEREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/oraclereader/pom.xml",
+          "sha256": "4ef487eebc3395b81a1af7b4315d7373916918c4a33afb0b53ad6aeb7c7ed7cf"
+        },
+        {
+          "path": "third_party/alibaba-datax/oraclereader/src/main/resources/plugin.json",
+          "sha256": "f3152d14ba7111e06d4c4ceca201aa22bacf93e93dbd48389356458e049245cf"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_OSS",
+      "kind": "READER_PLUGIN",
+      "module": "ossreader",
+      "name": "ossreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "ossreader",
+      "required_e3_test_id": "E3-CAP-READER-OSSREADER",
+      "required_e4_test_id": "E4-CAP-READER-OSSREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/ossreader/pom.xml",
+          "sha256": "e97c9ef4ee0ab8a8e359ec078ff07705a36a196c7af00b912b65d7fe553b5ae3"
+        },
+        {
+          "path": "third_party/alibaba-datax/ossreader/src/main/resources/plugin.json",
+          "sha256": "925d6078b24a66bc332242a29cae646a7d90410e5241dd0432accba21e2859e7"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_OTS",
+      "kind": "READER_PLUGIN",
+      "module": "otsreader",
+      "name": "otsreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "otsreader",
+      "required_e3_test_id": "E3-CAP-READER-OTSREADER",
+      "required_e4_test_id": "E4-CAP-READER-OTSREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/otsreader/pom.xml",
+          "sha256": "e40ff7f9ced509d942832a6176ce399f8a593c7d2c90ea305657e9f885608591"
+        },
+        {
+          "path": "third_party/alibaba-datax/otsreader/src/main/resources/plugin.json",
+          "sha256": "225cb04158cd450cc058f441a88f8dc09de662e10416a070ab07573d31c77aab"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_OTSSTREAM",
+      "kind": "READER_PLUGIN",
+      "module": "otsstreamreader",
+      "name": "otsstreamreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "otsstreamreader",
+      "required_e3_test_id": "E3-CAP-READER-OTSSTREAMREADER",
+      "required_e4_test_id": "E4-CAP-READER-OTSSTREAMREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/otsstreamreader/pom.xml",
+          "sha256": "61fffaa51209bd383a63b548360406f081a90ef80c9c4848f6cb773f21622a32"
+        },
+        {
+          "path": "third_party/alibaba-datax/otsstreamreader/src/main/resources/plugin.json",
+          "sha256": "0affeeed62b7c62b4c5f93900172c82063f1f447b20f4edd2afaab292023feef"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_POSTGRESQL",
+      "kind": "READER_PLUGIN",
+      "module": "postgresqlreader",
+      "name": "postgresqlreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "postgresqlreader",
+      "required_e3_test_id": "E2E-RUN-001",
+      "required_e4_test_id": "E2E-WIN-DX-001",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/postgresqlreader/pom.xml",
+          "sha256": "f14129fe23f6ca90bfc36b3c3bf64ff8d53288053af26e666411dde47211a835"
+        },
+        {
+          "path": "third_party/alibaba-datax/postgresqlreader/src/main/resources/plugin.json",
+          "sha256": "5f298fb97165625ae5de9c32cb8454128feaa9c7ef8856f943f7683191291b32"
+        }
+      ],
+      "v1_disposition": "V1_SCOPE_CANDIDATE"
+    },
+    {
+      "id": "READER_PLUGIN_RDBMS",
+      "kind": "READER_PLUGIN",
+      "module": "rdbmsreader",
+      "name": "rdbmsreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "rdbmsreader",
+      "required_e3_test_id": "E3-CAP-READER-RDBMSREADER",
+      "required_e4_test_id": "E4-CAP-READER-RDBMSREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/rdbmsreader/pom.xml",
+          "sha256": "1bac6d4965bbf77e0aa722be490a4222dc9389b4eee381ff3bd7c5bad6da429f"
+        },
+        {
+          "path": "third_party/alibaba-datax/rdbmsreader/src/main/resources/plugin.json",
+          "sha256": "3bd772835e264afb38b8608425e1e148d7eaa53c95be9048a8c18104fdf2e1a6"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_SQLSERVER",
+      "kind": "READER_PLUGIN",
+      "module": "sqlserverreader",
+      "name": "sqlserverreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "sqlserverreader",
+      "required_e3_test_id": "E3-CAP-READER-SQLSERVERREADER",
+      "required_e4_test_id": "E4-CAP-READER-SQLSERVERREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/sqlserverreader/pom.xml",
+          "sha256": "d008f83d4e6dd2941eb5cf676a5619fe5671596f2bc53c9df8b3bbf617539c7c"
+        },
+        {
+          "path": "third_party/alibaba-datax/sqlserverreader/src/main/resources/plugin.json",
+          "sha256": "bf7fc569dd41c249ecfd56225f8052457efbee13076e5a48a1db6d199a512b2c"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_STARROCKS",
+      "kind": "READER_PLUGIN",
+      "module": "starrocksreader",
+      "name": "starrocksreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "starrocksreader",
+      "required_e3_test_id": "E3-CAP-READER-STARROCKSREADER",
+      "required_e4_test_id": "E4-CAP-READER-STARROCKSREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/starrocksreader/pom.xml",
+          "sha256": "ff6d1c67e9d2f684c3221bcbb7b48387ed7f00c663e4d3d66dabb427ed830ac3"
+        },
+        {
+          "path": "third_party/alibaba-datax/starrocksreader/src/main/resources/plugin.json",
+          "sha256": "2598bff7a036cc647250de80dded4ca78ff033f981bcbe99a841fa8340573dfd"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_STREAM",
+      "kind": "READER_PLUGIN",
+      "module": "streamreader",
+      "name": "streamreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "streamreader",
+      "required_e3_test_id": "E3-CAP-READER-STREAMREADER",
+      "required_e4_test_id": "E4-CAP-READER-STREAMREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/streamreader/pom.xml",
+          "sha256": "26319b7dc5f99058eaf8b76902c4f90bc8a8d1a5cc6b6a9bd4940d65f269cc29"
+        },
+        {
+          "path": "third_party/alibaba-datax/streamreader/src/main/resources/plugin.json",
+          "sha256": "e3d49d018b29287d84775198b5c8449b140c81162865a7d5fcdd303814ed8af5"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_TDENGINE",
+      "kind": "READER_PLUGIN",
+      "module": "tdenginereader",
+      "name": "tdenginereader",
+      "ordinary_user_executable": false,
+      "plugin_name": "tdenginereader",
+      "required_e3_test_id": "E3-CAP-READER-TDENGINEREADER",
+      "required_e4_test_id": "E4-CAP-READER-TDENGINEREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/tdenginereader/pom.xml",
+          "sha256": "949288fb79f9290d1512600fa5e09124e9e5a8e6c19ac57fa8e8c0178e980f0c"
+        },
+        {
+          "path": "third_party/alibaba-datax/tdenginereader/src/main/resources/plugin.json",
+          "sha256": "4656675b8a6824d3d350a9f0917f7696a065f23cd36ae9da132b77a3a7473026"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_TSDB",
+      "kind": "READER_PLUGIN",
+      "module": "tsdbreader",
+      "name": "tsdbreader",
+      "ordinary_user_executable": false,
+      "plugin_name": "tsdbreader",
+      "required_e3_test_id": "E3-CAP-READER-TSDBREADER",
+      "required_e4_test_id": "E4-CAP-READER-TSDBREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/tsdbreader/pom.xml",
+          "sha256": "0cf15200abea2f10d8c447876b24f54e7ad3bbf5abeab77c6ebab5491435e3bc"
+        },
+        {
+          "path": "third_party/alibaba-datax/tsdbreader/src/main/resources/plugin.json",
+          "sha256": "3600f067161818cd3f263ab42c7ce2fc8e8001d435770c18875d880779b929b7"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "READER_PLUGIN_TXTFILE",
+      "kind": "READER_PLUGIN",
+      "module": "txtfilereader",
+      "name": "txtfilereader",
+      "ordinary_user_executable": false,
+      "plugin_name": "txtfilereader",
+      "required_e3_test_id": "E3-CAP-READER-TXTFILEREADER",
+      "required_e4_test_id": "E4-CAP-READER-TXTFILEREADER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/txtfilereader/pom.xml",
+          "sha256": "759e38515c5de99cb155ebde05fb7937ff4c1a2a8011a1b1af35f48addbec897"
+        },
+        {
+          "path": "third_party/alibaba-datax/txtfilereader/src/main/resources/plugin.json",
+          "sha256": "497b026cb893b62b7af614ed9c64656b5c0681789300414cbe173272b669bbec"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_ADBMYSQL",
+      "kind": "WRITER_PLUGIN",
+      "module": "adbmysqlwriter",
+      "name": "adbmysqlwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "adbmysqlwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-ADBMYSQLWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-ADBMYSQLWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/adbmysqlwriter/pom.xml",
+          "sha256": "8e141b58ecf65554b1ad10c04ae605853738aceb10ee6c116ab03a900aa0ad21"
+        },
+        {
+          "path": "third_party/alibaba-datax/adbmysqlwriter/src/main/resources/plugin.json",
+          "sha256": "cf0278ca94f434dbb61e78c0da4921597335b1f24d3ff775e03b27584396b589"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_ADBPG",
+      "kind": "WRITER_PLUGIN",
+      "module": "adbpgwriter",
+      "name": "adbpgwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "adbpgwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-ADBPGWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-ADBPGWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/adbpgwriter/pom.xml",
+          "sha256": "3ff5d29dd3462291a2f4c174b751f8dbc1f3cb2ce9d980509ac3b7c3918b7731"
+        },
+        {
+          "path": "third_party/alibaba-datax/adbpgwriter/src/main/resources/plugin.json",
+          "sha256": "8fcf75c74b4eb2fd35271c119a17317af8b96a141985c6fdb300f778ecc7b1af"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_ADS",
+      "kind": "WRITER_PLUGIN",
+      "module": "adswriter",
+      "name": "adswriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "adswriter",
+      "required_e3_test_id": "E3-CAP-WRITER-ADSWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-ADSWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/adswriter/pom.xml",
+          "sha256": "6e181f62a5ea3f9094d4ed8100e720dff2c92479d59682c60b8039d05e8070f3"
+        },
+        {
+          "path": "third_party/alibaba-datax/adswriter/src/main/resources/plugin.json",
+          "sha256": "2c5815ab1e33cbc11014bced9b2d5fed9d4356f7bb8eecda1489115308797e75"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_CASSANDRA",
+      "kind": "WRITER_PLUGIN",
+      "module": "cassandrawriter",
+      "name": "cassandrawriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "cassandrawriter",
+      "required_e3_test_id": "E3-CAP-WRITER-CASSANDRAWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-CASSANDRAWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/cassandrawriter/pom.xml",
+          "sha256": "094b7f80bdcef4f3850155313512aed8c98ea3f5397fecd2c513537112852c33"
+        },
+        {
+          "path": "third_party/alibaba-datax/cassandrawriter/src/main/resources/plugin.json",
+          "sha256": "15c62caf8feb7b8db6f714756cc0647d54ad445ccced3b9d18cd5c19e5610447"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_CLICKHOUSE",
+      "kind": "WRITER_PLUGIN",
+      "module": "clickhousewriter",
+      "name": "clickhousewriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "clickhousewriter",
+      "required_e3_test_id": "E3-CAP-WRITER-CLICKHOUSEWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-CLICKHOUSEWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/clickhousewriter/pom.xml",
+          "sha256": "80967aed27af26728d6eb0f10cee2db006030d899a3b8a04a5a8dd39590bce0d"
+        },
+        {
+          "path": "third_party/alibaba-datax/clickhousewriter/src/main/resources/plugin.json",
+          "sha256": "02393efa5d8879d6bfcd4dcb38f9f6d6c748a5bab4afecfe9710bf09be47812a"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_DATABEND",
+      "kind": "WRITER_PLUGIN",
+      "module": "databendwriter",
+      "name": "databendwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "databendwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-DATABENDWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-DATABENDWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/databendwriter/pom.xml",
+          "sha256": "4266b0b74b55fe4e3f02c45680661b250435ff6917db1c1cab279d24e5ed7dde"
+        },
+        {
+          "path": "third_party/alibaba-datax/databendwriter/src/main/resources/plugin.json",
+          "sha256": "42b81861cdd4457add75943b54fd6bb8af0c924ddceedc2e73ad71a5c8a294a0"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_DATAHUB",
+      "kind": "WRITER_PLUGIN",
+      "module": "datahubwriter",
+      "name": "datahubwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "datahubwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-DATAHUBWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-DATAHUBWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/datahubwriter/pom.xml",
+          "sha256": "8df88321c8a12c43acd46206661a5afe045fde0680bb64593d1955c6ca432053"
+        },
+        {
+          "path": "third_party/alibaba-datax/datahubwriter/src/main/resources/plugin.json",
+          "sha256": "c809282f81a084aae8a7c35dc2b06aada93ab926dde3d1f5b712077a8465d324"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_DORIS",
+      "kind": "WRITER_PLUGIN",
+      "module": "doriswriter",
+      "name": "doriswriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "doriswriter",
+      "required_e3_test_id": "E3-CAP-WRITER-DORISWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-DORISWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/doriswriter/pom.xml",
+          "sha256": "baa6d8652161a3f08109d06b7aa317bdb6bc4942b85268fd8cf5a202751b3b3d"
+        },
+        {
+          "path": "third_party/alibaba-datax/doriswriter/src/main/resources/plugin.json",
+          "sha256": "44ab4aaabd37979c51559f547a1e4d66c56d3e4786b6f9777eadaed000a6e548"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_DRDS",
+      "kind": "WRITER_PLUGIN",
+      "module": "drdswriter",
+      "name": "drdswriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "drdswriter",
+      "required_e3_test_id": "E3-CAP-WRITER-DRDSWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-DRDSWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/drdswriter/pom.xml",
+          "sha256": "ac10b0362e81e1f1c33cc3310b705121d640f996eca6be5b6dc86ef55c28b49a"
+        },
+        {
+          "path": "third_party/alibaba-datax/drdswriter/src/main/resources/plugin.json",
+          "sha256": "d354661f845cbf34f39c840e48f950a8708e7e4513236c85d5e7b01f75f03b80"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_ELASTICSEARCH",
+      "kind": "WRITER_PLUGIN",
+      "module": "elasticsearchwriter",
+      "name": "elasticsearchwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "elasticsearchwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-ELASTICSEARCHWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-ELASTICSEARCHWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/elasticsearchwriter/pom.xml",
+          "sha256": "b6ba8688b129d5f2077f83d2bf2bb5c50fe40932fa9b66c04fe03444bf5f5c34"
+        },
+        {
+          "path": "third_party/alibaba-datax/elasticsearchwriter/src/main/resources/plugin.json",
+          "sha256": "70ee71bdef0cd57be12a6d7731c3ae7db371f9e5e6bfa05abbbe6e5b923d9e57"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_FTP",
+      "kind": "WRITER_PLUGIN",
+      "module": "ftpwriter",
+      "name": "ftpwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "ftpwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-FTPWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-FTPWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/ftpwriter/pom.xml",
+          "sha256": "0a704afe77ca687baed3ef194ae7301890a8e65e0d25b927fb0d304e5694d7a7"
+        },
+        {
+          "path": "third_party/alibaba-datax/ftpwriter/src/main/resources/plugin.json",
+          "sha256": "490f7bebda3b09bf71ac79ffa6415cd191ff8eab716953d9ed9a01bb64041458"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_GAUSSDB",
+      "kind": "WRITER_PLUGIN",
+      "module": "gaussdbwriter",
+      "name": "gaussdbwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "gaussdbwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-GAUSSDBWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-GAUSSDBWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/gaussdbwriter/pom.xml",
+          "sha256": "01fe47d8cb184f0fee341c0c2329ce30fffb5d106f84a549eba37436a772f281"
+        },
+        {
+          "path": "third_party/alibaba-datax/gaussdbwriter/src/main/resources/plugin.json",
+          "sha256": "abe9ad55e816d12d646694a39eb8b7bca2632d9e53979f2f8d475c2dd5108015"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_GDB",
+      "kind": "WRITER_PLUGIN",
+      "module": "gdbwriter",
+      "name": "gdbwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "gdbwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-GDBWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-GDBWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/gdbwriter/pom.xml",
+          "sha256": "cc38522624fad7bed3ed81b1ba586e3c9fb25333ad4609b0ebea7b32d651f934"
+        },
+        {
+          "path": "third_party/alibaba-datax/gdbwriter/src/main/resources/plugin.json",
+          "sha256": "38b527d019dafa267424d0f11d2ef33f79f04bb4ebbeeb076d0d32321a13d1c9"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_HBASE094X",
+      "kind": "WRITER_PLUGIN",
+      "module": "hbase094xwriter",
+      "name": "hbase094xwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "hbase094xwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-HBASE094XWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-HBASE094XWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/hbase094xwriter/pom.xml",
+          "sha256": "25f751c5a9a4b4128bfacdf2cf51fb724eca3c71e6debd6f08a661a435ce829f"
+        },
+        {
+          "path": "third_party/alibaba-datax/hbase094xwriter/src/main/resources/plugin.json",
+          "sha256": "8c5fb235068d406bcf3259df5154f38a6c9a219313e8e08d925e0053917e0925"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_HBASE11X",
+      "kind": "WRITER_PLUGIN",
+      "module": "hbase11xwriter",
+      "name": "hbase11xwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "hbase11xwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-HBASE11XWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-HBASE11XWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/hbase11xwriter/pom.xml",
+          "sha256": "95ed8732eb9de8ef5ea29e176c455b4aa457d96af4888ed018775916a84c0404"
+        },
+        {
+          "path": "third_party/alibaba-datax/hbase11xwriter/src/main/resources/plugin.json",
+          "sha256": "d74e04daf5de9787ec2debe933e0238bbf172e7521f75d36b39314ac65af6eaf"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_HBASE11XSQL",
+      "kind": "WRITER_PLUGIN",
+      "module": "hbase11xsqlwriter",
+      "name": "hbase11xsqlwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "hbase11xsqlwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-HBASE11XSQLWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-HBASE11XSQLWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/hbase11xsqlwriter/pom.xml",
+          "sha256": "ba31bc3cd95ad36a873ff567a9b6a526ce32031f0095af9e035ce42e87cdab49"
+        },
+        {
+          "path": "third_party/alibaba-datax/hbase11xsqlwriter/src/main/resources/plugin.json",
+          "sha256": "b5adc81a7c5e17dfcdcbe539282d4169d758485596536001afff6c65b137af2c"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_HBASE20XSQL",
+      "kind": "WRITER_PLUGIN",
+      "module": "hbase20xsqlwriter",
+      "name": "hbase20xsqlwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "hbase20xsqlwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-HBASE20XSQLWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-HBASE20XSQLWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/hbase20xsqlwriter/pom.xml",
+          "sha256": "179fc3c8d67a368d32b3ee2549ad447866ae3d37e3e14b766f234032c748e508"
+        },
+        {
+          "path": "third_party/alibaba-datax/hbase20xsqlwriter/src/main/resources/plugin.json",
+          "sha256": "728c03916bea0bb3fa0ce4aa09d147c31a02c9aad49fa39315b1e79c1cc8725f"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_HDFS",
+      "kind": "WRITER_PLUGIN",
+      "module": "hdfswriter",
+      "name": "hdfswriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "hdfswriter",
+      "required_e3_test_id": "E3-CAP-WRITER-HDFSWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-HDFSWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/hdfswriter/pom.xml",
+          "sha256": "84e1350a333bf8c8cedcfaaa45d6977f835e5b0e13b9faaf4f44d96cc2b01a24"
+        },
+        {
+          "path": "third_party/alibaba-datax/hdfswriter/src/main/resources/plugin.json",
+          "sha256": "331c606c0b82c4228a088a4c791916e5d6ba484cdc06a4d92ac12ebf84822d6d"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_HOLOGRESJDBC",
+      "kind": "WRITER_PLUGIN",
+      "module": "hologresjdbcwriter",
+      "name": "hologresjdbcwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "hologresjdbcwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-HOLOGRESJDBCWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-HOLOGRESJDBCWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/hologresjdbcwriter/pom.xml",
+          "sha256": "3dfb72493efb8d667042c52a28906052810fb383d1629444aed7b4bc3bb8d07a"
+        },
+        {
+          "path": "third_party/alibaba-datax/hologresjdbcwriter/src/main/resources/plugin.json",
+          "sha256": "a037ba8a24d545fc7b9cd0f143f37363fe74f47ecd09aa91b60dac27c032cd09"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_KINGBASEES",
+      "kind": "WRITER_PLUGIN",
+      "module": "kingbaseeswriter",
+      "name": "kingbaseeswriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "kingbaseeswriter",
+      "required_e3_test_id": "E3-CAP-WRITER-KINGBASEESWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-KINGBASEESWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/kingbaseeswriter/pom.xml",
+          "sha256": "98f4d74c5a9bb028d9a2e1372fd3005f86bc49a7d40ed771d9d33f80cbb93351"
+        },
+        {
+          "path": "third_party/alibaba-datax/kingbaseeswriter/src/main/resources/plugin.json",
+          "sha256": "74136cc0064a7995d82c40dabd4d4292343a0350c4aef58c83f71754d33293b5"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_KUDU",
+      "kind": "WRITER_PLUGIN",
+      "module": "kuduwriter",
+      "name": "kuduwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "kuduwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-KUDUWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-KUDUWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/kuduwriter/pom.xml",
+          "sha256": "2778956ec77de1f579d64afb3a3dd86924521c9b49de904e525baaf5b2d1f4da"
+        },
+        {
+          "path": "third_party/alibaba-datax/kuduwriter/src/main/resources/plugin.json",
+          "sha256": "1e90c7a55bb125cab9f30978c8972c2c20741a6d86cc644a9c5ba453c40385ef"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_LOGHUB",
+      "kind": "WRITER_PLUGIN",
+      "module": "loghubwriter",
+      "name": "loghubwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "loghubwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-LOGHUBWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-LOGHUBWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/loghubwriter/pom.xml",
+          "sha256": "d3dabe98762d3d00bd616b96812d75709687d7cbe387eea1725efd440363edf9"
+        },
+        {
+          "path": "third_party/alibaba-datax/loghubwriter/src/main/resources/plugin.json",
+          "sha256": "246616497de5528a7ee775e2b1d5124bdb869a692e39f378dfc0e2bfb73476c2"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_MONGODB",
+      "kind": "WRITER_PLUGIN",
+      "module": "mongodbwriter",
+      "name": "mongodbwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "mongodbwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-MONGODBWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-MONGODBWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/mongodbwriter/pom.xml",
+          "sha256": "8293a55549fe1ffbc55be2f1119e24a24eccafd0514a89b5221c9cffec2ef001"
+        },
+        {
+          "path": "third_party/alibaba-datax/mongodbwriter/src/main/resources/plugin.json",
+          "sha256": "02daac3c0dc2a5199ccc9e12ee1b9cba1df9ed5756a4f46420845a1e87672794"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_MYSQL",
+      "kind": "WRITER_PLUGIN",
+      "module": "mysqlwriter",
+      "name": "mysqlwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "mysqlwriter",
+      "required_e3_test_id": "E2E-RUN-001",
+      "required_e4_test_id": "E2E-WIN-DX-001",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/mysqlwriter/pom.xml",
+          "sha256": "b83fe2a8eb0d1e535b84914e5fa169722bd085686eb11d63841e92a6d7cf1b2c"
+        },
+        {
+          "path": "third_party/alibaba-datax/mysqlwriter/src/main/resources/plugin.json",
+          "sha256": "2c5914e3625f3c32e79d661407ec4644e94905037c78e1aa21391e0174c2d3ed"
+        }
+      ],
+      "v1_disposition": "V1_SCOPE_CANDIDATE"
+    },
+    {
+      "id": "WRITER_PLUGIN_NEO4J",
+      "kind": "WRITER_PLUGIN",
+      "module": "neo4jwriter",
+      "name": "neo4jWriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "neo4jWriter",
+      "required_e3_test_id": "E3-CAP-WRITER-NEO4JWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-NEO4JWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/neo4jwriter/pom.xml",
+          "sha256": "47afda4d309bed7d58460f4b93e1dc77266061b34aea6bdc551a704fe0d34a85"
+        },
+        {
+          "path": "third_party/alibaba-datax/neo4jwriter/src/main/resources/plugin.json",
+          "sha256": "22daa31868d1d189e53da18cfc1d7ee5a22d6730582a8fe131c354a4f1b7eccb"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_OCEANBASEV10",
+      "kind": "WRITER_PLUGIN",
+      "module": "oceanbasev10writer",
+      "name": "oceanbasev10writer",
+      "ordinary_user_executable": false,
+      "plugin_name": "oceanbasev10writer",
+      "required_e3_test_id": "E3-CAP-WRITER-OCEANBASEV10WRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-OCEANBASEV10WRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/oceanbasev10writer/pom.xml",
+          "sha256": "b2b2dc66635affa02468e05cd6d3d1bd1fa899c3f1b6cdf18e4aff174b47aeb8"
+        },
+        {
+          "path": "third_party/alibaba-datax/oceanbasev10writer/src/main/resources/plugin.json",
+          "sha256": "7717ea9c9f0733d20c42d109e592e303f273e52a143a7abb44cb139d78b2d6a8"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_OCS",
+      "kind": "WRITER_PLUGIN",
+      "module": "ocswriter",
+      "name": "ocswriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "ocswriter",
+      "required_e3_test_id": "E3-CAP-WRITER-OCSWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-OCSWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/ocswriter/pom.xml",
+          "sha256": "304f11bd8824bc97d66715dd99c69932bddde2713587ab768102a5d7cb7eed9d"
+        },
+        {
+          "path": "third_party/alibaba-datax/ocswriter/src/main/resources/plugin.json",
+          "sha256": "cbfd8ea77ef9850147f7370592a35c0493ddea7af50aec17ab52cc62d3ff1d41"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_ODPS",
+      "kind": "WRITER_PLUGIN",
+      "module": "odpswriter",
+      "name": "odpswriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "odpswriter",
+      "required_e3_test_id": "E3-CAP-WRITER-ODPSWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-ODPSWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/odpswriter/pom.xml",
+          "sha256": "efe745bf0678b9ea66f64ee37771ef37fd2e1081f009c32549669246edf74610"
+        },
+        {
+          "path": "third_party/alibaba-datax/odpswriter/src/main/resources/plugin.json",
+          "sha256": "d5c9571e5838a76aca0713213326fcc8f5c4548d203a425f5f91485cf5c46cc7"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_ORACLE",
+      "kind": "WRITER_PLUGIN",
+      "module": "oraclewriter",
+      "name": "oraclewriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "oraclewriter",
+      "required_e3_test_id": "E3-CAP-WRITER-ORACLEWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-ORACLEWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/oraclewriter/pom.xml",
+          "sha256": "6b40125eee94f66e08219d6e32ed847c1779030aa014fb7090bb0439c3845f41"
+        },
+        {
+          "path": "third_party/alibaba-datax/oraclewriter/src/main/resources/plugin.json",
+          "sha256": "a9a93b3e6b65a342ee1a5fca3cce6b3733d16491fdd6a8e568d47cef11de85ea"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_OSCAR",
+      "kind": "WRITER_PLUGIN",
+      "module": "oscarwriter",
+      "name": "oscarwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "oscarwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-OSCARWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-OSCARWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/oscarwriter/pom.xml",
+          "sha256": "fc865edc5ffa80f9fa64a29fd9b73462db89759f20b6c221495b8a2eda89c5a6"
+        },
+        {
+          "path": "third_party/alibaba-datax/oscarwriter/src/main/resources/plugin.json",
+          "sha256": "97b3ef7827c8b8e386284e244e69d4c6bf066ddea7a4d6a2ff5dd98ee1ac0244"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_OSS",
+      "kind": "WRITER_PLUGIN",
+      "module": "osswriter",
+      "name": "osswriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "osswriter",
+      "required_e3_test_id": "E3-CAP-WRITER-OSSWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-OSSWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/osswriter/pom.xml",
+          "sha256": "e286c6b2730b15408b37fb97ac6e36f6182d06d8c529369e8e9eb9ffc1a03a10"
+        },
+        {
+          "path": "third_party/alibaba-datax/osswriter/src/main/resources/plugin.json",
+          "sha256": "7d578c1974b3743a71e34258adbc9017ea053f183d4a61c651c0cdcba2a78e49"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_OTS",
+      "kind": "WRITER_PLUGIN",
+      "module": "otswriter",
+      "name": "otswriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "otswriter",
+      "required_e3_test_id": "E3-CAP-WRITER-OTSWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-OTSWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/otswriter/pom.xml",
+          "sha256": "23fd55dc8a51d0f1c1ca3894897e41b942592084d2229702a61d2cade9d8bf3a"
+        },
+        {
+          "path": "third_party/alibaba-datax/otswriter/src/main/resources/plugin.json",
+          "sha256": "b5cbea7a0d34e4584b7eeac16919a188338be2e8df8e5b205d5145b79169afa5"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_POSTGRESQL",
+      "kind": "WRITER_PLUGIN",
+      "module": "postgresqlwriter",
+      "name": "postgresqlwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "postgresqlwriter",
+      "required_e3_test_id": "E2E-RUN-001",
+      "required_e4_test_id": "E2E-WIN-DX-001",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/postgresqlwriter/pom.xml",
+          "sha256": "d29dcd149b37c269e8e741184172a69ce80cd6ffc69503440fdd9d4afe49e4c4"
+        },
+        {
+          "path": "third_party/alibaba-datax/postgresqlwriter/src/main/resources/plugin.json",
+          "sha256": "1ea3e7ef4deebb90b36e4c7b1cb1e91852abbe9d6db0d52eee7a42fa037589f6"
+        }
+      ],
+      "v1_disposition": "V1_SCOPE_CANDIDATE"
+    },
+    {
+      "id": "WRITER_PLUGIN_RDBMS",
+      "kind": "WRITER_PLUGIN",
+      "module": "rdbmswriter",
+      "name": "rdbmswriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "rdbmswriter",
+      "required_e3_test_id": "E3-CAP-WRITER-RDBMSWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-RDBMSWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/rdbmswriter/pom.xml",
+          "sha256": "63270d0851bb0b4e8e7d62ed20aba7f33b13ddddfeaa551a78400523131becac"
+        },
+        {
+          "path": "third_party/alibaba-datax/rdbmswriter/src/main/resources/plugin.json",
+          "sha256": "87130d2a55810fb579160bcd9085efc3428d8799bc8b4ade122f407114387fc0"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_SELECTDB",
+      "kind": "WRITER_PLUGIN",
+      "module": "selectdbwriter",
+      "name": "selectdbwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "selectdbwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-SELECTDBWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-SELECTDBWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/selectdbwriter/pom.xml",
+          "sha256": "59b70d55b40fd6f82766149daa38b4ca39e6debbb6eb6aa0c8311582d37c13ad"
+        },
+        {
+          "path": "third_party/alibaba-datax/selectdbwriter/src/main/resources/plugin.json",
+          "sha256": "f7c181d3d61119621d6b2c7431f78d517aeeb3aa459e6ec8e6a0f66caf6c44db"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_SQLSERVER",
+      "kind": "WRITER_PLUGIN",
+      "module": "sqlserverwriter",
+      "name": "sqlserverwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "sqlserverwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-SQLSERVERWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-SQLSERVERWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/sqlserverwriter/pom.xml",
+          "sha256": "f2aeab2bb74268e6ff55a1236d5a995c3f706c1c7c97934f5900a98d57e4eb3e"
+        },
+        {
+          "path": "third_party/alibaba-datax/sqlserverwriter/src/main/resources/plugin.json",
+          "sha256": "bc1d2a67f78d8fedf3550173cd7bb54d35207c2a23f40ad62bab3e92ff61a61d"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_STARROCKS",
+      "kind": "WRITER_PLUGIN",
+      "module": "starrockswriter",
+      "name": "starrockswriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "starrockswriter",
+      "required_e3_test_id": "E3-CAP-WRITER-STARROCKSWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-STARROCKSWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/starrockswriter/pom.xml",
+          "sha256": "04380e93f6d5f08d85e525060e9534c02167b422f3d929dc995b36bda1a1d0f6"
+        },
+        {
+          "path": "third_party/alibaba-datax/starrockswriter/src/main/resources/plugin.json",
+          "sha256": "6c62024c7388884bcd683b636efdf728e1e1373ebeeadbf77a6b0ee8e019ab35"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_STREAM",
+      "kind": "WRITER_PLUGIN",
+      "module": "streamwriter",
+      "name": "streamwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "streamwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-STREAMWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-STREAMWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/streamwriter/pom.xml",
+          "sha256": "1d2ce6984e3270afe1fc027dcacab00ebc4859965dc655443898776f9ab7bab1"
+        },
+        {
+          "path": "third_party/alibaba-datax/streamwriter/src/main/resources/plugin.json",
+          "sha256": "c6da92852f9a4cb31707cd55a17e95aba196138c4a92d3052f47bf2c300856b8"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_TDENGINE",
+      "kind": "WRITER_PLUGIN",
+      "module": "tdenginewriter",
+      "name": "tdenginewriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "tdenginewriter",
+      "required_e3_test_id": "E3-CAP-WRITER-TDENGINEWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-TDENGINEWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/tdenginewriter/pom.xml",
+          "sha256": "b07125ca0b068dd3b2ac60ef564196ad3241a4163b2e7e53fcfae97756a4cc6a"
+        },
+        {
+          "path": "third_party/alibaba-datax/tdenginewriter/src/main/resources/plugin.json",
+          "sha256": "6359ab77a4ac2dc043d3acf6e355b9e1139d0a03a15b5556cc9c78171144361c"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_TSDB",
+      "kind": "WRITER_PLUGIN",
+      "module": "tsdbwriter",
+      "name": "tsdbwriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "tsdbwriter",
+      "required_e3_test_id": "E3-CAP-WRITER-TSDBWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-TSDBWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/tsdbwriter/pom.xml",
+          "sha256": "6b9b3cc76c4a2824112e8b2baa19a1c28cd6e6785ea717627fc32e7cae66ef8a"
+        },
+        {
+          "path": "third_party/alibaba-datax/tsdbwriter/src/main/resources/plugin.json",
+          "sha256": "b8dc549a4b0c5a68fa8f4ec8a5cf64346a64b604c48e795b0d819fc87e203a43"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    },
+    {
+      "id": "WRITER_PLUGIN_TXTFILE",
+      "kind": "WRITER_PLUGIN",
+      "module": "txtfilewriter",
+      "name": "txtfilewriter",
+      "ordinary_user_executable": false,
+      "plugin_name": "txtfilewriter",
+      "required_e3_test_id": "E3-CAP-WRITER-TXTFILEWRITER",
+      "required_e4_test_id": "E4-CAP-WRITER-TXTFILEWRITER",
+      "risk_category": "EXTERNAL_DATA_ENDPOINT",
+      "source_evidence_level": "SOURCE_PRESENT",
+      "source_files": [
+        {
+          "path": "third_party/alibaba-datax/txtfilewriter/pom.xml",
+          "sha256": "c678a7bb94b47d31c127e0d6cca5cbb0a95c693d16af42aabb351c5bb2ad4330"
+        },
+        {
+          "path": "third_party/alibaba-datax/txtfilewriter/src/main/resources/plugin.json",
+          "sha256": "3baacd6c17235b2a46281e8d4e6c84b4985541bf57ef4576408973c2dbecf96f"
+        }
+      ],
+      "v1_disposition": "FUTURE_CERTIFICATION_REQUIRED"
+    }
+  ],
+  "schema_version": "1.0",
+  "upstream": {
+    "commit": "9a1f88751e24314b083a74f1b83ef56d69ce98bd",
+    "repository": "https://github.com/alibaba/DataX.git",
+    "root_pom_path": "third_party/alibaba-datax/pom.xml",
+    "root_pom_sha256": "640da2e70c2740708570e549ee95873fcbcd0b83bf06bd404926bf36e279db45",
+    "source_manifest_path": "runtime/upstream-files.sha256",
+    "source_manifest_sha256": "65230e3a9b31e861b38a58d12d758eed4d8b539351706d0ddb241b851c899b3b",
+    "source_tree": "534508f96331c4b9f3737ea4e8294cc56aedc67d",
+    "tag": "datax_v202309",
+    "upstream_lock_path": "runtime/upstream.lock.json",
+    "upstream_lock_sha256": "167170231119740c4da9af9260264e8f1e6969710745bc26f5fb294dc66faa8b"
+  }
+}

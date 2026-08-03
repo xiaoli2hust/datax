@@ -1,0 +1,504 @@
+{
+  "schema_version": "1.0",
+  "contract_name": "runtime-db-write-matrix",
+  "status": "ACCEPTED_BASELINE_NOT_GRANT_READY",
+  "authority": "ADR-0013",
+  "scope": "FP-P1-003A execution-fact least privilege; 003B remains deferred",
+  "default_policy": {
+    "public_table_dml": "DENY_UNLESS_LISTED",
+    "future_table_dml": "DENY_UNLESS_LISTED",
+    "runtime_delete": "DENY_UNLESS_LISTED",
+    "sequence_usage": "DENY_UNLESS_LISTED",
+    "state_or_fence_write": "REQUIRES_COLUMN_GRANT_AND_DATABASE_CONSTRAINT"
+  },
+  "grant_ready": false,
+  "grant_ready_condition": "Every grouped product-management table must be expanded to exact SQL operation, writable column and transition rows before a DML-revocation migration is authored.",
+  "implementation_status": {
+    "overall": "ACCEPTED_BASELINE_NOT_GRANT_READY",
+    "worker_kek_read_only": "E1_SOURCE_COMPLETE_POSTGRES_PERMISSION_PENDING",
+    "scheduler_singleton": "E1_SOURCE_COMPLETE_POSTGRES_PERMISSION_PENDING",
+    "lifecycle_claim_lock": "E1_SOURCE_COMPLETE_FUNCTION_MIGRATION_AND_POSTGRES_CONCURRENCY_PENDING",
+    "lifecycle_function": "NOT_IMPLEMENTED"
+  },
+  "global_invariants": [
+    "No datax_api or datax_worker ON ALL TABLES INSERT UPDATE DELETE grant may remain.",
+    "No migration-owner ALTER DEFAULT PRIVILEGES grant may give runtime DML on future tables.",
+    "Execution state, fence, attempt linkage, target lock and event type constraints are enforced by PostgreSQL functions or triggers, not column grants alone.",
+    "execution_events are part of 003A; API must not create success, oracle, attempt, fence or Worker lifecycle events.",
+    "Every listed write path has a real PostgreSQL positive and direct-SQL negative test."
+  ],
+  "principals": {
+    "datax_api": {
+      "purpose": "HTTP/API and fixed lifecycle helper; product-management writes are explicitly enumerated.",
+      "function_only": [
+        {
+          "name": "des_api_request_local_stop",
+          "preconditions": [
+            "session_user=datax_api",
+            "singleton_id=1"
+          ],
+          "effect": {
+            "table": "system_control",
+            "columns": [
+              "draining",
+              "reason",
+              "updated_at"
+            ],
+            "fixed_values": {
+              "draining": true,
+              "reason": "LOCAL_STOP_REQUESTED"
+            }
+          },
+          "security": [
+            "SECURITY DEFINER",
+            "fixed safe search_path",
+            "PUBLIC EXECUTE revoked",
+            "no reverse draining transition"
+          ]
+        }
+      ],
+      "table_writes": [
+        {
+          "tables": [
+            "organizations",
+            "users",
+            "organization_members",
+            "role_assignments",
+            "auth_sessions",
+            "idempotency_records"
+          ],
+          "purpose": "bootstrap, identity, role, session and idempotency management",
+          "operations": "explicit per-table columns and transitions are required in migration tests; no generic runtime DML grant"
+        },
+        {
+          "tables": [
+            "projects",
+            "endpoint_policies",
+            "endpoint_policy_revisions",
+            "physical_endpoint_identities",
+            "datasources",
+            "datasource_revisions",
+            "datasource_usage_grants",
+            "transfer_policies",
+            "transfer_policy_approvals",
+            "sync_jobs",
+            "job_versions"
+          ],
+          "purpose": "admin/developer governance and immutable revision creation",
+          "operations": "explicit per-table management writes; immutable revision/fact rows are INSERT-only unless separately listed"
+        },
+        {
+          "table": "credential_secrets",
+          "insert": "new credential version",
+          "update_columns": [
+            "status",
+            "retired_at",
+            "revoked_at",
+            "compromised_at",
+            "status_reason",
+            "updated_at"
+          ],
+          "forbidden": [
+            "DELETE",
+            "plaintext credential access"
+          ]
+        },
+        {
+          "table": "credential_secret_envelopes",
+          "insert": "new envelope only",
+          "forbidden": [
+            "UPDATE",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "kek_key_versions",
+          "insert": "bootstrap/API or migration-owner registration only",
+          "forbidden": [
+            "datax_worker INSERT",
+            "UPDATE",
+            "DELETE"
+          ],
+          "implementation_prerequisite": "Worker CredentialService must use a read-only constructor and fail closed if no active KEK is registered.",
+          "implementation_status": "E1_SOURCE_COMPLETE_POSTGRES_PERMISSION_PENDING"
+        },
+        {
+          "table": "endpoint_connection_evidences",
+          "insert": {
+            "operation_kind": [
+              "TEST",
+              "METADATA"
+            ],
+            "required_null_columns": [
+              "execution_id",
+              "recovery_probe_id",
+              "attempt_id",
+              "fence_epoch"
+            ]
+          },
+          "forbidden": [
+            "UPDATE",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "project_queue_service_cursors",
+          "insert": "zero cursor when API creates project",
+          "forbidden": [
+            "UPDATE",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "queue_scheduler_state",
+          "forbidden": [
+            "INSERT",
+            "UPDATE",
+            "DELETE"
+          ],
+          "implementation_prerequisite": "migration owner initializes the singleton; create_project must not lazily create it.",
+          "implementation_status": "E1_SOURCE_COMPLETE_POSTGRES_PERMISSION_PENDING"
+        },
+        {
+          "table": "executions",
+          "write_paths": [
+            "api_queue_execution",
+            "api_rerun_execution",
+            "api_revoke_target_exclusivity"
+          ],
+          "insert_fixed_state": {
+            "process_state": "QUEUED",
+            "data_effect": "NONE",
+            "verification_state": "NOT_STARTED",
+            "state_version": 1,
+            "fence_epoch": 0,
+            "attempt_count": 0,
+            "active_attempt_id": null,
+            "summary_parse_status": "PENDING"
+          },
+          "update_columns": [
+            "target_exclusivity_status",
+            "target_exclusivity_revoked_at",
+            "target_exclusivity_revocation_reason",
+            "state_version"
+          ],
+          "update_transition": "ACTIVE -> REVOKED only, atomically paired with TARGET_EXCLUSIVITY_REVOKED event and PENDING work termination request",
+          "forbidden": [
+            "process_state transition",
+            "data_effect transition",
+            "verification_state transition",
+            "fence write",
+            "attempt binding",
+            "runtime_snapshot",
+            "oracle fields",
+            "terminal time or exit code",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "target_copy_locks",
+          "insert_fixed_state": "RESERVED only, in the same transaction as a new QUEUED execution; attempt/fence/acquired/released fields are null",
+          "update_transition": "RECOVERY_REQUIRED -> RELEASED only through api_rerun_execution after verified recovery gate",
+          "forbidden": [
+            "other state transition",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "execution_events",
+          "insert_event_types": [
+            "EXECUTION_QUEUED",
+            "EXECUTION_RERUN_QUEUED",
+            "TARGET_EXCLUSIVITY_REVOKED"
+          ],
+          "forbidden": [
+            "UPDATE",
+            "DELETE",
+            "success/oracle/attempt/fence/worker lifecycle event"
+          ]
+        },
+        {
+          "table": "execution_cancel_requests",
+          "insert_fixed_status": "PENDING",
+          "forbidden": [
+            "UPDATE",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "work_termination_requests",
+          "insert_fixed_status": "PENDING",
+          "insert_reasons": [
+            "TARGET_EXCLUSIVITY_REVOKED",
+            "CREDENTIAL_REVOKED",
+            "CREDENTIAL_COMPROMISED"
+          ],
+          "forbidden": [
+            "UPDATE",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "recovery_gates",
+          "update_transitions": [
+            "OPEN -> REMEDIATION_SUBMITTED",
+            "REJECTED -> REMEDIATION_SUBMITTED"
+          ],
+          "update_columns": [
+            "remediation_confirmation",
+            "target_empty_evidence",
+            "latest_recovery_probe_id",
+            "submitted_at",
+            "reason_code"
+          ],
+          "forbidden": [
+            "INSERT",
+            "DELETE",
+            "VERIFIED/REJECTED state write"
+          ]
+        },
+        {
+          "table": "recovery_probes",
+          "insert_fixed_state": {
+            "process_state": "QUEUED",
+            "verification_state": "NOT_STARTED",
+            "fence_epoch": 0,
+            "active_attempt_id": null
+          },
+          "forbidden": [
+            "UPDATE",
+            "DELETE"
+          ]
+        }
+      ],
+      "select_only": [
+        "target_namespaces",
+        "execution_attempts",
+        "recovery_probe_attempts",
+        "worker_heartbeats"
+      ]
+    },
+    "datax_worker": {
+      "purpose": "fenced execution, reconciliation, recovery probe and endpoint evidence only",
+      "table_writes": [
+        {
+          "table": "worker_heartbeats",
+          "operation": "worker_id-keyed INSERT/UPDATE only"
+        },
+        {
+          "table": "system_control",
+          "update_columns": [
+            "draining",
+            "reason",
+            "host_boot_id",
+            "reconcile_epoch",
+            "reconciled_at",
+            "updated_at"
+          ],
+          "constraint": "startup/reconcile/acceptance flow only"
+        },
+        {
+          "table": "executions",
+          "operation": "fenced claim, running, verification, cancellation, terminal and reconcile transitions only",
+          "constraint": "except unclaimed QUEUED cancellation, each mutation matches active_attempt_id, fence_epoch and valid lease",
+          "forbidden": [
+            "INSERT",
+            "DELETE",
+            "API-only ACTIVE -> REVOKED target exclusivity transition"
+          ]
+        },
+        {
+          "table": "execution_attempts",
+          "operation": "INSERT on claim; fenced lease, process, heartbeat, termination and terminal UPDATE only",
+          "forbidden": [
+            "DELETE"
+          ]
+        },
+        {
+          "table": "target_copy_locks",
+          "update_transitions": [
+            "RESERVED -> ACTIVE",
+            "RESERVED -> RELEASED",
+            "ACTIVE -> RELEASED",
+            "ACTIVE -> RECOVERY_REQUIRED"
+          ],
+          "forbidden": [
+            "INSERT",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "execution_events",
+          "operation": "claim, preflight, state transition, cancellation, reconciliation and terminal INSERT only",
+          "constraint": "post-claim event matches current attempt and fence",
+          "forbidden": [
+            "UPDATE",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "execution_cancel_requests",
+          "update_transitions": [
+            "PENDING -> ACKNOWLEDGED -> COMPLETED",
+            "PENDING -> COMPLETED",
+            "PENDING|ACKNOWLEDGED -> REJECTED"
+          ],
+          "forbidden": [
+            "INSERT",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "work_termination_requests",
+          "insert": "TARGET_EXCLUSIVITY_EXPIRED PENDING only",
+          "update_transitions": [
+            "PENDING -> ACKNOWLEDGED -> COMPLETED"
+          ],
+          "forbidden": [
+            "DELETE"
+          ]
+        },
+        {
+          "table": "recovery_gates",
+          "insert": "OPEN gate for terminal execution requiring remediation",
+          "update_transitions": [
+            "REMEDIATION_SUBMITTED -> VERIFIED",
+            "REMEDIATION_SUBMITTED -> REJECTED"
+          ],
+          "forbidden": [
+            "DELETE"
+          ]
+        },
+        {
+          "table": "recovery_probes",
+          "operation": "fenced claim, run and terminal update only",
+          "forbidden": [
+            "INSERT",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "recovery_probe_attempts",
+          "operation": "INSERT on claim and fenced lease/process/terminal update only",
+          "forbidden": [
+            "DELETE"
+          ]
+        },
+        {
+          "table": "endpoint_connection_evidences",
+          "insert_operation_kind": [
+            "PREFLIGHT",
+            "DATAX",
+            "ORACLE",
+            "RECOVERY_PROBE"
+          ],
+          "constraint": "binds current execution or probe, attempt and exact fence",
+          "forbidden": [
+            "UPDATE",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "project_queue_service_cursors",
+          "operation": "scheduler cursor UPDATE only",
+          "forbidden": [
+            "INSERT",
+            "DELETE"
+          ]
+        },
+        {
+          "table": "queue_scheduler_state",
+          "operation": "next_service_sequence and updated_at UPDATE only",
+          "forbidden": [
+            "INSERT",
+            "DELETE"
+          ]
+        }
+      ],
+      "must_be_select_only": [
+        "organizations",
+        "users",
+        "organization_members",
+        "role_assignments",
+        "auth_sessions",
+        "projects",
+        "endpoint_policies",
+        "endpoint_policy_revisions",
+        "physical_endpoint_identities",
+        "datasources",
+        "datasource_revisions",
+        "datasource_usage_grants",
+        "transfer_policies",
+        "transfer_policy_approvals",
+        "sync_jobs",
+        "job_versions",
+        "credential_secrets",
+        "credential_secret_envelopes",
+        "kek_key_versions",
+        "target_namespaces"
+      ]
+    }
+  },
+  "no_runtime_dml": [
+    {
+      "table": "target_namespaces",
+      "reason": "No production registration writer exists; do not invent one to satisfy grants."
+    },
+    {
+      "table": "retention_holds",
+      "reason": "No API/Worker production writer is currently identified."
+    }
+  ],
+  "deferred_to_fp_p1_003b": [
+    "audit_events",
+    "audit_chain_watermarks",
+    "execution_log_chunks",
+    "execution_log_gaps",
+    "executions.log_truncated",
+    "executions.log_incomplete",
+    "executions.log_raw_received_bytes",
+    "executions.log_redacted_received_bytes",
+    "executions.log_stored_bytes",
+    "executions.log_dropped_bytes",
+    "executions.first_truncated_sequence"
+  ],
+  "preimplementation_blockers": [
+    {
+      "id": "P1-003A-KEK-WORKER-WRITE",
+      "resolution": "Make Worker KEK lookup read-only and fail closed; register active KEK through migration/API/bootstrap owner.",
+      "source_prerequisite_status": "E1_COMPLETE",
+      "remaining": "PostgreSQL grant migration and direct-SQL negative evidence"
+    },
+    {
+      "id": "P1-003A-SCHEDULER-API-WRITE",
+      "resolution": "Initialize queue_scheduler_state through migration owner; remove API lazy singleton creation.",
+      "source_prerequisite_status": "E1_COMPLETE",
+      "remaining": "PostgreSQL grant migration and direct-SQL negative evidence"
+    },
+    {
+      "id": "P1-003A-LIFECYCLE-SYSTEM-CONTROL",
+      "resolution": "Use des_api_request_local_stop rather than generic system_control UPDATE.",
+      "source_prerequisite_status": "CLAIM_ROW_LOCK_E1_COMPLETE",
+      "remaining": "Create the constrained PostgreSQL function, revoke generic UPDATE/EXECUTE, and prove stop-versus-claim serialization on PostgreSQL"
+    },
+    {
+      "id": "P1-003A-MAINTENANCE-DELETE",
+      "resolution": "Create a controlled maintenance principal or explicitly block retention; do not grant DELETE to API or Worker."
+    },
+    {
+      "id": "P1-003A-TARGET-NAMESPACE",
+      "resolution": "Design a governed registration path in a separate change; both runtime roles stay SELECT-only."
+    },
+    {
+      "id": "P1-003A-MATRIX-COMPLETENESS",
+      "resolution": "Expand grouped API product-management rows to per-table/per-column SQL grants and direct PostgreSQL positive/negative cases; the current document is an accepted baseline inventory, not a migration-ready grant script."
+    }
+  ],
+  "required_evidence": [
+    "migration head -> previous -> head on real PostgreSQL",
+    "direct SQL permission and trigger negative tests under both runtime roles",
+    "legitimate API and Worker positive paths",
+    "no default DML and no unlisted grant inspection",
+    "003B remains explicitly BLOCKED until audit and log functions are implemented"
+  ]
+}
