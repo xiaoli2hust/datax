@@ -20,9 +20,11 @@ DataX Enterprise Studio 是面向企业内部数据工程团队的 DataX 可视�
 [第一性原理问题台账与开发修复计划](docs/14_第一性原理问题台账与开发修复计划.md)。
 
 > 最新所有者方向是把产品重构为 Windows 桌面应用直接运行随包 DataX/JRE，不再以 Docker、
-> 本地 PostgreSQL 或浏览器为运行前置。该方向仍在文档裁决阶段，详见
-> [Windows 直连 DataX 桌面版重构方案](docs/15_Windows直连DataX桌面版重构方案.md)；当前
-> Docker/Compose 架构尚未被替代，不能混用两套规则。
+> 本地 PostgreSQL 或浏览器为运行前置。产品方案见
+> [Windows 直连 DataX 桌面版重构方案](docs/15_Windows直连DataX桌面版重构方案.md)，可直接派给
+> 编码 Agent 的任务依赖、文件清单、逐项 DoD、测试和证据规则见
+> [Windows 直连 DataX 桌面版开发执行任务书](docs/16_Windows直连DataX桌面版开发执行任务书.md)。
+> 当前 Docker/Compose 架构尚未被 ADR-0016 替代，不能跳过 `DXD-000` 或混用两套规则。
 
 本轮还在隔离临时 MySQL 8/PostgreSQL 15 fixture 上实际复跑了固定 DataX Runtime：四个方向各
 覆盖完整表和选列，共 8 组、每组 10,000 行，进程返回码、独立 oracle 摘要、缺失行和意外行均通过。
@@ -247,6 +249,7 @@ Docker Desktop 停止期间服务不可用，恢复后必须先完成执行状�
 | [原始文档评审与修订说明](docs/13_原始文档完整性评审与修订说明.md) | 原始包为何不完整、如何补齐及修订后边界 |
 | [第一性原理问题台账与开发修复计划](docs/14_第一性原理问题台账与开发修复计划.md) | 当前 P0/P1、冲突、责任、证据、分阶段 DoD 和 DataX 能力分级 |
 | [Windows 直连 DataX 桌面版重构方案](docs/15_Windows直连DataX桌面版重构方案.md) | 所有者当前的轻量桌面版重构提案、范围、迁移和验收计划 |
+| [Windows 直连 DataX 桌面版开发执行任务书](docs/16_Windows直连DataX桌面版开发执行任务书.md) | 供 GPT-5.6 Luna/编码 Agent 执行的任务依赖、精确文件、实现步骤、DoD、测试和证据模板 |
 
 机器可校验契约位于 [`docs/contracts`](docs/contracts)，架构决策记录位于 [`docs/adr`](docs/adr)。各文档按关注点负责：PRD 定义产品结果，ADR 定义已接受决策，机器契约定义可交换结构。任何来源出现语义冲突都必须先阻断实现并共同修正，不能用机器契约静默覆盖产品或架构决策。
 
