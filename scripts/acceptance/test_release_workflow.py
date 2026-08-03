@@ -16,6 +16,18 @@ class ReleaseWorkflowTests(unittest.TestCase):
         cls.raw = RELEASE_WORKFLOW.read_text(encoding="utf-8")
         cls.workflow = yaml.load(cls.raw, Loader=yaml.BaseLoader)
 
+    def test_root_license_is_canonical_apache_2_0_and_upstream_notices_remain(self) -> None:
+        root_license = REPOSITORY_ROOT / "LICENSE"
+        canonical_apache = REPOSITORY_ROOT / "third_party/licenses/Apache-2.0.txt"
+        datax_license = REPOSITORY_ROOT / "third_party/alibaba-datax/license.txt"
+        datax_notice = REPOSITORY_ROOT / "third_party/alibaba-datax/NOTICE"
+
+        self.assertTrue(root_license.is_file())
+        self.assertEqual(root_license.read_bytes(), canonical_apache.read_bytes())
+        self.assertIn(b"Apache License, Version 2.0", root_license.read_bytes())
+        self.assertIn(b"Alibaba Group Holding Ltd.", datax_license.read_bytes())
+        self.assertIn(b"Alibaba Group Holding Ltd.", datax_notice.read_bytes())
+
     def test_hosted_attestor_has_the_fixed_trust_boundary(self) -> None:
         job = self.workflow["jobs"]["hosted-candidate-attestor"]
         self.assertEqual(job["runs-on"], "ubuntu-24.04")

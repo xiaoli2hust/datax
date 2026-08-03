@@ -6,7 +6,7 @@
 | 默认分支 | `main` |
 | 开发模式 | 受保护主干 + 短期分支 + Pull Request |
 | 发布单位 | Windows 11 x64 已签名 Setup/Launcher、源码标签、镜像摘要、迁移版本、Runtime manifest、哈希与 SBOM |
-| 当前许可证 | 仓库所有者尚未选择；公开源码前必须完成 |
+| 当前许可证 | Apache-2.0；上游 DataX 与第三方组件继续按各自许可证/NOTICE 分发 |
 
 > 当前远端治理边界：截至 2026-08-02，`main` 已启用经典分支保护，严格要求分支最新、
 > 线性历史、PR、会话解决以及本文列出的 12 个 CI/安全检查，且禁止强推和删除；管理员
@@ -37,9 +37,10 @@
 > 在决策前，签名 job 保持只路由到该 group 与
 > `self-hosted/windows/x64/datax-release-windows11` labels 的交集，缺组或缺 runner 保持阻断，
 > 不能回退到任意同标签 runner。
-> 2026-08-03 的复核还显示 Actions runner 总数为 0，根 `LICENSE` REST 端点返回 404；因此即使
-> PR 的普通 CI 全绿，也没有可执行签名 job 的受控机器、可用的受保护环境或候选组装所需的
-> 所有者许可证决策。上述 REST 结果是当次外部状态证据，不是签名、安装或 Windows E4 证据。
+> 2026-08-03 复核时 Actions runner 总数为 0，根 `LICENSE` REST 端点返回 404；本分支随后由
+> 所有者选择 Apache-2.0 并加入根 `LICENSE`，从而关闭“缺失许可证文本”这一项。即使 PR 的普通 CI
+> 全绿，仍没有可执行签名 job 的受控机器或可用的受保护环境；上述 REST 结果不是签名、安装或
+> Windows E4 证据。
 > 同一线上快照还显示仓库 Actions policy 为 `allowed_actions=all`、`sha_pinning_required=false`，
 > `main` 的 required approving review count 为 0 且未要求 CODEOWNERS review；源码中 action 已固定
 > SHA，但远端没有强制这些供应链/独立复核治理。迁入 Organization 后，Repository Owner 必须以
@@ -453,16 +454,14 @@ Windows 安装器、Launcher 框架、代码签名工具、WebView/浏览器组�
 
 ## 10. 本仓库许可证决策
 
-仓库公开不等于自动授予开源许可。在所有者明确选择前：
+仓库所有者已选择 Apache-2.0，并在根目录提供完整 `LICENSE`。这为本仓库原创代码授予
+Apache-2.0 权利；不会改写 DataX、JDBC 驱动、容器镜像或其他第三方组件的许可证/NOTICE
+义务。DataX 原始 `license.txt` 与 `NOTICE` 保留在 `third_party/alibaba-datax/`，Worker 镜像
+将其复制到 `/opt/datax/licenses/`。
 
-- 不添加推测性的 `LICENSE`。
-- README 明确当前无额外许可授予。
-- 允许公开阅读，但不得对再分发或商业使用作承诺。
-- 首次公开源码发布前，由所有者在 Apache-2.0、其他许可证或闭源策略中做出明确决定。
-- `release.yml` 在任何候选制品、镜像或 SBOM 组装前，要求根目录存在非空、非 symlink
-  的普通 UTF-8 文本 `LICENSE`；缺失、空文件、只含空白、NUL 字节、无效 UTF-8 或
-  reparse/symlink 一律失败关闭。该检查只证明所有者已提供文本，不能替 Legal 判定许可证
-  内容、兼容性或再分发义务。
+`release.yml` 在任何候选制品、镜像或 SBOM 组装前，仍要求根目录存在非空、非 symlink 的
+普通 UTF-8 文本 `LICENSE`；缺失、空文件、只含空白、NUL 字节、无效 UTF-8 或 reparse/symlink
+一律失败关闭。该检查证明发布输入包含许可证文本，不替代各依赖的兼容性或再分发审查。
 
 ## 11. 安全响应
 

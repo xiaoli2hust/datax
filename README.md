@@ -275,11 +275,11 @@ Docker Desktop 停止期间服务不可用，恢复后必须先完成执行状�
 
 ## 上游与许可证
 
-DataX 上游为 [alibaba/DataX](https://github.com/alibaba/DataX)，上游代码采用 Apache
-License 2.0。该事实不自动决定本仓库原创代码的许可证；在仓库所有者明确选择并加入
-`LICENSE` 前，本仓库不授予额外开源许可。依赖、插件和镜像必须分别记录来源、版本、
-许可证与校验和。发布工作流会在候选组装前拒绝缺失、空白、NUL/非 UTF-8 或 symlink
-的根 `LICENSE`，但不会替所有者或 Legal 选择、解释许可证。
+本仓库的原创代码采用 [Apache License 2.0](LICENSE)。DataX 上游为
+[alibaba/DataX](https://github.com/alibaba/DataX)，其代码和归属声明保留在
+`third_party/alibaba-datax/license.txt` 与 `third_party/alibaba-datax/NOTICE`；Worker 镜像会把
+相应许可证/NOTICE 一并带入运行时。依赖、插件和镜像仍必须分别记录来源、版本、许可证与校验和；
+Apache-2.0 不自动替代第三方驱动或 Docker 镜像的再分发审查。
 
 ## 参与方式
 
