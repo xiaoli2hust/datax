@@ -138,7 +138,8 @@ Launcher 配置目录余量，迁移、日志、复制或备份可能在真正�
 `backup` 在 staging 前，均运行带 opaque name/双标签的 release-locked Worker 容量探针：三个
 `local`/无 options 认证卷只读挂到固定 `/probe/*`，`network=none`、无 secret、只读根、`0:0`、
 `cap_drop=ALL` 后仅加 `DAC_READ_SEARCH`、16 PID/64 MiB/0.25 CPU、`--pull=never`；只允许固定
-行协议的 `statvfs` 输出，任一 Docker/协议异常或少于 200 GiB 均失败关闭。错误、超时或无效输出
+行协议的 `statvfs` 输出，任一 Docker/协议异常或当前可用空间少于 40 GiB 均失败关闭。40 GiB
+是启动水位而非每卷预留；200 GiB 仅为大表复制/30 天日志的推荐容量。错误、超时或无效输出
 只按重新认证 immutable ID 清理同名 probe 容器。容量失败前受控初始化或镜像缓存可能保留，但
 Compose/业务数据库不会启动。
 

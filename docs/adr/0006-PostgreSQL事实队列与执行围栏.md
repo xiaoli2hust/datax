@@ -63,7 +63,8 @@ Windows 睡眠/休眠/关机和 Docker Desktop/WSL2 生命周期又增加了“�
   取消并释放 `RESERVED`；已领取 Execution 停止并进入 `RECOVERY_REQUIRED`；已启动 oracle
   形成 `INCONCLUSIVE/TARGET_EXCLUSIVITY_BROKEN`。平台锁和队列事实不能证明未报告、瞬时
   或已回滚的外部写从未发生。
-- 默认 200 GiB 主机采用日志/数据库/工作区/安全保留分区预算、绿色/黄色/红色水位
+- 依 ADR-0015，40 GiB 是 Launcher 对实际 Docker 数据文件系统的最低启动水位，不能把
+  200 GiB 大表/30 天日志推荐容量当成启动硬门槛；运行后仍使用绿色/黄色/红色 waterline
   admission 与 20 小时/24 小时服务预算。轻量 200 次/天和大表 20 次/天是不同组合档，
   不能与单执行 100 MiB 日志硬上限同时取峰值。
 - PostgreSQL、脱敏日志和执行工作区分别使用固定 Docker named volumes；本地备份由

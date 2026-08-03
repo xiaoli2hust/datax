@@ -4,8 +4,11 @@ use std::path::{Path, PathBuf};
 // `%LOCALAPPDATA%` stores Launcher-owned configuration, secrets and local backup metadata, but
 // Docker Desktop may keep its VHD and named volumes on a different disk.  Keep the two storage
 // admission facts separate: the host check below protects Launcher-owned files; this probe
-// contract is for the actual Docker-managed volume filesystem.
-pub const MIN_DOCKER_STORAGE_FREE_BYTES: u64 = 200 * 1024 * 1024 * 1024;
+// contract is for the actual Docker-managed volume filesystem.  This is the minimum safe
+// *startup* waterline, not a per-volume reservation and not the 200 GiB large-table capacity
+// recommendation.  Docker commonly places these volumes on the same filesystem, so seeing the
+// same free-space value for all three does not require 3 × 40 GiB.
+pub const MIN_DOCKER_STORAGE_FREE_BYTES: u64 = 40 * 1024 * 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DockerStorageProbeMount {
@@ -121,7 +124,7 @@ pub fn ensure_docker_storage_capacity_probe(
         if free_bytes < MIN_DOCKER_STORAGE_FREE_BYTES {
             return Err(LauncherError::new(
                 "DOCKER_STORAGE_CAPACITY_INSUFFICIENT",
-                "Docker 实际数据卷可用空间低于 200 GiB 容量基线；未启动 Compose 或业务数据库写入，受控初始化或镜像缓存可能已保留。",
+                "Docker 实际数据卷可用空间低于 40 GiB 启动基线；未启动 Compose 或业务数据库写入，受控初始化或镜像缓存可能已保留。200 GiB 是大表/30 天日志包络的推荐容量，不是启动门槛。",
             ));
         }
     }
@@ -2225,6 +2228,7 @@ mod tests {
 
     #[test]
     fn docker_storage_capacity_probe_accepts_exact_fixed_schema_and_boundary() {
+        assert_eq!(MIN_DOCKER_STORAGE_FREE_BYTES, 40 * 1024 * 1024 * 1024);
         assert!(
             ensure_docker_storage_capacity_probe(
                 true,

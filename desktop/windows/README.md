@@ -81,8 +81,10 @@
    当前 generation named volume 的实际 `statvfs` 可用空间。探针只读挂载固定 `/probe/*`、
    `network=none`、无 secret、只读根、`0:0`、`cap_drop=ALL` 后仅加
    `DAC_READ_SEARCH` 以穿越 PostgreSQL `0700` 卷根、`no-new-privileges`、16 PID、64 MiB 与
-   0.25 CPU，并以 `--pull=never` 运行固定 Python 脚本；任一 Docker/协议失败或任一卷不足
-   200 GiB 均阻断。Linux 下该 capability 也可绕过普通文件读取和目录搜索权限，所以“脚本只执行
+   0.25 CPU，并以 `--pull=never` 运行固定 Python 脚本；任一 Docker/协议失败或任一卷当前可用
+   空间不足 40 GiB 均阻断。这是实际 Docker 数据文件系统的**启动水位**，不是每卷预留
+   40 GiB，也不是要求三卷合计 120 GiB；三卷通常在同一 Docker 文件系统上，因而会报告相同
+   的可用空间。200 GiB 只是在大表复制并保留 30 天日志时的推荐容量。Linux 下该 capability 也可绕过普通文件读取和目录搜索权限，所以“脚本只执行
    `statvfs`”不等于卷内容被内核隔离；无写入/网络/secret 与固定 Worker digest/脚本共同限制受信
    probe 的行为。错误、超时或无效输出时仅按重新认证的 immutable ID 清理同名 probe 容器，不把
    安装目录余量当作 Docker 容量。容量失败时受控初始化或镜像缓存可能已经存在，但 Compose/业务
